@@ -1,0 +1,15 @@
+schema_version = 1
+
+[policy]
+capital = "5000"
+max_live_exposure = "1000"
+max_position_risk = "25"
+max_combined_risk = "50"
+max_positions = 2
+max_entries_per_session = 1
+min_score = 80
+max_monthly_drawdown = "250"
+max_weekly_drawdown = "100"
+universe_max_age_days = 31
+live_quote_max_age_seconds = 300
+disagreement_tolerance = "0.005"

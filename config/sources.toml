@@ -1,0 +1,7 @@
+schema_version = 1
+
+[sources]
+alpaca_market_data_url = "https://data.alpaca.markets"
+sec_submissions_url = "https://data.sec.gov/submissions/"
+sec_archives_url = "https://www.sec.gov/Archives/"
+reference_hosts = ["www.nyse.com", "www.nasdaqtrader.com"]

@@ -130,6 +130,8 @@ class SettingsTests(unittest.TestCase):
                 "secret-key-canary\r\ninjected",
             ),
             ("key C1 control", "APCA_API_KEY_ID", "key\x85id"),
+            ("key non-ASCII", "APCA_API_KEY_ID", "clé-id"),
+            ("secret emoji", "APCA_API_SECRET_KEY", "secret-🔐"),
             (
                 "user agent null",
                 "SEC_USER_AGENT",
@@ -139,6 +141,11 @@ class SettingsTests(unittest.TestCase):
                 "user agent separator",
                 "SEC_USER_AGENT",
                 "Stock Monitor\u2028tests test@example.com",
+            ),
+            (
+                "user agent non-ASCII",
+                "SEC_USER_AGENT",
+                "Stock Monitör tests test@example.com",
             ),
             ("key excessive length", "APCA_API_KEY_ID", "k" * 257),
             (

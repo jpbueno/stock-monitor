@@ -6,7 +6,6 @@ import ipaddress
 import json
 import re
 import tomllib
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -240,11 +239,8 @@ def _http_environment_value(name: str, value: object, max_length: int) -> str:
         or not value
         or value != value.strip()
         or len(value) > max_length
-        or any(
-            (character.isspace() and character != " ")
-            or unicodedata.category(character).startswith("C")
-            for character in value
-        )
+        or not value.isascii()
+        or not value.isprintable()
     ):
         raise ConfigurationError(f"required environment variable {name} is invalid")
     return value

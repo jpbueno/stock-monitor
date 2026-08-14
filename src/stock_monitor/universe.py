@@ -196,7 +196,7 @@ class UniverseSnapshot:
             },
             "universe",
         )
-        if table["schema_version"] != 1:
+        if type(table["schema_version"]) is not int or table["schema_version"] != 1:
             raise UniverseError("unsupported universe schema version")
 
         effective_date = _iso_date(table["effective_date"], "effective_date")
@@ -253,6 +253,7 @@ class UniverseSnapshot:
             records,
             by_symbol,
             benchmark["regime_support_symbols"],
+            sector_mapping,
         )
         return cls(
             effective_date=effective_date,
@@ -800,6 +801,7 @@ def _validate_support_roles(
     records: tuple[UniverseRecord, ...],
     by_symbol: Mapping[str, UniverseRecord],
     regime_support_symbols: tuple[str, ...],
+    sector_mapping: Mapping[str, str],
 ) -> None:
     required_etfs = {"SPY", "QQQ", "VTI", "XLK"}
     if any(
@@ -807,11 +809,17 @@ def _validate_support_roles(
         for symbol in required_etfs
     ):
         raise UniverseError("required benchmark and support ETFs are missing")
+    sector_targets = set(sector_mapping.values())
+    if any(
+        symbol not in by_symbol or by_symbol[symbol].product_type != "etf"
+        for symbol in sector_targets
+    ):
+        raise UniverseError("sector benchmark target is not an ETF")
     expected_roles = {
         "market_benchmark": {"SPY"},
         "regime_benchmark": set(regime_support_symbols),
         "spy_benchmark": {"VTI"},
-        "sector_benchmark": {"XLK"},
+        "sector_benchmark": sector_targets,
     }
     for role, expected_symbols in expected_roles.items():
         actual_symbols = {

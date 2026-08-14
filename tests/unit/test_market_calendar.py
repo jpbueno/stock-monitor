@@ -4,10 +4,12 @@ import json
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from types import MappingProxyType
+from unittest.mock import patch
 
+import stock_monitor.market_calendar as market_calendar_module
 from stock_monitor.market_calendar import CalendarError, MarketCalendar
 from tests.support import calendar_fixture
 
@@ -66,6 +68,55 @@ class MarketCalendarTests(unittest.TestCase):
         )
         self.assertEqual(calendar.closed_dates, EXPECTED_CLOSED_DATES)
         self.assertEqual(calendar.open_session_count, 251)
+
+    def test_load_defaults_as_of_to_current_new_york_date(self) -> None:
+        with patch.object(
+            market_calendar_module,
+            "_current_new_york_date",
+            return_value=REVIEWED_AS_OF,
+            create=True,
+        ) as current_date:
+            try:
+                calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+            except TypeError as exc:
+                self.fail(f"load does not support an omitted as_of: {exc}")
+
+        self.assertEqual(calendar.reviewed_at, REVIEWED_AS_OF)
+        current_date.assert_called_once_with()
+
+    def test_default_as_of_fails_closed_when_manifest_is_future_or_stale(self) -> None:
+        for case, current_date in (
+            ("future", date(2026, 1, 1)),
+            ("stale", date(2026, 9, 15)),
+        ):
+            with self.subTest(case=case), patch.object(
+                market_calendar_module,
+                "_current_new_york_date",
+                return_value=current_date,
+                create=True,
+            ):
+                try:
+                    with self.assertRaises(CalendarError):
+                        MarketCalendar.load(PUBLISHED_CALENDAR)
+                except TypeError as exc:
+                    self.fail(f"load does not support an omitted as_of: {exc}")
+
+    def test_current_date_uses_new_york_at_utc_midnight_boundary(self) -> None:
+        utc_instant = datetime(2026, 8, 15, 3, 30, tzinfo=timezone.utc)
+        with patch.object(
+            market_calendar_module,
+            "datetime",
+            create=True,
+        ) as datetime_type:
+            datetime_type.now.side_effect = utc_instant.astimezone
+            try:
+                current_date = market_calendar_module._current_new_york_date()
+            except AttributeError as exc:
+                self.fail(f"New York current-date helper is missing: {exc}")
+
+        self.assertEqual(current_date, date(2026, 8, 14))
+        requested_timezone = datetime_type.now.call_args.args[0]
+        self.assertEqual(requested_timezone.key, "America/New_York")
 
     def test_regular_session_routes_review_to_1530(self) -> None:
         session = MarketCalendar.load(
@@ -231,7 +282,6 @@ class MarketCalendarTests(unittest.TestCase):
         invalid_values = (
             "2026-08-14",
             datetime(2026, 8, 14),
-            None,
             True,
         )
         for invalid in invalid_values:
@@ -247,6 +297,20 @@ class MarketCalendarTests(unittest.TestCase):
                     as_of=invalid,
                     expected_year=2026,
                 )
+        with self.assertRaises(CalendarError):
+            MarketCalendar.from_mapping(
+                calendar_fixture(),
+                as_of=None,  # type: ignore[arg-type]
+                expected_year=2026,
+            )
+
+    def test_calendar_schema_version_must_be_an_exact_integer(self) -> None:
+        for invalid in (True, False):
+            raw = calendar_fixture()
+            raw["schema_version"] = invalid
+
+            with self.subTest(value=invalid), self.assertRaises(CalendarError):
+                self._load_mapping(raw)
 
     def test_manifest_rejects_exchange_schedule_conflicts(self) -> None:
         raw = calendar_fixture()

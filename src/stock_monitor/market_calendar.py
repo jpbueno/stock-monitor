@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -22,6 +22,15 @@ _TIME_PATTERN = re.compile(r"\d{2}:\d{2}")
 
 class CalendarError(ValueError):
     """A calendar manifest is absent, inconsistent, or not reviewed."""
+
+
+def _current_new_york_date() -> date:
+    """Return today's date in the calendar's authoritative timezone."""
+    try:
+        timezone = ZoneInfo(_NEW_YORK)
+    except ZoneInfoNotFoundError as exc:  # pragma: no cover - platform defect
+        raise CalendarError("America/New_York timezone is unavailable") from exc
+    return datetime.now(timezone).date()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +76,10 @@ class MarketCalendar:
     _closed_date_set: frozenset[date] = field(repr=False)
 
     @classmethod
-    def load(cls, path: Path, as_of: date) -> MarketCalendar:
+    def load(cls, path: Path, as_of: date | None = None) -> MarketCalendar:
         """Load and fully validate a local JSON manifest without network I/O."""
+        if as_of is None:
+            as_of = _current_new_york_date()
         if type(as_of) is not date:
             raise CalendarError("calendar as_of must be an exact date")
         if not isinstance(path, Path):
@@ -127,7 +138,7 @@ class MarketCalendar:
             },
             "calendar",
         )
-        if table["schema_version"] != 1:
+        if type(table["schema_version"]) is not int or table["schema_version"] != 1:
             raise CalendarError("unsupported calendar schema version")
 
         year = _integer(table["year"], "year")

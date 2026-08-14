@@ -258,6 +258,37 @@ class UniverseSnapshotTests(unittest.TestCase):
         self.assertIn("spy_benchmark", snapshot.by_symbol["VTI"].support_roles)
         self.assertIn("sector_benchmark", snapshot.by_symbol["XLK"].support_roles)
 
+    def test_sector_mapping_targets_exactly_match_sector_benchmark_roles(self) -> None:
+        snapshot = UniverseSnapshot.load(
+            PUBLISHED_UNIVERSE,
+            as_of=date(2026, 8, 14),
+        )
+        mapping_targets = set(snapshot.sector_mapping.values())
+        role_holders = {
+            record.symbol
+            for record in snapshot.records
+            if "sector_benchmark" in record.support_roles
+        }
+        self.assertEqual(mapping_targets, role_holders)
+
+        raw = universe_fixture()
+        policy = raw["benchmark_policy"]
+        self.assertIsInstance(policy, dict)
+        sector_mapping = policy["sector_mapping"]
+        self.assertIsInstance(sector_mapping, dict)
+        sector_mapping["AAPL"] = "QQQ"
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        aapl = next(
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("symbol") == "AAPL"
+        )
+        aapl["sector_etf"] = "QQQ"
+
+        with self.assertRaises(UniverseError):
+            self._load_mapping(_resign(raw))
+
     def test_tick_sizes_are_exact_positive_decimals_with_reviewed_sources(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
@@ -319,6 +350,14 @@ class UniverseSnapshotTests(unittest.TestCase):
             raw = universe_fixture()
             raw[field] = value
             with self.subTest(field=field), self.assertRaises(UniverseError):
+                self._load_mapping(_resign(raw))
+
+    def test_universe_schema_version_must_be_an_exact_integer(self) -> None:
+        for invalid in (True, False):
+            raw = universe_fixture()
+            raw["schema_version"] = invalid
+
+            with self.subTest(value=invalid), self.assertRaises(UniverseError):
                 self._load_mapping(_resign(raw))
 
     def test_duplicate_symbol_is_rejected(self) -> None:

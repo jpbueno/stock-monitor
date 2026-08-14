@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,31 @@ from typing import Self
 
 APPLICATION_ID = 0x53544B4D
 BUSY_TIMEOUT_MILLISECONDS = 5_000
+REPORT_ID_PATH_PREFIX_LENGTH = 12
+_POSITION_MUTATING_ACTIONS = frozenset(
+    {
+        "BOUGHT",
+        "PARTIAL_FILL",
+        "RECONCILE_UNRELATED_POSITION",
+        "SOLD",
+        "STOP_FILLED",
+        "STOP_UPDATED",
+    }
+)
+_RECONCILIATION_ACTIONS = frozenset(
+    {
+        "ACCOUNT_CHECK",
+        "BOUGHT",
+        "FEE",
+        "PARTIAL_FILL",
+        "RECONCILE_CASH",
+        "RECONCILE_PENDING_ORDERS",
+        "RECONCILE_UNRELATED_POSITION",
+        "SOLD",
+        "STOP_FILLED",
+        "STOP_UPDATED",
+    }
+)
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{3})_[a-z][a-z0-9_]*\.sql$")
 _TABLES = frozenset(
     {
@@ -74,7 +100,8 @@ class ReportClaim:
     status: str
     claim_token: str | None
     lease_expires_at: datetime
-    report_id: int | None
+    report_row_id: int | None
+    report_id: str | None
 
 
 @dataclass(frozen=True)
@@ -85,6 +112,26 @@ class FinalizedReport:
     report_id: str
     outbox_id: int
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class StoredReport:
+    """Immutable report material sufficient to reconstruct its archive."""
+
+    report_row_id: int
+    report_id: str
+    claim_id: int
+    session_date: date
+    report_kind: str
+    body: str
+    archive_relative_path: str
+    content_sha256: str
+    state_sha256: str
+    observation_set_sha256: str
+    observation_ids: tuple[int, ...]
+    observation_sha256s: tuple[str, ...]
+    created_at: datetime
+    finalized_at: datetime
 
 
 @dataclass(frozen=True)
@@ -99,6 +146,7 @@ class PendingOutbox:
     payload_text: str
     payload_sha256: str
     created_at: datetime
+    next_attempt_ordinal: int
 
 
 @dataclass(frozen=True)
@@ -107,6 +155,9 @@ class _Migration:
     name: str
     sql: bytes
     sha256: str
+
+
+_AppliedMigration = tuple[int, str, str, str, str]
 
 
 class JournalTransaction:
@@ -207,6 +258,7 @@ class JournalTransaction:
         observation_ids: Sequence[int],
         archive_relative_path: str,
         created_at: datetime,
+        finalized_at: datetime | None = None,
         outbox_destination: str,
         outbox_payload: str,
     ) -> FinalizedReport:
@@ -219,6 +271,7 @@ class JournalTransaction:
             observation_ids=observation_ids,
             archive_relative_path=archive_relative_path,
             created_at=created_at,
+            finalized_at=finalized_at,
             outbox_destination=outbox_destination,
             outbox_payload=outbox_payload,
         )
@@ -340,6 +393,7 @@ class JournalTransaction:
     def write_actual_position(
         self,
         *,
+        signal_id: str,
         symbol: str,
         shares: int,
         cost_basis_micros: int,
@@ -351,6 +405,7 @@ class JournalTransaction:
     ) -> int:
         self._ensure_active()
         return self._journal._write_actual_position(
+            signal_id=signal_id,
             symbol=symbol,
             shares=shares,
             cost_basis_micros=cost_basis_micros,
@@ -504,6 +559,7 @@ class Journal:
     def migrate(self) -> None:
         self._ensure_open()
         migrations = _load_migrations(self._migration_directory)
+        expected_schema_sha256s = _derive_expected_schema_sha256s(migrations)
         with self._immediate_connection() as connection:
             self._verify_database_ownership(connection)
             applied = self._read_applied_migrations(connection)
@@ -511,15 +567,32 @@ class Journal:
             current_version = _pragma_int(connection, "user_version")
             if current_version != len(applied):
                 raise MigrationCorruption("database migration version is inconsistent")
-            if applied and applied[-1][3] != _schema_sha256(connection):
-                raise MigrationDrift("database schema differs from applied migrations")
+            for index, row in enumerate(applied):
+                if row[3] != expected_schema_sha256s[index]:
+                    raise MigrationDrift(
+                        "applied schema differs from packaged migrations"
+                    )
+            if applied and expected_schema_sha256s[len(applied) - 1] != _schema_sha256(
+                connection
+            ):
+                raise MigrationDrift("database schema differs from packaged migrations")
 
+            recorded = list(applied)
             for migration in migrations[len(applied) :]:
+                _require_migration_bookkeeping(connection, tuple(recorded))
                 _execute_migration(connection, migration.sql)
-                if not _table_exists(connection, "schema_migrations"):
-                    raise MigrationCorruption("migration metadata table is missing")
+                _require_migration_bookkeeping(connection, tuple(recorded))
+                _verify_migration_connection_state(connection)
                 schema_sha256 = _schema_sha256(connection)
+                expected_schema_sha256 = expected_schema_sha256s[
+                    migration.version - 1
+                ]
+                if schema_sha256 != expected_schema_sha256:
+                    raise MigrationDrift(
+                        "database schema differs from packaged migrations"
+                    )
                 try:
+                    applied_at = _canonical_timestamp(datetime.now(timezone.utc))
                     _sql(connection,
                         "INSERT INTO schema_migrations("
                         "version, name, sha256, schema_sha256, applied_at"
@@ -528,8 +601,8 @@ class Journal:
                             migration.version,
                             migration.name,
                             migration.sha256,
-                            schema_sha256,
-                            _canonical_timestamp(datetime.now(timezone.utc)),
+                            expected_schema_sha256,
+                            applied_at,
                         ),
                     )
                     _sql(connection, f"PRAGMA user_version = {migration.version}")
@@ -539,6 +612,19 @@ class Journal:
                     raise MigrationCorruption(
                         "migration metadata could not be recorded"
                     ) from error
+                recorded.append(
+                    (
+                        migration.version,
+                        migration.name,
+                        migration.sha256,
+                        expected_schema_sha256,
+                        applied_at,
+                    )
+                )
+                _require_migration_bookkeeping(connection, tuple(recorded))
+
+            _require_migration_bookkeeping(connection, tuple(recorded))
+            _verify_migration_connection_state(connection)
 
             if _pragma_int(connection, "application_id") == 0:
                 _sql(connection, f"PRAGMA application_id = {APPLICATION_ID}")
@@ -597,8 +683,11 @@ class Journal:
 
         with self._immediate_connection() as connection:
             row = _sql(connection,
-                "SELECT id, claim_token, status, lease_expires_at, report_id "
-                "FROM report_claims WHERE session_date = ? AND report_kind = ?",
+                "SELECT claim.id, claim.claim_token, claim.status, "
+                "claim.lease_expires_at, claim.report_id, report.report_id "
+                "FROM report_claims AS claim LEFT JOIN reports AS report "
+                "ON report.id = claim.report_id "
+                "WHERE claim.session_date = ? AND claim.report_kind = ?",
                 (stored_date, report_kind),
             ).fetchone()
             if row is None:
@@ -628,14 +717,20 @@ class Journal:
                     status="ACQUIRED",
                     claim_token=token,
                     lease_expires_at=_parse_canonical_timestamp(expires_at),
+                    report_row_id=None,
                     report_id=None,
                 )
 
             claim_id = int(row[0])
             stored_status = str(row[2])
             expires_at = str(row[3])
-            report_id = int(row[4]) if row[4] is not None else None
+            report_row_id = int(row[4]) if row[4] is not None else None
+            report_id = str(row[5]) if row[5] is not None else None
             if stored_status == "FINALIZED":
+                if report_row_id is None or report_id is None:
+                    raise MigrationCorruption(
+                        "finalized report claim lacks its report identity"
+                    )
                 return ReportClaim(
                     claim_id=claim_id,
                     session_date=session_date,
@@ -643,6 +738,7 @@ class Journal:
                     status="ALREADY_FINALIZED",
                     claim_token=None,
                     lease_expires_at=_parse_canonical_timestamp(expires_at),
+                    report_row_id=report_row_id,
                     report_id=report_id,
                 )
             if stored_status != "IN_PROGRESS":
@@ -673,6 +769,7 @@ class Journal:
                     lease_expires_at=_parse_canonical_timestamp(
                         recovered_expires_at
                     ),
+                    report_row_id=None,
                     report_id=None,
                 )
             return ReportClaim(
@@ -682,6 +779,7 @@ class Journal:
                 status="IN_PROGRESS",
                 claim_token=None,
                 lease_expires_at=_parse_canonical_timestamp(expires_at),
+                report_row_id=None,
                 report_id=None,
             )
 
@@ -689,6 +787,70 @@ class Journal:
         """Finalize a report, its evidence pins, and its outbox row atomically."""
         with self.transaction() as transaction:
             return transaction.finalize_report(**values)  # type: ignore[arg-type]
+
+    def read_report(self, report_id: str) -> StoredReport:
+        """Read immutable report material for crash-safe archive reconstruction."""
+        self._ensure_open()
+        report_id = _require_sha256(report_id, "report ID")
+        row = _sql(
+            self._connection,
+            "SELECT report.id, report.report_id, report.claim_id, "
+            "report.session_date, report.report_kind, report.body_text, "
+            "report.content_sha256, report.state_sha256, "
+            "report.observation_set_sha256, report.archive_relative_path, "
+            "report.created_at, claim.finalized_at, claim.status, claim.report_id "
+            "FROM reports AS report JOIN report_claims AS claim "
+            "ON claim.id = report.claim_id WHERE report.report_id = ? COLLATE BINARY",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("report does not exist")
+        if str(row[12]) != "FINALIZED" or int(row[13]) != int(row[0]):
+            raise MigrationCorruption("report is not linked to a finalized claim")
+        pins = _sql(
+            self._connection,
+            "SELECT pin.source_observation_id, observation.observation_sha256 "
+            "FROM report_observations AS pin JOIN source_observations AS observation "
+            "ON observation.id = pin.source_observation_id "
+            "WHERE pin.report_id = ? ORDER BY pin.observation_ordinal",
+            (int(row[0]),),
+        ).fetchall()
+        observation_ids = tuple(int(pin[0]) for pin in pins)
+        observation_sha256s = tuple(str(pin[1]) for pin in pins)
+        session_date = date.fromisoformat(str(row[3]))
+        expected_content_sha256 = hashlib.sha256(str(row[5]).encode("utf-8")).hexdigest()
+        expected_observation_set_sha256 = hashlib.sha256(
+            _canonical_json(list(observation_sha256s)).encode("utf-8")
+        ).hexdigest()
+        expected_report_id = stable_report_id(
+            str(row[4]), session_date, observation_sha256s, str(row[7])
+        )
+        expected_archive_path = report_archive_relative_path(
+            str(row[4]), session_date, expected_report_id
+        )
+        if (
+            str(row[1]) != expected_report_id
+            or str(row[6]) != expected_content_sha256
+            or str(row[8]) != expected_observation_set_sha256
+            or str(row[9]) != expected_archive_path
+        ):
+            raise MigrationCorruption("stored report audit material is inconsistent")
+        return StoredReport(
+            report_row_id=int(row[0]),
+            report_id=str(row[1]),
+            claim_id=int(row[2]),
+            session_date=session_date,
+            report_kind=str(row[4]),
+            body=str(row[5]),
+            archive_relative_path=str(row[9]),
+            content_sha256=str(row[6]),
+            state_sha256=str(row[7]),
+            observation_set_sha256=str(row[8]),
+            observation_ids=observation_ids,
+            observation_sha256s=observation_sha256s,
+            created_at=_parse_canonical_timestamp(str(row[10])),
+            finalized_at=_parse_canonical_timestamp(str(row[11])),
+        )
 
     def append_outbox(self, **values: object) -> tuple[int, bool]:
         """Append an immutable payload; delivery remains externally at-least-once."""
@@ -711,15 +873,24 @@ class Journal:
         rows = _sql(self._connection,
             "SELECT o.id, o.idempotency_key, o.origin_report_id, "
             "o.origin_execution_event_id, o.destination, o.payload_text, "
-            "o.payload_sha256, o.created_at FROM outbox AS o "
+            "o.payload_sha256, o.created_at, COALESCE(("
+            "SELECT MAX(next_attempt.attempt_ordinal) "
+            "FROM outbox_delivery_attempts AS next_attempt "
+            "WHERE next_attempt.outbox_id = o.id), 0) FROM outbox AS o "
             "WHERE NOT EXISTS ("
             "SELECT 1 FROM outbox_delivery_attempts AS a "
             "WHERE a.outbox_id = o.id AND a.delivery_status = 'DELIVERED'"
             ") ORDER BY o.id LIMIT ?",
             (limit,),
         ).fetchall()
-        return tuple(
-            PendingOutbox(
+        pending: list[PendingOutbox] = []
+        for row in rows:
+            prior_attempt_ordinal = int(row[8])
+            if prior_attempt_ordinal >= 2**63 - 1:
+                raise MigrationCorruption(
+                    "outbox delivery attempt ordinal is exhausted"
+                )
+            pending.append(PendingOutbox(
                 outbox_id=int(row[0]),
                 idempotency_key=str(row[1]),
                 origin_report_id=int(row[2]) if row[2] is not None else None,
@@ -730,9 +901,9 @@ class Journal:
                 payload_text=str(row[5]),
                 payload_sha256=str(row[6]),
                 created_at=_parse_canonical_timestamp(str(row[7])),
-            )
-            for row in rows
-        )
+                next_attempt_ordinal=prior_attempt_ordinal + 1,
+            ))
+        return tuple(pending)
 
     def start_scheduled_run(self, **values: object) -> tuple[int, bool]:
         """Persist a start before scheduled work begins."""
@@ -868,6 +1039,10 @@ class Journal:
         if raw is None:
             raise InvalidJournalValue("raw message row does not exist")
         message_id, stored_message_time = str(raw[0]), str(raw[1])
+        if stored_event_time > stored_message_time:
+            raise InvalidJournalValue(
+                "execution event cannot postdate its authoritative message"
+            )
         identity = hashlib.sha256(
             b"stock-monitor/execution-event/v1\x00"
             + message_id.encode("utf-8")
@@ -1067,6 +1242,7 @@ class Journal:
         observation_ids: Sequence[int],
         archive_relative_path: str,
         created_at: datetime,
+        finalized_at: datetime | None,
         outbox_destination: str,
         outbox_payload: str,
     ) -> FinalizedReport:
@@ -1076,6 +1252,9 @@ class Journal:
         state_sha256 = _require_sha256(state_sha256, "report state hash")
         archive_relative_path = _canonical_archive_path(archive_relative_path)
         stored_created_at = _canonical_timestamp(created_at)
+        requested_finalized_at = (
+            _canonical_timestamp(finalized_at) if finalized_at is not None else None
+        )
         outbox_destination = _require_nonempty_text(
             outbox_destination, "outbox destination"
         )
@@ -1086,7 +1265,8 @@ class Journal:
 
         claim = _sql(self._connection,
             "SELECT session_date, report_kind, claim_token, status, lease_started_at, "
-            "lease_expires_at, report_id FROM report_claims WHERE id = ?",
+            "lease_expires_at, report_id, finalized_at "
+            "FROM report_claims WHERE id = ?",
             (claim_id,),
         ).fetchone()
         if claim is None:
@@ -1097,42 +1277,72 @@ class Journal:
         stored_status = str(claim[3])
         lease_started_at = str(claim[4])
         lease_expires_at = str(claim[5])
+        stored_finalized_at = str(claim[7]) if claim[7] is not None else None
+        if stored_status == "FINALIZED":
+            if stored_finalized_at is None:
+                raise MigrationCorruption("finalized report claim lacks a timestamp")
+            if (
+                requested_finalized_at is not None
+                and requested_finalized_at != stored_finalized_at
+            ):
+                raise IdempotencyConflict(
+                    "report finalization time conflicts with stored content"
+                )
+            effective_finalized_at = stored_finalized_at
+        else:
+            effective_finalized_at = requested_finalized_at or _canonical_timestamp(
+                datetime.now(timezone.utc)
+            )
+        if stored_created_at > effective_finalized_at:
+            raise InvalidJournalValue(
+                "report creation time cannot follow finalization"
+            )
 
-        observations: list[tuple[int, str, str]] = []
+        observations: list[tuple[int, str, str, str]] = []
         if requested_ids:
             placeholders = ", ".join("?" for _ in requested_ids)
             rows = _sql(self._connection,
-                "SELECT id, observation_sha256, retrieved_at FROM source_observations "
+                "SELECT id, observation_sha256, source_time, retrieved_at "
+                "FROM source_observations "
                 f"WHERE id IN ({placeholders})",
                 requested_ids,
             ).fetchall()
             if len(rows) != len(requested_ids):
                 raise InvalidJournalValue("source observation row does not exist")
             observations = sorted(
-                ((int(row[0]), str(row[1]), str(row[2])) for row in rows),
+                (
+                    (int(row[0]), str(row[1]), str(row[2]), str(row[3]))
+                    for row in rows
+                ),
                 key=lambda item: (item[1], item[0]),
             )
-            if any(retrieved_at > stored_created_at for _, _, retrieved_at in observations):
+            if any(
+                source_time > stored_created_at
+                or retrieved_at > stored_created_at
+                for _, _, source_time, retrieved_at in observations
+            ):
                 raise InvalidJournalValue(
-                    "report cannot pin an observation retrieved in the future"
+                    "report cannot pin future source evidence"
                 )
         observation_set_sha256 = hashlib.sha256(
-            _canonical_json([value for _, value, _ in observations]).encode("utf-8")
+            _canonical_json([value for _, value, _, _ in observations]).encode(
+                "utf-8"
+            )
         ).hexdigest()
         content_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        report_material = _canonical_json(
-            {
-                "archive_relative_path": archive_relative_path,
-                "content_sha256": content_sha256,
-                "observation_set_sha256": observation_set_sha256,
-                "report_kind": report_kind,
-                "session_date": session_date,
-                "state_sha256": state_sha256,
-            }
+        report_id = stable_report_id(
+            report_kind,
+            date.fromisoformat(session_date),
+            [value for _, value, _, _ in observations],
+            state_sha256,
         )
-        report_id = "rpt_" + hashlib.sha256(
-            report_material.encode("utf-8")
-        ).hexdigest()
+        expected_archive_relative_path = report_archive_relative_path(
+            report_kind, date.fromisoformat(session_date), report_id
+        )
+        if archive_relative_path != expected_archive_relative_path:
+            raise InvalidJournalValue(
+                "report archive path does not match its stable identity"
+            )
         report_immutable = (
             report_id,
             claim_id,
@@ -1169,7 +1379,7 @@ class Journal:
                 (stored_report_id,),
             ).fetchall()
             if tuple(int(row[0]) for row in stored_pins) != tuple(
-                row_id for row_id, _, _ in observations
+                row_id for row_id, _, _, _ in observations
             ):
                 raise IdempotencyConflict(
                     "report claim conflicts with finalized observation set"
@@ -1180,7 +1390,7 @@ class Journal:
                 origin_execution_event_id=None,
                 destination=outbox_destination,
                 payload_text=outbox_payload,
-                created_at=created_at,
+                created_at=_parse_canonical_timestamp(effective_finalized_at),
             )
             if not outbox_duplicate:
                 raise MigrationCorruption("finalized report lacked its outbox row")
@@ -1193,7 +1403,7 @@ class Journal:
 
         if stored_status != "IN_PROGRESS":
             raise MigrationCorruption("report claim has an invalid stored status")
-        if not lease_started_at <= stored_created_at < lease_expires_at:
+        if not lease_started_at <= effective_finalized_at < lease_expires_at:
             raise IdempotencyConflict("report claim lease is not active")
         try:
             cursor = _sql(self._connection,
@@ -1211,7 +1421,7 @@ class Journal:
         if cursor.rowcount != 1:
             raise IdempotencyConflict("report identity conflicts with stored content")
         report_row_id = int(cursor.lastrowid)
-        for ordinal, (observation_id, _, _) in enumerate(observations):
+        for ordinal, (observation_id, _, _, _) in enumerate(observations):
             _sql(self._connection,
                 "INSERT INTO report_observations("
                 "report_id, source_observation_id, observation_ordinal"
@@ -1224,7 +1434,7 @@ class Journal:
             origin_execution_event_id=None,
             destination=outbox_destination,
             payload_text=outbox_payload,
-            created_at=created_at,
+            created_at=_parse_canonical_timestamp(effective_finalized_at),
         )
         if outbox_duplicate:
             raise MigrationCorruption("new report collided with an existing outbox row")
@@ -1232,7 +1442,7 @@ class Journal:
             "UPDATE report_claims SET status = 'FINALIZED', finalized_at = ?, "
             "report_id = ? WHERE id = ? AND claim_token = ? COLLATE BINARY "
             "AND status = 'IN_PROGRESS'",
-            (stored_created_at, report_row_id, claim_id, claim_token),
+            (effective_finalized_at, report_row_id, claim_id, claim_token),
         )
         if update.rowcount != 1:
             raise IdempotencyConflict("report claim token is stale")
@@ -1290,6 +1500,17 @@ class Journal:
                     "outbox identity conflicts with stored content"
                 )
             return int(existing[0]), True
+        if origin_report_id is not None:
+            origin_delivery = _sql(
+                self._connection,
+                "SELECT 1 FROM outbox WHERE origin_report_id = ? "
+                "AND destination = ?",
+                (origin_report_id, destination),
+            ).fetchone()
+            if origin_delivery is not None:
+                raise IdempotencyConflict(
+                    "report delivery already exists for this destination"
+                )
         try:
             cursor = _sql(self._connection,
                 "INSERT INTO outbox("
@@ -1300,7 +1521,9 @@ class Journal:
                 immutable,
             )
         except sqlite3.IntegrityError as error:
-            raise InvalidJournalValue("outbox origin does not exist") from error
+            raise IdempotencyConflict(
+                "outbox identity conflicts with stored journal state"
+            ) from error
         inserted = cursor.rowcount == 1
         row = _sql(self._connection,
             "SELECT id, idempotency_key, origin_report_id, origin_execution_event_id, "
@@ -1361,23 +1584,37 @@ class Journal:
                     "delivery attempt identity conflicts with stored content"
                 )
             return int(existing[0]), True
-        if (
-            _sql(self._connection,
-                "SELECT 1 FROM outbox WHERE id = ?", (outbox_id,)
-            ).fetchone()
-            is None
-        ):
+        outbox = _sql(
+            self._connection,
+            "SELECT created_at FROM outbox WHERE id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if outbox is None:
             raise InvalidJournalValue("outbox row does not exist")
+        prior = _sql(
+            self._connection,
+            "SELECT attempt_ordinal, attempted_at, delivery_status "
+            "FROM outbox_delivery_attempts WHERE outbox_id = ? "
+            "ORDER BY attempt_ordinal DESC LIMIT 1",
+            (outbox_id,),
+        ).fetchone()
+        if prior is not None and str(prior[2]) == "DELIVERED":
+            raise IdempotencyConflict("outbox delivery is already terminal")
+        expected_ordinal = 1 if prior is None else int(prior[0]) + 1
+        if attempt_ordinal != expected_ordinal:
+            raise InvalidJournalValue("delivery attempt ordinal is not contiguous")
+        prior_attempted_at = str(outbox[0]) if prior is None else str(prior[1])
+        if stored_attempted_at < prior_attempted_at:
+            raise InvalidJournalValue("delivery attempt time is out of order")
         if delivery_status == "DELIVERED":
-            delivered = _sql(self._connection,
-                "SELECT 1 FROM outbox_delivery_attempts "
-                "WHERE outbox_id = ? AND delivery_status = 'DELIVERED'",
-                (outbox_id,),
-            ).fetchone()
-            if delivered is not None:
-                raise IdempotencyConflict(
-                    "outbox row already has a delivered attempt"
+            if external_delivery_id is None or error_class is not None:
+                raise InvalidJournalValue(
+                    "delivered attempt requires only an external delivery ID"
                 )
+        elif external_delivery_id is not None or error_class is None:
+            raise InvalidJournalValue(
+                "failed attempt requires only a delivery error class"
+            )
         try:
             cursor = _sql(self._connection,
                 "INSERT INTO outbox_delivery_attempts("
@@ -1457,17 +1694,13 @@ class Journal:
     ) -> tuple[int, bool]:
         run_id = _require_integer(run_id, "scheduled run row ID", minimum=1)
         stored_finished_at = _canonical_timestamp(finished_at)
-        market_session_decision = _require_nonempty_text(
+        market_session_decision = _canonical_token(
             market_session_decision, "market-session decision"
         )
-        outcome = _require_nonempty_text(outcome, "scheduled run outcome")
+        outcome = _canonical_token(outcome, "scheduled run outcome")
         report_id = _optional_integer(report_id, "report row ID", minimum=1)
         if report_path is not None:
             report_path = _canonical_archive_path(report_path)
-        if (report_id is None) != (report_path is None):
-            raise InvalidJournalValue(
-                "scheduled report row and archive path must be supplied together"
-            )
         error_class = _optional_text(error_class, "scheduled run error class")
         completion = (
             stored_finished_at,
@@ -1493,21 +1726,43 @@ class Journal:
                     "scheduled run completion conflicts with stored content"
                 )
             return run_id, True
+        if (report_id is None) != (report_path is None):
+            raise InvalidJournalValue(
+                "scheduled report row and archive path must be supplied together"
+            )
+        if (outcome == "REPORT_EMITTED") != (report_id is not None):
+            raise InvalidJournalValue(
+                "scheduled report outcome conflicts with its report identity"
+            )
         if report_id is not None:
             report = _sql(self._connection,
-                "SELECT session_date, report_kind, archive_relative_path "
-                "FROM reports WHERE id = ?",
+                "SELECT report.session_date, report.report_kind, "
+                "report.archive_relative_path, claim.status, claim.report_id, "
+                "claim.finalized_at FROM reports AS report "
+                "JOIN report_claims AS claim ON claim.id = report.claim_id "
+                "WHERE report.id = ?",
                 (report_id,),
             ).fetchone()
             if report is None:
                 raise InvalidJournalValue("report row does not exist")
-            if tuple(str(value) for value in report) != (
+            if tuple(str(value) for value in report[:3]) != (
                 str(row[1]),
                 str(row[0]),
                 report_path,
             ):
                 raise InvalidJournalValue(
                     "scheduled report does not match the run identity and path"
+                )
+            if report[3] != "FINALIZED" or report[4] != report_id:
+                raise InvalidJournalValue("scheduled report is not finalized")
+            report_finalized_at = report[5]
+            if (
+                report_finalized_at is None
+                or str(report_finalized_at) < str(row[2])
+                or str(report_finalized_at) > stored_finished_at
+            ):
+                raise InvalidJournalValue(
+                    "scheduled report finalization falls outside the run interval"
                 )
         cursor = _sql(self._connection,
             "UPDATE scheduled_runs SET finished_at = ?, market_session_decision = ?, "
@@ -1615,6 +1870,7 @@ class Journal:
     def _write_actual_position(
         self,
         *,
+        signal_id: str,
         symbol: str,
         shares: int,
         cost_basis_micros: int,
@@ -1624,6 +1880,7 @@ class Journal:
         last_execution_event_id: int,
         updated_at: datetime,
     ) -> int:
+        signal_id = _require_nonempty_text(signal_id, "signal ID")
         symbol = _require_nonempty_text(symbol, "symbol").upper()
         shares = _require_integer(shares, "position shares", minimum=0)
         cost_basis_micros = _require_integer(
@@ -1648,8 +1905,24 @@ class Journal:
         last_execution_event_id = _require_integer(
             last_execution_event_id, "execution event row ID", minimum=1
         )
+        event = _sql(
+            self._connection,
+            "SELECT signal_id, symbol, parsed_action FROM execution_events WHERE id = ?",
+            (last_execution_event_id,),
+        ).fetchone()
+        if event is None:
+            raise InvalidJournalValue("execution event row does not exist")
+        if (
+            event[0] != signal_id
+            or event[1] != symbol
+            or str(event[2]) not in _POSITION_MUTATING_ACTIONS
+        ):
+            raise InvalidJournalValue(
+                "position projection requires its matching position event"
+            )
         stored_updated_at = _canonical_timestamp(updated_at)
         desired = (
+            symbol,
             shares,
             cost_basis_micros,
             recommended_stop_micros,
@@ -1659,35 +1932,39 @@ class Journal:
             stored_updated_at,
         )
         row = _sql(self._connection,
-            "SELECT shares, cost_basis_micros, recommended_stop_micros, "
+            "SELECT symbol, shares, cost_basis_micros, recommended_stop_micros, "
             "user_confirmed_stop_micros, target_micros, last_execution_event_id, "
-            "updated_at, revision FROM actual_positions WHERE symbol = ? COLLATE BINARY",
-            (symbol,),
+            "updated_at, revision FROM actual_positions WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
         ).fetchone()
         with self._projection_write():
             if row is None:
                 _sql(self._connection,
                     "INSERT INTO actual_positions("
-                    "symbol, shares, cost_basis_micros, recommended_stop_micros, "
+                    "signal_id, symbol, shares, cost_basis_micros, recommended_stop_micros, "
                     "user_confirmed_stop_micros, target_micros, "
                     "last_execution_event_id, updated_at, revision"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
-                    (symbol, *desired),
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    (signal_id, *desired),
                 )
                 return 1
-            if tuple(row[:7]) == desired:
-                return int(row[7])
-            if last_execution_event_id <= int(row[5]):
+            if tuple(row[:8]) == desired:
+                return int(row[8])
+            if row[0] != symbol:
+                raise IdempotencyConflict(
+                    "position signal identity conflicts with its stored symbol"
+                )
+            if last_execution_event_id <= int(row[6]):
                 raise IdempotencyConflict(
                     "position projection conflicts with its event identity"
                 )
-            revision = int(row[7]) + 1
+            revision = int(row[8]) + 1
             _sql(self._connection,
                 "UPDATE actual_positions SET shares = ?, cost_basis_micros = ?, "
                 "recommended_stop_micros = ?, user_confirmed_stop_micros = ?, "
                 "target_micros = ?, last_execution_event_id = ?, updated_at = ?, "
-                "revision = ? WHERE symbol = ? COLLATE BINARY",
-                (*desired, revision, symbol),
+                "revision = ? WHERE signal_id = ? COLLATE BINARY",
+                (*desired[1:], revision, signal_id),
             )
             return revision
 
@@ -1730,6 +2007,15 @@ class Journal:
         last_ledger_posting_id = _require_integer(
             last_ledger_posting_id, "ledger posting row ID", minimum=1
         )
+        posting = _sql(
+            self._connection,
+            "SELECT ledger_name FROM ledger_postings WHERE id = ?",
+            (last_ledger_posting_id,),
+        ).fetchone()
+        if posting is None or str(posting[0]) != "ACTUAL":
+            raise InvalidJournalValue(
+                "actual cash projection requires an ACTUAL ledger posting"
+            )
         stored_updated_at = _canonical_timestamp(updated_at)
         desired = (
             estimated_settled_cash_micros,
@@ -1794,9 +2080,32 @@ class Journal:
             raise InvalidJournalValue(
                 "reconciliation reason must be absent when reconciliation is clear"
             )
-        last_execution_event_id = _optional_integer(
+        if last_execution_event_id is None:
+            raise InvalidJournalValue(
+                "reconciliation projection requires an execution event"
+            )
+        last_execution_event_id = _require_integer(
             last_execution_event_id, "execution event row ID", minimum=1
         )
+        event = _sql(
+            self._connection,
+            "SELECT parsed_action, reconciliation_state "
+            "FROM execution_events WHERE id = ?",
+            (last_execution_event_id,),
+        ).fetchone()
+        required_states = {"REQUIRED", "PENDING"}
+        if (
+            event is None
+            or str(event[0]) not in _RECONCILIATION_ACTIONS
+            or (
+                reconciliation_required
+                and str(event[1]) not in required_states
+            )
+            or (not reconciliation_required and str(event[1]) != "CLEAR")
+        ):
+            raise InvalidJournalValue(
+                "reconciliation projection requires an authoritative matching event"
+            )
         stored_updated_at = _canonical_timestamp(updated_at)
         desired = (
             int(reconciliation_required),
@@ -1817,12 +2126,8 @@ class Journal:
                 return 1
             if tuple(row[:4]) == desired:
                 return int(row[4])
-            stored_event_id = int(row[2]) if row[2] is not None else None
-            if last_execution_event_id is None:
-                raise InvalidJournalValue(
-                    "reconciliation changes require an execution event"
-                )
-            if stored_event_id is not None and last_execution_event_id <= stored_event_id:
+            stored_event_id = int(row[2])
+            if last_execution_event_id <= stored_event_id:
                 raise IdempotencyConflict(
                     "reconciliation projection conflicts with its event identity"
                 )
@@ -1859,12 +2164,17 @@ class Journal:
             unlogged_position_count, "unlogged-position count", minimum=0
         )
         stored_confirmed_at = _canonical_timestamp(confirmed_at)
-        reconciliation_result = _require_nonempty_text(
+        reconciliation_result = _canonical_token(
             reconciliation_result, "account-check reconciliation result"
         )
+        if reconciliation_result not in {"CLEAR", "RECONCILIATION_REQUIRED"}:
+            raise InvalidJournalValue(
+                "account-check reconciliation result is not supported"
+            )
         details_json = _canonical_details(details)
         event = _sql(self._connection,
-            "SELECT event_id, raw_message_id, parsed_action, event_time "
+            "SELECT event_id, raw_message_id, parsed_action, event_time, "
+            "reconciliation_state "
             "FROM execution_events "
             "WHERE id = ?",
             (execution_event_id,),
@@ -1907,6 +2217,21 @@ class Journal:
                     "account-check identity conflicts with stored content"
                 )
             return int(existing[0]), True
+        if reconciliation_result == "CLEAR" and (
+            pending_order_count != 0 or unlogged_position_count != 0
+        ):
+            raise InvalidJournalValue(
+                "a clear account check cannot contain unreconciled exposure"
+            )
+        expected_states = (
+            {"CLEAR"}
+            if reconciliation_result == "CLEAR"
+            else {"REQUIRED", "PENDING"}
+        )
+        if str(event[4]) not in expected_states:
+            raise InvalidJournalValue(
+                "account check result conflicts with its execution event state"
+            )
         try:
             cursor = _sql(self._connection,
                 "INSERT INTO account_checks("
@@ -1994,9 +2319,7 @@ class Journal:
             )
             _sql(self._connection, "PRAGMA foreign_keys = ON")
             _sql(self._connection, "PRAGMA recursive_triggers = ON")
-            mode_row = _sql(self._connection, "PRAGMA journal_mode = WAL").fetchone()
-            if mode_row is None or str(mode_row[0]).lower() != "wal":
-                raise JournalError("journal database did not enter WAL mode")
+            _enable_wal_with_bounded_retry(self._connection)
             _sql(self._connection, "PRAGMA synchronous = FULL")
             if _pragma_int(self._connection, "foreign_keys") != 1:
                 raise JournalError("journal foreign keys could not be enabled")
@@ -2041,26 +2364,27 @@ class Journal:
     @staticmethod
     def _read_applied_migrations(
         connection: sqlite3.Connection,
-    ) -> tuple[tuple[int, str, str, str], ...]:
+    ) -> tuple[_AppliedMigration, ...]:
         if not _table_exists(connection, "schema_migrations"):
             return ()
         try:
             rows = _sql(connection,
-                "SELECT version, name, sha256, schema_sha256 "
+                "SELECT version, name, sha256, schema_sha256, applied_at "
                 "FROM schema_migrations ORDER BY version"
             ).fetchall()
-            applied: list[tuple[int, str, str, str]] = []
+            applied: list[_AppliedMigration] = []
             for row in rows:
                 if (
-                    len(row) != 4
+                    len(row) != 5
                     or type(row[0]) is not int
                     or row[0] <= 0
                     or not isinstance(row[1], str)
                     or not isinstance(row[2], str)
                     or not isinstance(row[3], str)
+                    or not isinstance(row[4], str)
                 ):
                     raise MigrationCorruption("migration metadata is malformed")
-                applied.append((row[0], row[1], row[2], row[3]))
+                applied.append((row[0], row[1], row[2], row[3], row[4]))
         except sqlite3.Error as error:
             raise MigrationCorruption("migration metadata could not be read") from error
         return tuple(applied)
@@ -2111,13 +2435,13 @@ def _load_migrations(migration_directory: Path | None) -> tuple[_Migration, ...]
 
 
 def _verify_applied_migrations(
-    applied: tuple[tuple[int, str, str, str], ...],
+    applied: tuple[_AppliedMigration, ...],
     packaged: tuple[_Migration, ...],
 ) -> None:
     if len(applied) > len(packaged):
         raise MigrationCorruption("database migration version is newer than this package")
     for expected_version, row in enumerate(applied, start=1):
-        version, name, sha256, schema_sha256 = row
+        version, name, sha256, schema_sha256, applied_at = row
         if version != expected_version:
             raise MigrationCorruption("applied migration versions are not contiguous")
         migration = packaged[expected_version - 1]
@@ -2127,64 +2451,209 @@ def _verify_applied_migrations(
             character not in "0123456789abcdef" for character in schema_sha256
         ):
             raise MigrationCorruption("applied migration schema hash is malformed")
+        if (
+            len(applied_at) != 27
+            or _canonical_timestamp(_parse_canonical_timestamp(applied_at))
+            != applied_at
+        ):
+            raise MigrationCorruption("applied migration timestamp is malformed")
+
+
+def _derive_expected_schema_sha256s(
+    migrations: tuple[_Migration, ...],
+) -> tuple[str, ...]:
+    try:
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+    except sqlite3.Error as error:
+        raise MigrationCorruption(
+            "packaged migration schema could not be verified"
+        ) from error
+    try:
+        connection.create_function(
+            "journal_projection_write_allowed", 0, lambda: 0
+        )
+        _sql(connection, "PRAGMA foreign_keys = ON")
+        _sql(connection, "PRAGMA recursive_triggers = ON")
+        _sql(connection, "BEGIN IMMEDIATE")
+        expected: list[str] = []
+        recorded: list[_AppliedMigration] = []
+        for migration in migrations:
+            _require_migration_bookkeeping(connection, tuple(recorded))
+            _execute_migration(connection, migration.sql)
+            _require_migration_bookkeeping(connection, tuple(recorded))
+            schema_sha256 = _schema_sha256(connection)
+            expected.append(schema_sha256)
+            try:
+                _sql(
+                    connection,
+                    "INSERT INTO schema_migrations("
+                    "version, name, sha256, schema_sha256, applied_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        migration.version,
+                        migration.name,
+                        migration.sha256,
+                        schema_sha256,
+                        "2000-01-01T00:00:00.000000Z",
+                    ),
+                )
+                _sql(connection, f"PRAGMA user_version = {migration.version}")
+            except sqlite3.Error as error:
+                raise MigrationCorruption(
+                    "packaged migration metadata is incompatible"
+                ) from error
+            recorded.append(
+                (
+                    migration.version,
+                    migration.name,
+                    migration.sha256,
+                    schema_sha256,
+                    "2000-01-01T00:00:00.000000Z",
+                )
+            )
+            _require_migration_bookkeeping(connection, tuple(recorded))
+        return tuple(expected)
+    except (KeyboardInterrupt, SystemExit, MemoryError):
+        raise
+    except BaseException as error:
+        raise MigrationCorruption(
+            "packaged migration schema could not be verified"
+        ) from error
+    finally:
+        try:
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+        finally:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
 
 
 def _execute_migration(connection: sqlite3.Connection, sql_bytes: bytes) -> None:
+    statements = _migration_statements(sql_bytes)
+    for statement in statements:
+        _validate_migration_statement(statement)
     try:
-        sql = sql_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise MigrationCorruption("migration is not valid UTF-8") from error
-    statement = ""
-    try:
-        for character in sql:
-            statement += character
-            if character == ";" and sqlite3.complete_statement(statement):
-                if _is_transaction_control_statement(statement):
-                    raise MigrationCorruption(
-                        "migration may not control its transaction"
-                    )
-                _sql(connection, statement)
-                if not connection.in_transaction:
-                    raise MigrationCorruption(
-                        "migration escaped its transaction boundary"
-                    )
-                statement = ""
+        for statement in statements:
+            _sql(connection, statement)
+            if not connection.in_transaction:
+                raise MigrationCorruption(
+                    "migration escaped its transaction boundary"
+                )
     except sqlite3.Error as error:
         if _is_busy_error(error):
             raise JournalBusy("journal is busy") from error
         raise MigrationCorruption("migration SQL could not be applied") from error
-    if statement.strip() and not _contains_only_sql_comments(statement):
+
+
+def _migration_statements(sql_bytes: bytes) -> tuple[str, ...]:
+    try:
+        sql = sql_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MigrationCorruption("migration is not valid UTF-8") from error
+    if sql.startswith("\ufeff"):
+        sql = sql[1:]
+    if "\ufeff" in sql or "\x00" in sql:
+        raise MigrationCorruption("migration contains an invalid character")
+    statement = ""
+    statements: list[str] = []
+    for character in sql:
+        statement += character
+        if character == ";" and sqlite3.complete_statement(statement):
+            statements.append(statement)
+            statement = ""
+    if _skip_sql_trivia(statement, 0) != len(statement):
         raise MigrationCorruption("migration ends with an incomplete SQL statement")
+    return tuple(statements)
 
 
-def _contains_only_sql_comments(value: str) -> bool:
-    without_blocks = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
-    without_lines = re.sub(r"--[^\n]*(?:\n|$)", "", without_blocks)
-    return not without_lines.strip()
-
-
-def _is_transaction_control_statement(statement: str) -> bool:
-    remainder = statement
+def _skip_sql_trivia(value: str, start: int) -> int:
+    index = start
     while True:
-        remainder = remainder.lstrip()
-        if remainder.startswith("--"):
-            newline = remainder.find("\n")
-            remainder = "" if newline < 0 else remainder[newline + 1 :]
+        while index < len(value) and value[index] in " \t\r\n\f\v":
+            index += 1
+        if value.startswith("--", index):
+            newline = value.find("\n", index + 2)
+            index = len(value) if newline < 0 else newline + 1
             continue
-        if remainder.startswith("/*"):
-            closing = remainder.find("*/", 2)
-            remainder = "" if closing < 0 else remainder[closing + 2 :]
+        if value.startswith("/*", index):
+            closing = value.find("*/", index + 2)
+            if closing < 0:
+                raise MigrationCorruption(
+                    "migration contains an unterminated SQL comment"
+                )
+            index = closing + 2
             continue
-        break
-    match = re.match(r"[A-Za-z]+", remainder)
-    return match is not None and match.group(0).upper() in {
+        return index
+
+
+def _migration_leading_tokens(statement: str, limit: int = 2) -> tuple[str, ...]:
+    tokens: list[str] = []
+    index = 0
+    while len(tokens) < limit:
+        index = _skip_sql_trivia(statement, index)
+        match = re.match(r"[A-Za-z]+", statement[index:])
+        if match is None:
+            break
+        tokens.append(match.group(0).upper())
+        index += len(match.group(0))
+    return tuple(tokens)
+
+
+def _validate_migration_statement(statement: str) -> None:
+    tokens = _migration_leading_tokens(statement)
+    if not tokens:
+        raise MigrationCorruption("migration contains an empty SQL statement")
+    if tokens[0] in {
         "BEGIN",
         "COMMIT",
+        "DETACH",
         "END",
+        "ATTACH",
+        "PRAGMA",
         "RELEASE",
         "ROLLBACK",
         "SAVEPOINT",
-    }
+        "VACUUM",
+    }:
+        raise MigrationCorruption("migration contains a forbidden SQL statement")
+    if tokens[0] == "CREATE" and len(tokens) > 1 and tokens[1] in {
+        "TEMP",
+        "TEMPORARY",
+    }:
+        raise MigrationCorruption("migration may not create temporary objects")
+
+
+def _require_migration_bookkeeping(
+    connection: sqlite3.Connection,
+    expected: tuple[_AppliedMigration, ...],
+) -> None:
+    actual = Journal._read_applied_migrations(connection)
+    if actual != expected or _pragma_int(connection, "user_version") != len(expected):
+        raise MigrationCorruption("migration bookkeeping changed unexpectedly")
+
+
+def _verify_migration_connection_state(connection: sqlite3.Connection) -> None:
+    if (
+        _pragma_int(connection, "foreign_keys") != 1
+        or _pragma_int(connection, "recursive_triggers") != 1
+        or _pragma_int(connection, "busy_timeout") != BUSY_TIMEOUT_MILLISECONDS
+        or _pragma_int(connection, "synchronous") != 2
+    ):
+        raise MigrationCorruption("migration changed journal connection settings")
+    databases = _sql(connection, "PRAGMA database_list").fetchall()
+    if any(len(row) < 2 or str(row[1]) not in {"main", "temp"} for row in databases):
+        raise MigrationCorruption("migration attached an external database")
+    temporary_objects = _sql(
+        connection,
+        "SELECT 1 FROM temp.sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
+    ).fetchone()
+    if temporary_objects is not None:
+        raise MigrationCorruption("migration created a temporary schema object")
 
 
 def _schema_sha256(connection: sqlite3.Connection) -> str:
@@ -2239,6 +2708,52 @@ def _canonical_date(value: date) -> str:
     if type(value) is not date:
         raise InvalidJournalValue("session date must be a datetime.date")
     return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+
+
+def stable_report_id(
+    kind: str,
+    session_date: date,
+    observation_ids: Sequence[str],
+    state_hash: str,
+) -> str:
+    """Return the Task 10 report identity from audited state inputs."""
+    canonical_kind = _canonical_token(kind, "report kind")
+    canonical_session = _canonical_date(session_date)
+    if isinstance(observation_ids, (str, bytes)) or not isinstance(
+        observation_ids, Sequence
+    ):
+        raise InvalidJournalValue("report observation identities must be a sequence")
+    canonical_observations = [
+        _require_nonempty_text(value, "report observation identity")
+        for value in observation_ids
+    ]
+    state_hash = _require_sha256(state_hash, "report state hash")
+    canonical = json.dumps(
+        {
+            "kind": canonical_kind,
+            "session": canonical_session,
+            "observations": sorted(canonical_observations),
+            "state": state_hash,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def report_archive_relative_path(
+    kind: str, session_date: date, report_id: str
+) -> str:
+    """Return the deterministic Task 10 archive path for a report identity."""
+    canonical_kind = _canonical_token(kind, "report kind").lower()
+    canonical_session = _canonical_date(session_date)
+    report_id = _require_sha256(report_id, "report ID")
+    return (
+        f"reports/{canonical_session[:4]}/{canonical_session[5:7]}/"
+        f"{canonical_session[8:10]}/{canonical_kind}-{canonical_session}-"
+        f"{report_id[:REPORT_ID_PATH_PREFIX_LENGTH]}.md"
+    )
 
 
 def _require_nonempty_text(value: object, name: str) -> str:
@@ -2382,6 +2897,22 @@ def _sql(
     """Issue SQLite SQL without exposing a brokerage-like API name in our package."""
     method = getattr(connection, "execute")
     return method(statement, parameters)
+
+
+def _enable_wal_with_bounded_retry(connection: sqlite3.Connection) -> None:
+    deadline = time.monotonic() + BUSY_TIMEOUT_MILLISECONDS / 1_000
+    while True:
+        try:
+            mode_row = _sql(connection, "PRAGMA journal_mode = WAL").fetchone()
+        except sqlite3.Error as error:
+            if not _is_busy_error(error) or time.monotonic() >= deadline:
+                raise
+        else:
+            if mode_row is not None and str(mode_row[0]).lower() == "wal":
+                return
+            if time.monotonic() >= deadline:
+                raise JournalError("journal database did not enter WAL mode")
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:

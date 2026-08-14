@@ -114,9 +114,9 @@ CREATE TABLE execution_events (
     user_confirmed_stop_micros INTEGER
         CHECK(user_confirmed_stop_micros IS NULL OR (typeof(user_confirmed_stop_micros) = 'integer' AND user_confirmed_stop_micros > 0)),
     event_time TEXT NOT NULL
-        CHECK(length(event_time) = 27 AND substr(event_time, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', event_time) AND substr(event_time, 24, 3) NOT GLOB '*[^0-9]*' AND substr(event_time, 27, 1) = 'Z' AND CAST(substr(event_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(event_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', event_time) IS NOT NULL),
+        CHECK(length(event_time) = 27 AND substr(event_time, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', event_time) AND substr(event_time, 20, 1) = '.' AND substr(event_time, 21, 6) NOT GLOB '*[^0-9]*' AND substr(event_time, 27, 1) = 'Z' AND CAST(substr(event_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(event_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', event_time) IS NOT NULL),
     message_time TEXT NOT NULL
-        CHECK(length(message_time) = 27 AND substr(message_time, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', message_time) AND substr(message_time, 24, 3) NOT GLOB '*[^0-9]*' AND substr(message_time, 27, 1) = 'Z' AND CAST(substr(message_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(message_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', message_time) IS NOT NULL),
+        CHECK(length(message_time) = 27 AND substr(message_time, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', message_time) AND substr(message_time, 20, 1) = '.' AND substr(message_time, 21, 6) NOT GLOB '*[^0-9]*' AND substr(message_time, 27, 1) = 'Z' AND CAST(substr(message_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(message_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', message_time) IS NOT NULL),
     compliance_result TEXT NOT NULL,
     reconciliation_state TEXT NOT NULL,
     details_json TEXT NOT NULL,
@@ -137,6 +137,18 @@ BEGIN
     SELECT RAISE(ABORT, 'execution_events is append-only');
 END;
 
+CREATE TRIGGER execution_events_validate_message_time
+BEFORE INSERT ON execution_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM raw_messages
+    WHERE id = NEW.raw_message_id
+      AND message_time = NEW.message_time
+      AND NEW.event_time <= message_time
+)
+BEGIN
+    SELECT RAISE(ABORT, 'execution event time conflicts with raw message');
+END;
+
 CREATE TABLE source_observations (
     id INTEGER PRIMARY KEY CHECK(typeof(id) = 'integer' AND id > 0),
     observation_sha256 TEXT NOT NULL COLLATE BINARY UNIQUE
@@ -148,9 +160,9 @@ CREATE TABLE source_observations (
     provider TEXT NOT NULL,
     feed TEXT,
     source_time TEXT NOT NULL
-        CHECK(length(source_time) = 27 AND substr(source_time, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', source_time) AND substr(source_time, 24, 3) NOT GLOB '*[^0-9]*' AND substr(source_time, 27, 1) = 'Z' AND CAST(substr(source_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(source_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', source_time) IS NOT NULL),
+        CHECK(length(source_time) = 27 AND substr(source_time, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', source_time) AND substr(source_time, 20, 1) = '.' AND substr(source_time, 21, 6) NOT GLOB '*[^0-9]*' AND substr(source_time, 27, 1) = 'Z' AND CAST(substr(source_time, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(source_time, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', source_time) IS NOT NULL),
     retrieved_at TEXT NOT NULL
-        CHECK(length(retrieved_at) = 27 AND substr(retrieved_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', retrieved_at) AND substr(retrieved_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(retrieved_at, 27, 1) = 'Z' AND CAST(substr(retrieved_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(retrieved_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', retrieved_at) IS NOT NULL),
+        CHECK(length(retrieved_at) = 27 AND substr(retrieved_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', retrieved_at) AND substr(retrieved_at, 20, 1) = '.' AND substr(retrieved_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(retrieved_at, 27, 1) = 'Z' AND CAST(substr(retrieved_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(retrieved_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', retrieved_at) IS NOT NULL),
     provider_sequence INTEGER
         CHECK(provider_sequence IS NULL OR (typeof(provider_sequence) = 'integer' AND provider_sequence >= 0)),
     delay_seconds INTEGER
@@ -173,9 +185,14 @@ CREATE TABLE account_checks (
     unlogged_position_count INTEGER NOT NULL
         CHECK(typeof(unlogged_position_count) = 'integer' AND unlogged_position_count >= 0),
     confirmed_at TEXT NOT NULL
-        CHECK(length(confirmed_at) = 27 AND substr(confirmed_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', confirmed_at) AND substr(confirmed_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(confirmed_at, 27, 1) = 'Z' AND CAST(substr(confirmed_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(confirmed_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', confirmed_at) IS NOT NULL),
-    reconciliation_result TEXT NOT NULL,
+        CHECK(length(confirmed_at) = 27 AND substr(confirmed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', confirmed_at) AND substr(confirmed_at, 20, 1) = '.' AND substr(confirmed_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(confirmed_at, 27, 1) = 'Z' AND CAST(substr(confirmed_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(confirmed_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', confirmed_at) IS NOT NULL),
+    reconciliation_result TEXT NOT NULL
+        CHECK(reconciliation_result IN ('CLEAR', 'RECONCILIATION_REQUIRED')),
     details_json TEXT NOT NULL,
+    CHECK(
+        reconciliation_result = 'RECONCILIATION_REQUIRED'
+        OR (pending_order_count = 0 AND unlogged_position_count = 0)
+    ),
     FOREIGN KEY(raw_message_id) REFERENCES raw_messages(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     FOREIGN KEY(execution_event_id) REFERENCES execution_events(id)
@@ -192,13 +209,13 @@ CREATE TABLE report_claims (
     status TEXT NOT NULL
         CHECK(status IN ('IN_PROGRESS', 'FINALIZED')),
     created_at TEXT NOT NULL
-        CHECK(length(created_at) = 27 AND substr(created_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', created_at) AND substr(created_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', created_at) IS NOT NULL),
+        CHECK(length(created_at) = 27 AND substr(created_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', created_at) AND substr(created_at, 20, 1) = '.' AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', created_at) IS NOT NULL),
     lease_started_at TEXT NOT NULL
-        CHECK(length(lease_started_at) = 27 AND substr(lease_started_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', lease_started_at) AND substr(lease_started_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(lease_started_at, 27, 1) = 'Z' AND CAST(substr(lease_started_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(lease_started_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', lease_started_at) IS NOT NULL),
+        CHECK(length(lease_started_at) = 27 AND substr(lease_started_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', lease_started_at) AND substr(lease_started_at, 20, 1) = '.' AND substr(lease_started_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(lease_started_at, 27, 1) = 'Z' AND CAST(substr(lease_started_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(lease_started_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', lease_started_at) IS NOT NULL),
     lease_expires_at TEXT NOT NULL
-        CHECK(length(lease_expires_at) = 27 AND substr(lease_expires_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', lease_expires_at) AND substr(lease_expires_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(lease_expires_at, 27, 1) = 'Z' AND CAST(substr(lease_expires_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(lease_expires_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', lease_expires_at) IS NOT NULL),
+        CHECK(length(lease_expires_at) = 27 AND substr(lease_expires_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', lease_expires_at) AND substr(lease_expires_at, 20, 1) = '.' AND substr(lease_expires_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(lease_expires_at, 27, 1) = 'Z' AND CAST(substr(lease_expires_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(lease_expires_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', lease_expires_at) IS NOT NULL),
     finalized_at TEXT
-        CHECK(finalized_at IS NULL OR (length(finalized_at) = 27 AND substr(finalized_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', finalized_at) AND substr(finalized_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(finalized_at, 27, 1) = 'Z' AND CAST(substr(finalized_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(finalized_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', finalized_at) IS NOT NULL)),
+        CHECK(finalized_at IS NULL OR (length(finalized_at) = 27 AND substr(finalized_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', finalized_at) AND substr(finalized_at, 20, 1) = '.' AND substr(finalized_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(finalized_at, 27, 1) = 'Z' AND CAST(substr(finalized_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(finalized_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', finalized_at) IS NOT NULL)),
     report_id INTEGER
         CHECK(report_id IS NULL OR (typeof(report_id) = 'integer' AND report_id > 0)),
     CHECK(lease_expires_at > lease_started_at),
@@ -215,7 +232,8 @@ CREATE TABLE report_claims (
 
 CREATE TABLE reports (
     id INTEGER PRIMARY KEY CHECK(typeof(id) = 'integer' AND id > 0),
-    report_id TEXT NOT NULL COLLATE BINARY UNIQUE,
+    report_id TEXT NOT NULL COLLATE BINARY UNIQUE
+        CHECK(length(report_id) = 64 AND report_id NOT GLOB '*[^0-9a-f]*'),
     claim_id INTEGER NOT NULL UNIQUE
         CHECK(typeof(claim_id) = 'integer' AND claim_id > 0),
     session_date TEXT NOT NULL
@@ -231,7 +249,15 @@ CREATE TABLE reports (
         CHECK(length(observation_set_sha256) = 64 AND observation_set_sha256 NOT GLOB '*[^0-9a-f]*'),
     archive_relative_path TEXT NOT NULL COLLATE BINARY UNIQUE,
     created_at TEXT NOT NULL
-        CHECK(length(created_at) = 27 AND substr(created_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', created_at) AND substr(created_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', created_at) IS NOT NULL),
+        CHECK(length(created_at) = 27 AND substr(created_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', created_at) AND substr(created_at, 20, 1) = '.' AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', created_at) IS NOT NULL),
+    CHECK(
+        archive_relative_path =
+            'reports/' || substr(session_date, 1, 4) || '/'
+            || substr(session_date, 6, 2) || '/'
+            || substr(session_date, 9, 2) || '/'
+            || lower(report_kind) || '-' || session_date || '-'
+            || substr(report_id, 1, 12) || '.md'
+    ),
     UNIQUE(session_date, report_kind),
     FOREIGN KEY(claim_id) REFERENCES report_claims(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -265,13 +291,17 @@ CREATE TABLE outbox (
     payload_sha256 TEXT NOT NULL COLLATE BINARY
         CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
     created_at TEXT NOT NULL
-        CHECK(length(created_at) = 27 AND substr(created_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', created_at) AND substr(created_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', created_at) IS NOT NULL),
+        CHECK(length(created_at) = 27 AND substr(created_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', created_at) AND substr(created_at, 20, 1) = '.' AND substr(created_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(created_at, 27, 1) = 'Z' AND CAST(substr(created_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(created_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', created_at) IS NOT NULL),
     CHECK((origin_report_id IS NOT NULL) != (origin_execution_event_id IS NOT NULL)),
     FOREIGN KEY(origin_report_id) REFERENCES reports(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     FOREIGN KEY(origin_execution_event_id) REFERENCES execution_events(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) STRICT;
+
+CREATE UNIQUE INDEX outbox_one_report_destination
+ON outbox(origin_report_id, destination)
+WHERE origin_report_id IS NOT NULL;
 
 CREATE TABLE outbox_delivery_attempts (
     id INTEGER PRIMARY KEY CHECK(typeof(id) = 'integer' AND id > 0),
@@ -280,12 +310,20 @@ CREATE TABLE outbox_delivery_attempts (
     attempt_ordinal INTEGER NOT NULL
         CHECK(typeof(attempt_ordinal) = 'integer' AND attempt_ordinal > 0),
     attempted_at TEXT NOT NULL
-        CHECK(length(attempted_at) = 27 AND substr(attempted_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', attempted_at) AND substr(attempted_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(attempted_at, 27, 1) = 'Z' AND CAST(substr(attempted_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(attempted_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', attempted_at) IS NOT NULL),
+        CHECK(length(attempted_at) = 27 AND substr(attempted_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', attempted_at) AND substr(attempted_at, 20, 1) = '.' AND substr(attempted_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(attempted_at, 27, 1) = 'Z' AND CAST(substr(attempted_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(attempted_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', attempted_at) IS NOT NULL),
     delivery_status TEXT NOT NULL
         CHECK(delivery_status IN ('FAILED', 'DELIVERED')),
     external_delivery_id TEXT,
     error_class TEXT,
     details_json TEXT NOT NULL,
+    CHECK(
+        (delivery_status = 'DELIVERED'
+            AND external_delivery_id IS NOT NULL
+            AND error_class IS NULL)
+        OR (delivery_status = 'FAILED'
+            AND external_delivery_id IS NULL
+            AND error_class IS NOT NULL)
+    ),
     UNIQUE(outbox_id, attempt_ordinal),
     FOREIGN KEY(outbox_id) REFERENCES outbox(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -303,16 +341,28 @@ CREATE TABLE scheduled_runs (
     session_date TEXT NOT NULL
         CHECK(length(session_date) = 10 AND session_date = strftime('%Y-%m-%d', session_date) AND CAST(substr(session_date, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND strftime('%Y-%m-%d', session_date) IS NOT NULL),
     intended_run_at TEXT NOT NULL
-        CHECK(length(intended_run_at) = 27 AND substr(intended_run_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', intended_run_at) AND substr(intended_run_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(intended_run_at, 27, 1) = 'Z' AND CAST(substr(intended_run_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(intended_run_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', intended_run_at) IS NOT NULL),
+        CHECK(length(intended_run_at) = 27 AND substr(intended_run_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', intended_run_at) AND substr(intended_run_at, 20, 1) = '.' AND substr(intended_run_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(intended_run_at, 27, 1) = 'Z' AND CAST(substr(intended_run_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(intended_run_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', intended_run_at) IS NOT NULL),
     started_at TEXT NOT NULL
-        CHECK(length(started_at) = 27 AND substr(started_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', started_at) AND substr(started_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(started_at, 27, 1) = 'Z' AND CAST(substr(started_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(started_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', started_at) IS NOT NULL),
+        CHECK(length(started_at) = 27 AND substr(started_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', started_at) AND substr(started_at, 20, 1) = '.' AND substr(started_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(started_at, 27, 1) = 'Z' AND CAST(substr(started_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(started_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', started_at) IS NOT NULL),
     finished_at TEXT
-        CHECK(finished_at IS NULL OR (length(finished_at) = 27 AND substr(finished_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', finished_at) AND substr(finished_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(finished_at, 27, 1) = 'Z' AND CAST(substr(finished_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(finished_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', finished_at) IS NOT NULL)),
-    market_session_decision TEXT,
+        CHECK(finished_at IS NULL OR (length(finished_at) = 27 AND substr(finished_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', finished_at) AND substr(finished_at, 20, 1) = '.' AND substr(finished_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(finished_at, 27, 1) = 'Z' AND CAST(substr(finished_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(finished_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', finished_at) IS NOT NULL)),
+    market_session_decision TEXT
+        CHECK(market_session_decision IS NULL OR (
+            length(market_session_decision) > 0
+            AND market_session_decision = upper(market_session_decision)
+            AND market_session_decision NOT GLOB '*[^A-Z0-9_]*'
+            AND substr(market_session_decision, 1, 1) GLOB '[A-Z]'
+        )),
     report_id INTEGER
         CHECK(report_id IS NULL OR (typeof(report_id) = 'integer' AND report_id > 0)),
     report_path TEXT,
-    outcome TEXT,
+    outcome TEXT
+        CHECK(outcome IS NULL OR (
+            length(outcome) > 0
+            AND outcome = upper(outcome)
+            AND outcome NOT GLOB '*[^A-Z0-9_]*'
+            AND substr(outcome, 1, 1) GLOB '[A-Z]'
+        )),
     error_class TEXT,
     CHECK(finished_at IS NULL OR finished_at >= started_at),
     CHECK(
@@ -321,8 +371,12 @@ CREATE TABLE scheduled_runs (
             AND outcome IS NULL AND error_class IS NULL)
         OR (finished_at IS NOT NULL AND market_session_decision IS NOT NULL
             AND outcome IS NOT NULL
-            AND ((report_id IS NULL AND report_path IS NULL)
-                OR (report_id IS NOT NULL AND report_path IS NOT NULL)))
+            AND (
+                (outcome = 'REPORT_EMITTED'
+                    AND report_id IS NOT NULL AND report_path IS NOT NULL)
+                OR (outcome != 'REPORT_EMITTED'
+                    AND report_id IS NULL AND report_path IS NULL)
+            ))
     ),
     FOREIGN KEY(report_id) REFERENCES reports(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -346,7 +400,7 @@ CREATE TABLE ledger_postings (
     unit_price_micros INTEGER
         CHECK(unit_price_micros IS NULL OR (typeof(unit_price_micros) = 'integer' AND unit_price_micros > 0)),
     occurred_at TEXT NOT NULL
-        CHECK(length(occurred_at) = 27 AND substr(occurred_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', occurred_at) AND substr(occurred_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(occurred_at, 27, 1) = 'Z' AND CAST(substr(occurred_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(occurred_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', occurred_at) IS NOT NULL),
+        CHECK(length(occurred_at) = 27 AND substr(occurred_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', occurred_at) AND substr(occurred_at, 20, 1) = '.' AND substr(occurred_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(occurred_at, 27, 1) = 'Z' AND CAST(substr(occurred_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(occurred_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', occurred_at) IS NOT NULL),
     details_json TEXT NOT NULL,
     FOREIGN KEY(execution_event_id) REFERENCES execution_events(id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -356,7 +410,8 @@ CREATE TABLE ledger_postings (
 
 CREATE TABLE actual_positions (
     id INTEGER PRIMARY KEY CHECK(typeof(id) = 'integer' AND id > 0),
-    symbol TEXT NOT NULL COLLATE BINARY UNIQUE,
+    signal_id TEXT NOT NULL COLLATE BINARY UNIQUE,
+    symbol TEXT NOT NULL COLLATE BINARY,
     shares INTEGER NOT NULL
         CHECK(typeof(shares) = 'integer' AND shares >= 0),
     cost_basis_micros INTEGER NOT NULL
@@ -370,7 +425,7 @@ CREATE TABLE actual_positions (
     last_execution_event_id INTEGER NOT NULL
         CHECK(typeof(last_execution_event_id) = 'integer' AND last_execution_event_id > 0),
     updated_at TEXT NOT NULL
-        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', updated_at) AND substr(updated_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', updated_at) IS NOT NULL),
+        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', updated_at) AND substr(updated_at, 20, 1) = '.' AND substr(updated_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', updated_at) IS NOT NULL),
     revision INTEGER NOT NULL
         CHECK(typeof(revision) = 'integer' AND revision > 0),
     CHECK(
@@ -403,7 +458,7 @@ CREATE TABLE actual_cash_projection (
     last_ledger_posting_id INTEGER NOT NULL
         CHECK(typeof(last_ledger_posting_id) = 'integer' AND last_ledger_posting_id > 0),
     updated_at TEXT NOT NULL
-        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', updated_at) AND substr(updated_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', updated_at) IS NOT NULL),
+        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', updated_at) AND substr(updated_at, 20, 1) = '.' AND substr(updated_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', updated_at) IS NOT NULL),
     revision INTEGER NOT NULL
         CHECK(typeof(revision) = 'integer' AND revision > 0),
     FOREIGN KEY(last_ledger_posting_id) REFERENCES ledger_postings(id)
@@ -415,10 +470,10 @@ CREATE TABLE reconciliation_projection (
     reconciliation_required INTEGER NOT NULL
         CHECK(typeof(reconciliation_required) = 'integer' AND reconciliation_required IN (0, 1)),
     reason TEXT,
-    last_execution_event_id INTEGER
-        CHECK(last_execution_event_id IS NULL OR (typeof(last_execution_event_id) = 'integer' AND last_execution_event_id > 0)),
+    last_execution_event_id INTEGER NOT NULL
+        CHECK(typeof(last_execution_event_id) = 'integer' AND last_execution_event_id > 0),
     updated_at TEXT NOT NULL
-        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 23) = strftime('%Y-%m-%dT%H:%M:%f', updated_at) AND substr(updated_at, 24, 3) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%f', updated_at) IS NOT NULL),
+        CHECK(length(updated_at) = 27 AND substr(updated_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', updated_at) AND substr(updated_at, 20, 1) = '.' AND substr(updated_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(updated_at, 27, 1) = 'Z' AND CAST(substr(updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', updated_at) IS NOT NULL),
     revision INTEGER NOT NULL
         CHECK(typeof(revision) = 'integer' AND revision > 0),
     CHECK(
@@ -497,6 +552,12 @@ WHEN NOT EXISTS (
       AND raw_message_id = NEW.raw_message_id
       AND parsed_action = 'ACCOUNT_CHECK'
       AND event_time = NEW.confirmed_at
+      AND (
+          (NEW.reconciliation_result = 'CLEAR'
+              AND reconciliation_state = 'CLEAR')
+          OR (NEW.reconciliation_result = 'RECONCILIATION_REQUIRED'
+              AND reconciliation_state IN ('REQUIRED', 'PENDING'))
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'account_checks requires its matching execution event');
@@ -536,7 +597,6 @@ WHEN NOT EXISTS (
       AND session_date = NEW.session_date
       AND report_kind = NEW.report_kind
       AND status = 'IN_PROGRESS'
-      AND NEW.created_at >= lease_started_at
       AND NEW.created_at < lease_expires_at
 )
 BEGIN
@@ -565,6 +625,7 @@ WHEN NOT EXISTS (
     JOIN source_observations AS observation
       ON observation.id = NEW.source_observation_id
     WHERE report.id = NEW.report_id
+      AND observation.source_time <= report.created_at
       AND observation.retrieved_at <= report.created_at
 )
 BEGIN
@@ -577,6 +638,9 @@ WHEN EXISTS (
     SELECT 1 FROM outbox
     WHERE id = NEW.id
        OR idempotency_key = NEW.idempotency_key COLLATE BINARY
+       OR (NEW.origin_report_id IS NOT NULL
+           AND origin_report_id = NEW.origin_report_id
+           AND destination = NEW.destination)
 )
 BEGIN
     SELECT RAISE(ABORT, 'outbox rejects conflicting inserts');
@@ -595,6 +659,32 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'outbox_delivery_attempts rejects conflicting inserts');
+END;
+
+CREATE TRIGGER outbox_delivery_attempts_validate_sequence
+BEFORE INSERT ON outbox_delivery_attempts
+WHEN NOT EXISTS (
+        SELECT 1 FROM outbox
+        WHERE id = NEW.outbox_id AND NEW.attempted_at >= created_at
+    )
+    OR EXISTS (
+        SELECT 1 FROM outbox_delivery_attempts
+        WHERE outbox_id = NEW.outbox_id AND delivery_status = 'DELIVERED'
+    )
+    OR NEW.attempt_ordinal != COALESCE((
+        SELECT MAX(attempt_ordinal) + 1
+        FROM outbox_delivery_attempts
+        WHERE outbox_id = NEW.outbox_id
+    ), 1)
+    OR NEW.attempted_at < COALESCE((
+        SELECT attempted_at
+        FROM outbox_delivery_attempts
+        WHERE outbox_id = NEW.outbox_id
+        ORDER BY attempt_ordinal DESC
+        LIMIT 1
+    ), NEW.attempted_at)
+BEGIN
+    SELECT RAISE(ABORT, 'outbox delivery attempt is out of sequence');
 END;
 
 CREATE TRIGGER ledger_postings_no_conflicting_insert
@@ -748,7 +838,7 @@ WHEN NOT (
                   AND claim_id = OLD.id
                   AND session_date = OLD.session_date
                   AND report_kind = OLD.report_kind
-                  AND created_at = NEW.finalized_at
+                  AND created_at <= NEW.finalized_at
             )
             AND EXISTS (
                 SELECT 1 FROM outbox
@@ -799,6 +889,8 @@ WHEN NOT (
                   AND report.archive_relative_path = NEW.report_path
                   AND claim.status = 'FINALIZED'
                   AND claim.report_id = report.id
+                  AND claim.finalized_at >= OLD.started_at
+                  AND claim.finalized_at <= NEW.finished_at
             )
         )
     )
@@ -828,6 +920,48 @@ BEGIN
     SELECT RAISE(ABORT, 'actual_positions requires journal transaction API');
 END;
 
+CREATE TRIGGER actual_positions_validate_event_insert
+BEFORE INSERT ON actual_positions
+WHEN NOT EXISTS (
+    SELECT 1 FROM execution_events
+    WHERE id = NEW.last_execution_event_id
+      AND signal_id = NEW.signal_id COLLATE BINARY
+      AND symbol = NEW.symbol COLLATE BINARY
+      AND parsed_action IN (
+          'BOUGHT',
+          'PARTIAL_FILL',
+          'RECONCILE_UNRELATED_POSITION',
+          'SOLD',
+          'STOP_FILLED',
+          'STOP_UPDATED'
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'actual_positions requires its matching position event');
+END;
+
+CREATE TRIGGER actual_positions_validate_event_update
+BEFORE UPDATE ON actual_positions
+WHEN NEW.signal_id != OLD.signal_id COLLATE BINARY
+   OR NEW.symbol != OLD.symbol COLLATE BINARY
+   OR NOT EXISTS (
+       SELECT 1 FROM execution_events
+       WHERE id = NEW.last_execution_event_id
+         AND signal_id = NEW.signal_id COLLATE BINARY
+         AND symbol = NEW.symbol COLLATE BINARY
+         AND parsed_action IN (
+             'BOUGHT',
+             'PARTIAL_FILL',
+             'RECONCILE_UNRELATED_POSITION',
+             'SOLD',
+             'STOP_FILLED',
+             'STOP_UPDATED'
+         )
+   )
+BEGIN
+    SELECT RAISE(ABORT, 'actual_positions requires its matching position event');
+END;
+
 CREATE TRIGGER actual_cash_projection_guard_insert
 BEFORE INSERT ON actual_cash_projection
 WHEN journal_projection_write_allowed() != 1
@@ -849,6 +983,26 @@ BEGIN
     SELECT RAISE(ABORT, 'actual_cash_projection requires journal transaction API');
 END;
 
+CREATE TRIGGER actual_cash_projection_validate_posting_insert
+BEFORE INSERT ON actual_cash_projection
+WHEN NOT EXISTS (
+    SELECT 1 FROM ledger_postings
+    WHERE id = NEW.last_ledger_posting_id AND ledger_name = 'ACTUAL'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'actual_cash_projection requires an ACTUAL posting');
+END;
+
+CREATE TRIGGER actual_cash_projection_validate_posting_update
+BEFORE UPDATE ON actual_cash_projection
+WHEN NOT EXISTS (
+    SELECT 1 FROM ledger_postings
+    WHERE id = NEW.last_ledger_posting_id AND ledger_name = 'ACTUAL'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'actual_cash_projection requires an ACTUAL posting');
+END;
+
 CREATE TRIGGER reconciliation_projection_guard_insert
 BEFORE INSERT ON reconciliation_projection
 WHEN journal_projection_write_allowed() != 1
@@ -868,4 +1022,60 @@ BEFORE DELETE ON reconciliation_projection
 WHEN journal_projection_write_allowed() != 1
 BEGIN
     SELECT RAISE(ABORT, 'reconciliation_projection requires journal transaction API');
+END;
+
+CREATE TRIGGER reconciliation_projection_validate_event_insert
+BEFORE INSERT ON reconciliation_projection
+WHEN NOT EXISTS (
+    SELECT 1 FROM execution_events
+    WHERE id = NEW.last_execution_event_id
+      AND parsed_action IN (
+          'ACCOUNT_CHECK',
+          'BOUGHT',
+          'FEE',
+          'PARTIAL_FILL',
+          'RECONCILE_CASH',
+          'RECONCILE_PENDING_ORDERS',
+          'RECONCILE_UNRELATED_POSITION',
+          'SOLD',
+          'STOP_FILLED',
+          'STOP_UPDATED'
+      )
+      AND (
+          (NEW.reconciliation_required = 1
+              AND reconciliation_state IN ('REQUIRED', 'PENDING'))
+          OR (NEW.reconciliation_required = 0
+              AND reconciliation_state = 'CLEAR')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation_projection requires an authoritative event');
+END;
+
+CREATE TRIGGER reconciliation_projection_validate_event_update
+BEFORE UPDATE ON reconciliation_projection
+WHEN NOT EXISTS (
+    SELECT 1 FROM execution_events
+    WHERE id = NEW.last_execution_event_id
+      AND parsed_action IN (
+          'ACCOUNT_CHECK',
+          'BOUGHT',
+          'FEE',
+          'PARTIAL_FILL',
+          'RECONCILE_CASH',
+          'RECONCILE_PENDING_ORDERS',
+          'RECONCILE_UNRELATED_POSITION',
+          'SOLD',
+          'STOP_FILLED',
+          'STOP_UPDATED'
+      )
+      AND (
+          (NEW.reconciliation_required = 1
+              AND reconciliation_state IN ('REQUIRED', 'PENDING'))
+          OR (NEW.reconciliation_required = 0
+              AND reconciliation_state = 'CLEAR')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation_projection requires an authoritative event');
 END;

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -17,6 +19,8 @@ from stock_monitor.journal import (
     Journal,
     JournalBusy,
     JournalError,
+    report_archive_relative_path,
+    stable_report_id,
 )
 
 
@@ -191,6 +195,54 @@ class JournalTests(unittest.TestCase):
                         symbol="SPY",
                     )
 
+    def test_execution_event_cannot_postdate_its_authoritative_message(self) -> None:
+        message_time = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        future_event_time = message_time + timedelta(days=1)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-future-event", message_time, "BOUGHT SPY"
+            )
+            with self.assertRaises(InvalidJournalValue):
+                journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="BOUGHT",
+                    event_time=future_event_time,
+                    signal_id="signal-future",
+                    symbol="SPY",
+                    shares=1,
+                    price_micros=100_000_000,
+                )
+
+        with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA recursive_triggers = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO execution_events("
+                    "event_id, raw_message_id, action_ordinal, idempotency_key, "
+                    "signal_id, parsed_action, symbol, shares, price_micros, "
+                    "event_time, message_time, compliance_result, "
+                    "reconciliation_state, details_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "evt_future",
+                        raw_id,
+                        0,
+                        "message-action:future",
+                        "signal-future",
+                        "BOUGHT",
+                        "SPY",
+                        1,
+                        100_000_000,
+                        "2026-08-15T14:00:00.000000Z",
+                        "2026-08-14T14:00:00.000000Z",
+                        "ALLOWED",
+                        "CLEAR",
+                        "{}",
+                    ),
+                )
+
     def test_money_inputs_reject_nonintegers_invalid_signs_and_overflow(self) -> None:
         at = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
         with Journal.open(self.db_path) as journal:
@@ -318,6 +370,8 @@ class JournalTests(unittest.TestCase):
     def test_report_finalization_requires_the_current_token_and_active_lease(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
         with Journal.open(self.db_path) as journal:
             claim = journal.claim_report(
                 session_date, "CLOSE", now=now, lease_seconds=300
@@ -327,9 +381,12 @@ class JournalTests(unittest.TestCase):
                 "claim_id": claim.claim_id,
                 "claim_token": claim.claim_token,
                 "body": "# Close\n",
-                "state_sha256": "a" * 64,
+                "state_sha256": state_sha256,
                 "observation_ids": (),
-                "archive_relative_path": "reports/2026/08/14/close.md",
+                "archive_relative_path": report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                ),
+                "finalized_at": now + timedelta(seconds=301),
                 "outbox_destination": "CODEX_TASK",
                 "outbox_payload": "close",
             }
@@ -366,6 +423,85 @@ class JournalTests(unittest.TestCase):
                 created_at=now + timedelta(seconds=301),
             )
             self.assertFalse(finalized.duplicate)
+
+    def test_report_finalization_uses_finalized_at_for_lease_authority(self) -> None:
+        session_date = date(2026, 8, 14)
+        lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        values = {
+            "body": "# Close\n",
+            "state_sha256": state_sha256,
+            "observation_ids": (),
+            "archive_relative_path": report_archive_relative_path(
+                "CLOSE", session_date, report_id
+            ),
+            "outbox_destination": "CODEX_TASK",
+            "outbox_payload": "close",
+        }
+        with Journal.open(self.db_path) as journal:
+            stale = journal.claim_report(
+                session_date, "CLOSE", now=lease_start, lease_seconds=300
+            )
+            assert stale.claim_token is not None
+            with self.assertRaises(IdempotencyConflict):
+                journal.finalize_report(
+                    claim_id=stale.claim_id,
+                    claim_token=stale.claim_token,
+                    created_at=lease_start + timedelta(seconds=1),
+                    finalized_at=lease_start + timedelta(seconds=300),
+                    **values,
+                )
+
+            recovered = journal.claim_report(
+                session_date,
+                "CLOSE",
+                now=lease_start + timedelta(seconds=300),
+                lease_seconds=300,
+            )
+            assert recovered.claim_token is not None
+            with self.assertRaises(InvalidJournalValue):
+                journal.finalize_report(
+                    claim_id=recovered.claim_id,
+                    claim_token=recovered.claim_token,
+                    created_at=lease_start + timedelta(seconds=302),
+                    finalized_at=lease_start + timedelta(seconds=301),
+                    **values,
+                )
+
+            finalized = journal.finalize_report(
+                claim_id=recovered.claim_id,
+                claim_token=recovered.claim_token,
+                created_at=lease_start + timedelta(seconds=1),
+                finalized_at=lease_start + timedelta(seconds=301),
+                **values,
+            )
+            self.assertFalse(finalized.duplicate)
+
+    def test_report_finalization_defaults_to_the_current_utc_instant(self) -> None:
+        session_date = date(2026, 8, 14)
+        lease_start = datetime.now(timezone.utc) - timedelta(seconds=5)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        with Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(
+                session_date, "CLOSE", now=lease_start, lease_seconds=1
+            )
+            assert claim.claim_token is not None
+            with self.assertRaises(IdempotencyConflict):
+                journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Close\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(),
+                    archive_relative_path=report_archive_relative_path(
+                        "CLOSE", session_date, report_id
+                    ),
+                    created_at=lease_start,
+                    outbox_destination="CODEX_TASK",
+                    outbox_payload="close",
+                )
 
     def test_report_finalization_atomically_pins_observations_and_outbox(self) -> None:
         session_date = date(2026, 8, 14)
@@ -406,13 +542,26 @@ class JournalTests(unittest.TestCase):
                 "body": "# Close report\n\nNO TRADE\n",
                 "state_sha256": "a" * 64,
                 "observation_ids": (second_observation, first_observation),
-                "archive_relative_path": (
-                    "reports/2026/08/14/close-2026-08-14-audit.md"
-                ),
                 "created_at": now + timedelta(seconds=1),
+                "finalized_at": now + timedelta(seconds=1),
                 "outbox_destination": "CODEX_TASK",
                 "outbox_payload": "CLOSE: NO TRADE",
             }
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                observation_sha256s = tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT observation_sha256 FROM source_observations "
+                        "WHERE id IN (?, ?) ORDER BY observation_sha256",
+                        (first_observation, second_observation),
+                    )
+                )
+            report_id = stable_report_id(
+                "CLOSE", session_date, observation_sha256s, values["state_sha256"]
+            )
+            values["archive_relative_path"] = report_archive_relative_path(
+                "CLOSE", session_date, report_id
+            )
 
             with self.assertRaises(InvalidJournalValue):
                 journal.finalize_report(
@@ -443,6 +592,196 @@ class JournalTests(unittest.TestCase):
                 journal.claim_report(session_date, "CLOSE").status,
                 "ALREADY_FINALIZED",
             )
+
+    def test_report_id_and_archive_path_match_the_task10_contract(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        with Journal.open(self.db_path) as journal:
+            observation_ids = []
+            for suffix in ("a", "b"):
+                observation_id, _ = journal.append_source_observation(
+                    payload=f"payload-{suffix}".encode(),
+                    source_uri=f"https://example.test/source-{suffix}",
+                    source_type="MARKET_DATA",
+                    provider="fixture",
+                    feed=None,
+                    source_time=now,
+                    retrieved_at=now,
+                    provider_sequence=None,
+                    delay_seconds=None,
+                    health_result="OK",
+                )
+                observation_ids.append(observation_id)
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                observation_sha256s = tuple(
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT observation_sha256 FROM source_observations "
+                        "ORDER BY observation_sha256"
+                    )
+                )
+            canonical = json.dumps(
+                {
+                    "kind": "CLOSE",
+                    "session": session_date.isoformat(),
+                    "observations": sorted(observation_sha256s),
+                    "state": state_sha256,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            expected_report_id = hashlib.sha256(canonical.encode()).hexdigest()
+            expected_path = (
+                "reports/2026/08/14/close-2026-08-14-"
+                f"{expected_report_id[:12]}.md"
+            )
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+
+            finalized = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=tuple(reversed(observation_ids)),
+                archive_relative_path=expected_path,
+                created_at=now + timedelta(seconds=1),
+                finalized_at=now + timedelta(seconds=1),
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+
+            self.assertEqual(finalized.report_id, expected_report_id)
+
+    def test_report_finalization_rejects_a_nondeterministic_archive_path(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+
+            with self.assertRaises(InvalidJournalValue):
+                journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Close\n",
+                    state_sha256="a" * 64,
+                    observation_ids=(),
+                    archive_relative_path="reports/2026/08/14/close.md",
+                    created_at=now + timedelta(seconds=1),
+                    outbox_destination="CODEX_TASK",
+                    outbox_payload="close",
+                )
+
+    def test_report_rejects_source_publication_after_its_created_at(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        with Journal.open(self.db_path) as journal:
+            observation_id, _ = journal.append_source_observation(
+                payload=b"future publication",
+                source_uri="https://example.test/future-publication",
+                source_type="MARKET_DATA",
+                provider="fixture",
+                feed=None,
+                source_time=now + timedelta(seconds=2),
+                retrieved_at=now,
+                provider_sequence=None,
+                delay_seconds=None,
+                health_result="OK",
+            )
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                observation_sha256 = str(
+                    connection.execute(
+                        "SELECT observation_sha256 FROM source_observations WHERE id = ?",
+                        (observation_id,),
+                    ).fetchone()[0]
+                )
+            report_id = stable_report_id(
+                "CLOSE", session_date, (observation_sha256,), state_sha256
+            )
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+
+            with self.assertRaises(InvalidJournalValue):
+                journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Close\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(observation_id,),
+                    archive_relative_path=report_archive_relative_path(
+                        "CLOSE", session_date, report_id
+                    ),
+                    created_at=now + timedelta(seconds=1),
+                    outbox_destination="CODEX_TASK",
+                    outbox_payload="close",
+                )
+
+    def test_finalized_report_can_be_read_after_restart_for_archive_recovery(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        body = "# Close\n\nNO TRADE\n"
+        with Journal.open(self.db_path) as journal:
+            observation_id, _ = journal.append_source_observation(
+                payload=b"recovery evidence",
+                source_uri="https://example.test/recovery",
+                source_type="MARKET_DATA",
+                provider="fixture",
+                feed=None,
+                source_time=now,
+                retrieved_at=now,
+                provider_sequence=None,
+                delay_seconds=None,
+                health_result="OK",
+            )
+            with closing(sqlite3.connect(self.db_path)) as connection:
+                observation_sha256 = str(
+                    connection.execute(
+                        "SELECT observation_sha256 FROM source_observations WHERE id = ?",
+                        (observation_id,),
+                    ).fetchone()[0]
+                )
+            report_id = stable_report_id(
+                "CLOSE", session_date, (observation_sha256,), state_sha256
+            )
+            archive_path = report_archive_relative_path(
+                "CLOSE", session_date, report_id
+            )
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+            finalized = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body=body,
+                state_sha256=state_sha256,
+                observation_ids=(observation_id,),
+                archive_relative_path=archive_path,
+                created_at=now,
+                finalized_at=now + timedelta(seconds=1),
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+
+        with Journal.open(self.db_path) as journal:
+            existing = journal.claim_report(session_date, "CLOSE")
+            self.assertEqual(existing.status, "ALREADY_FINALIZED")
+            self.assertEqual(existing.report_row_id, finalized.report_row_id)
+            self.assertEqual(existing.report_id, finalized.report_id)
+
+            stored = journal.read_report(existing.report_id)
+            self.assertEqual(stored.report_row_id, finalized.report_row_id)
+            self.assertEqual(stored.report_id, report_id)
+            self.assertEqual(stored.body, body)
+            self.assertEqual(stored.archive_relative_path, archive_path)
+            self.assertEqual(
+                stored.content_sha256, hashlib.sha256(body.encode()).hexdigest()
+            )
+            self.assertEqual(stored.state_sha256, state_sha256)
+            self.assertEqual(stored.observation_ids, (observation_id,))
+            self.assertEqual(stored.observation_sha256s, (observation_sha256,))
 
     def test_outbox_recovers_pending_delivery_with_append_only_attempts(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
@@ -502,6 +841,164 @@ class JournalTests(unittest.TestCase):
                     external_delivery_id="delivery-2",
                 )
 
+    def test_report_outbox_is_effectively_once_per_destination(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        with Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+            report = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=(),
+                archive_relative_path=report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                ),
+                created_at=now,
+                finalized_at=now + timedelta(seconds=1),
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+
+            with self.assertRaises(IdempotencyConflict):
+                journal.append_outbox(
+                    idempotency_key="different-report-delivery-key",
+                    origin_report_id=report.report_row_id,
+                    origin_execution_event_id=None,
+                    destination="CODEX_TASK",
+                    payload_text="duplicate close",
+                    created_at=now + timedelta(seconds=2),
+                )
+            self.assertEqual(journal.count("outbox"), 1)
+
+    def test_pending_outbox_exposes_next_attempt_after_restart(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message("msg-restart", now, "SKIPPED SPY")
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+            outbox_id, _ = journal.append_outbox(
+                idempotency_key="event-restart",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="restart",
+                created_at=now,
+            )
+            journal.record_outbox_delivery_attempt(
+                outbox_id=outbox_id,
+                attempt_ordinal=1,
+                attempted_at=now + timedelta(seconds=1),
+                delivery_status="FAILED",
+                error_class="NETWORK",
+            )
+
+        with Journal.open(self.db_path) as journal:
+            pending = journal.pending_outbox()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].next_attempt_ordinal, 2)
+            journal.record_outbox_delivery_attempt(
+                outbox_id=pending[0].outbox_id,
+                attempt_ordinal=pending[0].next_attempt_ordinal,
+                attempted_at=now + timedelta(seconds=2),
+                delivery_status="DELIVERED",
+                external_delivery_id="delivery-restart",
+            )
+            self.assertEqual(journal.pending_outbox(), ())
+
+    def test_outbox_attempts_are_contiguous_well_formed_and_terminal(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message("msg-attempts", now, "SKIPPED SPY")
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+            outbox_id, _ = journal.append_outbox(
+                idempotency_key="attempt-contract",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="recorded",
+                created_at=now,
+            )
+
+            invalid_attempts = (
+                {
+                    "attempt_ordinal": 2,
+                    "attempted_at": now,
+                    "delivery_status": "FAILED",
+                    "error_class": "NETWORK",
+                },
+                {
+                    "attempt_ordinal": 1,
+                    "attempted_at": now - timedelta(microseconds=1),
+                    "delivery_status": "FAILED",
+                    "error_class": "NETWORK",
+                },
+                {
+                    "attempt_ordinal": 1,
+                    "attempted_at": now,
+                    "delivery_status": "DELIVERED",
+                },
+                {
+                    "attempt_ordinal": 1,
+                    "attempted_at": now,
+                    "delivery_status": "FAILED",
+                    "external_delivery_id": "unexpected",
+                },
+            )
+            for values in invalid_attempts:
+                with self.subTest(values=values):
+                    with self.assertRaises(InvalidJournalValue):
+                        journal.record_outbox_delivery_attempt(
+                            outbox_id=outbox_id,
+                            **values,
+                        )
+
+            journal.record_outbox_delivery_attempt(
+                outbox_id=outbox_id,
+                attempt_ordinal=1,
+                attempted_at=now + timedelta(seconds=1),
+                delivery_status="FAILED",
+                error_class="NETWORK",
+            )
+            with self.assertRaises(InvalidJournalValue):
+                journal.record_outbox_delivery_attempt(
+                    outbox_id=outbox_id,
+                    attempt_ordinal=3,
+                    attempted_at=now + timedelta(seconds=2),
+                    delivery_status="FAILED",
+                    error_class="NETWORK",
+                )
+            journal.record_outbox_delivery_attempt(
+                outbox_id=outbox_id,
+                attempt_ordinal=2,
+                attempted_at=now + timedelta(seconds=2),
+                delivery_status="DELIVERED",
+                external_delivery_id="delivery-2",
+            )
+            with self.assertRaises(IdempotencyConflict):
+                journal.record_outbox_delivery_attempt(
+                    outbox_id=outbox_id,
+                    attempt_ordinal=3,
+                    attempted_at=now + timedelta(seconds=3),
+                    delivery_status="FAILED",
+                    error_class="NETWORK",
+                )
+
     def test_scheduled_runs_preserve_starts_and_complete_only_once(self) -> None:
         session_date = date(2026, 8, 14)
         intended = datetime(2026, 8, 14, 19, 30, tzinfo=timezone.utc)
@@ -551,10 +1048,29 @@ class JournalTests(unittest.TestCase):
                     outcome="REPORT_EMITTED",
                 )
 
+            missing_report_run_id, _ = journal.start_scheduled_run(
+                run_key="missing-report-2026-08-14",
+                run_kind="CLOSE",
+                session_date=session_date,
+                intended_run_at=intended,
+                started_at=started,
+            )
+            with self.assertRaises(InvalidJournalValue):
+                journal.complete_scheduled_run(
+                    run_id=missing_report_run_id,
+                    finished_at=started + timedelta(seconds=10),
+                    market_session_decision="OPEN_NORMAL",
+                    outcome="REPORT_EMITTED",
+                )
+
     def test_scheduled_completion_report_must_match_the_run_identity_and_path(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
-        archive_path = "reports/2026/08/14/close.md"
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        archive_path = report_archive_relative_path(
+            "CLOSE", session_date, report_id
+        )
         with Journal.open(self.db_path) as journal:
             claim = journal.claim_report(session_date, "CLOSE", now=now)
             assert claim.claim_token is not None
@@ -562,10 +1078,11 @@ class JournalTests(unittest.TestCase):
                 claim_id=claim.claim_id,
                 claim_token=claim.claim_token,
                 body="# Close\n",
-                state_sha256="a" * 64,
+                state_sha256=state_sha256,
                 observation_ids=(),
                 archive_relative_path=archive_path,
                 created_at=now + timedelta(seconds=1),
+                finalized_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -611,6 +1128,64 @@ class JournalTests(unittest.TestCase):
                 report_path=archive_path,
             )
 
+    def test_scheduled_emission_requires_finalization_within_the_run(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        finalized_at = now + timedelta(seconds=10)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        archive_path = report_archive_relative_path(
+            "CLOSE", session_date, report_id
+        )
+        with Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            assert claim.claim_token is not None
+            report = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=(),
+                archive_relative_path=archive_path,
+                created_at=now + timedelta(seconds=1),
+                finalized_at=finalized_at,
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+            run_id, _ = journal.start_scheduled_run(
+                run_key="close-impossible-chronology",
+                run_kind="CLOSE",
+                session_date=session_date,
+                intended_run_at=now,
+                started_at=now,
+            )
+
+            with self.assertRaises(InvalidJournalValue):
+                journal.complete_scheduled_run(
+                    run_id=run_id,
+                    finished_at=now + timedelta(seconds=2),
+                    market_session_decision="OPEN",
+                    outcome="REPORT_EMITTED",
+                    report_id=report.report_row_id,
+                    report_path=archive_path,
+                )
+
+        with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA recursive_triggers = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE scheduled_runs SET finished_at = ?, "
+                    "market_session_decision = 'OPEN', outcome = 'REPORT_EMITTED', "
+                    "report_id = ?, report_path = ? WHERE id = ?",
+                    (
+                        "2026-08-14T12:45:02.000000Z",
+                        report.report_row_id,
+                        archive_path,
+                        run_id,
+                    ),
+                )
+
     def test_event_posting_projection_and_outbox_commit_as_one_unit(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
 
@@ -624,6 +1199,7 @@ class JournalTests(unittest.TestCase):
                     action_ordinal=0,
                     parsed_action="BOUGHT",
                     event_time=now,
+                    signal_id="signal-spy",
                     symbol="SPY",
                     shares=1,
                     price_micros=100_000_000,
@@ -641,6 +1217,7 @@ class JournalTests(unittest.TestCase):
                     unit_price_micros=100_000_000,
                 )
                 transaction.write_actual_position(
+                    signal_id="signal-spy",
                     symbol="SPY",
                     shares=1,
                     cost_basis_micros=100_000_000,
@@ -731,9 +1308,9 @@ class JournalTests(unittest.TestCase):
             resolution_event_id, _ = journal.append_execution_event(
                 raw_message_id=resolution_raw_id,
                 action_ordinal=0,
-                parsed_action="RECONCILED",
+                parsed_action="ACCOUNT_CHECK",
                 event_time=now + timedelta(seconds=1),
-                symbol="SPY",
+                reconciliation_state="CLEAR",
             )
             with self.assertRaises(InvalidJournalValue):
                 with journal.transaction() as transaction:
@@ -758,12 +1335,14 @@ class JournalTests(unittest.TestCase):
                 action_ordinal=0,
                 parsed_action="SOLD",
                 event_time=now + timedelta(seconds=2),
+                signal_id="signal-spy",
                 symbol="SPY",
                 shares=1,
                 price_micros=101_000_000,
             )
             with journal.transaction() as transaction:
                 transaction.write_actual_position(
+                    signal_id="signal-spy",
                     symbol="SPY",
                     shares=0,
                     cost_basis_micros=0,
@@ -780,6 +1359,142 @@ class JournalTests(unittest.TestCase):
                     "UPDATE actual_positions SET shares = 2 WHERE symbol = 'SPY'"
                 )
 
+    def test_actual_positions_are_per_signal_and_require_matching_mutation_events(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-two-lots", now, "BOUGHT SPY for two signals"
+            )
+            with journal.transaction() as transaction:
+                first_event_id, _ = transaction.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="BOUGHT",
+                    event_time=now,
+                    signal_id="signal-one",
+                    symbol="SPY",
+                    shares=1,
+                )
+                second_event_id, _ = transaction.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=1,
+                    parsed_action="BOUGHT",
+                    event_time=now,
+                    signal_id="signal-two",
+                    symbol="SPY",
+                    shares=2,
+                )
+                transaction.write_actual_position(
+                    signal_id="signal-one",
+                    symbol="SPY",
+                    shares=1,
+                    cost_basis_micros=100_000_000,
+                    recommended_stop_micros=None,
+                    user_confirmed_stop_micros=None,
+                    target_micros=None,
+                    last_execution_event_id=first_event_id,
+                    updated_at=now,
+                )
+                transaction.write_actual_position(
+                    signal_id="signal-two",
+                    symbol="SPY",
+                    shares=2,
+                    cost_basis_micros=200_000_000,
+                    recommended_stop_micros=None,
+                    user_confirmed_stop_micros=None,
+                    target_micros=None,
+                    last_execution_event_id=second_event_id,
+                    updated_at=now,
+                )
+
+            self.assertEqual(journal.count("actual_positions"), 2)
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.write_actual_position(
+                        signal_id="signal-one",
+                        symbol="SPY",
+                        shares=2,
+                        cost_basis_micros=200_000_000,
+                        recommended_stop_micros=None,
+                        user_confirmed_stop_micros=None,
+                        target_micros=None,
+                        last_execution_event_id=second_event_id,
+                        updated_at=now,
+                    )
+
+    def test_actual_cash_projection_requires_an_actual_ledger_posting(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            with journal.transaction() as transaction:
+                posting_id, _ = transaction.append_ledger_posting(
+                    posting_key="canonical-cash",
+                    ledger_name="CANONICAL",
+                    account_name="CASH",
+                    entry_kind="OPENING_BALANCE",
+                    occurred_at=now,
+                    amount_micros=5_000_000_000,
+                )
+
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.write_actual_cash_projection(
+                        estimated_settled_cash_micros=5_000_000_000,
+                        user_confirmed_settled_cash_micros=None,
+                        deployed_capital_micros=0,
+                        open_planned_risk_micros=0,
+                        consecutive_losses=0,
+                        weekly_high_water_micros=5_000_000_000,
+                        monthly_high_water_micros=5_000_000_000,
+                        last_ledger_posting_id=posting_id,
+                        updated_at=now,
+                    )
+
+    def test_reconciliation_projection_rejects_non_authoritative_events(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message("msg-skip", now, "SKIPPED SPY")
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+                reconciliation_state="CLEAR",
+            )
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.write_reconciliation_projection(
+                        reconciliation_required=False,
+                        reason=None,
+                        last_execution_event_id=event_id,
+                        updated_at=now,
+                    )
+
+    def test_clear_account_check_cannot_hide_unreconciled_exposure(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-account-pending", now, "ACCOUNT CHECK pending order"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="ACCOUNT_CHECK",
+                event_time=now,
+                reconciliation_state="CLEAR",
+            )
+            with self.assertRaises(InvalidJournalValue):
+                journal.append_account_check(
+                    execution_event_id=event_id,
+                    settled_cash_micros=5_000_000_000,
+                    pending_order_count=1,
+                    unlogged_position_count=0,
+                    confirmed_at=now,
+                    reconciliation_result="CLEAR",
+                )
+
     def test_account_checks_are_exact_append_only_integer_records(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
         with Journal.open(self.db_path) as journal:
@@ -791,6 +1506,7 @@ class JournalTests(unittest.TestCase):
                 action_ordinal=0,
                 parsed_action="ACCOUNT_CHECK",
                 event_time=now,
+                reconciliation_state="CLEAR",
             )
             values = {
                 "execution_event_id": event_id,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.resources
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -8,12 +10,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import stock_monitor.journal as journal_module
 from stock_monitor.journal import (
     APPLICATION_ID,
     Journal,
+    JournalBusy,
     MigrationCorruption,
     MigrationDrift,
+    report_archive_relative_path,
+    stable_report_id,
 )
 
 
@@ -72,6 +79,53 @@ class JournalMigrationTests(unittest.TestCase):
                     ).fetchone()[0],
                     1,
                 )
+
+    def test_forged_self_attested_schema_is_rejected_against_packaged_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            packaged = importlib.resources.files("stock_monitor.sql").joinpath(
+                "001_core.sql"
+            )
+            migration_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "CREATE TABLE schema_migrations ("
+                    "version INTEGER, name TEXT, sha256 TEXT, "
+                    "schema_sha256 TEXT, applied_at TEXT)"
+                )
+                rows = connection.execute(
+                    "SELECT type, name, tbl_name, COALESCE(sql, '') "
+                    "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' "
+                    "ORDER BY type, name"
+                ).fetchall()
+                material = json.dumps(
+                    [tuple(str(value) for value in row) for row in rows],
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self_attested_sha256 = hashlib.sha256(material).hexdigest()
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES (?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "001_core.sql",
+                        migration_sha256,
+                        self_attested_sha256,
+                        "2026-08-14T14:00:00.000000Z",
+                    ),
+                )
+                connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+                connection.execute("PRAGMA user_version = 1")
+                connection.commit()
+
+            unexpectedly_opened: Journal | None = None
+            try:
+                with self.assertRaises(MigrationDrift) as raised:
+                    unexpectedly_opened = Journal.open(path)
+                self.assertNotIn("001_core.sql", str(raised.exception))
+            finally:
+                if unexpectedly_opened is not None:
+                    unexpectedly_opened.close()
 
     def test_migration_names_and_versions_must_be_ordered_and_contiguous(self) -> None:
         cases = {
@@ -150,6 +204,176 @@ class JournalMigrationTests(unittest.TestCase):
                     "AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
                 self.assertEqual(tables, [])
+
+    def test_bom_prefixed_transaction_control_is_rejected_before_any_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            (migration_directory / "001_core.sql").write_bytes(
+                b"CREATE TABLE schema_migrations (version INTEGER);\n"
+                b"\xef\xbb\xbf/* hidden transaction */ COMMIT;\n"
+                b"CREATE TABLE escaped (value TEXT);\n"
+            )
+            path = root / "journal.db"
+
+            with self.assertRaises(MigrationCorruption):
+                Journal.open(path, migration_directory=migration_directory)
+
+            with closing(sqlite3.connect(path)) as connection:
+                tables = connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                self.assertEqual(tables, [])
+
+    def test_nul_in_migration_is_reported_before_any_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            (migration_directory / "001_core.sql").write_bytes(
+                b"CREATE TABLE schema_migrations (version INTEGER);\n"
+                b"\x00COMMIT;\n"
+            )
+            path = root / "journal.db"
+
+            with self.assertRaises(MigrationCorruption):
+                Journal.open(path, migration_directory=migration_directory)
+
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' "
+                        "AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall(),
+                    [],
+                )
+
+    def test_migration_cannot_erase_prior_bookkeeping(self) -> None:
+        metadata_sql = (
+            "CREATE TABLE schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "sha256 TEXT NOT NULL, schema_sha256 TEXT NOT NULL, "
+            "applied_at TEXT NOT NULL);"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            (migration_directory / "001_core.sql").write_text(
+                metadata_sql + "CREATE TABLE first_object (value TEXT);",
+                encoding="utf-8",
+            )
+            (migration_directory / "002_erase_history.sql").write_text(
+                "DELETE FROM schema_migrations;"
+                "CREATE TABLE escaped_object (value TEXT);",
+                encoding="utf-8",
+            )
+            path = root / "journal.db"
+
+            with self.assertRaises(MigrationCorruption):
+                Journal.open(path, migration_directory=migration_directory)
+
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' "
+                        "AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall(),
+                    [],
+                )
+
+    def test_migration_cannot_rewrite_prior_applied_time(self) -> None:
+        metadata_sql = (
+            "CREATE TABLE schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "sha256 TEXT NOT NULL, schema_sha256 TEXT NOT NULL, "
+            "applied_at TEXT NOT NULL);"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            (migration_directory / "001_core.sql").write_text(
+                metadata_sql + "CREATE TABLE first_object (value TEXT);",
+                encoding="utf-8",
+            )
+            (migration_directory / "002_rewrite_history.sql").write_text(
+                "UPDATE schema_migrations "
+                "SET applied_at = '1999-01-01T00:00:00.000000Z' "
+                "WHERE version = 1;",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(MigrationCorruption):
+                Journal.open(
+                    root / "journal.db", migration_directory=migration_directory
+                )
+
+    def test_scratch_verification_never_leaks_a_busy_domain_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with patch(
+                "stock_monitor.journal._execute_migration",
+                side_effect=JournalBusy("synthetic scratch failure"),
+            ):
+                with self.assertRaises(MigrationCorruption):
+                    Journal.open(path)
+
+    def test_migration_rejects_external_database_escape_before_execution(self) -> None:
+        metadata_sql = (
+            "CREATE TABLE schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "sha256 TEXT NOT NULL, schema_sha256 TEXT NOT NULL, "
+            "applied_at TEXT NOT NULL);"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            escaped = root / "escaped.db"
+            escaped_sql_path = str(escaped).replace("'", "''")
+            (migration_directory / "001_core.sql").write_text(
+                metadata_sql
+                + f"ATTACH DATABASE '{escaped_sql_path}' AS escaped;"
+                + "CREATE TABLE escaped.leaked (value TEXT);",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(MigrationCorruption):
+                Journal.open(
+                    root / "journal.db", migration_directory=migration_directory
+                )
+
+            self.assertFalse(escaped.exists())
+
+    def test_migration_parser_allows_bom_comments_strings_and_trigger_bodies(self) -> None:
+        metadata_sql = (
+            "CREATE TABLE schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+            "sha256 TEXT NOT NULL, schema_sha256 TEXT NOT NULL, "
+            "applied_at TEXT NOT NULL);"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            migration_directory = root / "migrations"
+            migration_directory.mkdir()
+            (migration_directory / "001_core.sql").write_text(
+                "\ufeff-- BEGIN and ROLLBACK are harmless here\n"
+                + metadata_sql
+                + "CREATE TABLE audit (value TEXT);"
+                + "CREATE TRIGGER audit_insert AFTER INSERT ON audit BEGIN "
+                + "INSERT INTO audit(value) VALUES ('COMMIT is data'); END;"
+                + "/* trailing SAVEPOINT comment */\n",
+                encoding="utf-8",
+            )
+
+            with Journal.open(
+                root / "journal.db", migration_directory=migration_directory
+            ) as journal:
+                self.assertEqual(journal.count("schema_migrations"), 1)
 
     def test_malformed_migration_metadata_is_reported_and_rolled_back(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -264,6 +488,30 @@ class JournalMigrationTests(unittest.TestCase):
             self.assertEqual(counts, (1, 1))
             with Journal.open(path) as journal:
                 self.assertEqual(journal.count("schema_migrations"), 1)
+
+    def test_open_retries_a_transient_wal_mode_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            real_sql = journal_module._sql
+            wal_attempts = 0
+
+            def busy_once(
+                connection: sqlite3.Connection,
+                statement: str,
+                parameters: tuple[object, ...] = (),
+            ) -> sqlite3.Cursor:
+                nonlocal wal_attempts
+                if statement == "PRAGMA journal_mode = WAL":
+                    wal_attempts += 1
+                    if wal_attempts == 1:
+                        raise sqlite3.OperationalError("database is locked")
+                return real_sql(connection, statement, parameters)
+
+            with patch("stock_monitor.journal._sql", side_effect=busy_once):
+                with Journal.open(path) as journal:
+                    self.assertEqual(journal.pragma("journal_mode"), "wal")
+
+            self.assertEqual(wal_attempts, 2)
 
     def test_core_schema_anticipates_audit_and_live_projection_persistence_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -626,7 +874,7 @@ class JournalMigrationTests(unittest.TestCase):
                     "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         1,
-                        "report-seed",
+                        "d" * 64,
                         1,
                         "2026-08-14",
                         "CLOSE",
@@ -634,7 +882,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "d" * 64,
                         "e" * 64,
                         "f" * 64,
-                        "reports/2026/08/14/close.md",
+                        "reports/2026/08/14/close-2026-08-14-dddddddddddd.md",
                         timestamp,
                     ),
                 )
@@ -984,6 +1232,17 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                     )
 
+    def test_schema_accepts_canonical_full_microsecond_instants(self) -> None:
+        instant = datetime(2026, 8, 14, 12, 45, 0, 139_771, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                claim = journal.claim_report(
+                    date(2026, 8, 14), "CLOSE", now=instant, lease_seconds=300
+                )
+
+            self.assertEqual(claim.status, "ACQUIRED")
+
     def test_outbox_schema_requires_one_origin_and_one_delivered_attempt(self) -> None:
         timestamp = "2026-08-14T14:00:00.000000Z"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1046,14 +1305,22 @@ class JournalMigrationTests(unittest.TestCase):
                     date(2026, 8, 14), "CLOSE", now=now, lease_seconds=300
                 )
                 assert finalized.claim_token is not None
-                journal.finalize_report(
+                session_date = date(2026, 8, 14)
+                state_sha256 = "a" * 64
+                report_id = stable_report_id(
+                    "CLOSE", session_date, (), state_sha256
+                )
+                report = journal.finalize_report(
                     claim_id=finalized.claim_id,
                     claim_token=finalized.claim_token,
                     body="# Close\n",
-                    state_sha256="a" * 64,
+                    state_sha256=state_sha256,
                     observation_ids=(),
-                    archive_relative_path="reports/2026/08/14/close.md",
+                    archive_relative_path=report_archive_relative_path(
+                        "CLOSE", session_date, report_id
+                    ),
                     created_at=now + timedelta(seconds=1),
+                    finalized_at=now + timedelta(seconds=1),
                     outbox_destination="TASK",
                     outbox_payload="close",
                 )
@@ -1069,8 +1336,10 @@ class JournalMigrationTests(unittest.TestCase):
                     finished_at=now + timedelta(seconds=2),
                     market_session_decision="OPEN",
                     outcome="REPORT_EMITTED",
-                    report_id=1,
-                    report_path="reports/2026/08/14/close.md",
+                    report_id=report.report_row_id,
+                    report_path=report_archive_relative_path(
+                        "CLOSE", session_date, report_id
+                    ),
                 )
 
             with closing(sqlite3.connect(path)) as connection:
@@ -1108,6 +1377,35 @@ class JournalMigrationTests(unittest.TestCase):
                         with self.assertRaises(sqlite3.IntegrityError):
                             connection.execute(statement, parameters)
 
+    def test_scheduled_completion_tokens_are_canonical_in_sql(self) -> None:
+        timestamp = "2026-08-14T14:00:00.000000Z"
+        finished = "2026-08-14T14:00:01.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.execute(
+                    "INSERT INTO scheduled_runs("
+                    "run_key, run_kind, session_date, intended_run_at, started_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "lowercase-completion",
+                        "CLOSE",
+                        "2026-08-14",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE scheduled_runs SET finished_at = ?, "
+                        "market_session_decision = 'open', "
+                        "outcome = 'report_emitted' WHERE run_key = ?",
+                        (finished, "lowercase-completion"),
+                    )
+
     def test_report_links_enforce_claim_identity_and_no_future_evidence(self) -> None:
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         report_time = now + timedelta(seconds=1)
@@ -1129,6 +1427,18 @@ class JournalMigrationTests(unittest.TestCase):
                     delay_seconds=None,
                     health_result="OK",
                 )
+                future_source_observation_id, _ = journal.append_source_observation(
+                    payload=b"future source payload",
+                    source_uri="https://example.test/future-source",
+                    source_type="MARKET_DATA",
+                    provider="fixture",
+                    feed=None,
+                    source_time=now + timedelta(days=1),
+                    retrieved_at=now,
+                    provider_sequence=None,
+                    delay_seconds=None,
+                    health_result="OK",
+                )
                 run_id, _ = journal.start_scheduled_run(
                     run_key="close-2026-08-14",
                     run_kind="CLOSE",
@@ -1145,7 +1455,7 @@ class JournalMigrationTests(unittest.TestCase):
                 connection.execute("PRAGMA recursive_triggers = ON")
                 report_values = (
                     1,
-                    "report-1",
+                    "1" * 64,
                     claim.claim_id,
                     "2026-08-14",
                     "CLOSE",
@@ -1153,7 +1463,7 @@ class JournalMigrationTests(unittest.TestCase):
                     "a" * 64,
                     "b" * 64,
                     "c" * 64,
-                    "reports/2026/08/14/close.md",
+                    "reports/2026/08/14/close-2026-08-14-111111111111.md",
                     canonical_report_time,
                 )
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -1196,6 +1506,11 @@ class JournalMigrationTests(unittest.TestCase):
                         "INSERT INTO report_observations VALUES (?, ?, ?, ?)",
                         (1, 1, future_observation_id, 0),
                     )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO report_observations VALUES (?, ?, ?, ?)",
+                        (2, 1, future_source_observation_id, 0),
+                    )
 
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
@@ -1221,6 +1536,54 @@ class JournalMigrationTests(unittest.TestCase):
                     "finalized_at = ?, report_id = 1 WHERE id = ?",
                     (canonical_report_time, claim.claim_id),
                 )
+
+    def test_report_rows_require_sha256_ids_and_identity_compatible_paths(self) -> None:
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        report_time = now + timedelta(seconds=1)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                claim = journal.claim_report(
+                    date(2026, 8, 14), "CLOSE", now=now, lease_seconds=300
+                )
+
+            canonical_report_time = report_time.strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                invalid_id = (
+                    1,
+                    "not-a-sha256",
+                    claim.claim_id,
+                    "2026-08-14",
+                    "CLOSE",
+                    "# Close\n",
+                    "a" * 64,
+                    "b" * 64,
+                    "c" * 64,
+                    "reports/2026/08/14/close.md",
+                    canonical_report_time,
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        invalid_id,
+                    )
+
+                valid_id = "d" * 64
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            *invalid_id[:1],
+                            valid_id,
+                            *invalid_id[2:9],
+                            "reports/2026/08/14/wrong.md",
+                            canonical_report_time,
+                        ),
+                    )
 
 
 if __name__ == "__main__":

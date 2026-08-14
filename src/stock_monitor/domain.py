@@ -7,7 +7,6 @@ from decimal import Decimal
 
 
 MICRODOLLARS_PER_DOLLAR = 1_000_000
-_MICRODOLLARS_PER_DOLLAR_DECIMAL = Decimal(MICRODOLLARS_PER_DOLLAR)
 
 
 class ConfigurationError(ValueError):
@@ -22,18 +21,39 @@ def money_to_micros(value: Decimal) -> int:
     """Convert an exact decimal dollar value to integer microdollars."""
     if not isinstance(value, Decimal) or not value.is_finite():
         raise DomainValidationError("money must be a finite Decimal")
-    scaled = value * _MICRODOLLARS_PER_DOLLAR_DECIMAL
-    integral = scaled.to_integral_value()
-    if scaled != integral:
-        raise DomainValidationError("money supports at most six decimal places")
-    return int(integral)
+
+    sign, digits, exponent = value.as_tuple()
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    if coefficient == 0:
+        return 0
+
+    micro_exponent = exponent + 6
+    if micro_exponent >= 0:
+        micros = coefficient * (10**micro_exponent)
+    else:
+        micros, remainder = divmod(coefficient, 10 ** (-micro_exponent))
+        if remainder:
+            raise DomainValidationError("money supports at most six decimal places")
+    if sign:
+        micros = -micros
+    return micros
 
 
 def money_from_micros(value: int) -> Decimal:
     """Convert integer microdollars to an exact decimal dollar value."""
     if type(value) is not int:
         raise DomainValidationError("microdollars must be an integer")
-    return Decimal(value) / _MICRODOLLARS_PER_DOLLAR_DECIMAL
+
+    sign = int(value < 0)
+    remaining = abs(value)
+    reversed_digits: list[int] = []
+    while remaining:
+        remaining, digit = divmod(remaining, 10)
+        reversed_digits.append(digit)
+    digits = tuple(reversed(reversed_digits)) if reversed_digits else (0,)
+    return Decimal((sign, digits, -6))
 
 
 def require_aware_timestamp(value: datetime, name: str = "timestamp") -> datetime:

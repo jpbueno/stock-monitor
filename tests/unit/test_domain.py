@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from stock_monitor.domain import (
     DomainValidationError,
@@ -30,6 +30,28 @@ class MoneyTests(unittest.TestCase):
         for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
             with self.subTest(value=value), self.assertRaises(DomainValidationError):
                 money_to_micros(value)
+
+    def test_conversion_is_exact_under_low_decimal_context_precision(self) -> None:
+        with localcontext() as context:
+            context.prec = 6
+
+            micros = money_to_micros(Decimal("25.010001"))
+            restored = money_from_micros(micros)
+            with self.assertRaises(DomainValidationError):
+                money_to_micros(Decimal("25.0100011"))
+
+        self.assertEqual(micros, 25_010_001)
+        self.assertEqual(restored, Decimal("25.010001"))
+
+    def test_large_negative_microdollars_round_trip_without_context_rounding(self) -> None:
+        micros = -123_456_789_012_345_678_901_234_567_890_123_456_789
+        with localcontext() as context:
+            context.prec = 6
+
+            restored = money_from_micros(micros)
+            round_trip = money_to_micros(restored)
+
+        self.assertEqual(round_trip, micros)
 
 
 class DomainInvariantTests(unittest.TestCase):

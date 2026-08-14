@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -39,6 +40,23 @@ class SettingsTests(unittest.TestCase):
         self.addCleanup(self.temporary_directory.cleanup)
         self.project_root = Path(self.temporary_directory.name) / "project"
         shutil.copytree(PROJECT_ROOT / "config", self.project_root / "config")
+        self.sources_text = (
+            self.project_root / "config" / "sources.toml"
+        ).read_text(encoding="utf-8")
+
+    def _write_sources(self, **replacements: object) -> None:
+        lines = self.sources_text.splitlines()
+        for name, value in replacements.items():
+            prefix = f"{name} = "
+            matches = [
+                index for index, line in enumerate(lines) if line.startswith(prefix)
+            ]
+            self.assertEqual(len(matches), 1, name)
+            lines[matches[0]] = prefix + json.dumps(value)
+        (self.project_root / "config" / "sources.toml").write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
 
     def test_project_and_default_runtime_paths_are_resolved(self) -> None:
         settings = load_settings(self.project_root / ".", ENVIRONMENT)
@@ -127,6 +145,84 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("sources.toml", message)
         self.assertNotIn(ENVIRONMENT["APCA_API_KEY_ID"], message)
         self.assertNotIn(ENVIRONMENT["APCA_API_SECRET_KEY"], message)
+
+    def test_alpaca_url_is_pinned_to_the_approved_market_data_origin(self) -> None:
+        poisoned_urls = (
+            "https://paper-api.alpaca.markets",
+            "https://api.alpaca.markets",
+            "https://data.alpaca.markets/v2/orders",
+            "https://data.alpaca.markets?",
+            "https://data.alpaca.markets#",
+            "https://data.alpaca.markets.evil.example",
+            "http://data.alpaca.markets",
+            "https://data.alpaca.markets:444",
+            "https://user:password@data.alpaca.markets",
+        )
+        for url in poisoned_urls:
+            with self.subTest(url=url):
+                self._write_sources(alpaca_market_data_url=url)
+                with self.assertRaises(ConfigurationError):
+                    load_settings(self.project_root, ENVIRONMENT)
+
+    def test_approved_alpaca_origin_is_canonicalized(self) -> None:
+        self._write_sources(
+            alpaca_market_data_url="HTTPS://DATA.ALPACA.MARKETS.:443/"
+        )
+
+        settings = load_settings(self.project_root, ENVIRONMENT)
+
+        self.assertEqual(
+            settings.sources.alpaca_market_data_url,
+            "https://data.alpaca.markets",
+        )
+
+    def test_source_urls_reject_ip_local_and_prohibited_hosts(self) -> None:
+        poisoned_urls = (
+            "https://127.0.0.1/submissions/",
+            "https://127.1/submissions/",
+            "https://0x7f.1/submissions/",
+            "https://[::1]/submissions/",
+            "https://[::1/submissions/",
+            "https://localhost/submissions/",
+            "https://api.robinhood.com/submissions/",
+            "https://paper-api.alpaca.markets/submissions/",
+        )
+        for field in ("sec_submissions_url", "sec_archives_url"):
+            for url in poisoned_urls:
+                with self.subTest(field=field, url=url):
+                    self._write_sources(**{field: url})
+                    with self.assertRaises(ConfigurationError):
+                        load_settings(self.project_root, ENVIRONMENT)
+
+    def test_reference_hosts_are_canonicalized(self) -> None:
+        self._write_sources(
+            reference_hosts=["WWW.NYSE.COM.", "WWW.NASDAQTRADER.COM"]
+        )
+
+        settings = load_settings(self.project_root, ENVIRONMENT)
+
+        self.assertEqual(
+            settings.sources.reference_hosts,
+            ("www.nyse.com", "www.nasdaqtrader.com"),
+        )
+
+    def test_reference_hosts_reject_non_dns_and_prohibited_values(self) -> None:
+        poisoned_hosts = (
+            "127.0.0.1",
+            "127.1",
+            "0x7f.1",
+            "localhost",
+            "api.robinhood.com",
+            "paper-api.alpaca.markets",
+            "https://www.nyse.com",
+            "www.nyse.com/path",
+            "www.nyse.com:443",
+        )
+        for host in poisoned_hosts:
+            with self.subTest(host=host):
+                self._write_sources(reference_hosts=[host])
+                with self.assertRaises(ConfigurationError):
+                    load_settings(self.project_root, ENVIRONMENT)
 
 
 if __name__ == "__main__":

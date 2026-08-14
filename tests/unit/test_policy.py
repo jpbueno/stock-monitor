@@ -43,6 +43,9 @@ class PolicyTests(unittest.TestCase):
             "min_score": 79,
             "max_weekly_drawdown": "101",
             "max_monthly_drawdown": "251",
+            "universe_max_age_days": 32,
+            "live_quote_max_age_seconds": 301,
+            "disagreement_tolerance": "0.006",
         }
         for name, value in overrides.items():
             with self.subTest(name=name), self.assertRaises(ConfigurationError):

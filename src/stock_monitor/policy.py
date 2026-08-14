@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import MappingProxyType
 from typing import ClassVar
 
 from .domain import ConfigurationError
@@ -28,6 +30,22 @@ _INTEGER_FIELDS = (
     "live_quote_max_age_seconds",
 )
 _POLICY_FIELDS = frozenset((*_DECIMAL_FIELDS, *_INTEGER_FIELDS))
+_FIXED_POLICY_VALUES: Mapping[str, Decimal | int] = MappingProxyType(
+    {
+        "capital": Decimal("5000"),
+        "max_live_exposure": Decimal("1000"),
+        "max_position_risk": Decimal("25"),
+        "max_combined_risk": Decimal("50"),
+        "max_positions": 2,
+        "max_entries_per_session": 1,
+        "min_score": 80,
+        "max_monthly_drawdown": Decimal("250"),
+        "max_weekly_drawdown": Decimal("100"),
+        "universe_max_age_days": 31,
+        "live_quote_max_age_seconds": 300,
+        "disagreement_tolerance": Decimal("0.005"),
+    }
+)
 
 
 def _decimal_field(name: str, value: object) -> Decimal:
@@ -63,20 +81,7 @@ class Policy:
     live_quote_max_age_seconds: int
     disagreement_tolerance: Decimal
 
-    _FIXED_VALUES: ClassVar[dict[str, Decimal | int]] = {
-        "capital": Decimal("5000"),
-        "max_live_exposure": Decimal("1000"),
-        "max_position_risk": Decimal("25"),
-        "max_combined_risk": Decimal("50"),
-        "max_positions": 2,
-        "max_entries_per_session": 1,
-        "min_score": 80,
-        "max_monthly_drawdown": Decimal("250"),
-        "max_weekly_drawdown": Decimal("100"),
-        "universe_max_age_days": 31,
-        "live_quote_max_age_seconds": 300,
-        "disagreement_tolerance": Decimal("0.005"),
-    }
+    _FIXED_VALUES: ClassVar[Mapping[str, Decimal | int]] = _FIXED_POLICY_VALUES
 
     @classmethod
     def from_toml(cls, path: Path) -> Policy:
@@ -116,7 +121,7 @@ class Policy:
 
     def validate(self) -> None:
         """Reject any alteration to the approved validation boundary."""
-        for name, fixed_value in self._FIXED_VALUES.items():
+        for name, fixed_value in _FIXED_POLICY_VALUES.items():
             configured_value = getattr(self, name)
             if (
                 type(configured_value) is not type(fixed_value)

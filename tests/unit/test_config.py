@@ -121,6 +121,55 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn("key-id-canary", message)
         self.assertNotIn("secret-key-canary", message)
 
+    def test_http_environment_values_reject_whitespace_controls_and_excess_length(self) -> None:
+        invalid_values = (
+            ("key surrounding whitespace", "APCA_API_KEY_ID", " key-id-canary"),
+            (
+                "secret CRLF",
+                "APCA_API_SECRET_KEY",
+                "secret-key-canary\r\ninjected",
+            ),
+            ("key C1 control", "APCA_API_KEY_ID", "key\x85id"),
+            (
+                "user agent null",
+                "SEC_USER_AGENT",
+                "Stock Monitor tests test@example.com\x00",
+            ),
+            (
+                "user agent separator",
+                "SEC_USER_AGENT",
+                "Stock Monitor\u2028tests test@example.com",
+            ),
+            ("key excessive length", "APCA_API_KEY_ID", "k" * 257),
+            (
+                "user agent excessive length",
+                "SEC_USER_AGENT",
+                "Stock Monitor " + "x" * 500 + " test@example.com",
+            ),
+        )
+        for case, field, value in invalid_values:
+            environ = {**ENVIRONMENT, field: value}
+            with self.subTest(case=case):
+                with self.assertRaises(ConfigurationError) as raised:
+                    load_settings(self.project_root, environ)
+                self.assertNotIn(value, str(raised.exception))
+
+    def test_sec_user_agent_requires_application_identity_and_email(self) -> None:
+        invalid_user_agents = (
+            "test@example.com",
+            "first@example.com second@example.com",
+            "Stock Monitor Operations",
+            "Stock Monitor invalid@example",
+            "Stock Monitor a..b@example.com",
+        )
+        for user_agent in invalid_user_agents:
+            environ = {**ENVIRONMENT, "SEC_USER_AGENT": user_agent}
+            with self.subTest(user_agent=user_agent):
+                with self.assertRaises(ConfigurationError) as raised:
+                    load_settings(self.project_root, environ)
+                self.assertIn("SEC_USER_AGENT", str(raised.exception))
+                self.assertNotIn(user_agent, str(raised.exception))
+
     def test_missing_sources_table_is_rejected(self) -> None:
         (self.project_root / "config" / "sources.toml").write_text(
             "schema_version = 1\n",

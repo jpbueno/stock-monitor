@@ -15,6 +15,10 @@ from stock_monitor.domain import (
 from tests.support import aware_et
 
 
+MIN_MICRODOLLARS = -(2**63)
+MAX_MICRODOLLARS = 2**63 - 1
+
+
 class MoneyTests(unittest.TestCase):
     def test_microdollar_round_trip_is_exact(self) -> None:
         self.assertEqual(
@@ -44,7 +48,7 @@ class MoneyTests(unittest.TestCase):
         self.assertEqual(restored, Decimal("25.010001"))
 
     def test_large_negative_microdollars_round_trip_without_context_rounding(self) -> None:
-        micros = -123_456_789_012_345_678_901_234_567_890_123_456_789
+        micros = -9_000_000_000_000_000_000
         with localcontext() as context:
             context.prec = 6
 
@@ -52,6 +56,46 @@ class MoneyTests(unittest.TestCase):
             round_trip = money_to_micros(restored)
 
         self.assertEqual(round_trip, micros)
+
+    def test_sqlite_signed_64_bit_boundaries_round_trip_exactly(self) -> None:
+        with localcontext() as context:
+            context.prec = 6
+            for micros in (MIN_MICRODOLLARS, MAX_MICRODOLLARS):
+                with self.subTest(micros=micros):
+                    restored = money_from_micros(micros)
+                    self.assertEqual(money_to_micros(restored), micros)
+
+    def test_values_outside_sqlite_signed_64_bit_range_are_rejected(self) -> None:
+        for micros in (MIN_MICRODOLLARS - 1, MAX_MICRODOLLARS + 1):
+            with self.subTest(direction="from", micros=micros):
+                with self.assertRaises(DomainValidationError):
+                    money_from_micros(micros)
+
+        outside_money = (
+            Decimal("-9223372036854.775809"),
+            Decimal("9223372036854.775808"),
+        )
+        with localcontext() as context:
+            context.prec = 6
+            for value in outside_money:
+                with self.subTest(direction="to", value=value):
+                    with self.assertRaises(DomainValidationError):
+                        money_to_micros(value)
+
+    def test_extreme_decimal_exponents_fail_closed_without_power_expansion(self) -> None:
+        extreme_values = (
+            Decimal("1E+100000"),
+            Decimal("-1E+100000"),
+            Decimal("1E-100000"),
+            Decimal("-1E-100000"),
+        )
+        with localcontext() as context:
+            context.prec = 6
+            for value in extreme_values:
+                with self.subTest(value=value), self.assertRaises(
+                    DomainValidationError
+                ):
+                    money_to_micros(value)
 
 
 class DomainInvariantTests(unittest.TestCase):

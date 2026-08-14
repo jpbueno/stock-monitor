@@ -65,6 +65,26 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ConfigurationError):
                 replace(policy, **{name: value}).validate()
 
+    def test_validation_baseline_mapping_cannot_be_mutated(self) -> None:
+        baseline = Policy._FIXED_VALUES
+        original = dict(baseline)
+        try:
+            with self.assertRaises(TypeError):
+                baseline["max_live_exposure"] = Decimal("1000000")
+        finally:
+            if isinstance(baseline, dict):
+                baseline.clear()
+                baseline.update(original)
+
+    def test_validation_does_not_trust_a_rebound_class_alias(self) -> None:
+        baseline = Policy._FIXED_VALUES
+        try:
+            Policy._FIXED_VALUES = {"max_live_exposure": Decimal("1000000")}
+            with self.assertRaises(ConfigurationError):
+                policy_fixture(max_live_exposure="1000000").validate()
+        finally:
+            Policy._FIXED_VALUES = baseline
+
     def test_missing_policy_field_is_a_configuration_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "policy.toml"

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import re
 import tomllib
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,16 @@ _ALPACA_DOMAIN = "alpaca.markets"
 _PROHIBITED_BROKER_TOKEN = "robinhood"
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _IPV4_COMPONENT = re.compile(r"(?:[0-9]+|0x[0-9a-f]+)\Z")
+_EMAIL_ATOM = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_EMAIL_CONTACT = re.compile(
+    rf"(?<![A-Za-z0-9.!#$%&'*+/=?^_`{{|}}~-])"
+    rf"{_EMAIL_ATOM}(?:\.{_EMAIL_ATOM})*@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+    r"(?![A-Za-z0-9.-])"
+)
+_ALPACA_CREDENTIAL_MAX_LENGTH = 256
+_SEC_USER_AGENT_MAX_LENGTH = 512
 
 
 @dataclass(frozen=True)
@@ -223,16 +234,59 @@ def _operator_root(project_root: Path, configured_home: str) -> Path:
     return candidate.resolve()
 
 
+def _http_environment_value(name: str, value: object, max_length: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > max_length
+        or any(
+            (character.isspace() and character != " ")
+            or unicodedata.category(character).startswith("C")
+            for character in value
+        )
+    ):
+        raise ConfigurationError(f"required environment variable {name} is invalid")
+    return value
+
+
+def _sec_user_agent(value: object) -> str:
+    user_agent = _http_environment_value(
+        "SEC_USER_AGENT",
+        value,
+        _SEC_USER_AGENT_MAX_LENGTH,
+    )
+    contacts = tuple(_EMAIL_CONTACT.finditer(user_agent))
+    identity_parts: list[str] = []
+    cursor = 0
+    for contact in contacts:
+        identity_parts.append(user_agent[cursor : contact.start()])
+        cursor = contact.end()
+    identity_parts.append(user_agent[cursor:])
+    identity = "".join(identity_parts)
+    if not contacts or not any(character.isalpha() for character in identity):
+        raise ConfigurationError(
+            "required environment variable SEC_USER_AGENT needs application identity and email"
+        )
+    return user_agent
+
+
 def load_settings(project_root: Path, environ: Mapping[str, str]) -> Settings:
     """Load versioned non-secret config and four approved environment values."""
     environment = {name: environ.get(name, "") for name in _ENVIRONMENT_NAMES}
-    for required in (
+    environment["APCA_API_KEY_ID"] = _http_environment_value(
         "APCA_API_KEY_ID",
+        environment["APCA_API_KEY_ID"],
+        _ALPACA_CREDENTIAL_MAX_LENGTH,
+    )
+    environment["APCA_API_SECRET_KEY"] = _http_environment_value(
         "APCA_API_SECRET_KEY",
-        "SEC_USER_AGENT",
-    ):
-        if not environment[required].strip():
-            raise ConfigurationError(f"required environment variable {required} is missing")
+        environment["APCA_API_SECRET_KEY"],
+        _ALPACA_CREDENTIAL_MAX_LENGTH,
+    )
+    environment["SEC_USER_AGENT"] = _sec_user_agent(
+        environment["SEC_USER_AGENT"]
+    )
 
     resolved_project_root = Path(project_root).expanduser().resolve()
     config_root = resolved_project_root / "config"

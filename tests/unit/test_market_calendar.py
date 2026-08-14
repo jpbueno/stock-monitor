@@ -213,6 +213,20 @@ class MarketCalendarTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(CalendarError):
                 self._load_mapping(raw, as_of=REVIEWED_AS_OF)
 
+    def test_calendar_rejects_cross_year_as_of_inside_freshness_window(self) -> None:
+        raw = calendar_fixture()
+        raw["retrieved_at"] = "2026-12-31"
+        raw["reviewed_at"] = "2026-12-31"
+        sources = raw["sources"]
+        self.assertIsInstance(sources, dict)
+        for source in sources.values():
+            self.assertIsInstance(source, dict)
+            source["retrieved_at"] = "2026-12-31"
+            source["reviewed_at"] = "2026-12-31"
+
+        with self.assertRaises(CalendarError):
+            self._load_mapping(raw, as_of=date(2027, 1, 1))
+
     def test_calendar_as_of_requires_an_exact_date(self) -> None:
         invalid_values = (
             "2026-08-14",

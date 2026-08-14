@@ -740,10 +740,14 @@ def _float_derivation(
         corroborating_as_of = _evidence_date(
             table["corroborating_shares_outstanding_as_of"],
             "corroborating_shares_outstanding_as_of",
-            reviewed_at,
+            source_as_of,
         )
         if formula != "floor(nonaffiliate_market_value / share_price)":
             raise UniverseError("unexpected stock float corroboration metadata")
+        if corroborating_as_of not in {
+            source.source_as_of for source in sources
+        }:
+            raise UniverseError("stock float corroboration lacks matching source evidence")
     elif formula == "floor(nonaffiliate_market_value / share_price)":
         raise UniverseError("division float derivation lacks outstanding-share evidence")
 

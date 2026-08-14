@@ -135,6 +135,8 @@ class MarketCalendar:
             raise CalendarError("calendar year is invalid")
         if expected_year is not None and year != expected_year:
             raise CalendarError("calendar year does not match its filename")
+        if as_of.year != year:
+            raise CalendarError("calendar as_of is outside the manifest year")
         if table["timezone"] != _NEW_YORK:
             raise CalendarError("calendar timezone must be America/New_York")
         try:

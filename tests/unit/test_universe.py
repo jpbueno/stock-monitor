@@ -412,6 +412,26 @@ class UniverseSnapshotTests(unittest.TestCase):
         with self.assertRaises(UniverseError):
             self._load_mapping(_resign(raw))
 
+    def test_amd_corroborating_date_must_match_float_source_evidence(self) -> None:
+        for corroborating_date in ("2026-08-14", "2026-01-29"):
+            raw = universe_fixture()
+            records = raw["records"]
+            self.assertIsInstance(records, list)
+            amd = next(
+                record
+                for record in records
+                if isinstance(record, dict) and record.get("symbol") == "AMD"
+            )
+            float_source = amd["float_source"]
+            self.assertIsInstance(float_source, dict)
+            float_source["corroborating_shares_outstanding_as_of"] = (
+                corroborating_date
+            )
+
+            with self.subTest(corroborating_date=corroborating_date):
+                with self.assertRaises(UniverseError):
+                    self._load_mapping(_resign(raw))
+
     def test_float_operand_dates_cannot_exceed_evidence_date(self) -> None:
         raw = universe_fixture()
         records = raw["records"]

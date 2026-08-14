@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "effective_date": "2026-08-14",
+  "reviewed_at": "2026-08-14",
+  "review_by": "2026-09-14",
+  "acquisition_method": "manual_primary_source_review",
+  "benchmark_policy": {
+    "stock_market_benchmark": "SPY",
+    "spy_market_benchmark": "VTI",
+    "other_etf_market_benchmark": "SPY",
+    "regime_support_symbols": ["SPY", "QQQ"],
+    "sector_mapping": {"AAPL": "XLK", "AMD": "XLK", "NVDA": "XLK"}
+  },
+  "tick_policy": {
+    "classification": "reviewed_conditional_price_at_or_above_1_usd",
+    "reviewed_at": "2026-08-14",
+    "sources": [
+      {"scope": "nasdaq_listed", "url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201", "source_as_of": "2026-08-14"},
+      {"scope": "nyse_listed", "url": "https://www.nyse.com/regulation/rules", "source_as_of": "2026-08-14"},
+      {"scope": "sec_subpenny_faq", "url": "https://www.sec.gov/divisions/marketreg/subpenny612faq.htm", "source_as_of": "2026-08-14"},
+      {"scope": "sec_minimum_increment_postponement", "url": "https://www.sec.gov/newsroom/speeches-statements/atkins-statement-minimum-pricing-increments-access-fee-caps-061126", "source_as_of": "2026-08-14"}
+    ]
+  },
+  "records": [
+    {
+      "symbol": "AAPL", "product_type": "common_stock", "listing_venue": "NASDAQ", "benchmark": "SPY", "sector_etf": "XLK", "support_roles": ["eligible"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm", "source_as_of": "2026-01-02",
+      "membership_sources": [
+        {"index": "sp_500_information_technology", "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/", "source_as_of": "2026-06-30", "acquisition_method": "manual_primary_source_review", "member": true},
+        {"index": "nasdaq_100", "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf", "source_as_of": "2026-05-01", "acquisition_method": "manual_primary_source_review", "member": true}
+      ],
+      "free_float": 14600000000,
+      "float_source": {"source_as_of": "2026-01-02", "sources": [{"url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm", "source_as_of": "2026-01-02"}, {"url": "https://www.sec.gov/Archives/edgar/data/320193/000130817926000008/aapl014016-def14a.htm", "source_as_of": "2026-01-02"}], "formula": "shares_outstanding - directors_and_officers_shares", "operands": {"shares_outstanding": 14697926000, "directors_and_officers_shares": 9079765}, "operand_source_dates": {"shares_outstanding": "2026-01-02", "directors_and_officers_shares": "2026-01-02"}, "derived_value": 14688846235, "stored_value": 14600000000, "rounding": "conservative_round_down", "rounded_down": true}
+    },
+    {
+      "symbol": "AMD", "product_type": "common_stock", "listing_venue": "NASDAQ", "benchmark": "SPY", "sector_etf": "XLK", "support_roles": ["eligible"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.sec.gov/Archives/edgar/data/2488/000000248826000018/amd-20251227.htm", "source_as_of": "2026-01-30",
+      "membership_sources": [
+        {"index": "sp_500_information_technology", "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/", "source_as_of": "2026-06-30", "acquisition_method": "manual_primary_source_review", "member": true},
+        {"index": "nasdaq_100", "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf", "source_as_of": "2026-05-01", "acquisition_method": "manual_primary_source_review", "member": true}
+      ],
+      "free_float": 1600000000,
+      "float_source": {"source_as_of": "2026-01-30", "sources": [{"url": "https://www.sec.gov/Archives/edgar/data/2488/000000248826000018/amd-20251227.htm", "source_as_of": "2026-01-30"}], "formula": "floor(nonaffiliate_market_value / share_price)", "operands": {"nonaffiliate_market_value": 232300000000, "share_price": "143.81"}, "operand_source_dates": {"nonaffiliate_market_value": "2025-06-28", "share_price": "2025-06-27"}, "derived_value": 1615325777, "stored_value": 1600000000, "rounding": "conservative_round_down", "rounded_down": true, "corroborating_shares_outstanding": 1630410843, "corroborating_shares_outstanding_as_of": "2026-01-30"}
+    },
+    {
+      "symbol": "NVDA", "product_type": "common_stock", "listing_venue": "NASDAQ", "benchmark": "SPY", "sector_etf": "XLK", "support_roles": ["eligible"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm", "source_as_of": "2026-03-23",
+      "membership_sources": [
+        {"index": "sp_500_information_technology", "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/", "source_as_of": "2026-06-30", "acquisition_method": "manual_primary_source_review", "member": true},
+        {"index": "nasdaq_100", "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf", "source_as_of": "2026-05-01", "acquisition_method": "manual_primary_source_review", "member": true}
+      ],
+      "free_float": 23000000000,
+      "float_source": {"source_as_of": "2026-03-23", "sources": [{"url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm", "source_as_of": "2026-03-23"}, {"url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000036/nvda-20260512.htm", "source_as_of": "2026-03-23"}], "formula": "shares_outstanding - directors_and_officers_shares", "operands": {"shares_outstanding": 24312141810, "directors_and_officers_shares": 957313517}, "operand_source_dates": {"shares_outstanding": "2026-03-23", "directors_and_officers_shares": "2026-03-23"}, "derived_value": 23354828293, "stored_value": 23000000000, "rounding": "conservative_round_down", "rounded_down": true}
+    },
+    {
+      "symbol": "QQQ", "product_type": "etf", "listing_venue": "NASDAQ", "benchmark": "SPY", "sector_etf": null, "support_roles": ["eligible", "regime_benchmark"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.invesco.com/us-rest/contentdetail?contentId=3a48e01e98630410VgnVCM10000046f1bf0aRCRD", "source_as_of": "2026-03-31", "sponsor_sources": [{"url": "https://www.invesco.com/us-rest/contentdetail?contentId=3a48e01e98630410VgnVCM10000046f1bf0aRCRD", "source_as_of": "2026-03-31"}], "objective_classification_method": "manual_official_sponsor_objective_review_same_direction"
+    },
+    {
+      "symbol": "SPY", "product_type": "etf", "listing_venue": "NYSE_ARCA", "benchmark": "VTI", "sector_etf": null, "support_roles": ["eligible", "market_benchmark", "regime_benchmark"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://www.nyse.com/regulation/rules", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy", "source_as_of": "2026-08-14", "sponsor_sources": [{"url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy", "source_as_of": "2026-08-14"}], "objective_classification_method": "manual_official_sponsor_objective_review_same_direction"
+    },
+    {
+      "symbol": "VTI", "product_type": "etf", "listing_venue": "NYSE_ARCA", "benchmark": "SPY", "sector_etf": null, "support_roles": ["eligible", "spy_benchmark"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://www.nyse.com/regulation/rules", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://personal1.vanguard.com/pub/Pdf/p961.pdf", "source_as_of": "2026-04-28", "sponsor_sources": [{"url": "https://investor.vanguard.com/investment-products/etfs/profile/vti", "source_as_of": "2026-08-14"}, {"url": "https://personal1.vanguard.com/pub/Pdf/p961.pdf", "source_as_of": "2026-04-28"}], "objective_classification_method": "manual_official_sponsor_objective_review_same_direction"
+    },
+    {
+      "symbol": "XLK", "product_type": "etf", "listing_venue": "NYSE_ARCA", "benchmark": "SPY", "sector_etf": null, "support_roles": ["eligible", "sector_benchmark"], "enabled": true, "leveraged": false, "inverse": false, "reviewed_at": "2026-08-14", "tick_size": "0.01", "tick_source_url": "https://www.nyse.com/regulation/rules", "tick_source_as_of": "2026-08-14", "tick_classification": "reviewed_conditional_price_at_or_above_1_usd", "source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-technology-select-sector-spdr-etf-xlk", "source_as_of": "2026-08-14", "sponsor_sources": [{"url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-technology-select-sector-spdr-etf-xlk", "source_as_of": "2026-08-14"}], "objective_classification_method": "manual_official_sponsor_objective_review_same_direction"
+    }
+  ],
+  "checksum": "sha256:8a85242c8148cfedc165febb4f7e2fffdeca5413b159d607c78205b2f098bdcb"
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from collections.abc import Mapping
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -14,6 +15,7 @@ from stock_monitor.policy import Policy
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+REFERENCE_FIXTURE_ROOT = FIXTURE_ROOT / "reference"
 
 
 def load_json(relative: str) -> object:
@@ -69,3 +71,27 @@ def policy_fixture(**overrides: object) -> Policy:
     ):
         values[name] = Decimal(str(values[name]))
     return Policy(**values)  # type: ignore[arg-type]
+
+
+def calendar_fixture() -> dict[str, object]:
+    """Return a mutable copy of the reviewed 2026 calendar fixture."""
+    raw = json.loads(
+        (REFERENCE_FIXTURE_ROOT / "calendar-2026.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if not isinstance(raw, dict):
+        raise TypeError("calendar fixture must contain a JSON object")
+    return deepcopy(raw)
+
+
+def universe_fixture() -> dict[str, object]:
+    """Return a mutable copy of the reviewed universe fixture."""
+    raw = json.loads(
+        (REFERENCE_FIXTURE_ROOT / "universe-2026-08-14.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if not isinstance(raw, dict):
+        raise TypeError("universe fixture must contain a JSON object")
+    return deepcopy(raw)

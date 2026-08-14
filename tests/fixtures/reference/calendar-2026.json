@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "year": 2026,
+  "timezone": "America/New_York",
+  "retrieved_at": "2026-08-14",
+  "reviewed_at": "2026-08-14",
+  "review_status": "reviewed",
+  "regular_session": {
+    "open_time": "09:30",
+    "close_time": "16:00",
+    "review_time": "15:30"
+  },
+  "closures": [
+    "2026-01-01",
+    "2026-01-19",
+    "2026-02-16",
+    "2026-04-03",
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-03",
+    "2026-09-07",
+    "2026-11-26",
+    "2026-12-25"
+  ],
+  "early_closes": [
+    {"date": "2026-11-27", "close_time": "13:00", "review_time": "12:30"},
+    {"date": "2026-12-24", "close_time": "13:00", "review_time": "12:30"}
+  ],
+  "manual_disable_dates": [],
+  "expected_open_sessions": 251,
+  "sources": {
+    "primary": {
+      "name": "NYSE",
+      "url": "https://www.nyse.com/trade/hours-calendars",
+      "retrieved_at": "2026-08-14",
+      "reviewed_at": "2026-08-14",
+      "closures": [
+        {"date": "2026-01-01", "label": "New Year's Day"},
+        {"date": "2026-01-19", "label": "Martin Luther King, Jr. Day"},
+        {"date": "2026-02-16", "label": "Washington's Birthday"},
+        {"date": "2026-04-03", "label": "Good Friday"},
+        {"date": "2026-05-25", "label": "Memorial Day"},
+        {"date": "2026-06-19", "label": "Juneteenth National Independence Day"},
+        {"date": "2026-07-03", "label": "Independence Day"},
+        {"date": "2026-09-07", "label": "Labor Day"},
+        {"date": "2026-11-26", "label": "Thanksgiving Day"},
+        {"date": "2026-12-25", "label": "Christmas Day"}
+      ],
+      "early_closes": [
+        {"date": "2026-11-27", "label": "Day after Thanksgiving", "close_time": "13:00"},
+        {"date": "2026-12-24", "label": "Christmas Eve", "close_time": "13:00"}
+      ]
+    },
+    "cross_check": {
+      "name": "Nasdaq Trader",
+      "url": "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+      "retrieved_at": "2026-08-14",
+      "reviewed_at": "2026-08-14",
+      "closures": [
+        {"date": "2026-01-01", "label": "New Year's Day"},
+        {"date": "2026-01-19", "label": "Martin Luther King Jr. Day"},
+        {"date": "2026-02-16", "label": "Presidents Day"},
+        {"date": "2026-04-03", "label": "Good Friday"},
+        {"date": "2026-05-25", "label": "Memorial Day"},
+        {"date": "2026-06-19", "label": "Juneteenth"},
+        {"date": "2026-07-03", "label": "Independence Day observed"},
+        {"date": "2026-09-07", "label": "Labor Day"},
+        {"date": "2026-11-26", "label": "Thanksgiving"},
+        {"date": "2026-12-25", "label": "Christmas Day"}
+      ],
+      "early_closes": [
+        {"date": "2026-11-27", "label": "Thanksgiving early close", "close_time": "13:00"},
+        {"date": "2026-12-24", "label": "Christmas early close", "close_time": "13:00"}
+      ]
+    }
+  }
+}

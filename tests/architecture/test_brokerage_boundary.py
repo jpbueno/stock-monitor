@@ -407,6 +407,29 @@ def _urlopen_is_get_only(
     return _qualified_name(request, aliases, provider_exports) in request_names
 
 
+def _attribute_open_has_body(call: ast.Call) -> bool:
+    return len(call.args) >= 2 or any(
+        keyword.arg in {"body", "data"} for keyword in call.keywords
+    )
+
+
+def _attribute_open_has_tracked_request(
+    call: ast.Call,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+    request_names: set[str],
+) -> bool:
+    if not call.args:
+        return False
+    request = call.args[0]
+    if isinstance(request, ast.Call):
+        return (
+            _qualified_name(request.func, aliases, provider_exports)
+            == "urllib.request.Request"
+        )
+    return _qualified_name(request, aliases, provider_exports) in request_names
+
+
 def _assigned_targets(node: ast.Assign | ast.AnnAssign) -> tuple[ast.AST, ...]:
     if isinstance(node, ast.Assign):
         return tuple(node.targets)
@@ -547,34 +570,39 @@ def _network_call_violation(
     request_names: set[str],
 ) -> str | None:
     path = _qualified_name(call.func, aliases, provider_exports)
-    if path is None:
-        if (
-            relative == _HTTP_PROVIDER_PATH
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "open"
-            and isinstance(call.func.value, ast.Call)
+    if isinstance(call.func, ast.Attribute) and call.func.attr == "open":
+        owner = _qualified_name(call.func.value, aliases, provider_exports)
+        directly_constructed = (
+            isinstance(call.func.value, ast.Call)
             and _qualified_name(
                 call.func.value.func,
                 aliases,
                 provider_exports,
             )
             == "urllib.request.build_opener"
-        ):
-            return (
-                None
-                if _urlopen_is_get_only(
+        )
+        approved_opener = owner in opener_names or directly_constructed
+        has_body = _attribute_open_has_body(call)
+        has_tracked_request = _attribute_open_has_tracked_request(
+            call,
+            aliases,
+            provider_exports,
+            request_names,
+        )
+        if relative == _HTTP_PROVIDER_PATH and (has_body or has_tracked_request):
+            if (
+                not approved_opener
+                or has_body
+                or not _urlopen_is_get_only(
                     call,
                     aliases,
                     provider_exports,
                     request_names,
                 )
-                else "opener.open"
-            )
-        return None
-
-    if isinstance(call.func, ast.Attribute) and call.func.attr == "open":
-        owner = _qualified_name(call.func.value, aliases, provider_exports)
-        if owner in opener_names:
+            ):
+                return "opener.open"
+            return None
+        if approved_opener:
             if relative != _HTTP_PROVIDER_PATH or not _urlopen_is_get_only(
                 call,
                 aliases,
@@ -583,6 +611,9 @@ def _network_call_violation(
             ):
                 return "opener.open"
             return None
+
+    if path is None:
+        return None
 
     bare_primitive = path in {"Request", "urlopen"}
     if not bare_primitive and not _is_network_path(path):
@@ -913,6 +944,24 @@ class BrokerageBoundaryTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_non_network_open_names_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "stock_monitor"
+            provider = package / "providers" / "http.py"
+            provider.parent.mkdir(parents=True)
+            provider.write_text(
+                "class Archive:\n"
+                "    def open(self, record):\n"
+                "        return record\n"
+                "def read(archive, record):\n"
+                "    return archive.open(record)\n",
+                encoding="utf-8",
+            )
+
+            violations = _boundary_violations(package)
+
+        self.assertEqual(violations, [])
+
     def test_network_imports_and_calls_are_rejected_outside_http_provider(self) -> None:
         fixtures = {
             "urllib import alias": (
@@ -979,13 +1028,35 @@ class BrokerageBoundaryTests(unittest.TestCase):
                 "OPENER = url_request.build_opener(NoAutomaticRedirects)\n"
                 "def fetch(url):\n"
                 "    request = url_request.Request(url, method='GET')\n"
-                "    return OPENER.open(request, data=None)\n",
+                "    return OPENER.open(request)\n",
                 encoding="utf-8",
             )
 
             violations = _boundary_violations(package)
 
         self.assertEqual(violations, [])
+
+    def test_designated_http_provider_rejects_factory_opener_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "stock_monitor"
+            provider = package / "providers" / "http.py"
+            provider.parent.mkdir(parents=True)
+            provider.write_text(
+                "from urllib.request import Request, build_opener\n"
+                "def make_opener():\n"
+                "    return build_opener()\n"
+                "OPENER = make_opener()\n"
+                "def fetch(url, payload):\n"
+                "    request = Request(url)\n"
+                "    return OPENER.open(request, data=payload)\n",
+                encoding="utf-8",
+            )
+
+            violations = _boundary_violations(package)
+
+        self.assertTrue(
+            any(violation.endswith(":opener.open") for violation in violations)
+        )
 
     def test_designated_http_provider_rejects_dynamic_method_and_body_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

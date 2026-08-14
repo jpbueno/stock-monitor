@@ -410,8 +410,8 @@ def _universe_record(
             reviewed_at=reviewed_at,
         )
         free_float = _positive_integer(table["free_float"], "free_float")
-        if free_float <= _MINIMUM_FREE_FLOAT:
-            raise UniverseError("stock free float must exceed 50 million shares")
+        if free_float < _MINIMUM_FREE_FLOAT:
+            raise UniverseError("stock free float must be at least 50 million shares")
         float_derivation = _float_derivation(
             table["float_source"],
             reviewed_at=reviewed_at,
@@ -746,6 +746,12 @@ def _float_derivation(
             raise UniverseError("unexpected stock float corroboration metadata")
     elif formula == "floor(nonaffiliate_market_value / share_price)":
         raise UniverseError("division float derivation lacks outstanding-share evidence")
+
+    if corroborating_value is not None and (
+        derived_value > corroborating_value
+        or stored_value > corroborating_value
+    ):
+        raise UniverseError("stock float exceeds corroborating outstanding shares")
 
     return FloatDerivation(
         source_as_of=source_as_of,

@@ -358,22 +358,32 @@ class UniverseSnapshotTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(UniverseError):
                 self._load_mapping(_resign(raw))
 
-    def test_float_at_or_below_threshold_and_bad_derivation_are_rejected(self) -> None:
-        for case, mutation in (
-            ("at threshold", {"free_float": 50_000_000}),
-            ("below threshold", {"free_float": 49_999_999}),
-        ):
-            raw = universe_fixture()
-            records = raw["records"]
-            self.assertIsInstance(records, list)
-            record = records[0]
-            self.assertIsInstance(record, dict)
-            float_source = record["float_source"]
-            self.assertIsInstance(float_source, dict)
-            record.update(mutation)
-            float_source["stored_value"] = mutation["free_float"]
-            with self.subTest(case=case), self.assertRaises(UniverseError):
-                self._load_mapping(_resign(raw))
+    def test_float_at_threshold_is_accepted_and_below_is_rejected(self) -> None:
+        raw = universe_fixture()
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        record = records[0]
+        self.assertIsInstance(record, dict)
+        float_source = record["float_source"]
+        self.assertIsInstance(float_source, dict)
+        record["free_float"] = 50_000_000
+        float_source["stored_value"] = 50_000_000
+
+        snapshot = self._load_mapping(_resign(raw))
+
+        self.assertEqual(snapshot.by_symbol["AAPL"].free_float, 50_000_000)
+
+        raw = universe_fixture()
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        record = records[0]
+        self.assertIsInstance(record, dict)
+        float_source = record["float_source"]
+        self.assertIsInstance(float_source, dict)
+        record["free_float"] = 49_999_999
+        float_source["stored_value"] = 49_999_999
+        with self.assertRaises(UniverseError):
+            self._load_mapping(_resign(raw))
 
         raw = universe_fixture()
         records = raw["records"]
@@ -383,6 +393,40 @@ class UniverseSnapshotTests(unittest.TestCase):
         float_source = record["float_source"]
         self.assertIsInstance(float_source, dict)
         float_source["derived_value"] = 14_688_846_236
+        with self.assertRaises(UniverseError):
+            self._load_mapping(_resign(raw))
+
+    def test_amd_float_cannot_exceed_corroborating_outstanding_shares(self) -> None:
+        raw = universe_fixture()
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        amd = next(
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("symbol") == "AMD"
+        )
+        float_source = amd["float_source"]
+        self.assertIsInstance(float_source, dict)
+        float_source["corroborating_shares_outstanding"] = 1_610_000_000
+
+        with self.assertRaises(UniverseError):
+            self._load_mapping(_resign(raw))
+
+    def test_float_operand_dates_cannot_exceed_evidence_date(self) -> None:
+        raw = universe_fixture()
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        amd = next(
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("symbol") == "AMD"
+        )
+        float_source = amd["float_source"]
+        self.assertIsInstance(float_source, dict)
+        operand_dates = float_source["operand_source_dates"]
+        self.assertIsInstance(operand_dates, dict)
+        operand_dates["share_price"] = "2026-01-31"
+
         with self.assertRaises(UniverseError):
             self._load_mapping(_resign(raw))
 

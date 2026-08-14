@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
-from datetime import date, time
+from datetime import date, datetime, time
 from pathlib import Path
 from types import MappingProxyType
 
@@ -14,6 +14,7 @@ from tests.support import calendar_fixture
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLISHED_CALENDAR = PROJECT_ROOT / "data" / "calendars" / "2026.json"
+REVIEWED_AS_OF = date(2026, 8, 14)
 EXPECTED_CLOSED_DATES = (
     date(2026, 1, 1),
     date(2026, 1, 19),
@@ -34,6 +35,7 @@ class MarketCalendarTests(unittest.TestCase):
         raw: dict[str, object],
         *,
         filename: str = "2026.json",
+        as_of: date = REVIEWED_AS_OF,
     ) -> MarketCalendar:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / filename
@@ -41,7 +43,7 @@ class MarketCalendarTests(unittest.TestCase):
                 json.dumps(raw, indent=2) + "\n",
                 encoding="utf-8",
             )
-            return MarketCalendar.load(path)
+            return MarketCalendar.load(path, as_of=as_of)
 
     def test_published_calendar_matches_reviewed_reference_fixture(self) -> None:
         published = json.loads(PUBLISHED_CALENDAR.read_text(encoding="utf-8"))
@@ -49,7 +51,7 @@ class MarketCalendarTests(unittest.TestCase):
         self.assertEqual(published, calendar_fixture())
 
     def test_calendar_uses_reviewed_exchange_sources_and_new_york_time(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         self.assertEqual(calendar.year, 2026)
         self.assertEqual(calendar.timezone.key, "America/New_York")
@@ -66,9 +68,10 @@ class MarketCalendarTests(unittest.TestCase):
         self.assertEqual(calendar.open_session_count, 251)
 
     def test_regular_session_routes_review_to_1530(self) -> None:
-        session = MarketCalendar.load(PUBLISHED_CALENDAR).session(
-            date(2026, 8, 14)
-        )
+        session = MarketCalendar.load(
+            PUBLISHED_CALENDAR,
+            as_of=REVIEWED_AS_OF,
+        ).session(date(2026, 8, 14))
 
         self.assertEqual(session.open_time, time(9, 30))
         self.assertEqual(session.close_time, time(16, 0))
@@ -77,7 +80,7 @@ class MarketCalendarTests(unittest.TestCase):
         self.assertEqual(session.timezone.key, "America/New_York")
 
     def test_both_early_closes_route_review_to_1230(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         for session_date in (date(2026, 11, 27), date(2026, 12, 24)):
             with self.subTest(session_date=session_date):
@@ -87,7 +90,7 @@ class MarketCalendarTests(unittest.TestCase):
                 self.assertTrue(session.is_early_close)
 
     def test_closed_dates_and_weekends_are_not_sessions(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         for session_date in (*EXPECTED_CLOSED_DATES, date(2026, 8, 15)):
             with self.subTest(session_date=session_date):
@@ -96,7 +99,7 @@ class MarketCalendarTests(unittest.TestCase):
                     calendar.session(session_date)
 
     def test_add_sessions_supports_zero_and_skips_weekends_and_closures(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         self.assertEqual(
             calendar.add_sessions(date(2026, 8, 14), 0),
@@ -112,7 +115,7 @@ class MarketCalendarTests(unittest.TestCase):
         )
 
     def test_add_sessions_rejects_negative_non_integer_and_missing_year(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         for invalid_count in (-1, True, 1.0):
             with self.subTest(count=invalid_count), self.assertRaises(CalendarError):
@@ -123,7 +126,7 @@ class MarketCalendarTests(unittest.TestCase):
             calendar.add_sessions(date(2026, 12, 31), 1)
 
     def test_session_and_is_open_fail_closed_outside_manifest_year(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
 
         for method in (calendar.session, calendar.is_open):
             with self.subTest(method=method.__name__), self.assertRaises(CalendarError):
@@ -171,6 +174,65 @@ class MarketCalendarTests(unittest.TestCase):
                 CalendarError
             ):
                 self._load_mapping(raw)
+
+    def test_calendar_freshness_window_is_inclusive_through_day_31(self) -> None:
+        calendar = MarketCalendar.load(
+            PUBLISHED_CALENDAR,
+            as_of=date(2026, 9, 14),
+        )
+
+        self.assertEqual(calendar.reviewed_at, REVIEWED_AS_OF)
+        with self.assertRaises(CalendarError):
+            MarketCalendar.load(
+                PUBLISHED_CALENDAR,
+                as_of=date(2026, 9, 15),
+            )
+
+    def test_calendar_rejects_future_dated_and_stale_as_of_values(self) -> None:
+        for case, as_of in (
+            ("manifest is future dated", date(2026, 1, 1)),
+            ("manifest is stale", date(2026, 12, 31)),
+        ):
+            with self.subTest(case=case), self.assertRaises(CalendarError):
+                MarketCalendar.load(PUBLISHED_CALENDAR, as_of=as_of)
+
+    def test_calendar_rejects_internally_consistent_stale_or_future_reviews(self) -> None:
+        for case, source_date in (
+            ("stale January review", "2026-01-01"),
+            ("future December review", "2026-12-31"),
+        ):
+            raw = calendar_fixture()
+            raw["retrieved_at"] = source_date
+            raw["reviewed_at"] = source_date
+            sources = raw["sources"]
+            self.assertIsInstance(sources, dict)
+            for source in sources.values():
+                self.assertIsInstance(source, dict)
+                source["retrieved_at"] = source_date
+                source["reviewed_at"] = source_date
+            with self.subTest(case=case), self.assertRaises(CalendarError):
+                self._load_mapping(raw, as_of=REVIEWED_AS_OF)
+
+    def test_calendar_as_of_requires_an_exact_date(self) -> None:
+        invalid_values = (
+            "2026-08-14",
+            datetime(2026, 8, 14),
+            None,
+            True,
+        )
+        for invalid in invalid_values:
+            with self.subTest(api="load", value=invalid), self.assertRaises(
+                CalendarError
+            ):
+                MarketCalendar.load(PUBLISHED_CALENDAR, as_of=invalid)  # type: ignore[arg-type]
+            with self.subTest(api="from_mapping", value=invalid), self.assertRaises(
+                CalendarError
+            ):
+                MarketCalendar.from_mapping(  # type: ignore[arg-type]
+                    calendar_fixture(),
+                    as_of=invalid,
+                    expected_year=2026,
+                )
 
     def test_manifest_rejects_exchange_schedule_conflicts(self) -> None:
         raw = calendar_fixture()
@@ -276,7 +338,7 @@ class MarketCalendarTests(unittest.TestCase):
             self._load_mapping(raw)
 
     def test_calendar_data_structures_are_immutable(self) -> None:
-        calendar = MarketCalendar.load(PUBLISHED_CALENDAR)
+        calendar = MarketCalendar.load(PUBLISHED_CALENDAR, as_of=REVIEWED_AS_OF)
         session = calendar.session(date(2026, 8, 14))
 
         self.assertIsInstance(calendar.early_closes, MappingProxyType)

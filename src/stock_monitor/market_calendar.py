@@ -67,8 +67,10 @@ class MarketCalendar:
     _closed_date_set: frozenset[date] = field(repr=False)
 
     @classmethod
-    def load(cls, path: Path) -> MarketCalendar:
+    def load(cls, path: Path, as_of: date) -> MarketCalendar:
         """Load and fully validate a local JSON manifest without network I/O."""
+        if type(as_of) is not date:
+            raise CalendarError("calendar as_of must be an exact date")
         if not isinstance(path, Path):
             raise CalendarError("calendar path must be a Path")
         try:
@@ -89,16 +91,23 @@ class MarketCalendar:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise CalendarError("calendar manifest could not be read") from exc
-        return cls.from_mapping(raw, expected_year=expected_year)
+        return cls.from_mapping(
+            raw,
+            as_of=as_of,
+            expected_year=expected_year,
+        )
 
     @classmethod
     def from_mapping(
         cls,
         raw: object,
+        as_of: date,
         *,
         expected_year: int | None = None,
     ) -> MarketCalendar:
         """Validate a decoded manifest and return an immutable calendar."""
+        if type(as_of) is not date:
+            raise CalendarError("calendar as_of must be an exact date")
         table = _mapping(raw, "calendar")
         _exact_keys(
             table,
@@ -139,6 +148,13 @@ class MarketCalendar:
             raise CalendarError("calendar manifest is not reviewed")
         if retrieved_at != reviewed_at:
             raise CalendarError("calendar source data is stale or unreviewed")
+        if as_of < retrieved_at or as_of < reviewed_at:
+            raise CalendarError("calendar manifest is future dated")
+        if (
+            (as_of - retrieved_at).days > 31
+            or (as_of - reviewed_at).days > 31
+        ):
+            raise CalendarError("calendar manifest is stale")
 
         regular = _mapping(table["regular_session"], "regular_session")
         _exact_keys(

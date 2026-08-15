@@ -7,13 +7,15 @@ import hmac
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR, localcontext
 from pathlib import Path
+from threading import RLock
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
+from weakref import ReferenceType, ref
 
 
 _ACQUISITION_METHOD = "manual_primary_source_review"
@@ -66,7 +68,15 @@ _SPONSOR_HOSTS = frozenset(
 _SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]{0,5}")
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9]\d*)(?:\.\d+)?")
 _CHECKSUM_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_SHA256_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MINIMUM_FREE_FLOAT = 50_000_000
+_VERIFIED_UNIVERSE_AUTHORITY = object()
+_MAPPING_PROXY_TYPE = type(MappingProxyType({}))
+_CURRENT_UNIVERSE_RELATIVE_PATH = Path("data/universe/2026-08-14.json")
+_MAXIMUM_UNIVERSE_BYTES = 1_048_576
+CURRENT_UNIVERSE_SHA256 = (
+    "e277048b6c0580dc7f82d062f04ac2898f51ff81cb3673e4d79b54f320fba753"
+)
 
 
 class UniverseError(ValueError):
@@ -135,7 +145,7 @@ class UniverseRecord:
     objective_classification_method: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class UniverseSnapshot:
     """A checksum-verified universe that is valid for a bounded review window."""
 
@@ -149,6 +159,24 @@ class UniverseSnapshot:
     regime_support_symbols: tuple[str, ...]
     sector_mapping: Mapping[str, str]
     tick_policy_sources: tuple[SourceEvidence, ...]
+    _authority: object = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _snapshot_digest: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _release_pin: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def load(cls, path: Path, as_of: date) -> UniverseSnapshot:
@@ -273,6 +301,13 @@ class UniverseSnapshot:
         return tuple(record for record in self.records if record.enabled)
 
 
+_ISSUED_UNIVERSES: dict[
+    int,
+    tuple[ReferenceType[UniverseSnapshot], str],
+] = {}
+_ISSUED_UNIVERSES_LOCK = RLock()
+
+
 def canonical_payload_checksum(raw: Mapping[str, object]) -> str:
     """Hash canonical JSON after removing only the top-level checksum field."""
     payload = {key: value for key, value in raw.items() if key != "checksum"}
@@ -287,6 +322,317 @@ def canonical_payload_checksum(raw: Mapping[str, object]) -> str:
     except (TypeError, ValueError) as exc:
         raise UniverseError("universe payload is not canonical JSON") from exc
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def load_current_universe(
+    project_root: Path,
+    *,
+    as_of: date,
+) -> UniverseSnapshot:
+    """Load only the externally pinned current reviewed universe release."""
+    root = Path(project_root)
+    manifest = root / _CURRENT_UNIVERSE_RELATIVE_PATH
+    try:
+        payload = manifest.read_bytes()
+    except OSError as exc:
+        raise UniverseError("current universe manifest could not be read") from exc
+    if not payload or len(payload) > _MAXIMUM_UNIVERSE_BYTES:
+        raise UniverseError("current universe manifest size is invalid")
+    digest = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(digest, CURRENT_UNIVERSE_SHA256):
+        raise UniverseError("current universe release checksum mismatch")
+    try:
+        raw = json.loads(
+            payload,
+            object_pairs_hook=_unique_object,
+            parse_float=_reject_json_float,
+            parse_constant=_reject_json_constant,
+        )
+    except UniverseError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise UniverseError("current universe manifest could not be read") from exc
+    snapshot = UniverseSnapshot.from_mapping(raw, as_of=as_of)
+    object.__setattr__(snapshot, "_authority", _VERIFIED_UNIVERSE_AUTHORITY)
+    object.__setattr__(snapshot, "_release_pin", CURRENT_UNIVERSE_SHA256)
+    snapshot_digest = _snapshot_fingerprint(snapshot)
+    object.__setattr__(snapshot, "_snapshot_digest", snapshot_digest)
+    identity = id(snapshot)
+
+    def discard_snapshot(
+        dead_reference: ReferenceType[UniverseSnapshot],
+    ) -> None:
+        with _ISSUED_UNIVERSES_LOCK:
+            current = _ISSUED_UNIVERSES.get(identity)
+            if current is not None and current[0] is dead_reference:
+                del _ISSUED_UNIVERSES[identity]
+
+    snapshot_reference = ref(snapshot, discard_snapshot)
+    with _ISSUED_UNIVERSES_LOCK:
+        _ISSUED_UNIVERSES[identity] = (snapshot_reference, snapshot_digest)
+    return snapshot
+
+
+def _date_document(value: object, name: str) -> str:
+    if type(value) is not date:
+        raise TypeError(f"verified universe {name} is malformed")
+    return value.isoformat()
+
+
+def _decimal_document(value: object, name: str) -> dict[str, object]:
+    if type(value) is not Decimal or not value.is_finite():
+        raise TypeError(f"verified universe {name} is malformed")
+    parts = value.as_tuple()
+    return {
+        "digits": list(parts.digits),
+        "exponent": parts.exponent,
+        "sign": parts.sign,
+    }
+
+
+def _source_evidence_document(value: object) -> dict[str, object]:
+    if (
+        type(value) is not SourceEvidence
+        or type(value.url) is not str
+        or type(value.scope) is not str
+    ):
+        raise TypeError("verified universe source evidence is malformed")
+    return {
+        "scope": value.scope,
+        "source_as_of": _date_document(value.source_as_of, "source date"),
+        "url": value.url,
+    }
+
+
+def _membership_evidence_document(value: object) -> dict[str, object]:
+    if (
+        type(value) is not MembershipEvidence
+        or type(value.index) is not str
+        or type(value.url) is not str
+        or type(value.acquisition_method) is not str
+    ):
+        raise TypeError("verified universe membership evidence is malformed")
+    return {
+        "acquisition_method": value.acquisition_method,
+        "index": value.index,
+        "source_as_of": _date_document(value.source_as_of, "membership date"),
+        "url": value.url,
+    }
+
+
+def _string_mapping_document(value: object, name: str) -> dict[str, str]:
+    if type(value) is not _MAPPING_PROXY_TYPE or any(
+        type(key) is not str or type(item) is not str
+        for key, item in value.items()
+    ):
+        raise TypeError(f"verified universe {name} is malformed")
+    return dict(value)
+
+
+def _float_derivation_document(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if (
+        type(value) is not FloatDerivation
+        or type(value.sources) is not tuple
+        or any(type(item) is not SourceEvidence for item in value.sources)
+        or type(value.formula) is not str
+        or type(value.operands) is not _MAPPING_PROXY_TYPE
+        or any(
+            type(key) is not str or type(item) not in {int, str}
+            for key, item in value.operands.items()
+        )
+        or type(value.operand_source_dates) is not _MAPPING_PROXY_TYPE
+        or any(
+            type(key) is not str or type(item) is not date
+            for key, item in value.operand_source_dates.items()
+        )
+        or type(value.derived_value) is not int
+        or type(value.stored_value) is not int
+        or type(value.rounding) is not str
+        or type(value.rounded_down) is not bool
+        or (
+            value.corroborating_shares_outstanding is not None
+            and type(value.corroborating_shares_outstanding) is not int
+        )
+        or (
+            value.corroborating_shares_outstanding_as_of is not None
+            and type(value.corroborating_shares_outstanding_as_of) is not date
+        )
+    ):
+        raise TypeError("verified universe float derivation is malformed")
+    operands = {
+        key: {"type": "integer", "value": item}
+        if type(item) is int
+        else {"type": "string", "value": item}
+        for key, item in value.operands.items()
+    }
+    operand_dates = {
+        key: _date_document(item, "float operand date")
+        for key, item in value.operand_source_dates.items()
+    }
+    return {
+        "corroborating_shares_outstanding": (
+            value.corroborating_shares_outstanding
+        ),
+        "corroborating_shares_outstanding_as_of": (
+            _date_document(
+                value.corroborating_shares_outstanding_as_of,
+                "float corroboration date",
+            )
+            if value.corroborating_shares_outstanding_as_of is not None
+            else None
+        ),
+        "derived_value": value.derived_value,
+        "formula": value.formula,
+        "operand_source_dates": operand_dates,
+        "operands": operands,
+        "rounded_down": value.rounded_down,
+        "rounding": value.rounding,
+        "source_as_of": _date_document(value.source_as_of, "float source date"),
+        "sources": [_source_evidence_document(item) for item in value.sources],
+        "stored_value": value.stored_value,
+    }
+
+
+def _universe_record_document(value: object) -> dict[str, object]:
+    if (
+        type(value) is not UniverseRecord
+        or any(
+            type(item) is not str
+            for item in (
+                value.symbol,
+                value.product_type,
+                value.listing_venue,
+                value.benchmark,
+                value.tick_classification,
+                value.source_url,
+            )
+        )
+        or (value.sector_etf is not None and type(value.sector_etf) is not str)
+        or type(value.support_roles) is not tuple
+        or any(type(item) is not str for item in value.support_roles)
+        or type(value.enabled) is not bool
+        or type(value.leveraged) is not bool
+        or type(value.inverse) is not bool
+        or type(value.tick_source) is not SourceEvidence
+        or type(value.membership_sources) is not tuple
+        or any(
+            type(item) is not MembershipEvidence
+            for item in value.membership_sources
+        )
+        or (value.free_float is not None and type(value.free_float) is not int)
+        or type(value.sponsor_sources) is not tuple
+        or any(type(item) is not SourceEvidence for item in value.sponsor_sources)
+        or (
+            value.objective_classification_method is not None
+            and type(value.objective_classification_method) is not str
+        )
+    ):
+        raise TypeError("verified universe record is malformed")
+    return {
+        "benchmark": value.benchmark,
+        "enabled": value.enabled,
+        "float_derivation": _float_derivation_document(value.float_derivation),
+        "free_float": value.free_float,
+        "inverse": value.inverse,
+        "leveraged": value.leveraged,
+        "listing_venue": value.listing_venue,
+        "membership_sources": [
+            _membership_evidence_document(item)
+            for item in value.membership_sources
+        ],
+        "objective_classification_method": value.objective_classification_method,
+        "product_type": value.product_type,
+        "reviewed_at": _date_document(value.reviewed_at, "record review date"),
+        "sector_etf": value.sector_etf,
+        "source_as_of": _date_document(value.source_as_of, "record source date"),
+        "source_url": value.source_url,
+        "sponsor_sources": [
+            _source_evidence_document(item) for item in value.sponsor_sources
+        ],
+        "support_roles": list(value.support_roles),
+        "symbol": value.symbol,
+        "tick_classification": value.tick_classification,
+        "tick_size": _decimal_document(value.tick_size, "record tick size"),
+        "tick_source": _source_evidence_document(value.tick_source),
+    }
+
+
+def _snapshot_fingerprint(value: UniverseSnapshot) -> str:
+    if (
+        type(value) is not UniverseSnapshot
+        or type(value.acquisition_method) is not str
+        or type(value.checksum) is not str
+        or type(value.records) is not tuple
+        or any(type(record) is not UniverseRecord for record in value.records)
+        or type(value.by_symbol) is not _MAPPING_PROXY_TYPE
+        or any(
+            type(symbol) is not str or type(record) is not UniverseRecord
+            for symbol, record in value.by_symbol.items()
+        )
+        or type(value.regime_support_symbols) is not tuple
+        or any(type(symbol) is not str for symbol in value.regime_support_symbols)
+        or type(value.sector_mapping) is not _MAPPING_PROXY_TYPE
+        or type(value.tick_policy_sources) is not tuple
+        or any(
+            type(item) is not SourceEvidence for item in value.tick_policy_sources
+        )
+    ):
+        raise TypeError("verified universe snapshot fields are malformed")
+    document = {
+        "acquisition_method": value.acquisition_method,
+        "by_symbol": {
+            symbol: _universe_record_document(record)
+            for symbol, record in value.by_symbol.items()
+        },
+        "checksum": value.checksum,
+        "effective_date": _date_document(value.effective_date, "effective date"),
+        "records": [_universe_record_document(record) for record in value.records],
+        "regime_support_symbols": list(value.regime_support_symbols),
+        "review_by": _date_document(value.review_by, "review deadline"),
+        "reviewed_at": _date_document(value.reviewed_at, "review date"),
+        "sector_mapping": _string_mapping_document(
+            value.sector_mapping,
+            "sector mapping",
+        ),
+        "tick_policy_sources": [
+            _source_evidence_document(item) for item in value.tick_policy_sources
+        ],
+    }
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _issued_universe_digest(value: UniverseSnapshot) -> str | None:
+    with _ISSUED_UNIVERSES_LOCK:
+        issued = _ISSUED_UNIVERSES.get(id(value))
+        if issued is None or issued[0]() is not value:
+            return None
+        return issued[1]
+
+
+def is_verified_universe_snapshot(value: object) -> bool:
+    """Return true only for an untampered snapshot from the validated loader."""
+    if type(value) is not UniverseSnapshot:
+        return False
+    issued_digest = _issued_universe_digest(value)
+    if (
+        issued_digest is None
+        or value._authority is not _VERIFIED_UNIVERSE_AUTHORITY
+        or value._release_pin != CURRENT_UNIVERSE_SHA256
+        or type(value._snapshot_digest) is not str
+        or _SHA256_DIGEST_PATTERN.fullmatch(value._snapshot_digest) is None
+        or not hmac.compare_digest(value._snapshot_digest, issued_digest)
+    ):
+        return False
+    try:
+        return hmac.compare_digest(
+            value._snapshot_digest,
+            _snapshot_fingerprint(value),
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _universe_record(
@@ -956,6 +1302,7 @@ def _source_url(value: object, name: str) -> str:
 
 
 __all__ = [
+    "CURRENT_UNIVERSE_SHA256",
     "FloatDerivation",
     "MembershipEvidence",
     "SourceEvidence",
@@ -963,4 +1310,6 @@ __all__ = [
     "UniverseRecord",
     "UniverseSnapshot",
     "canonical_payload_checksum",
+    "is_verified_universe_snapshot",
+    "load_current_universe",
 ]

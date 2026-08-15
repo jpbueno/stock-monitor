@@ -4,13 +4,22 @@ import hashlib
 import json
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from copy import copy
+from dataclasses import FrozenInstanceError, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
+from unittest import mock
 
-from stock_monitor.universe import UniverseError, UniverseSnapshot
+from stock_monitor import universe as universe_module
+from stock_monitor.universe import (
+    CURRENT_UNIVERSE_SHA256,
+    UniverseError,
+    UniverseSnapshot,
+    is_verified_universe_snapshot,
+    load_current_universe,
+)
 from tests.support import load_json, universe_fixture
 
 
@@ -60,8 +69,8 @@ class UniverseSnapshotTests(unittest.TestCase):
         self.assertEqual(published, universe_fixture())
 
     def test_loads_current_manually_reviewed_snapshot_and_exact_seed(self) -> None:
-        snapshot = UniverseSnapshot.load(
-            PUBLISHED_UNIVERSE,
+        snapshot = load_current_universe(
+            PROJECT_ROOT,
             as_of=date(2026, 8, 14),
         )
 
@@ -77,6 +86,129 @@ class UniverseSnapshotTests(unittest.TestCase):
             ("AAPL", "AMD", "NVDA", "QQQ", "SPY", "VTI", "XLK"),
         )
         self.assertIsInstance(snapshot.eligible_records(), tuple)
+        self.assertTrue(is_verified_universe_snapshot(snapshot))
+
+    def test_generic_validators_cannot_mint_production_universe_authority(self) -> None:
+        raw = universe_fixture()
+        loaded = UniverseSnapshot.load(
+            PUBLISHED_UNIVERSE,
+            as_of=date(2026, 8, 14),
+        )
+        decoded = UniverseSnapshot.from_mapping(raw, as_of=date(2026, 8, 14))
+
+        self.assertFalse(is_verified_universe_snapshot(loaded))
+        self.assertFalse(is_verified_universe_snapshot(decoded))
+
+    def test_current_universe_release_pin_rejects_alternate_reviewed_content(self) -> None:
+        raw = universe_fixture()
+        records = raw["records"]
+        self.assertIsInstance(records, list)
+        raw["records"] = [
+            record for record in records if record["symbol"] != "NVDA"
+        ]
+        benchmark = raw["benchmark_policy"]
+        self.assertIsInstance(benchmark, dict)
+        sector_mapping = benchmark["sector_mapping"]
+        self.assertIsInstance(sector_mapping, dict)
+        del sector_mapping["NVDA"]
+        payload = json.dumps(_resign(raw), sort_keys=True).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            manifest = project_root / "data" / "universe" / "2026-08-14.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_bytes(payload)
+            generic = UniverseSnapshot.load(manifest, as_of=date(2026, 8, 14))
+            self.assertFalse(is_verified_universe_snapshot(generic))
+            with self.assertRaises(UniverseError):
+                load_current_universe(project_root, as_of=date(2026, 8, 14))
+
+        with mock.patch.object(Path, "read_bytes", return_value=payload):
+            with self.assertRaises(UniverseError):
+                load_current_universe(PROJECT_ROOT, as_of=date(2026, 8, 14))
+
+        self.assertEqual(
+            CURRENT_UNIVERSE_SHA256,
+            "e277048b6c0580dc7f82d062f04ac2898f51ff81cb3673e4d79b54f320fba753",
+        )
+
+    def test_direct_and_replaced_snapshots_are_not_loader_verified(self) -> None:
+        snapshot = load_current_universe(
+            PROJECT_ROOT,
+            as_of=date(2026, 8, 14),
+        )
+        aapl = snapshot.by_symbol["AAPL"]
+
+        direct = UniverseSnapshot(
+            effective_date=snapshot.effective_date,
+            reviewed_at=snapshot.reviewed_at,
+            review_by=snapshot.review_by,
+            acquisition_method=snapshot.acquisition_method,
+            checksum=snapshot.checksum,
+            records=snapshot.records,
+            by_symbol=snapshot.by_symbol,
+            regime_support_symbols=snapshot.regime_support_symbols,
+            sector_mapping=snapshot.sector_mapping,
+            tick_policy_sources=snapshot.tick_policy_sources,
+        )
+        subset = replace(
+            snapshot,
+            records=(aapl,),
+            by_symbol=MappingProxyType({"AAPL": aapl}),
+            sector_mapping=MappingProxyType({"AAPL": "XLK"}),
+        )
+        changed_tick = replace(aapl, tick_size=Decimal("1"))
+        mutated = replace(
+            snapshot,
+            records=(changed_tick,) + snapshot.records[1:],
+            by_symbol=MappingProxyType(
+                {**snapshot.by_symbol, "AAPL": changed_tick}
+            ),
+        )
+
+        self.assertFalse(is_verified_universe_snapshot(direct))
+        self.assertFalse(is_verified_universe_snapshot(subset))
+        self.assertFalse(is_verified_universe_snapshot(mutated))
+
+    def test_copied_or_mutated_release_cannot_be_resealed_with_private_digest(self) -> None:
+        for case, forged in (
+            (
+                "copy",
+                copy(
+                    load_current_universe(
+                        PROJECT_ROOT,
+                        as_of=date(2026, 8, 14),
+                    )
+                ),
+            ),
+            (
+                "issued-object",
+                load_current_universe(
+                    PROJECT_ROOT,
+                    as_of=date(2026, 8, 14),
+                ),
+            ),
+        ):
+            with self.subTest(case=case):
+                aapl = forged.by_symbol["AAPL"]
+                object.__setattr__(forged, "records", (aapl,))
+                object.__setattr__(
+                    forged,
+                    "by_symbol",
+                    MappingProxyType({"AAPL": aapl}),
+                )
+                object.__setattr__(
+                    forged,
+                    "sector_mapping",
+                    MappingProxyType({"AAPL": "XLK"}),
+                )
+                object.__setattr__(
+                    forged,
+                    "_snapshot_digest",
+                    universe_module._snapshot_fingerprint(forged),
+                )
+
+                self.assertFalse(is_verified_universe_snapshot(forged))
 
     def test_checksum_is_canonical_json_excluding_only_checksum(self) -> None:
         raw = universe_fixture()

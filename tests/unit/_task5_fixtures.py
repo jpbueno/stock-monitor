@@ -21,7 +21,7 @@ from stock_monitor.evidence import (
     EvidenceSourceBinding,
     classify_evidence,
 )
-from stock_monitor.market_calendar import MarketCalendar
+from stock_monitor.market_calendar import MarketCalendar, load_current_market_calendar
 from stock_monitor.providers.cache import SourceDocument
 from stock_monitor.providers.http import EgressPolicy, HttpResponse
 from stock_monitor.providers.reference import (
@@ -37,8 +37,8 @@ SESSION_DATE = date(2026, 8, 14)
 RUN_AT = datetime.combine(SESSION_DATE, time(8, 45), ET)
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "market"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MARKET_CALENDAR = MarketCalendar.load(
-    PROJECT_ROOT / "data" / "calendars" / "2026.json",
+MARKET_CALENDAR = load_current_market_calendar(
+    PROJECT_ROOT,
     as_of=SESSION_DATE,
 )
 PRIMARY_SYMBOL = "AAPL"

@@ -3,14 +3,20 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
 import stock_monitor.market_calendar as market_calendar_module
-from stock_monitor.market_calendar import CalendarError, MarketCalendar
+from stock_monitor.market_calendar import (
+    CalendarError,
+    MarketCalendar,
+    is_release_verified_market_calendar,
+    is_validated_market_calendar,
+    load_current_market_calendar,
+)
 from tests.support import calendar_fixture
 
 
@@ -32,6 +38,55 @@ EXPECTED_CLOSED_DATES = (
 
 
 class MarketCalendarTests(unittest.TestCase):
+    def test_structural_and_pinned_release_authority_are_distinct(self) -> None:
+        structural = MarketCalendar.load(
+            PUBLISHED_CALENDAR,
+            as_of=REVIEWED_AS_OF,
+        )
+        release = load_current_market_calendar(
+            PROJECT_ROOT,
+            as_of=REVIEWED_AS_OF,
+        )
+
+        self.assertTrue(is_validated_market_calendar(structural))
+        self.assertFalse(is_release_verified_market_calendar(structural))
+        self.assertTrue(is_validated_market_calendar(release))
+        self.assertTrue(is_release_verified_market_calendar(release))
+        for forged in (
+            replace(release),
+            replace(
+                release,
+                _closed_date_set=release._closed_date_set - {date(2026, 12, 25)},
+            ),
+        ):
+            with self.subTest(forged=forged):
+                self.assertFalse(is_validated_market_calendar(forged))
+                self.assertFalse(is_release_verified_market_calendar(forged))
+
+    def test_direct_calendar_cannot_mint_validation_or_release_authority(self) -> None:
+        release = load_current_market_calendar(
+            PROJECT_ROOT,
+            as_of=REVIEWED_AS_OF,
+        )
+        forged = MarketCalendar(
+            year=release.year,
+            timezone=release.timezone,
+            retrieved_at=release.retrieved_at,
+            reviewed_at=release.reviewed_at,
+            sources=release.sources,
+            closed_dates=(),
+            early_closes=MappingProxyType({}),
+            open_session_count=261,
+            _regular_open_time=time(0, 0),
+            _regular_close_time=time(23, 59),
+            _regular_review_time=time(23, 0),
+            _closed_date_set=frozenset(),
+        )
+
+        self.assertTrue(forged.is_open(date(2026, 12, 25)))
+        self.assertFalse(is_validated_market_calendar(forged))
+        self.assertFalse(is_release_verified_market_calendar(forged))
+
     def _load_mapping(
         self,
         raw: dict[str, object],

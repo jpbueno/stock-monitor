@@ -29,7 +29,11 @@ from .indicators import (
     twenty_session_return,
     wilder_atr,
 )
-from .market_calendar import CalendarError, MarketCalendar
+from .market_calendar import (
+    CalendarError,
+    MarketCalendar,
+    is_release_verified_market_calendar,
+)
 from .providers.reference import is_reviewed_instrument_status_decision
 from .universe import UniverseSnapshot, is_verified_universe_snapshot
 
@@ -170,6 +174,8 @@ def build_market_session_attestation(
     """Derive the previous and inclusive ten-session window from one reviewed year."""
     if not isinstance(calendar, MarketCalendar):
         raise ScreeningError("market-session attestation requires a MarketCalendar")
+    if not is_release_verified_market_calendar(calendar):
+        raise ScreeningError("calendar release authority is unverified")
     if type(session_date) is not date:
         raise ScreeningError("publication session must be an exact date")
     current = _aware(as_of)
@@ -501,7 +507,7 @@ class ScoreCard:
             raise ScreeningError("score total does not equal its category arithmetic")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class ScoredCandidate:
     """Portfolio-agnostic scored setup and its exact Task 6 price contract."""
 
@@ -643,6 +649,37 @@ class ScoredCandidate:
                 raise ScreeningError("scored-candidate setup decision is inconsistent")
 
 
+_ISSUED_SCORED_CANDIDATES: dict[
+    int,
+    tuple[ReferenceType[ScoredCandidate], str],
+] = {}
+_ISSUED_SCORED_CANDIDATES_LOCK = RLock()
+
+
+def _scored_candidate_fingerprint(candidate: ScoredCandidate) -> str:
+    document = _canonical_snapshot_value(candidate)
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def is_issued_scored_candidate(candidate: object) -> bool:
+    if not isinstance(candidate, ScoredCandidate):
+        return False
+    with _ISSUED_SCORED_CANDIDATES_LOCK:
+        issued = _ISSUED_SCORED_CANDIDATES.get(id(candidate))
+        return (
+            issued is not None
+            and issued[0]() is candidate
+            and issued[1] == _scored_candidate_fingerprint(candidate)
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationCandidate:
     rank: int
@@ -654,11 +691,60 @@ class PublicationCandidate:
         return self.candidate.symbol
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class PublicationDecision:
     status: str
     candidates: tuple[PublicationCandidate, ...]
     primary: PublicationCandidate | None
+
+    def __post_init__(self) -> None:
+        candidates = tuple(self.candidates)
+        if any(not isinstance(item, PublicationCandidate) for item in candidates):
+            raise ScreeningError("publication candidates are malformed")
+        object.__setattr__(self, "candidates", candidates)
+        if self.status not in {"READY", "NO_PRIMARY_CAPACITY", "NO_TRADE"}:
+            raise ScreeningError("publication status is malformed")
+        expected_primary = next(
+            (item for item in candidates if item.role == "PRIMARY"),
+            None,
+        )
+        if self.primary != expected_primary:
+            raise ScreeningError("publication primary conflicts with roles")
+
+
+_ISSUED_PUBLICATION_DECISIONS: dict[
+    int,
+    tuple[ReferenceType[PublicationDecision], str],
+] = {}
+_ISSUED_PUBLICATION_DECISIONS_LOCK = RLock()
+
+
+def _publication_decision_fingerprint(decision: PublicationDecision) -> str:
+    document = _canonical_snapshot_value(decision)
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def is_issued_publication_decision(decision: object) -> bool:
+    if not isinstance(decision, PublicationDecision):
+        return False
+    with _ISSUED_PUBLICATION_DECISIONS_LOCK:
+        issued = _ISSUED_PUBLICATION_DECISIONS.get(id(decision))
+        return (
+            issued is not None
+            and issued[0]() is decision
+            and issued[1] == _publication_decision_fingerprint(decision)
+            and all(
+                is_issued_scored_candidate(item.candidate)
+                for item in decision.candidates
+            )
+        )
 
 
 def _append(values: list[str], value: str) -> None:
@@ -2123,25 +2209,38 @@ def to_scored_candidate(context: CandidateContext) -> ScoredCandidate:
     with localcontext() as decimal_context:
         decimal_context.prec = _decimal_work_precision(ask, bid)
         spread = ask - bid
-    return ScoredCandidate(
-        symbol=str(context.record.symbol).upper(),
-        total_score=score.total,
-        relative_strength_percentile=(
-            score.twenty_session_relative_strength_percentile
-        ),
-        average_dollar_volume=eligibility.average_dollar_volume,
-        publication_session=context.session_date,
-        raw_trigger=setup.raw_trigger,
-        raw_stop=setup.raw_stop,
-        delayed_spread_amount=spread,
-        tick_size=context.record.tick_size,
-        trigger_price=setup.trigger_price,
-        maximum_permitted_entry=setup.maximum_permitted_entry,
-        recommended_stop=setup.stop_price,
-        target_price=setup.target_price,
-        score_card=score,
-        setup=setup,
-    )
+    candidate = ScoredCandidate(
+            symbol=str(context.record.symbol).upper(),
+            total_score=score.total,
+            relative_strength_percentile=(
+                score.twenty_session_relative_strength_percentile
+            ),
+            average_dollar_volume=eligibility.average_dollar_volume,
+            publication_session=context.session_date,
+            raw_trigger=setup.raw_trigger,
+            raw_stop=setup.raw_stop,
+            delayed_spread_amount=spread,
+            tick_size=context.record.tick_size,
+            trigger_price=setup.trigger_price,
+            maximum_permitted_entry=setup.maximum_permitted_entry,
+            recommended_stop=setup.stop_price,
+            target_price=setup.target_price,
+            score_card=score,
+            setup=setup,
+        )
+    identity = id(candidate)
+    digest = _scored_candidate_fingerprint(candidate)
+
+    def discard(dead: ReferenceType[ScoredCandidate]) -> None:
+        with _ISSUED_SCORED_CANDIDATES_LOCK:
+            current = _ISSUED_SCORED_CANDIDATES.get(identity)
+            if current is not None and current[0] is dead:
+                _ISSUED_SCORED_CANDIDATES.pop(identity, None)
+
+    reference = ref(candidate, discard)
+    with _ISSUED_SCORED_CANDIDATES_LOCK:
+        _ISSUED_SCORED_CANDIDATES[identity] = (reference, digest)
+    return candidate
 
 
 def rank_candidates(
@@ -2189,12 +2288,20 @@ def select_publication_roles(
     *,
     capacity_available: bool,
 ) -> PublicationDecision:
-    """Provisionally label rank one; capacity is an external Task 6 outcome only."""
+    """Provisionally label rank one without minting capacity authority.
+
+    ``capacity_available`` is a caller-supplied diagnostic input.  A later
+    coordinator must bind the exact ranked cohort to an issued Task 6 capacity
+    decision before a :class:`PublicationDecision` can become authoritative.
+    """
     if type(capacity_available) is not bool:
         raise TypeError("rank-one capacity outcome must be boolean")
     ranked = rank_candidates(candidates)
+    def finish(decision: PublicationDecision) -> PublicationDecision:
+        return decision
+
     if not ranked:
-        return PublicationDecision(status="NO_TRADE", candidates=(), primary=None)
+        return finish(PublicationDecision(status="NO_TRADE", candidates=(), primary=None))
     if not capacity_available:
         shadows = tuple(
             PublicationCandidate(
@@ -2204,10 +2311,12 @@ def select_publication_roles(
             )
             for index, candidate in enumerate(ranked, start=1)
         )
-        return PublicationDecision(
-            status="NO_PRIMARY_CAPACITY",
-            candidates=shadows,
-            primary=None,
+        return finish(
+            PublicationDecision(
+                status="NO_PRIMARY_CAPACITY",
+                candidates=shadows,
+                primary=None,
+            )
         )
     publications = tuple(
         PublicationCandidate(
@@ -2217,10 +2326,12 @@ def select_publication_roles(
         )
         for index, candidate in enumerate(ranked, start=1)
     )
-    return PublicationDecision(
-        status="READY",
-        candidates=publications,
-        primary=publications[0],
+    return finish(
+        PublicationDecision(
+            status="READY",
+            candidates=publications,
+            primary=publications[0],
+        )
     )
 
 
@@ -2246,6 +2357,8 @@ __all__ = [
     "build_market_session_attestation",
     "detect_setup",
     "evaluate_eligibility",
+    "is_issued_publication_decision",
+    "is_issued_scored_candidate",
     "midrank_percentile",
     "rank_candidates",
     "score_candidate",

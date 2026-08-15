@@ -9,7 +9,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from stock_monitor.evidence import EvidenceDecision
-from stock_monitor.market_calendar import MarketCalendar
+from stock_monitor.market_calendar import (
+    MarketCalendar,
+    load_current_market_calendar,
+)
 from stock_monitor.providers import reference as reference_module
 from stock_monitor.providers.reference import InstrumentStatusDecision
 from stock_monitor.screening import (
@@ -37,9 +40,30 @@ from tests.unit._task5_fixtures import (
 
 
 class EligibilityTests(unittest.TestCase):
+    def test_attestation_rejects_nonrelease_and_copied_calendar_authority(self) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        structural = MarketCalendar.load(
+            project_root / "data" / "calendars" / "2026.json",
+            as_of=date(2026, 8, 14),
+        )
+        release = load_current_market_calendar(
+            project_root,
+            as_of=date(2026, 8, 14),
+        )
+        for calendar in (structural, replace(release)):
+            with self.subTest(calendar=calendar), self.assertRaisesRegex(
+                ScreeningError,
+                "calendar release authority is unverified",
+            ):
+                build_market_session_attestation(
+                    calendar,
+                    session_date=date(2026, 8, 14),
+                    as_of=RUN_AT,
+                )
+
     def test_market_session_attestation_is_derived_from_reviewed_calendar(self) -> None:
-        calendar = MarketCalendar.load(
-            Path(__file__).resolve().parents[2] / "data" / "calendars" / "2026.json",
+        calendar = load_current_market_calendar(
+            Path(__file__).resolve().parents[2],
             as_of=date(2026, 9, 4),
         )
         as_of = RUN_AT.replace(month=9, day=4)

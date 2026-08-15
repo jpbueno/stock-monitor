@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 
@@ -18,6 +19,28 @@ class ConfigurationError(ValueError):
 
 class DomainValidationError(ValueError):
     """A value violates a shared domain invariant."""
+
+
+def stable_execution_event_identity(
+    message_id: str,
+    action_ordinal: int,
+) -> tuple[str, str]:
+    """Return the one canonical Journal event ID and idempotency key."""
+    if type(message_id) is not str or not message_id:
+        raise DomainValidationError("message ID must be non-empty text")
+    if (
+        type(action_ordinal) is not int
+        or action_ordinal < 0
+        or action_ordinal > MAX_MICRODOLLARS
+    ):
+        raise DomainValidationError("action ordinal must be a non-negative integer")
+    identity = hashlib.sha256(
+        b"stock-monitor/execution-event/v1\x00"
+        + message_id.encode("utf-8")
+        + b"\x00"
+        + str(action_ordinal).encode("ascii")
+    ).hexdigest()
+    return f"evt_{identity}", f"message-action:{identity}"
 
 
 def money_to_micros(value: Decimal) -> int:

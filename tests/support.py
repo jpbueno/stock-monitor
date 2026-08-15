@@ -18,6 +18,7 @@ FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 REFERENCE_FIXTURE_ROOT = FIXTURE_ROOT / "reference"
 PROVIDER_FIXTURE_ROOT = FIXTURE_ROOT / "providers"
 EVIDENCE_FIXTURE_ROOT = FIXTURE_ROOT / "evidence"
+PORTFOLIO_FIXTURE_ROOT = FIXTURE_ROOT / "portfolios"
 
 
 class FixtureTransport:
@@ -139,10 +140,10 @@ def policy_fixture(**overrides: object) -> Policy:
     return Policy(**values)  # type: ignore[arg-type]
 
 
-def calendar_fixture() -> dict[str, object]:
-    """Return a mutable copy of the reviewed 2026 calendar fixture."""
+def calendar_fixture(year: int = 2026) -> dict[str, object]:
+    """Return a mutable copy of one reviewed calendar fixture."""
     raw = json.loads(
-        (REFERENCE_FIXTURE_ROOT / "calendar-2026.json").read_text(
+        (REFERENCE_FIXTURE_ROOT / f"calendar-{year}.json").read_text(
             encoding="utf-8"
         )
     )
@@ -177,3 +178,104 @@ def reference_fixture(name: str) -> dict[str, object]:
     if not isinstance(raw, dict):
         raise TypeError("reference fixture must contain a JSON object")
     return deepcopy(raw)
+
+
+def seeded_ledgers(canonical_entry: Decimal = Decimal("100")):
+    """Return the deterministic Task 6 ledger pair without eager imports."""
+    from stock_monitor.ledger import (
+        LedgerPair,
+        LedgerSignal,
+    )
+
+    raw = json.loads(
+        (PORTFOLIO_FIXTURE_ROOT / "seeded-ledgers.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if not isinstance(raw, dict) or not isinstance(raw.get("signals"), list):
+        raise TypeError("seeded-ledgers fixture must contain a signals list")
+    signals = []
+    for item in raw["signals"]:
+        if not isinstance(item, dict):
+            raise TypeError("seeded-ledgers signal must be an object")
+        entry = (
+            canonical_entry
+            if item["signal_id"] == "sig-1"
+            else Decimal(str(item["maximum_entry"]))
+        )
+        signal = LedgerSignal(
+                signal_id=str(item["signal_id"]),
+                symbol=str(item["symbol"]),
+                role=str(item["role"]),
+                publication_session=date.fromisoformat(
+                    str(item["publication_session"])
+                ),
+                maximum_entry=entry,
+                recommended_stop=Decimal(str(item["recommended_stop"])),
+                target=Decimal(str(item["target"])),
+                planned_shares=int(item["planned_shares"]),
+                tick_size=Decimal(str(item["tick_size"])),
+                trigger_price=Decimal(str(item["trigger_price"])),
+            )
+        signals.append(signal)
+    pair = LedgerPair(signals=tuple(signals))
+    pair.record_canonical_fill(
+        signal_id="sig-1",
+        price=canonical_entry,
+        shares=5,
+        at=aware_et(date(2026, 8, 14), "10:14"),
+    )
+    return pair
+
+
+def account_check(
+    *,
+    at: str,
+    settled_cash: str,
+    pending_orders: int = 0,
+    unlogged_positions: int = 0,
+    session_date: date = date(2026, 8, 14),
+):
+    """Build a same-session account check for risk tests."""
+    from stock_monitor.risk import AccountCheck
+
+    return AccountCheck(
+        settled_cash=Decimal(settled_cash),
+        pending_orders=pending_orders,
+        unlogged_positions=unlogged_positions,
+        at=aware_et(session_date, at),
+    )
+
+
+def buy_event(
+    *,
+    at: str,
+    price: str,
+    shares: int,
+    session_date: date = date(2026, 8, 14),
+):
+    """Build a confirmed buy event for risk tests."""
+    from stock_monitor.risk import ExecutionEvent
+
+    return ExecutionEvent(
+        kind="BUY",
+        at=aware_et(session_date, at),
+        price=Decimal(price),
+        shares=shares,
+    )
+
+
+def cash_adjustment(
+    *,
+    at: str,
+    amount: str,
+    session_date: date = date(2026, 8, 14),
+):
+    """Build an account-wide cash adjustment for ordering tests."""
+    from stock_monitor.risk import ExecutionEvent
+
+    return ExecutionEvent(
+        kind="CASH_ADJUSTMENT",
+        at=aware_et(session_date, at),
+        amount=Decimal(amount),
+    )

@@ -1,0 +1,40 @@
+{
+  "signals": [
+    {
+      "signal_id": "sig-1",
+      "symbol": "SPY",
+      "role": "PRIMARY",
+      "publication_session": "2026-08-14",
+      "trigger_price": "99.50",
+      "maximum_entry": "100",
+      "recommended_stop": "97.50",
+      "target": "105.00",
+      "planned_shares": 5,
+      "tick_size": "0.01"
+    },
+    {
+      "signal_id": "sig-shadow",
+      "symbol": "QQQ",
+      "role": "WATCHLIST_SHADOW",
+      "publication_session": "2026-08-14",
+      "trigger_price": "199.00",
+      "maximum_entry": "200",
+      "recommended_stop": "195",
+      "target": "210",
+      "planned_shares": 2,
+      "tick_size": "0.01"
+    },
+    {
+      "signal_id": "sig-spy-2",
+      "symbol": "SPY",
+      "role": "PRIMARY",
+      "publication_session": "2026-08-17",
+      "trigger_price": "101.00",
+      "maximum_entry": "102",
+      "recommended_stop": "99",
+      "target": "108",
+      "planned_shares": 2,
+      "tick_size": "0.01"
+    }
+  ]
+}

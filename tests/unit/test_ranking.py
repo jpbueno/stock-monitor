@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 from dataclasses import replace
 from datetime import date
@@ -11,9 +12,11 @@ from stock_monitor.screening import (
     ScreeningError,
     SetupDecision,
     rank_candidates,
+    is_issued_publication_decision,
     select_publication_roles,
     to_scored_candidate,
 )
+import stock_monitor.screening as screening_module
 from tests.unit._task5_fixtures import candidate_context, evidence, previous_quote
 
 
@@ -172,6 +175,45 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(decision.status, "NO_PRIMARY_CAPACITY")
         self.assertIsNone(decision.primary)
 
+    def test_raw_capacity_boolean_cannot_issue_publication_authority(self) -> None:
+        scored = to_scored_candidate(
+            candidate_context(evidence=evidence(age_days=11))
+        )
+        issued = select_publication_roles(
+            (scored,),
+            capacity_available=True,
+        )
+
+        self.assertFalse(is_issued_publication_decision(issued))
+        self.assertFalse(hasattr(screening_module, "_issue_scored_candidate"))
+        self.assertFalse(hasattr(screening_module, "_issue_publication_decision"))
+        self.assertFalse(is_issued_publication_decision(copy.copy(issued)))
+        self.assertFalse(is_issued_publication_decision(replace(issued)))
+        self.assertFalse(
+            is_issued_publication_decision(
+                replace(
+                    issued,
+                    status="NO_PRIMARY_CAPACITY",
+                    candidates=(
+                        replace(
+                            issued.candidates[0],
+                            role="WATCHLIST_SHADOW",
+                        ),
+                    ),
+                    primary=None,
+                )
+            )
+        )
+
+        direct = candidate("AAA")
+        for unissued in (direct, copy.copy(scored), replace(scored)):
+            with self.subTest(unissued=unissued):
+                decision = select_publication_roles(
+                    (unissued,),
+                    capacity_available=True,
+                )
+                self.assertFalse(is_issued_publication_decision(decision))
+
     def test_scored_candidate_exposes_task6_price_contract_without_portfolio_state(self) -> None:
         context = candidate_context(evidence=evidence(age_days=11))
         candidate_value = to_scored_candidate(context)
@@ -287,6 +329,7 @@ class RankingTests(unittest.TestCase):
         decision = select_publication_roles((), capacity_available=True)
         self.assertEqual(decision.status, "NO_TRADE")
         self.assertEqual(decision.candidates, ())
+        self.assertFalse(is_issued_publication_decision(decision))
 
     def test_duplicate_symbols_and_nonpublishable_or_incomplete_contracts_are_rejected(self) -> None:
         valid = candidate("AAA")

@@ -7,10 +7,13 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
+from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -18,6 +21,18 @@ _NEW_YORK = "America/New_York"
 _NYSE_URL = "https://www.nyse.com/trade/hours-calendars"
 _NASDAQ_URL = "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar"
 _TIME_PATTERN = re.compile(r"\d{2}:\d{2}")
+_RELEASE_MANIFEST_SHA256 = {
+    2026: "e9c45e4c39202e2d39e0db5a33a7ebbcb5a58c71e17270ff6ffa68a80ae58d38",
+}
+_CALENDAR_AUTHORITY_LOCK = RLock()
+_VALIDATED_CALENDARS: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_RELEASE_CALENDARS: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
 
 
 class CalendarError(ValueError):
@@ -58,7 +73,7 @@ class MarketSession:
     is_early_close: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class MarketCalendar:
     """A complete, source-agreed calendar for exactly one year."""
 
@@ -258,7 +273,7 @@ class MarketCalendar:
             )
             for day, (close_time, review_time) in early_schedule.items()
         }
-        return cls(
+        calendar = cls(
             year=year,
             timezone=timezone,
             retrieved_at=retrieved_at,
@@ -272,6 +287,8 @@ class MarketCalendar:
             _regular_review_time=regular_review,
             _closed_date_set=closed_set,
         )
+        _register_calendar_authority(_VALIDATED_CALENDARS, calendar)
+        return calendar
 
     def is_open(self, day: date) -> bool:
         """Return whether *day* is an open session in this manifest year."""
@@ -310,6 +327,122 @@ class MarketCalendar:
     def _require_supported_day(self, day: date) -> None:
         if type(day) is not date or day.year != self.year:
             raise CalendarError("requested date is outside the loaded calendar year")
+
+
+def _calendar_fingerprint(calendar: MarketCalendar) -> tuple[object, ...]:
+    return (
+        calendar.year,
+        getattr(calendar.timezone, "key", None),
+        calendar.retrieved_at,
+        calendar.reviewed_at,
+        tuple(
+            (
+                source.role,
+                source.name,
+                source.url,
+                source.retrieved_at,
+                source.reviewed_at,
+                source.closed_dates,
+                source.early_closes,
+            )
+            for source in calendar.sources
+        ),
+        calendar.closed_dates,
+        tuple(
+            (
+                day,
+                session.session_date,
+                session.open_time,
+                session.close_time,
+                session.review_time,
+                getattr(session.timezone, "key", None),
+                session.is_early_close,
+            )
+            for day, session in sorted(calendar.early_closes.items())
+        ),
+        calendar.open_session_count,
+        calendar._regular_open_time,
+        calendar._regular_close_time,
+        calendar._regular_review_time,
+        tuple(sorted(calendar._closed_date_set)),
+    )
+
+
+def _register_calendar_authority(
+    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
+    calendar: MarketCalendar,
+) -> None:
+    identity = id(calendar)
+
+    def discard(reference: ReferenceType[object]) -> None:
+        with _CALENDAR_AUTHORITY_LOCK:
+            current = registry.get(identity)
+            if current is not None and current[0] is reference:
+                registry.pop(identity, None)
+
+    reference = ref(calendar, discard)
+    with _CALENDAR_AUTHORITY_LOCK:
+        registry[identity] = (reference, _calendar_fingerprint(calendar))
+
+
+def _has_calendar_authority(
+    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
+    calendar: object,
+) -> bool:
+    if not isinstance(calendar, MarketCalendar):
+        return False
+    with _CALENDAR_AUTHORITY_LOCK:
+        issued = registry.get(id(calendar))
+        return bool(
+            issued is not None
+            and issued[0]() is calendar
+            and issued[1] == _calendar_fingerprint(calendar)
+        )
+
+
+def is_validated_market_calendar(calendar: object) -> bool:
+    """Return whether the exact object came from full manifest validation."""
+    return _has_calendar_authority(_VALIDATED_CALENDARS, calendar)
+
+
+def is_release_verified_market_calendar(calendar: object) -> bool:
+    """Return whether the exact object came from the pinned project manifest."""
+    return _has_calendar_authority(_RELEASE_CALENDARS, calendar)
+
+
+def load_current_market_calendar(
+    project_root: Path,
+    *,
+    as_of: date | None = None,
+) -> MarketCalendar:
+    """Load the year-specific, path-pinned and checksum-pinned live manifest."""
+    if not isinstance(project_root, Path):
+        raise CalendarError("calendar project root must be a Path")
+    if as_of is None:
+        as_of = _current_new_york_date()
+    if type(as_of) is not date:
+        raise CalendarError("calendar as_of must be an exact date")
+    expected_digest = _RELEASE_MANIFEST_SHA256.get(as_of.year)
+    if expected_digest is None:
+        raise CalendarError("calendar release coverage is missing")
+    path = (project_root / "data" / "calendars" / f"{as_of.year:04d}.json").resolve()
+    expected_path = (
+        project_root.resolve()
+        / "data"
+        / "calendars"
+        / f"{as_of.year:04d}.json"
+    )
+    if path != expected_path:
+        raise CalendarError("calendar release path is invalid")
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
+        raise CalendarError("calendar release manifest could not be read") from exc
+    if sha256(raw_bytes).hexdigest() != expected_digest:
+        raise CalendarError("calendar release checksum mismatch")
+    calendar = MarketCalendar.load(path, as_of=as_of)
+    _register_calendar_authority(_RELEASE_CALENDARS, calendar)
+    return calendar
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -529,4 +662,7 @@ __all__ = [
     "CalendarSource",
     "MarketCalendar",
     "MarketSession",
+    "is_release_verified_market_calendar",
+    "is_validated_market_calendar",
+    "load_current_market_calendar",
 ]

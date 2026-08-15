@@ -16,6 +16,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Self
 
+from .domain import stable_execution_event_identity
+
 
 APPLICATION_ID = 0x53544B4D
 BUSY_TIMEOUT_MILLISECONDS = 5_000
@@ -1262,14 +1264,10 @@ class Journal:
             raise InvalidJournalValue(
                 "execution event cannot postdate its authoritative message"
             )
-        identity = hashlib.sha256(
-            b"stock-monitor/execution-event/v1\x00"
-            + message_id.encode("utf-8")
-            + b"\x00"
-            + str(action_ordinal).encode("ascii")
-        ).hexdigest()
-        event_id = f"evt_{identity}"
-        idempotency_key = f"message-action:{identity}"
+        event_id, idempotency_key = stable_execution_event_identity(
+            message_id,
+            action_ordinal,
+        )
         immutable = (
             event_id,
             raw_message_id,

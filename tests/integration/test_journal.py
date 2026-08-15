@@ -1801,6 +1801,136 @@ class JournalTests(unittest.TestCase):
             self.assertGreater(posting_id, 0)
             self.assertFalse(duplicate)
 
+    def test_skipped_event_cannot_drive_actual_cash_projection(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-skipped-cash", now, "SKIPPED SPY"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    posting_id, _ = transaction.append_ledger_posting(
+                        posting_key="actual-from-skipped",
+                        ledger_name="ACTUAL",
+                        account_name="CASH",
+                        entry_kind="SALE",
+                        occurred_at=now,
+                        amount_micros=100_000_000,
+                        execution_event_id=event_id,
+                        symbol="SPY",
+                    )
+                    transaction.write_actual_cash_projection(
+                        estimated_settled_cash_micros=5_100_000_000,
+                        user_confirmed_settled_cash_micros=None,
+                        deployed_capital_micros=0,
+                        open_planned_risk_micros=0,
+                        consecutive_losses=0,
+                        weekly_high_water_micros=5_100_000_000,
+                        monthly_high_water_micros=5_100_000_000,
+                        last_ledger_posting_id=posting_id,
+                        updated_at=now,
+                    )
+
+            self.assertEqual(journal.count("ledger_postings"), 0)
+            self.assertEqual(journal.count("actual_cash_projection"), 0)
+
+    def test_actual_ledger_accepts_task7_cash_mutating_event_actions(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        actions = (
+            "BOUGHT",
+            "BUY",
+            "SOLD",
+            "SELL",
+            "STOP_FILLED",
+            "PARTIAL_FILL",
+            "RECONCILE_CASH",
+            "RECONCILE_UNRELATED_POSITION",
+            "FEE",
+        )
+        with Journal.open(self.db_path) as journal:
+            for ordinal, action in enumerate(actions):
+                with self.subTest(action=action):
+                    symbol = None if action in {"RECONCILE_CASH", "FEE"} else "SPY"
+                    raw_id, _ = journal.append_raw_message(
+                        f"msg-actual-{action.lower()}", now, action
+                    )
+                    event_id, _ = journal.append_execution_event(
+                        raw_message_id=raw_id,
+                        action_ordinal=0,
+                        parsed_action=action,
+                        event_time=now,
+                        symbol=symbol,
+                    )
+                    occurred_at = (
+                        now + timedelta(days=1)
+                        if action in {"SOLD", "SELL", "STOP_FILLED"}
+                        else now
+                    )
+                    with journal.transaction() as transaction:
+                        posting_id, duplicate = transaction.append_ledger_posting(
+                            posting_key=f"actual-{ordinal}-{action.lower()}",
+                            ledger_name="ACTUAL",
+                            account_name="CASH",
+                            entry_kind=action,
+                            occurred_at=occurred_at,
+                            amount_micros=0,
+                            execution_event_id=event_id,
+                            symbol=symbol,
+                        )
+                    self.assertGreater(posting_id, 0)
+                    self.assertFalse(duplicate)
+
+            self.assertEqual(journal.count("ledger_postings"), len(actions))
+
+    def test_actual_ledger_rejects_non_cash_mutating_event_actions(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        actions = (
+            "SKIPPED",
+            "ACCOUNT_CHECK",
+            "STOP_UPDATED",
+            "RECONCILE_PENDING_ORDERS",
+            "OPTION_PAPER_WINDOW_START",
+            "OPTION_PAPER_OPEN",
+            "OPTION_PAPER_MARK",
+            "OPTION_PAPER_CLOSE",
+            "PENDING",
+        )
+        with Journal.open(self.db_path) as journal:
+            for ordinal, action in enumerate(actions):
+                with self.subTest(action=action):
+                    raw_id, _ = journal.append_raw_message(
+                        f"msg-noncash-{ordinal}", now, action
+                    )
+                    event_id, _ = journal.append_execution_event(
+                        raw_message_id=raw_id,
+                        action_ordinal=0,
+                        parsed_action=action,
+                        event_time=now,
+                        symbol="SPY",
+                    )
+                    with self.assertRaises(InvalidJournalValue):
+                        with journal.transaction() as transaction:
+                            transaction.append_ledger_posting(
+                                posting_key=f"actual-noncash-{ordinal}",
+                                ledger_name="ACTUAL",
+                                account_name="CASH",
+                                entry_kind="SALE",
+                                occurred_at=now,
+                                amount_micros=100_000_000,
+                                execution_event_id=event_id,
+                                symbol="SPY",
+                            )
+
+            self.assertEqual(journal.count("ledger_postings"), 0)
+
     def test_actual_ledger_posting_enforces_account_check_symbol_and_time(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
         with Journal.open(self.db_path) as journal:

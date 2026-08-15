@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, current_thread
 from unittest.mock import patch
 
 import stock_monitor.journal as journal_module
@@ -489,6 +491,52 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(path) as journal:
                 self.assertEqual(journal.count("schema_migrations"), 1)
 
+    def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with closing(sqlite3.connect(path)) as connection:
+                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                self.assertEqual(mode, ("wal",))
+
+            application_id_read = Event()
+            release_preflight = Event()
+            real_pragma_int = journal_module._pragma_int
+            victim_paused = False
+
+            def pause_after_unowned_read(
+                connection: sqlite3.Connection, name: str
+            ) -> int:
+                nonlocal victim_paused
+                value = real_pragma_int(connection, name)
+                if (
+                    not victim_paused
+                    and current_thread().name.startswith("ownership-victim")
+                    and name == "application_id"
+                ):
+                    victim_paused = True
+                    self.assertEqual(value, 0)
+                    application_id_read.set()
+                    self.assertTrue(release_preflight.wait(timeout=10))
+                return value
+
+            def open_and_count() -> int:
+                with Journal.open(path) as journal:
+                    return journal.count("schema_migrations")
+
+            with patch.object(
+                journal_module, "_pragma_int", side_effect=pause_after_unowned_read
+            ), ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ownership-victim"
+            ) as executor:
+                victim = executor.submit(open_and_count)
+                self.assertTrue(application_id_read.wait(timeout=10))
+                try:
+                    with Journal.open(path) as journal:
+                        self.assertEqual(journal.count("schema_migrations"), 1)
+                finally:
+                    release_preflight.set()
+                self.assertEqual(victim.result(timeout=10), 1)
+
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -915,8 +963,8 @@ class JournalMigrationTests(unittest.TestCase):
                         "ACTUAL",
                         "CASH",
                         "EXECUTION",
-                        1,
                         None,
+                        1,
                         "SPY",
                         -100_000_000,
                         1,
@@ -1396,6 +1444,79 @@ class JournalMigrationTests(unittest.TestCase):
                             event_time,
                         ),
                     )
+
+    def test_actual_ledger_sql_requires_cash_mutating_event_action(self) -> None:
+        instant = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        timestamp = "2026-08-14T14:00:00.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                raw_id, _ = journal.append_raw_message(
+                    "msg-skipped-actual-sql", instant, "SKIPPED SPY"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="SKIPPED",
+                    event_time=instant,
+                    symbol="SPY",
+                )
+
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO ledger_postings("
+                        "posting_key, ledger_name, account_name, entry_kind, "
+                        "execution_event_id, symbol, amount_micros, occurred_at, "
+                        "details_json"
+                        ") VALUES (?, 'ACTUAL', 'CASH', 'SALE', ?, 'SPY', ?, ?, '{}')",
+                        (
+                            "actual-sql-from-skipped",
+                            event_id,
+                            100_000_000,
+                            timestamp,
+                        ),
+                    )
+
+    def test_actual_ledger_event_action_allowlist_matches_sql_trigger(self) -> None:
+        expected = frozenset(
+            {
+                "BOUGHT",
+                "BUY",
+                "FEE",
+                "PARTIAL_FILL",
+                "RECONCILE_CASH",
+                "RECONCILE_UNRELATED_POSITION",
+                "SELL",
+                "SOLD",
+                "STOP_FILLED",
+            }
+        )
+        self.assertEqual(journal_module._ACTUAL_LEDGER_EVENT_ACTIONS, expected)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                row = connection.execute(
+                    "SELECT sql FROM sqlite_schema "
+                    "WHERE type = 'trigger' "
+                    "AND name = 'ledger_postings_validate_actual_origin'"
+                ).fetchone()
+        self.assertIsNotNone(row)
+        trigger_sql = str(row[0])
+        match = re.search(
+            r"event\.parsed_action\s+IN\s*\((?P<actions>.*?)\)",
+            trigger_sql,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        sql_actions = frozenset(re.findall(r"'([A-Z_]+)'", match.group("actions")))
+        self.assertEqual(sql_actions, expected)
 
     def test_controlled_claim_and_scheduled_rows_reject_forbidden_mutations(self) -> None:
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)

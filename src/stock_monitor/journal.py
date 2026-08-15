@@ -21,6 +21,19 @@ APPLICATION_ID = 0x53544B4D
 BUSY_TIMEOUT_MILLISECONDS = 5_000
 REPORT_ID_PATH_PREFIX_LENGTH = 12
 _REPORT_CLAIM_LEASE_SECONDS = 300
+_ACTUAL_LEDGER_EVENT_ACTIONS = frozenset(
+    {
+        "BOUGHT",
+        "BUY",
+        "FEE",
+        "PARTIAL_FILL",
+        "RECONCILE_CASH",
+        "RECONCILE_UNRELATED_POSITION",
+        "SELL",
+        "SOLD",
+        "STOP_FILLED",
+    }
+)
 _POSITION_MUTATING_ACTIONS = frozenset(
     {
         "BOUGHT",
@@ -529,7 +542,7 @@ class Journal:
 
         journal = cls(path, connection, migration_directory)
         try:
-            journal._verify_database_ownership(connection)
+            journal._verify_database_ownership_snapshot(connection)
             journal._configure_connection()
             journal.migrate()
         except BaseException:
@@ -1815,9 +1828,16 @@ class Journal:
             if execution_event_id is not None:
                 origin = _sql(
                     self._connection,
-                    "SELECT symbol, event_time FROM execution_events WHERE id = ?",
+                    "SELECT parsed_action, symbol, event_time "
+                    "FROM execution_events WHERE id = ?",
                     (execution_event_id,),
                 ).fetchone()
+                if origin is not None and str(origin[0]) not in _ACTUAL_LEDGER_EVENT_ACTIONS:
+                    raise InvalidJournalValue(
+                        "ACTUAL ledger posting requires a cash-mutating event origin"
+                    )
+                origin_symbol_index = 1
+                origin_time_index = 2
             else:
                 origin = _sql(
                     self._connection,
@@ -1828,16 +1848,22 @@ class Journal:
                     "WHERE account.id = ?",
                     (account_check_id,),
                 ).fetchone()
+                origin_symbol_index = 0
+                origin_time_index = 1
             if origin is None:
                 raise InvalidJournalValue(
                     "ACTUAL ledger posting origin does not exist"
                 )
-            origin_symbol = str(origin[0]) if origin[0] is not None else None
+            origin_symbol = (
+                str(origin[origin_symbol_index])
+                if origin[origin_symbol_index] is not None
+                else None
+            )
             if symbol != origin_symbol:
                 raise InvalidJournalValue(
                     "ACTUAL ledger posting symbol conflicts with its origin"
                 )
-            if stored_occurred_at < str(origin[1]):
+            if stored_occurred_at < str(origin[origin_time_index]):
                 raise InvalidJournalValue(
                     "ACTUAL ledger posting cannot predate its origin"
                 )
@@ -2407,6 +2433,32 @@ class Journal:
         except sqlite3.Error as error:
             if _is_busy_error(error):
                 raise JournalBusy("journal is busy") from error
+            raise MigrationCorruption(
+                "database ownership could not be verified"
+            ) from error
+
+    def _verify_database_ownership_snapshot(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        try:
+            _sql(connection, "BEGIN")
+        except sqlite3.Error as error:
+            if _is_busy_error(error):
+                raise JournalBusy("journal is busy") from error
+            raise MigrationCorruption(
+                "database ownership could not be verified"
+            ) from error
+        try:
+            self._verify_database_ownership(connection)
+        except BaseException:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        try:
+            connection.rollback()
+        except sqlite3.Error as error:
             raise MigrationCorruption(
                 "database ownership could not be verified"
             ) from error

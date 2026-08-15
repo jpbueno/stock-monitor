@@ -720,6 +720,17 @@ WHEN NEW.ledger_name = 'ACTUAL' AND NOT (
         AND EXISTS (
             SELECT 1 FROM execution_events AS event
             WHERE event.id = NEW.execution_event_id
+              AND event.parsed_action IN (
+                  'BOUGHT',
+                  'BUY',
+                  'FEE',
+                  'PARTIAL_FILL',
+                  'RECONCILE_CASH',
+                  'RECONCILE_UNRELATED_POSITION',
+                  'SELL',
+                  'SOLD',
+                  'STOP_FILLED'
+              )
               AND (
                   NEW.symbol = event.symbol COLLATE BINARY
                   OR (NEW.symbol IS NULL AND event.symbol IS NULL)

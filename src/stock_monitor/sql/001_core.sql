@@ -994,6 +994,99 @@ BEGIN
     SELECT RAISE(ABORT, 'actual_positions rejects conflicting inserts');
 END;
 
+CREATE TRIGGER actual_positions_validate_shape_insert
+AFTER INSERT ON actual_positions
+WHEN typeof(NEW.id) != 'integer'
+  OR NEW.id <= 0
+  OR typeof(NEW.shares) != 'integer'
+  OR NEW.shares < 0
+  OR typeof(NEW.cost_basis_micros) != 'integer'
+  OR NEW.cost_basis_micros < 0
+  OR (NEW.recommended_stop_micros IS NOT NULL AND (
+      typeof(NEW.recommended_stop_micros) != 'integer'
+      OR NEW.recommended_stop_micros <= 0
+  ))
+  OR (NEW.user_confirmed_stop_micros IS NOT NULL AND (
+      typeof(NEW.user_confirmed_stop_micros) != 'integer'
+      OR NEW.user_confirmed_stop_micros <= 0
+  ))
+  OR (NEW.target_micros IS NOT NULL AND (
+      typeof(NEW.target_micros) != 'integer'
+      OR NEW.target_micros <= 0
+  ))
+  OR typeof(NEW.last_execution_event_id) != 'integer'
+  OR NEW.last_execution_event_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+  OR NOT (
+      NEW.shares > 0
+      OR (NEW.cost_basis_micros = 0
+          AND NEW.recommended_stop_micros IS NULL
+          AND NEW.user_confirmed_stop_micros IS NULL
+          AND NEW.target_micros IS NULL)
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'actual_positions row shape is invalid');
+END;
+
+CREATE TRIGGER actual_positions_validate_shape_update
+BEFORE UPDATE ON actual_positions
+WHEN NEW.id != OLD.id
+  OR typeof(NEW.id) != 'integer'
+  OR NEW.id <= 0
+  OR typeof(NEW.shares) != 'integer'
+  OR NEW.shares < 0
+  OR typeof(NEW.cost_basis_micros) != 'integer'
+  OR NEW.cost_basis_micros < 0
+  OR (NEW.recommended_stop_micros IS NOT NULL AND (
+      typeof(NEW.recommended_stop_micros) != 'integer'
+      OR NEW.recommended_stop_micros <= 0
+  ))
+  OR (NEW.user_confirmed_stop_micros IS NOT NULL AND (
+      typeof(NEW.user_confirmed_stop_micros) != 'integer'
+      OR NEW.user_confirmed_stop_micros <= 0
+  ))
+  OR (NEW.target_micros IS NOT NULL AND (
+      typeof(NEW.target_micros) != 'integer'
+      OR NEW.target_micros <= 0
+  ))
+  OR typeof(NEW.last_execution_event_id) != 'integer'
+  OR NEW.last_execution_event_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+  OR NOT (
+      NEW.shares > 0
+      OR (NEW.cost_basis_micros = 0
+          AND NEW.recommended_stop_micros IS NULL
+          AND NEW.user_confirmed_stop_micros IS NULL
+          AND NEW.target_micros IS NULL)
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'actual_positions row shape is invalid');
+END;
+
 CREATE TRIGGER actual_positions_validate_event_insert
 BEFORE INSERT ON actual_positions
 WHEN NEW.revision != 1 OR NOT EXISTS (
@@ -1075,6 +1168,85 @@ BEGIN
     SELECT RAISE(ABORT, 'actual_cash_projection rejects conflicting inserts');
 END;
 
+CREATE TRIGGER actual_cash_projection_validate_shape_insert
+BEFORE INSERT ON actual_cash_projection
+WHEN typeof(NEW.id) != 'integer'
+  OR NEW.id != 1
+  OR typeof(NEW.estimated_settled_cash_micros) != 'integer'
+  OR NEW.estimated_settled_cash_micros < 0
+  OR (NEW.user_confirmed_settled_cash_micros IS NOT NULL AND (
+      typeof(NEW.user_confirmed_settled_cash_micros) != 'integer'
+      OR NEW.user_confirmed_settled_cash_micros < 0
+  ))
+  OR typeof(NEW.deployed_capital_micros) != 'integer'
+  OR NEW.deployed_capital_micros < 0
+  OR typeof(NEW.open_planned_risk_micros) != 'integer'
+  OR NEW.open_planned_risk_micros < 0
+  OR typeof(NEW.consecutive_losses) != 'integer'
+  OR NEW.consecutive_losses < 0
+  OR typeof(NEW.weekly_high_water_micros) != 'integer'
+  OR NEW.weekly_high_water_micros < 0
+  OR typeof(NEW.monthly_high_water_micros) != 'integer'
+  OR NEW.monthly_high_water_micros < 0
+  OR typeof(NEW.last_ledger_posting_id) != 'integer'
+  OR NEW.last_ledger_posting_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'actual_cash_projection row shape is invalid');
+END;
+
+CREATE TRIGGER actual_cash_projection_validate_shape_update
+BEFORE UPDATE ON actual_cash_projection
+WHEN NEW.id != OLD.id
+  OR typeof(NEW.id) != 'integer'
+  OR NEW.id != 1
+  OR typeof(NEW.estimated_settled_cash_micros) != 'integer'
+  OR NEW.estimated_settled_cash_micros < 0
+  OR (NEW.user_confirmed_settled_cash_micros IS NOT NULL AND (
+      typeof(NEW.user_confirmed_settled_cash_micros) != 'integer'
+      OR NEW.user_confirmed_settled_cash_micros < 0
+  ))
+  OR typeof(NEW.deployed_capital_micros) != 'integer'
+  OR NEW.deployed_capital_micros < 0
+  OR typeof(NEW.open_planned_risk_micros) != 'integer'
+  OR NEW.open_planned_risk_micros < 0
+  OR typeof(NEW.consecutive_losses) != 'integer'
+  OR NEW.consecutive_losses < 0
+  OR typeof(NEW.weekly_high_water_micros) != 'integer'
+  OR NEW.weekly_high_water_micros < 0
+  OR typeof(NEW.monthly_high_water_micros) != 'integer'
+  OR NEW.monthly_high_water_micros < 0
+  OR typeof(NEW.last_ledger_posting_id) != 'integer'
+  OR NEW.last_ledger_posting_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'actual_cash_projection row shape is invalid');
+END;
+
 CREATE TRIGGER actual_cash_projection_validate_posting_insert
 BEFORE INSERT ON actual_cash_projection
 WHEN NEW.revision != 1 OR NOT EXISTS (
@@ -1133,6 +1305,65 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'reconciliation_projection rejects conflicting inserts');
+END;
+
+CREATE TRIGGER reconciliation_projection_validate_shape_insert
+BEFORE INSERT ON reconciliation_projection
+WHEN typeof(NEW.id) != 'integer'
+  OR NEW.id != 1
+  OR typeof(NEW.reconciliation_required) != 'integer'
+  OR NEW.reconciliation_required NOT IN (0, 1)
+  OR (NEW.reconciliation_required = 1 AND (
+      NEW.reason IS NULL OR length(NEW.reason) = 0
+  ))
+  OR (NEW.reconciliation_required = 0 AND NEW.reason IS NOT NULL)
+  OR typeof(NEW.last_execution_event_id) != 'integer'
+  OR NEW.last_execution_event_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation_projection row shape is invalid');
+END;
+
+CREATE TRIGGER reconciliation_projection_validate_shape_update
+BEFORE UPDATE ON reconciliation_projection
+WHEN NEW.id != OLD.id
+  OR typeof(NEW.id) != 'integer'
+  OR NEW.id != 1
+  OR typeof(NEW.reconciliation_required) != 'integer'
+  OR NEW.reconciliation_required NOT IN (0, 1)
+  OR (NEW.reconciliation_required = 1 AND (
+      NEW.reason IS NULL OR length(NEW.reason) = 0
+  ))
+  OR (NEW.reconciliation_required = 0 AND NEW.reason IS NOT NULL)
+  OR typeof(NEW.last_execution_event_id) != 'integer'
+  OR NEW.last_execution_event_id <= 0
+  OR NOT (
+      length(NEW.updated_at) = 27
+      AND substr(NEW.updated_at, 1, 19) =
+          strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at)
+      AND substr(NEW.updated_at, 20, 1) = '.'
+      AND substr(NEW.updated_at, 21, 6) NOT GLOB '*[^0-9]*'
+      AND substr(NEW.updated_at, 27, 1) = 'Z'
+      AND CAST(substr(NEW.updated_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999
+      AND CAST(substr(NEW.updated_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+      AND strftime('%Y-%m-%dT%H:%M:%S', NEW.updated_at) IS NOT NULL
+  )
+  OR typeof(NEW.revision) != 'integer'
+  OR NEW.revision <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation_projection row shape is invalid');
 END;
 
 CREATE TRIGGER reconciliation_projection_validate_event_insert

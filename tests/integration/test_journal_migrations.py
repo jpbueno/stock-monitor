@@ -1816,6 +1816,502 @@ class JournalMigrationTests(unittest.TestCase):
                                 else:
                                     connection.execute(delete_sql)
 
+    def test_projection_triggers_reject_id_and_reason_reset_when_checks_ignored(
+        self,
+    ) -> None:
+        updated_at = datetime(2026, 8, 14, 14, 0, 20, tzinfo=timezone.utc)
+        stored_updated_at = "2026-08-14T14:00:20.000000Z"
+        for recursive_triggers in (0, 1):
+            for table in ("actual_cash_projection", "reconciliation_projection"):
+                with self.subTest(
+                    table=table, recursive_triggers=recursive_triggers
+                ), tempfile.TemporaryDirectory() as temporary_directory:
+                    path = Path(temporary_directory) / "journal.db"
+                    event_ids, posting_ids, _, _ = self._seed_projection_chronology(
+                        path
+                    )
+                    with closing(
+                        sqlite3.connect(path, isolation_level=None)
+                    ) as connection:
+                        connection.execute("PRAGMA foreign_keys = ON")
+                        connection.execute(
+                            f"PRAGMA recursive_triggers = {recursive_triggers}"
+                        )
+                        connection.execute("PRAGMA ignore_check_constraints = ON")
+                        connection.create_function(
+                            "journal_projection_write_allowed", 0, lambda: 1
+                        )
+                        connection.execute("BEGIN IMMEDIATE")
+                        try:
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                if table == "actual_cash_projection":
+                                    connection.execute(
+                                        "UPDATE actual_cash_projection SET id = 2, "
+                                        "estimated_settled_cash_micros = 5100000000, "
+                                        "weekly_high_water_micros = 5100000000, "
+                                        "monthly_high_water_micros = 5100000000, "
+                                        "last_ledger_posting_id = ?, updated_at = ?, "
+                                        "revision = 2 WHERE id = 1",
+                                        (posting_ids[2], stored_updated_at),
+                                    )
+                                    connection.execute(
+                                        "INSERT OR REPLACE INTO "
+                                        "actual_cash_projection VALUES "
+                                        "(1, 5000000000, NULL, 0, 0, 0, "
+                                        "5000000000, 5000000000, ?, ?, 1)",
+                                        (posting_ids[0], stored_updated_at),
+                                    )
+                                else:
+                                    connection.execute(
+                                        "UPDATE reconciliation_projection SET "
+                                        "id = 2, reason = '', "
+                                        "last_execution_event_id = ?, "
+                                        "updated_at = ?, revision = 2 WHERE id = 1",
+                                        (event_ids[2], stored_updated_at),
+                                    )
+                                    connection.execute(
+                                        "INSERT OR REPLACE INTO "
+                                        "reconciliation_projection VALUES "
+                                        "(1, 1, 'INITIAL', ?, ?, 1)",
+                                        (event_ids[0], stored_updated_at),
+                                    )
+                        finally:
+                            if connection.in_transaction:
+                                connection.rollback()
+
+                    with Journal.open(path) as journal:
+                        with journal.transaction() as transaction:
+                            self.assertEqual(
+                                transaction.write_actual_cash_projection(
+                                    estimated_settled_cash_micros=5_000_000_000,
+                                    user_confirmed_settled_cash_micros=None,
+                                    deployed_capital_micros=0,
+                                    open_planned_risk_micros=0,
+                                    consecutive_losses=0,
+                                    weekly_high_water_micros=5_000_000_000,
+                                    monthly_high_water_micros=5_000_000_000,
+                                    last_ledger_posting_id=posting_ids[0],
+                                    updated_at=updated_at,
+                                ),
+                                1,
+                            )
+                            self.assertEqual(
+                                transaction.write_reconciliation_projection(
+                                    reconciliation_required=True,
+                                    reason="INITIAL",
+                                    last_execution_event_id=event_ids[0],
+                                    updated_at=updated_at,
+                                ),
+                                1,
+                            )
+                        self.assertEqual(journal.count(table), 1)
+
+    def test_projection_insert_triggers_mirror_check_invariants_when_ignored(
+        self,
+    ) -> None:
+        stored_updated_at = "2026-08-14T14:00:20.000000Z"
+        updated_at = datetime(2026, 8, 14, 14, 0, 20, tzinfo=timezone.utc)
+        position_sql = (
+            "INSERT INTO actual_positions("
+            "id, signal_id, symbol, shares, cost_basis_micros, "
+            "recommended_stop_micros, user_confirmed_stop_micros, "
+            "target_micros, last_execution_event_id, updated_at, revision"
+            ") VALUES (:id, :signal_id, :symbol, :shares, :cost_basis, "
+            ":recommended_stop, :confirmed_stop, :target, :source_id, "
+            ":updated_at, :revision)"
+        )
+        cash_sql = (
+            "INSERT INTO actual_cash_projection VALUES "
+            "(:id, :estimated, :confirmed, :deployed, :risk, :losses, "
+            ":weekly, :monthly, :source_id, :updated_at, :revision)"
+        )
+        reconciliation_sql = (
+            "INSERT INTO reconciliation_projection VALUES "
+            "(:id, :required, :reason, :source_id, :updated_at, :revision)"
+        )
+        for recursive_triggers in (0, 1):
+            with self.subTest(
+                control="recursive-mode", recursive_triggers=recursive_triggers
+            ), tempfile.TemporaryDirectory() as temporary_directory:
+                path = Path(temporary_directory) / "journal.db"
+                event_ids, posting_ids, _, _ = self._seed_projection_chronology(
+                    path, include_projections=False
+                )
+                position = {
+                    "id": 1,
+                    "signal_id": "signal-sql-chronology",
+                    "symbol": "SPY",
+                    "shares": 2,
+                    "cost_basis": 200_000_000,
+                    "recommended_stop": None,
+                    "confirmed_stop": None,
+                    "target": None,
+                    "source_id": event_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 1,
+                }
+                cash = {
+                    "id": 1,
+                    "estimated": 5_100_000_000,
+                    "confirmed": None,
+                    "deployed": 0,
+                    "risk": 0,
+                    "losses": 0,
+                    "weekly": 5_100_000_000,
+                    "monthly": 5_100_000_000,
+                    "source_id": posting_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 1,
+                }
+                reconciliation = {
+                    "id": 1,
+                    "required": 1,
+                    "reason": "VALID",
+                    "source_id": event_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 1,
+                }
+                cases = {
+                    "actual_positions": (
+                        position_sql,
+                        position,
+                        {
+                            "id": {"id": 0},
+                            "shares": {"shares": -1},
+                            "cost_basis": {"cost_basis": -1},
+                            "recommended_stop": {"recommended_stop": 0},
+                            "confirmed_stop": {"confirmed_stop": 0},
+                            "target": {"target": 0},
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                            "closed_position": {"shares": 0},
+                        },
+                    ),
+                    "actual_cash_projection": (
+                        cash_sql,
+                        cash,
+                        {
+                            "id": {"id": 0},
+                            "estimated": {"estimated": -1},
+                            "confirmed": {"confirmed": -1},
+                            "deployed": {"deployed": -1},
+                            "risk": {"risk": -1},
+                            "losses": {"losses": -1},
+                            "weekly": {"weekly": -1},
+                            "monthly": {"monthly": -1},
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                        },
+                    ),
+                    "reconciliation_projection": (
+                        reconciliation_sql,
+                        reconciliation,
+                        {
+                            "id": {"id": 0},
+                            "required": {"required": 2},
+                            "active_reason_absent": {"reason": None},
+                            "active_reason_empty": {"reason": ""},
+                            "clear_reason_present": {
+                                "required": 0,
+                                "reason": "NOT CLEAR",
+                            },
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                        },
+                    ),
+                }
+                with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute(
+                        f"PRAGMA recursive_triggers = {recursive_triggers}"
+                    )
+                    connection.execute("PRAGMA ignore_check_constraints = ON")
+                    connection.create_function(
+                        "journal_projection_write_allowed", 0, lambda: 1
+                    )
+                    for table, (statement, valid, invalid_cases) in cases.items():
+                        for case, overrides in invalid_cases.items():
+                            with self.subTest(
+                                table=table,
+                                case=case,
+                                recursive_triggers=recursive_triggers,
+                            ):
+                                values = dict(valid)
+                                values.update(overrides)
+                                connection.execute("SAVEPOINT invalid_projection")
+                                try:
+                                    with self.assertRaises(sqlite3.IntegrityError):
+                                        connection.execute(statement, values)
+                                finally:
+                                    connection.execute(
+                                        "ROLLBACK TO SAVEPOINT invalid_projection"
+                                    )
+                                    connection.execute(
+                                        "RELEASE SAVEPOINT invalid_projection"
+                                    )
+                    connection.execute(position_sql, position)
+                    connection.execute(cash_sql, cash)
+                    connection.execute(reconciliation_sql, reconciliation)
+
+                with Journal.open(path) as journal:
+                    with journal.transaction() as transaction:
+                        self.assertEqual(
+                            transaction.write_actual_position(
+                                signal_id="signal-sql-chronology",
+                                symbol="SPY",
+                                shares=2,
+                                cost_basis_micros=200_000_000,
+                                recommended_stop_micros=None,
+                                user_confirmed_stop_micros=None,
+                                target_micros=None,
+                                last_execution_event_id=event_ids[2],
+                                updated_at=updated_at,
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            transaction.write_actual_cash_projection(
+                                estimated_settled_cash_micros=5_100_000_000,
+                                user_confirmed_settled_cash_micros=None,
+                                deployed_capital_micros=0,
+                                open_planned_risk_micros=0,
+                                consecutive_losses=0,
+                                weekly_high_water_micros=5_100_000_000,
+                                monthly_high_water_micros=5_100_000_000,
+                                last_ledger_posting_id=posting_ids[2],
+                                updated_at=updated_at,
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            transaction.write_reconciliation_projection(
+                                reconciliation_required=True,
+                                reason="VALID",
+                                last_execution_event_id=event_ids[2],
+                                updated_at=updated_at,
+                            ),
+                            1,
+                        )
+
+    def test_projection_update_triggers_mirror_check_invariants_when_ignored(
+        self,
+    ) -> None:
+        stored_updated_at = "2026-08-14T14:00:20.000000Z"
+        updated_at = datetime(2026, 8, 14, 14, 0, 20, tzinfo=timezone.utc)
+        clear_at = datetime(2026, 8, 14, 14, 0, 21, tzinfo=timezone.utc)
+        stored_clear_at = "2026-08-14T14:00:21.000000Z"
+        position_sql = (
+            "UPDATE actual_positions SET id = :id, shares = :shares, "
+            "cost_basis_micros = :cost_basis, "
+            "recommended_stop_micros = :recommended_stop, "
+            "user_confirmed_stop_micros = :confirmed_stop, "
+            "target_micros = :target, last_execution_event_id = :source_id, "
+            "updated_at = :updated_at, revision = :revision "
+            "WHERE signal_id = 'signal-sql-chronology'"
+        )
+        cash_sql = (
+            "UPDATE actual_cash_projection SET id = :id, "
+            "estimated_settled_cash_micros = :estimated, "
+            "user_confirmed_settled_cash_micros = :confirmed, "
+            "deployed_capital_micros = :deployed, "
+            "open_planned_risk_micros = :risk, consecutive_losses = :losses, "
+            "weekly_high_water_micros = :weekly, "
+            "monthly_high_water_micros = :monthly, "
+            "last_ledger_posting_id = :source_id, updated_at = :updated_at, "
+            "revision = :revision WHERE id = 1"
+        )
+        reconciliation_sql = (
+            "UPDATE reconciliation_projection SET id = :id, "
+            "reconciliation_required = :required, reason = :reason, "
+            "last_execution_event_id = :source_id, updated_at = :updated_at, "
+            "revision = :revision WHERE id = 1"
+        )
+        for recursive_triggers in (0, 1):
+            with self.subTest(
+                control="recursive-mode", recursive_triggers=recursive_triggers
+            ), tempfile.TemporaryDirectory() as temporary_directory:
+                path = Path(temporary_directory) / "journal.db"
+                event_ids, posting_ids, _, _ = self._seed_projection_chronology(path)
+                with Journal.open(path) as journal:
+                    raw_id, _ = journal.append_raw_message(
+                        f"msg-sql-projection-clear-{recursive_triggers}",
+                        clear_at,
+                        "ACCOUNT CHECK CLEAR",
+                    )
+                    clear_event_id, _ = journal.append_execution_event(
+                        raw_message_id=raw_id,
+                        action_ordinal=0,
+                        parsed_action="ACCOUNT_CHECK",
+                        event_time=clear_at,
+                        reconciliation_state="CLEAR",
+                    )
+                position = {
+                    "id": 1,
+                    "shares": 2,
+                    "cost_basis": 200_000_000,
+                    "recommended_stop": None,
+                    "confirmed_stop": None,
+                    "target": None,
+                    "source_id": event_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 2,
+                }
+                cash = {
+                    "id": 1,
+                    "estimated": 5_100_000_000,
+                    "confirmed": None,
+                    "deployed": 0,
+                    "risk": 0,
+                    "losses": 0,
+                    "weekly": 5_100_000_000,
+                    "monthly": 5_100_000_000,
+                    "source_id": posting_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 2,
+                }
+                reconciliation = {
+                    "id": 1,
+                    "required": 1,
+                    "reason": "UPDATED",
+                    "source_id": event_ids[2],
+                    "updated_at": stored_updated_at,
+                    "revision": 2,
+                }
+                cases = {
+                    "actual_positions": (
+                        position_sql,
+                        position,
+                        {
+                            "id": {"id": 0},
+                            "shares": {"shares": -1},
+                            "cost_basis": {"cost_basis": -1},
+                            "recommended_stop": {"recommended_stop": 0},
+                            "confirmed_stop": {"confirmed_stop": 0},
+                            "target": {"target": 0},
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                            "closed_position": {"shares": 0},
+                        },
+                    ),
+                    "actual_cash_projection": (
+                        cash_sql,
+                        cash,
+                        {
+                            "id": {"id": 2},
+                            "estimated": {"estimated": -1},
+                            "confirmed": {"confirmed": -1},
+                            "deployed": {"deployed": -1},
+                            "risk": {"risk": -1},
+                            "losses": {"losses": -1},
+                            "weekly": {"weekly": -1},
+                            "monthly": {"monthly": -1},
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                        },
+                    ),
+                    "reconciliation_projection": (
+                        reconciliation_sql,
+                        reconciliation,
+                        {
+                            "id": {"id": 2},
+                            "required": {"required": 2},
+                            "active_reason_absent": {"reason": None},
+                            "active_reason_empty": {"reason": ""},
+                            "source_id": {"source_id": 0},
+                            "timestamp": {"updated_at": "not-a-timestamp"},
+                            "revision": {"revision": 0},
+                        },
+                    ),
+                }
+                with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute(
+                        f"PRAGMA recursive_triggers = {recursive_triggers}"
+                    )
+                    connection.execute("PRAGMA ignore_check_constraints = ON")
+                    connection.create_function(
+                        "journal_projection_write_allowed", 0, lambda: 1
+                    )
+                    for table, (statement, valid, invalid_cases) in cases.items():
+                        for case, overrides in invalid_cases.items():
+                            with self.subTest(
+                                table=table,
+                                case=case,
+                                recursive_triggers=recursive_triggers,
+                            ):
+                                values = dict(valid)
+                                values.update(overrides)
+                                connection.execute("SAVEPOINT invalid_projection")
+                                try:
+                                    with self.assertRaises(sqlite3.IntegrityError):
+                                        connection.execute(statement, values)
+                                finally:
+                                    connection.execute(
+                                        "ROLLBACK TO SAVEPOINT invalid_projection"
+                                    )
+                                    connection.execute(
+                                        "RELEASE SAVEPOINT invalid_projection"
+                                    )
+                    connection.execute(position_sql, position)
+                    connection.execute(cash_sql, cash)
+                    connection.execute(reconciliation_sql, reconciliation)
+                    connection.execute(
+                        reconciliation_sql,
+                        {
+                            "id": 1,
+                            "required": 0,
+                            "reason": None,
+                            "source_id": clear_event_id,
+                            "updated_at": stored_clear_at,
+                            "revision": 3,
+                        },
+                    )
+
+                with Journal.open(path) as journal:
+                    with journal.transaction() as transaction:
+                        self.assertEqual(
+                            transaction.write_actual_position(
+                                signal_id="signal-sql-chronology",
+                                symbol="SPY",
+                                shares=2,
+                                cost_basis_micros=200_000_000,
+                                recommended_stop_micros=None,
+                                user_confirmed_stop_micros=None,
+                                target_micros=None,
+                                last_execution_event_id=event_ids[2],
+                                updated_at=updated_at,
+                            ),
+                            2,
+                        )
+                        self.assertEqual(
+                            transaction.write_actual_cash_projection(
+                                estimated_settled_cash_micros=5_100_000_000,
+                                user_confirmed_settled_cash_micros=None,
+                                deployed_capital_micros=0,
+                                open_planned_risk_micros=0,
+                                consecutive_losses=0,
+                                weekly_high_water_micros=5_100_000_000,
+                                monthly_high_water_micros=5_100_000_000,
+                                last_ledger_posting_id=posting_ids[2],
+                                updated_at=updated_at,
+                            ),
+                            2,
+                        )
+                        self.assertEqual(
+                            transaction.write_reconciliation_projection(
+                                reconciliation_required=False,
+                                reason=None,
+                                last_execution_event_id=clear_event_id,
+                                updated_at=clear_at,
+                            ),
+                            3,
+                        )
+
     def test_actual_ledger_sql_requires_cash_mutating_event_action(self) -> None:
         instant = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
         timestamp = "2026-08-14T14:00:00.000000Z"

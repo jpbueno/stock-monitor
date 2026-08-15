@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import sqlite3
 import tempfile
@@ -20,6 +21,7 @@ from stock_monitor.journal import (
     Journal,
     JournalBusy,
     JournalError,
+    MigrationCorruption,
     report_archive_relative_path,
     stable_report_id,
 )
@@ -150,6 +152,106 @@ class JournalTests(unittest.TestCase):
                     "msg-after-commit", at, "SKIPPED SPY"
                 )
             self.assertEqual(journal.count("raw_messages"), 0)
+
+    def test_close_during_transaction_raises_domain_error_and_unwinds_safely(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        journal = Journal.open(self.db_path)
+
+        with self.assertRaises(JournalError):
+            with journal.transaction() as transaction:
+                transaction.append_raw_message(
+                    "msg-close-rollback", now, "SKIPPED SPY"
+                )
+                journal.close()
+
+        self.assertEqual(journal.count("raw_messages"), 0)
+        journal.append_raw_message("msg-after-close-rejection", now, "SKIPPED QQQ")
+        journal.close()
+        journal.close()
+
+        with Journal.open(self.db_path) as reopened:
+            self.assertEqual(reopened.count("raw_messages"), 1)
+
+    def test_caught_close_error_leaves_active_transaction_usable(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            with journal.transaction() as transaction:
+                transaction.append_raw_message(
+                    "msg-before-close-rejection", now, "SKIPPED SPY"
+                )
+                with self.assertRaises(JournalError):
+                    journal.close()
+                transaction.append_raw_message(
+                    "msg-after-close-rejection", now, "SKIPPED QQQ"
+                )
+
+            self.assertEqual(journal.count("raw_messages"), 2)
+
+    def test_public_transaction_convenience_signatures_are_explicit_and_typed(
+        self,
+    ) -> None:
+        method_names = (
+            "append_execution_event",
+            "append_source_observation",
+            "finalize_report",
+            "append_outbox",
+            "record_outbox_delivery_attempt",
+            "start_scheduled_run",
+            "complete_scheduled_run",
+            "append_account_check",
+        )
+        for method_name in method_names:
+            with self.subTest(method=method_name):
+                journal_signature = inspect.signature(getattr(Journal, method_name))
+                transaction_signature = inspect.signature(
+                    getattr(journal_module.JournalTransaction, method_name)
+                )
+                journal_parameters = tuple(journal_signature.parameters.values())[1:]
+                transaction_parameters = tuple(
+                    transaction_signature.parameters.values()
+                )[1:]
+                self.assertEqual(journal_parameters, transaction_parameters)
+                self.assertEqual(
+                    journal_signature.return_annotation,
+                    transaction_signature.return_annotation,
+                )
+                self.assertNotIn(
+                    inspect.Parameter.VAR_KEYWORD,
+                    {parameter.kind for parameter in journal_parameters},
+                )
+
+    def test_invalid_public_wrapper_arguments_fail_before_opening_transaction(
+        self,
+    ) -> None:
+        with Journal.open(self.db_path) as journal, patch.object(
+            journal, "transaction"
+        ) as transaction:
+            with self.assertRaises(TypeError):
+                journal.append_outbox()
+            with self.assertRaises(TypeError):
+                journal.append_outbox(unknown="value")  # type: ignore[call-arg]
+            with self.assertRaises(TypeError):
+                journal.append_outbox({})  # type: ignore[arg-type]
+            transaction.assert_not_called()
+
+    def test_explicit_public_wrapper_accepts_a_keyword_mapping(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-wrapper-mapping", now, "SKIPPED SPY"
+            )
+            values = {
+                "raw_message_id": raw_id,
+                "action_ordinal": 0,
+                "parsed_action": "SKIPPED",
+                "event_time": now,
+                "symbol": "SPY",
+            }
+            event_id, duplicate = journal.append_execution_event(**values)
+
+            self.assertGreater(event_id, 0)
+            self.assertFalse(duplicate)
+            self.assertEqual(journal.count("execution_events"), 1)
 
     def test_execution_events_use_stable_zero_based_action_ordinals(self) -> None:
         at = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
@@ -549,7 +651,7 @@ class JournalTests(unittest.TestCase):
             clock.return_value = now + timedelta(seconds=301)
             with self.assertRaises(IdempotencyConflict):
                 journal.finalize_report(
-                    **values, created_at=now - timedelta(microseconds=1)
+                    **values, created_at=now
                 )
 
             recovered = journal.claim_report(session_date, "CLOSE")
@@ -649,6 +751,51 @@ class JournalTests(unittest.TestCase):
                     outbox_payload="close",
                 )
 
+    def test_report_cannot_predate_its_original_claim(self) -> None:
+        session_date = date(2026, 8, 14)
+        claim_time = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        with patch.object(
+            journal_module, "_utc_now", return_value=claim_time
+        ) as clock, Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
+            assert claim.claim_token is not None
+            clock.return_value = claim_time + timedelta(seconds=1)
+
+            with self.assertRaises(InvalidJournalValue):
+                journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Close\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(),
+                    archive_relative_path=report_archive_relative_path(
+                        "CLOSE", session_date, report_id
+                    ),
+                    created_at=claim_time - timedelta(microseconds=1),
+                    outbox_destination="CODEX_TASK",
+                    outbox_payload="close",
+                )
+
+            self.assertEqual(journal.count("reports"), 0)
+            self.assertEqual(journal.count("outbox"), 0)
+
+            finalized = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=(),
+                archive_relative_path=report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                ),
+                created_at=claim_time,
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+            self.assertFalse(finalized.duplicate)
+
     def test_report_finalization_atomically_pins_observations_and_outbox(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
@@ -664,7 +811,9 @@ class JournalTests(unittest.TestCase):
             "delay_seconds": None,
             "health_result": "OK",
         }
-        with Journal.open(self.db_path) as journal:
+        with patch.object(
+            journal_module, "_utc_now", return_value=now + timedelta(seconds=1)
+        ), Journal.open(self.db_path) as journal:
             first_observation, _ = journal.append_source_observation(
                 **observation_values
             )
@@ -960,7 +1109,7 @@ class JournalTests(unittest.TestCase):
                 state_sha256=state_sha256,
                 observation_ids=(observation_id,),
                 archive_relative_path=archive_path,
-                created_at=now,
+                created_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -1062,7 +1211,7 @@ class JournalTests(unittest.TestCase):
                 archive_relative_path=report_archive_relative_path(
                     "CLOSE", session_date, report_id
                 ),
-                created_at=now,
+                created_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -1189,6 +1338,183 @@ class JournalTests(unittest.TestCase):
                 external_delivery_id="delivery-restart",
             )
             self.assertEqual(journal.pending_outbox(), ())
+
+    def test_pending_outbox_validates_report_and_event_origins_before_return(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        finalized_at = now + timedelta(seconds=1)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        with patch.object(journal_module, "_utc_now", return_value=now) as clock, Journal.open(
+            self.db_path
+        ) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
+            assert claim.claim_token is not None
+            clock.return_value = finalized_at
+            report = journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=(),
+                archive_relative_path=report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                ),
+                created_at=finalized_at,
+                outbox_destination="CODEX_TASK",
+                outbox_payload="report pending",
+            )
+            raw_id, _ = journal.append_raw_message(
+                "msg-valid-pending", now, "SKIPPED SPY"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+            event_outbox_id, _ = journal.append_outbox(
+                idempotency_key="valid-unicode-pending",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="recorded ✓",
+                created_at=finalized_at,
+            )
+            with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
+                empty_payload_cursor = connection.execute(
+                    "INSERT INTO outbox("
+                    "idempotency_key, origin_report_id, origin_execution_event_id, "
+                    "destination, payload_text, payload_sha256, created_at"
+                    ") VALUES (?, NULL, ?, ?, '', ?, ?)",
+                    (
+                        "valid-empty-pending",
+                        event_id,
+                        "AUDIT_EXPORT",
+                        hashlib.sha256(b"").hexdigest(),
+                        "2026-08-14T14:00:01.000000Z",
+                    ),
+                )
+                empty_payload_outbox_id = int(empty_payload_cursor.lastrowid)
+
+            pending = journal.pending_outbox()
+            self.assertEqual(
+                {item.outbox_id for item in pending},
+                {report.outbox_id, event_outbox_id, empty_payload_outbox_id},
+            )
+            self.assertEqual(
+                {item.origin_report_id for item in pending if item.origin_report_id},
+                {report.report_row_id},
+            )
+            self.assertEqual(
+                {
+                    item.origin_execution_event_id
+                    for item in pending
+                    if item.origin_execution_event_id
+                },
+                {event_id},
+            )
+
+    def test_pending_outbox_rejects_payload_hash_corruption_without_exposure(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        timestamp = "2026-08-14T14:00:00.000000Z"
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-corrupt-pending", now, "SKIPPED SPY"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+            valid_id, _ = journal.append_outbox(
+                idempotency_key="valid-before-corrupt",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="safe",
+                created_at=now,
+            )
+            with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
+                connection.execute(
+                    "INSERT INTO outbox("
+                    "idempotency_key, origin_report_id, origin_execution_event_id, "
+                    "destination, payload_text, payload_sha256, created_at"
+                    ") VALUES (?, NULL, ?, ?, ?, ?, ?)",
+                    (
+                        "corrupt-after-valid",
+                        event_id,
+                        "AUDIT_EXPORT",
+                        "do not expose",
+                        "0" * 64,
+                        timestamp,
+                    ),
+                )
+
+            with self.assertRaises(MigrationCorruption):
+                journal.pending_outbox()
+            self.assertGreater(valid_id, 0)
+
+    def test_pending_outbox_rejects_orphaned_origin_without_exposure(self) -> None:
+        payload = "orphaned"
+        with Journal.open(self.db_path) as journal:
+            with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute(
+                    "INSERT INTO outbox("
+                    "idempotency_key, origin_report_id, origin_execution_event_id, "
+                    "destination, payload_text, payload_sha256, created_at"
+                    ") VALUES (?, NULL, ?, ?, ?, ?, ?)",
+                    (
+                        "orphaned-pending",
+                        999_999,
+                        "CODEX_TASK",
+                        payload,
+                        hashlib.sha256(payload.encode()).hexdigest(),
+                        "2026-08-14T14:00:00.000000Z",
+                    ),
+                )
+
+            with self.assertRaises(MigrationCorruption):
+                journal.pending_outbox()
+
+    def test_pending_outbox_rejects_invalid_origin_shape_even_if_checks_are_ignored(
+        self,
+    ) -> None:
+        payload = "invalid origin shape"
+        payload_sha256 = hashlib.sha256(payload.encode()).hexdigest()
+        for suffix, report_origin, event_origin in (
+            ("neither", None, None),
+            ("both", 1, 1),
+        ):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "journal.db"
+                with Journal.open(path) as journal:
+                    with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                        connection.execute("PRAGMA foreign_keys = OFF")
+                        connection.execute("PRAGMA ignore_check_constraints = ON")
+                        connection.execute(
+                            "INSERT INTO outbox("
+                            "idempotency_key, origin_report_id, "
+                            "origin_execution_event_id, destination, payload_text, "
+                            "payload_sha256, created_at"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                f"invalid-origin-{suffix}",
+                                report_origin,
+                                event_origin,
+                                "CODEX_TASK",
+                                payload,
+                                payload_sha256,
+                                "2026-08-14T14:00:00.000000Z",
+                            ),
+                        )
+
+                    with self.assertRaises(MigrationCorruption):
+                        journal.pending_outbox()
 
     def test_outbox_attempts_are_contiguous_well_formed_and_terminal(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
@@ -1416,10 +1742,11 @@ class JournalTests(unittest.TestCase):
             "CLOSE", session_date, report_id
         )
         with patch.object(
-            journal_module, "_utc_now", return_value=finalized_at
-        ), Journal.open(self.db_path) as journal:
+            journal_module, "_utc_now", return_value=now
+        ) as clock, Journal.open(self.db_path) as journal:
             claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
+            clock.return_value = finalized_at
             report = journal.finalize_report(
                 claim_id=claim.claim_id,
                 claim_token=claim.claim_token,
@@ -1703,6 +2030,217 @@ class JournalTests(unittest.TestCase):
                         last_execution_event_id=second_event_id,
                         updated_at=now,
                     )
+
+    def test_actual_position_source_and_update_chronology_never_regress(self) -> None:
+        base = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        source_time = base + timedelta(seconds=10)
+        delayed_time = base + timedelta(seconds=5)
+        updated_at = base + timedelta(seconds=20)
+        with Journal.open(self.db_path) as journal:
+            event_ids: list[int] = []
+            for suffix, event_time in (
+                ("initial", source_time),
+                ("delayed", delayed_time),
+                ("equal-time", source_time),
+            ):
+                raw_id, _ = journal.append_raw_message(
+                    f"msg-position-{suffix}", event_time, "BOUGHT SPY"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="BOUGHT",
+                    event_time=event_time,
+                    signal_id="signal-position-time",
+                    symbol="SPY",
+                    shares=1,
+                )
+                event_ids.append(event_id)
+
+            def write_position(
+                event_id: int, *, shares: int, projection_time: datetime
+            ) -> int:
+                with journal.transaction() as transaction:
+                    return transaction.write_actual_position(
+                        signal_id="signal-position-time",
+                        symbol="SPY",
+                        shares=shares,
+                        cost_basis_micros=shares * 100_000_000,
+                        recommended_stop_micros=None,
+                        user_confirmed_stop_micros=None,
+                        target_micros=None,
+                        last_execution_event_id=event_id,
+                        updated_at=projection_time,
+                    )
+
+            with self.assertRaises(InvalidJournalValue):
+                write_position(
+                    event_ids[0], shares=1, projection_time=source_time - timedelta(microseconds=1)
+                )
+            self.assertEqual(
+                write_position(event_ids[0], shares=1, projection_time=updated_at), 1
+            )
+            with self.assertRaises(IdempotencyConflict):
+                write_position(
+                    event_ids[1], shares=2, projection_time=updated_at + timedelta(seconds=1)
+                )
+            with self.assertRaises(IdempotencyConflict):
+                write_position(
+                    event_ids[2], shares=2, projection_time=updated_at - timedelta(microseconds=1)
+                )
+            self.assertEqual(
+                write_position(event_ids[2], shares=2, projection_time=updated_at), 2
+            )
+            self.assertEqual(
+                write_position(event_ids[2], shares=2, projection_time=updated_at), 2
+            )
+
+    def test_actual_cash_source_and_update_chronology_never_regress(self) -> None:
+        base = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        source_time = base + timedelta(seconds=10)
+        delayed_time = base + timedelta(seconds=5)
+        updated_at = base + timedelta(seconds=20)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-cash-chronology", base, "RECONCILE CASH"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="RECONCILE_CASH",
+                event_time=base,
+                reconciliation_state="CLEAR",
+            )
+            posting_ids: list[int] = []
+            with journal.transaction() as transaction:
+                for suffix, occurred_at in (
+                    ("initial", source_time),
+                    ("delayed", delayed_time),
+                    ("equal-time", source_time),
+                ):
+                    posting_id, _ = transaction.append_ledger_posting(
+                        posting_key=f"cash-chronology-{suffix}",
+                        ledger_name="ACTUAL",
+                        account_name="CASH",
+                        entry_kind="RECONCILIATION",
+                        occurred_at=occurred_at,
+                        amount_micros=0,
+                        execution_event_id=event_id,
+                    )
+                    posting_ids.append(posting_id)
+
+            def write_cash(
+                posting_id: int, *, cash: int, projection_time: datetime
+            ) -> int:
+                with journal.transaction() as transaction:
+                    return transaction.write_actual_cash_projection(
+                        estimated_settled_cash_micros=cash,
+                        user_confirmed_settled_cash_micros=None,
+                        deployed_capital_micros=0,
+                        open_planned_risk_micros=0,
+                        consecutive_losses=0,
+                        weekly_high_water_micros=cash,
+                        monthly_high_water_micros=cash,
+                        last_ledger_posting_id=posting_id,
+                        updated_at=projection_time,
+                    )
+
+            self.assertEqual(
+                write_cash(posting_ids[0], cash=5_000_000_000, projection_time=updated_at),
+                1,
+            )
+            with self.assertRaises(IdempotencyConflict):
+                write_cash(
+                    posting_ids[1],
+                    cash=5_100_000_000,
+                    projection_time=updated_at + timedelta(seconds=1),
+                )
+            with self.assertRaises(IdempotencyConflict):
+                write_cash(
+                    posting_ids[2],
+                    cash=5_100_000_000,
+                    projection_time=updated_at - timedelta(microseconds=1),
+                )
+            self.assertEqual(
+                write_cash(posting_ids[2], cash=5_100_000_000, projection_time=updated_at),
+                2,
+            )
+            self.assertEqual(
+                write_cash(posting_ids[2], cash=5_100_000_000, projection_time=updated_at),
+                2,
+            )
+
+    def test_reconciliation_source_and_update_chronology_never_regress(self) -> None:
+        base = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        source_time = base + timedelta(seconds=10)
+        delayed_time = base + timedelta(seconds=5)
+        updated_at = base + timedelta(seconds=20)
+        with Journal.open(self.db_path) as journal:
+            event_ids: list[int] = []
+            for suffix, event_time in (
+                ("initial", source_time),
+                ("delayed", delayed_time),
+                ("equal-time", source_time),
+            ):
+                raw_id, _ = journal.append_raw_message(
+                    f"msg-reconciliation-{suffix}", event_time, "RECONCILE CASH"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="RECONCILE_CASH",
+                    event_time=event_time,
+                    reconciliation_state="REQUIRED",
+                )
+                event_ids.append(event_id)
+
+            def write_reconciliation(
+                event_id: int, *, reason: str, projection_time: datetime
+            ) -> int:
+                with journal.transaction() as transaction:
+                    return transaction.write_reconciliation_projection(
+                        reconciliation_required=True,
+                        reason=reason,
+                        last_execution_event_id=event_id,
+                        updated_at=projection_time,
+                    )
+
+            with self.assertRaises(InvalidJournalValue):
+                write_reconciliation(
+                    event_ids[0],
+                    reason="INITIAL",
+                    projection_time=source_time - timedelta(microseconds=1),
+                )
+            self.assertEqual(
+                write_reconciliation(
+                    event_ids[0], reason="INITIAL", projection_time=updated_at
+                ),
+                1,
+            )
+            with self.assertRaises(IdempotencyConflict):
+                write_reconciliation(
+                    event_ids[1],
+                    reason="DELAYED",
+                    projection_time=updated_at + timedelta(seconds=1),
+                )
+            with self.assertRaises(IdempotencyConflict):
+                write_reconciliation(
+                    event_ids[2],
+                    reason="EQUAL",
+                    projection_time=updated_at - timedelta(microseconds=1),
+                )
+            self.assertEqual(
+                write_reconciliation(
+                    event_ids[2], reason="EQUAL", projection_time=updated_at
+                ),
+                2,
+            )
+            self.assertEqual(
+                write_reconciliation(
+                    event_ids[2], reason="EQUAL", projection_time=updated_at
+                ),
+                2,
+            )
 
     def test_actual_cash_projection_requires_an_actual_ledger_posting(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)

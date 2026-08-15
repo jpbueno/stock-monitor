@@ -562,10 +562,7 @@ class Journal:
         if self._closed:
             return
         if self._transaction_active:
-            try:
-                self._connection.rollback()
-            finally:
-                self._transaction_active = False
+            raise JournalError("journal cannot close during an active transaction")
         self._connection.close()
         self._closed = True
 
@@ -665,15 +662,75 @@ class Journal:
         with self.transaction() as transaction:
             return transaction.append_raw_message(message_id, message_time, text)
 
-    def append_execution_event(self, **values: object) -> tuple[int, bool]:
+    def append_execution_event(
+        self,
+        *,
+        raw_message_id: int,
+        action_ordinal: int,
+        parsed_action: str,
+        event_time: datetime,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        shares: int | None = None,
+        price_micros: int | None = None,
+        bid_micros: int | None = None,
+        ask_micros: int | None = None,
+        recommended_stop_micros: int | None = None,
+        user_confirmed_stop_micros: int | None = None,
+        compliance_result: str = "UNASSESSED",
+        reconciliation_state: str = "PENDING",
+        details: Mapping[str, object] | None = None,
+    ) -> tuple[int, bool]:
         """Append one parsed action outside a larger caller-owned transaction."""
         with self.transaction() as transaction:
-            return transaction.append_execution_event(**values)  # type: ignore[arg-type]
+            return transaction.append_execution_event(
+                raw_message_id=raw_message_id,
+                action_ordinal=action_ordinal,
+                parsed_action=parsed_action,
+                event_time=event_time,
+                signal_id=signal_id,
+                symbol=symbol,
+                shares=shares,
+                price_micros=price_micros,
+                bid_micros=bid_micros,
+                ask_micros=ask_micros,
+                recommended_stop_micros=recommended_stop_micros,
+                user_confirmed_stop_micros=user_confirmed_stop_micros,
+                compliance_result=compliance_result,
+                reconciliation_state=reconciliation_state,
+                details=details,
+            )
 
-    def append_source_observation(self, **values: object) -> tuple[int, bool]:
+    def append_source_observation(
+        self,
+        *,
+        payload: bytes,
+        source_uri: str,
+        source_type: str,
+        provider: str,
+        feed: str | None,
+        source_time: datetime,
+        retrieved_at: datetime,
+        provider_sequence: int | None,
+        delay_seconds: int | None,
+        health_result: str,
+        details: Mapping[str, object] | None = None,
+    ) -> tuple[int, bool]:
         """Append one content-addressed source observation."""
         with self.transaction() as transaction:
-            return transaction.append_source_observation(**values)  # type: ignore[arg-type]
+            return transaction.append_source_observation(
+                payload=payload,
+                source_uri=source_uri,
+                source_type=source_type,
+                provider=provider,
+                feed=feed,
+                source_time=source_time,
+                retrieved_at=retrieved_at,
+                provider_sequence=provider_sequence,
+                delay_seconds=delay_seconds,
+                health_result=health_result,
+                details=details,
+            )
 
     def claim_report(
         self,
@@ -791,10 +848,32 @@ class Journal:
                 report_id=None,
             )
 
-    def finalize_report(self, **values: object) -> FinalizedReport:
+    def finalize_report(
+        self,
+        *,
+        claim_id: int,
+        claim_token: str,
+        body: str,
+        state_sha256: str,
+        observation_ids: Sequence[int],
+        archive_relative_path: str,
+        created_at: datetime,
+        outbox_destination: str,
+        outbox_payload: str,
+    ) -> FinalizedReport:
         """Finalize a report, its evidence pins, and its outbox row atomically."""
         with self.transaction() as transaction:
-            return transaction.finalize_report(**values)  # type: ignore[arg-type]
+            return transaction.finalize_report(
+                claim_id=claim_id,
+                claim_token=claim_token,
+                body=body,
+                state_sha256=state_sha256,
+                observation_ids=observation_ids,
+                archive_relative_path=archive_relative_path,
+                created_at=created_at,
+                outbox_destination=outbox_destination,
+                outbox_payload=outbox_payload,
+            )
 
     def read_report(self, report_id: str) -> StoredReport:
         """Read immutable report material for crash-safe archive reconstruction."""
@@ -860,16 +939,48 @@ class Journal:
             finalized_at=_parse_canonical_timestamp(str(row[11])),
         )
 
-    def append_outbox(self, **values: object) -> tuple[int, bool]:
+    def append_outbox(
+        self,
+        *,
+        idempotency_key: str,
+        origin_report_id: int | None,
+        origin_execution_event_id: int | None,
+        destination: str,
+        payload_text: str,
+        created_at: datetime,
+    ) -> tuple[int, bool]:
         """Append an immutable payload; delivery remains externally at-least-once."""
         with self.transaction() as transaction:
-            return transaction.append_outbox(**values)  # type: ignore[arg-type]
+            return transaction.append_outbox(
+                idempotency_key=idempotency_key,
+                origin_report_id=origin_report_id,
+                origin_execution_event_id=origin_execution_event_id,
+                destination=destination,
+                payload_text=payload_text,
+                created_at=created_at,
+            )
 
-    def record_outbox_delivery_attempt(self, **values: object) -> tuple[int, bool]:
+    def record_outbox_delivery_attempt(
+        self,
+        *,
+        outbox_id: int,
+        attempt_ordinal: int,
+        attempted_at: datetime,
+        delivery_status: str,
+        external_delivery_id: str | None = None,
+        error_class: str | None = None,
+        details: Mapping[str, object] | None = None,
+    ) -> tuple[int, bool]:
         """Append one delivery result without mutating the payload."""
         with self.transaction() as transaction:
-            return transaction.record_outbox_delivery_attempt(  # type: ignore[arg-type]
-                **values
+            return transaction.record_outbox_delivery_attempt(
+                outbox_id=outbox_id,
+                attempt_ordinal=attempt_ordinal,
+                attempted_at=attempted_at,
+                delivery_status=delivery_status,
+                external_delivery_id=external_delivery_id,
+                error_class=error_class,
+                details=details,
             )
 
     def pending_outbox(self, *, limit: int = 100) -> tuple[PendingOutbox, ...]:
@@ -884,49 +995,149 @@ class Journal:
             "o.payload_sha256, o.created_at, COALESCE(("
             "SELECT MAX(next_attempt.attempt_ordinal) "
             "FROM outbox_delivery_attempts AS next_attempt "
-            "WHERE next_attempt.outbox_id = o.id), 0) FROM outbox AS o "
+            "WHERE next_attempt.outbox_id = o.id), 0), "
+            "EXISTS(SELECT 1 FROM reports AS origin_report "
+            "WHERE origin_report.id = o.origin_report_id), "
+            "EXISTS(SELECT 1 FROM execution_events AS origin_event "
+            "WHERE origin_event.id = o.origin_execution_event_id) "
+            "FROM outbox AS o "
             "WHERE NOT EXISTS ("
             "SELECT 1 FROM outbox_delivery_attempts AS a "
             "WHERE a.outbox_id = o.id AND a.delivery_status = 'DELIVERED'"
             ") ORDER BY o.id LIMIT ?",
             (limit,),
         ).fetchall()
-        pending: list[PendingOutbox] = []
+        validated: list[
+            tuple[int, str, int | None, int | None, str, str, str, datetime, int]
+        ] = []
         for row in rows:
-            prior_attempt_ordinal = int(row[8])
+            if (
+                len(row) != 11
+                or type(row[0]) is not int
+                or row[0] <= 0
+                or type(row[1]) is not str
+                or not row[1]
+                or type(row[4]) is not str
+                or not row[4]
+                or type(row[5]) is not str
+                or type(row[6]) is not str
+                or type(row[7]) is not str
+                or type(row[8]) is not int
+                or row[8] < 0
+                or type(row[9]) is not int
+                or type(row[10]) is not int
+            ):
+                raise MigrationCorruption("pending outbox row is malformed")
+            origin_report_id = row[2]
+            origin_execution_event_id = row[3]
+            if (
+                origin_report_id is not None
+                and (type(origin_report_id) is not int or origin_report_id <= 0)
+            ) or (
+                origin_execution_event_id is not None
+                and (
+                    type(origin_execution_event_id) is not int
+                    or origin_execution_event_id <= 0
+                )
+            ):
+                raise MigrationCorruption("pending outbox origin is malformed")
+            if (origin_report_id is None) == (origin_execution_event_id is None):
+                raise MigrationCorruption("pending outbox origin is inconsistent")
+            if (
+                (origin_report_id is not None and row[9] != 1)
+                or (
+                    origin_execution_event_id is not None
+                    and row[10] != 1
+                )
+            ):
+                raise MigrationCorruption("pending outbox origin is missing")
+            payload_sha256 = hashlib.sha256(row[5].encode("utf-8")).hexdigest()
+            if row[6] != payload_sha256:
+                raise MigrationCorruption("pending outbox payload integrity failed")
+            prior_attempt_ordinal = row[8]
             if prior_attempt_ordinal >= 2**63 - 1:
                 raise MigrationCorruption(
                     "outbox delivery attempt ordinal is exhausted"
                 )
-            pending.append(PendingOutbox(
-                outbox_id=int(row[0]),
-                idempotency_key=str(row[1]),
-                origin_report_id=int(row[2]) if row[2] is not None else None,
-                origin_execution_event_id=(
-                    int(row[3]) if row[3] is not None else None
-                ),
-                destination=str(row[4]),
-                payload_text=str(row[5]),
-                payload_sha256=str(row[6]),
-                created_at=_parse_canonical_timestamp(str(row[7])),
-                next_attempt_ordinal=prior_attempt_ordinal + 1,
-            ))
-        return tuple(pending)
+            validated.append(
+                (
+                    row[0],
+                    row[1],
+                    origin_report_id,
+                    origin_execution_event_id,
+                    row[4],
+                    row[5],
+                    row[6],
+                    _parse_canonical_timestamp(row[7]),
+                    prior_attempt_ordinal + 1,
+                )
+            )
+        return tuple(PendingOutbox(*values) for values in validated)
 
-    def start_scheduled_run(self, **values: object) -> tuple[int, bool]:
+    def start_scheduled_run(
+        self,
+        *,
+        run_key: str,
+        run_kind: str,
+        session_date: date,
+        intended_run_at: datetime,
+        started_at: datetime,
+    ) -> tuple[int, bool]:
         """Persist a start before scheduled work begins."""
         with self.transaction() as transaction:
-            return transaction.start_scheduled_run(**values)  # type: ignore[arg-type]
+            return transaction.start_scheduled_run(
+                run_key=run_key,
+                run_kind=run_kind,
+                session_date=session_date,
+                intended_run_at=intended_run_at,
+                started_at=started_at,
+            )
 
-    def complete_scheduled_run(self, **values: object) -> tuple[int, bool]:
+    def complete_scheduled_run(
+        self,
+        *,
+        run_id: int,
+        finished_at: datetime,
+        market_session_decision: str,
+        outcome: str,
+        report_id: int | None = None,
+        report_path: str | None = None,
+        error_class: str | None = None,
+    ) -> tuple[int, bool]:
         """Apply the sole permitted completion transition to a scheduled run."""
         with self.transaction() as transaction:
-            return transaction.complete_scheduled_run(**values)  # type: ignore[arg-type]
+            return transaction.complete_scheduled_run(
+                run_id=run_id,
+                finished_at=finished_at,
+                market_session_decision=market_session_decision,
+                outcome=outcome,
+                report_id=report_id,
+                report_path=report_path,
+                error_class=error_class,
+            )
 
-    def append_account_check(self, **values: object) -> tuple[int, bool]:
+    def append_account_check(
+        self,
+        *,
+        execution_event_id: int,
+        settled_cash_micros: int,
+        pending_order_count: int,
+        unlogged_position_count: int,
+        confirmed_at: datetime,
+        reconciliation_result: str,
+        details: Mapping[str, object] | None = None,
+    ) -> tuple[int, bool]:
         """Append one user-confirmed account state snapshot."""
         with self.transaction() as transaction:
-            return transaction.append_account_check(**values)  # type: ignore[arg-type]
+            return transaction.append_account_check(
+                execution_event_id=execution_event_id,
+                settled_cash_micros=settled_cash_micros,
+                pending_order_count=pending_order_count,
+                unlogged_position_count=unlogged_position_count,
+                confirmed_at=confirmed_at,
+                reconciliation_result=reconciliation_result,
+                details=details,
+            )
 
     def count(self, table: str) -> int:
         self._ensure_open()
@@ -1269,7 +1480,7 @@ class Journal:
 
         claim = _sql(self._connection,
             "SELECT session_date, report_kind, claim_token, status, lease_started_at, "
-            "lease_expires_at, report_id, finalized_at "
+            "lease_expires_at, report_id, finalized_at, created_at "
             "FROM report_claims WHERE id = ?",
             (claim_id,),
         ).fetchone()
@@ -1282,10 +1493,13 @@ class Journal:
         lease_started_at = str(claim[4])
         lease_expires_at = str(claim[5])
         stored_finalized_at = str(claim[7]) if claim[7] is not None else None
+        claim_created_at = str(claim[8])
         if stored_status not in {"IN_PROGRESS", "FINALIZED"}:
             raise MigrationCorruption("report claim has an invalid stored status")
         if stored_status == "FINALIZED" and stored_finalized_at is None:
             raise MigrationCorruption("finalized report claim lacks a timestamp")
+        if stored_created_at < claim_created_at:
+            raise InvalidJournalValue("report creation time cannot predate its claim")
 
         observations: list[tuple[int, str, str, str]] = []
         if requested_ids:
@@ -1964,7 +2178,8 @@ class Journal:
         )
         event = _sql(
             self._connection,
-            "SELECT signal_id, symbol, parsed_action FROM execution_events WHERE id = ?",
+            "SELECT signal_id, symbol, parsed_action, event_time "
+            "FROM execution_events WHERE id = ?",
             (last_execution_event_id,),
         ).fetchone()
         if event is None:
@@ -1978,6 +2193,11 @@ class Journal:
                 "position projection requires its matching position event"
             )
         stored_updated_at = _canonical_timestamp(updated_at)
+        event_time = str(event[3])
+        if event_time > stored_updated_at:
+            raise InvalidJournalValue(
+                "position projection cannot predate its execution event"
+            )
         desired = (
             symbol,
             shares,
@@ -1991,7 +2211,9 @@ class Journal:
         row = _sql(self._connection,
             "SELECT symbol, shares, cost_basis_micros, recommended_stop_micros, "
             "user_confirmed_stop_micros, target_micros, last_execution_event_id, "
-            "updated_at, revision FROM actual_positions WHERE signal_id = ? COLLATE BINARY",
+            "updated_at, revision, (SELECT event_time FROM execution_events "
+            "WHERE id = actual_positions.last_execution_event_id) "
+            "FROM actual_positions WHERE signal_id = ? COLLATE BINARY",
             (signal_id,),
         ).fetchone()
         with self._projection_write():
@@ -2014,6 +2236,14 @@ class Journal:
             if last_execution_event_id <= int(row[6]):
                 raise IdempotencyConflict(
                     "position projection conflicts with its event identity"
+                )
+            if row[9] is None:
+                raise MigrationCorruption(
+                    "position projection source lineage is inconsistent"
+                )
+            if event_time < str(row[9]) or stored_updated_at < str(row[7]):
+                raise IdempotencyConflict(
+                    "position projection chronology would move backward"
                 )
             revision = int(row[8]) + 1
             _sql(self._connection,
@@ -2093,7 +2323,9 @@ class Journal:
             "SELECT estimated_settled_cash_micros, "
             "user_confirmed_settled_cash_micros, deployed_capital_micros, "
             "open_planned_risk_micros, consecutive_losses, weekly_high_water_micros, "
-            "monthly_high_water_micros, last_ledger_posting_id, updated_at, revision "
+            "monthly_high_water_micros, last_ledger_posting_id, updated_at, revision, "
+            "(SELECT occurred_at FROM ledger_postings "
+            "WHERE id = actual_cash_projection.last_ledger_posting_id) "
             "FROM actual_cash_projection WHERE id = 1"
         ).fetchone()
         with self._projection_write():
@@ -2109,6 +2341,14 @@ class Journal:
             if last_ledger_posting_id <= int(row[7]):
                 raise IdempotencyConflict(
                     "cash projection conflicts with its posting identity"
+                )
+            if row[10] is None:
+                raise MigrationCorruption(
+                    "cash projection source lineage is inconsistent"
+                )
+            if str(posting[1]) < str(row[10]) or stored_updated_at < str(row[8]):
+                raise IdempotencyConflict(
+                    "cash projection chronology would move backward"
                 )
             revision = int(row[9]) + 1
             _sql(self._connection,
@@ -2150,7 +2390,7 @@ class Journal:
         )
         event = _sql(
             self._connection,
-            "SELECT parsed_action, reconciliation_state "
+            "SELECT parsed_action, reconciliation_state, event_time "
             "FROM execution_events WHERE id = ?",
             (last_execution_event_id,),
         ).fetchone()
@@ -2168,6 +2408,11 @@ class Journal:
                 "reconciliation projection requires an authoritative matching event"
             )
         stored_updated_at = _canonical_timestamp(updated_at)
+        event_time = str(event[2])
+        if event_time > stored_updated_at:
+            raise InvalidJournalValue(
+                "reconciliation projection cannot predate its execution event"
+            )
         desired = (
             int(reconciliation_required),
             reason,
@@ -2176,7 +2421,9 @@ class Journal:
         )
         row = _sql(self._connection,
             "SELECT reconciliation_required, reason, last_execution_event_id, "
-            "updated_at, revision FROM reconciliation_projection WHERE id = 1"
+            "updated_at, revision, (SELECT event_time FROM execution_events "
+            "WHERE id = reconciliation_projection.last_execution_event_id) "
+            "FROM reconciliation_projection WHERE id = 1"
         ).fetchone()
         with self._projection_write():
             if row is None:
@@ -2191,6 +2438,14 @@ class Journal:
             if last_execution_event_id <= stored_event_id:
                 raise IdempotencyConflict(
                     "reconciliation projection conflicts with its event identity"
+                )
+            if row[5] is None:
+                raise MigrationCorruption(
+                    "reconciliation projection source lineage is inconsistent"
+                )
+            if event_time < str(row[5]) or stored_updated_at < str(row[3]):
+                raise IdempotencyConflict(
+                    "reconciliation projection chronology would move backward"
                 )
             revision = int(row[4]) + 1
             _sql(self._connection,

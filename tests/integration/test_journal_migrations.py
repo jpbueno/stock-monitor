@@ -27,6 +27,93 @@ from stock_monitor.journal import (
 
 
 class JournalMigrationTests(unittest.TestCase):
+    @staticmethod
+    def _seed_projection_chronology(
+        path: Path,
+        *,
+        include_projections: bool = True,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int], str, str]:
+        base = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        source_time = base + timedelta(seconds=10)
+        delayed_time = base + timedelta(seconds=5)
+        updated_at = base + timedelta(seconds=20)
+        event_ids: list[int] = []
+        with Journal.open(path) as journal:
+            for suffix, event_time in (
+                ("initial", source_time),
+                ("delayed", delayed_time),
+                ("equal-time", source_time),
+            ):
+                raw_id, _ = journal.append_raw_message(
+                    f"msg-sql-projection-{suffix}", event_time, "BOUGHT SPY"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="BOUGHT",
+                    event_time=event_time,
+                    signal_id="signal-sql-chronology",
+                    symbol="SPY",
+                    shares=1,
+                    reconciliation_state="REQUIRED",
+                )
+                event_ids.append(event_id)
+
+            posting_ids: list[int] = []
+            with journal.transaction() as transaction:
+                for suffix, occurred_at, event_id in zip(
+                    ("initial", "delayed", "equal-time"),
+                    (source_time, delayed_time, source_time),
+                    event_ids,
+                    strict=True,
+                ):
+                    posting_id, _ = transaction.append_ledger_posting(
+                        posting_key=f"sql-projection-{suffix}",
+                        ledger_name="ACTUAL",
+                        account_name="CASH",
+                        entry_kind="BUY",
+                        occurred_at=occurred_at,
+                        amount_micros=-100_000_000,
+                        execution_event_id=event_id,
+                        symbol="SPY",
+                    )
+                    posting_ids.append(posting_id)
+                if include_projections:
+                    transaction.write_actual_position(
+                        signal_id="signal-sql-chronology",
+                        symbol="SPY",
+                        shares=1,
+                        cost_basis_micros=100_000_000,
+                        recommended_stop_micros=None,
+                        user_confirmed_stop_micros=None,
+                        target_micros=None,
+                        last_execution_event_id=event_ids[0],
+                        updated_at=updated_at,
+                    )
+                    transaction.write_actual_cash_projection(
+                        estimated_settled_cash_micros=5_000_000_000,
+                        user_confirmed_settled_cash_micros=None,
+                        deployed_capital_micros=0,
+                        open_planned_risk_micros=0,
+                        consecutive_losses=0,
+                        weekly_high_water_micros=5_000_000_000,
+                        monthly_high_water_micros=5_000_000_000,
+                        last_ledger_posting_id=posting_ids[0],
+                        updated_at=updated_at,
+                    )
+                    transaction.write_reconciliation_projection(
+                        reconciliation_required=True,
+                        reason="INITIAL",
+                        last_execution_event_id=event_ids[0],
+                        updated_at=updated_at,
+                    )
+        return (
+            (event_ids[0], event_ids[1], event_ids[2]),
+            (posting_ids[0], posting_ids[1], posting_ids[2]),
+            "2026-08-14T14:00:20.000000Z",
+            "2026-08-14T14:00:19.999999Z",
+        )
+
     def test_reopening_an_unchanged_database_replays_migrations_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -1445,6 +1532,290 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                     )
 
+    def test_actual_position_sql_rejects_source_and_update_time_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            event_ids, _, updated_at, earlier_updated_at = (
+                self._seed_projection_chronology(path)
+            )
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_projection_write_allowed", 0, lambda: 1
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_positions SET shares = 2, "
+                        "cost_basis_micros = 200000000, revision = 2 "
+                        "WHERE signal_id = 'signal-sql-chronology'"
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_positions SET shares = 2, "
+                        "cost_basis_micros = 200000000, "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 3 "
+                        "WHERE signal_id = 'signal-sql-chronology'",
+                        (event_ids[2], updated_at),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_positions SET id = 999, shares = 2, "
+                        "cost_basis_micros = 200000000, "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE signal_id = 'signal-sql-chronology'",
+                        (event_ids[2], updated_at),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_positions SET shares = 2, "
+                        "cost_basis_micros = 200000000, "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE signal_id = 'signal-sql-chronology'",
+                        (event_ids[1], "2026-08-14T14:00:21.000000Z"),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_positions SET shares = 2, "
+                        "cost_basis_micros = 200000000, "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE signal_id = 'signal-sql-chronology'",
+                        (event_ids[2], earlier_updated_at),
+                    )
+                connection.execute(
+                    "UPDATE actual_positions SET shares = 2, "
+                    "cost_basis_micros = 200000000, "
+                    "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                    "WHERE signal_id = 'signal-sql-chronology'",
+                    (event_ids[2], updated_at),
+                )
+
+    def test_actual_cash_sql_rejects_source_and_update_time_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            _, posting_ids, updated_at, earlier_updated_at = (
+                self._seed_projection_chronology(path)
+            )
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_projection_write_allowed", 0, lambda: 1
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_cash_projection SET "
+                        "estimated_settled_cash_micros = 5100000000, revision = 2 "
+                        "WHERE id = 1"
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_cash_projection SET "
+                        "estimated_settled_cash_micros = 5100000000, "
+                        "last_ledger_posting_id = ?, updated_at = ?, revision = 3 "
+                        "WHERE id = 1",
+                        (posting_ids[2], updated_at),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_cash_projection SET "
+                        "estimated_settled_cash_micros = 5100000000, "
+                        "weekly_high_water_micros = 5100000000, "
+                        "monthly_high_water_micros = 5100000000, "
+                        "last_ledger_posting_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE id = 1",
+                        (posting_ids[1], "2026-08-14T14:00:21.000000Z"),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE actual_cash_projection SET "
+                        "estimated_settled_cash_micros = 5100000000, "
+                        "weekly_high_water_micros = 5100000000, "
+                        "monthly_high_water_micros = 5100000000, "
+                        "last_ledger_posting_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE id = 1",
+                        (posting_ids[2], earlier_updated_at),
+                    )
+                connection.execute(
+                    "UPDATE actual_cash_projection SET "
+                    "estimated_settled_cash_micros = 5100000000, "
+                    "weekly_high_water_micros = 5100000000, "
+                    "monthly_high_water_micros = 5100000000, "
+                    "last_ledger_posting_id = ?, updated_at = ?, revision = 2 "
+                    "WHERE id = 1",
+                    (posting_ids[2], updated_at),
+                )
+
+    def test_reconciliation_sql_rejects_source_and_update_time_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            event_ids, _, updated_at, earlier_updated_at = (
+                self._seed_projection_chronology(path)
+            )
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_projection_write_allowed", 0, lambda: 1
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE reconciliation_projection SET reason = 'CHANGED', "
+                        "revision = 2 WHERE id = 1"
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE reconciliation_projection SET reason = 'CHANGED', "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 3 "
+                        "WHERE id = 1",
+                        (event_ids[2], updated_at),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE reconciliation_projection SET reason = '', "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE id = 1",
+                        (event_ids[2], updated_at),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE reconciliation_projection SET reason = 'DELAYED', "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE id = 1",
+                        (event_ids[1], "2026-08-14T14:00:21.000000Z"),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE reconciliation_projection SET reason = 'EQUAL', "
+                        "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                        "WHERE id = 1",
+                        (event_ids[2], earlier_updated_at),
+                    )
+                connection.execute(
+                    "UPDATE reconciliation_projection SET reason = 'EQUAL', "
+                    "last_execution_event_id = ?, updated_at = ?, revision = 2 "
+                    "WHERE id = 1",
+                    (event_ids[2], updated_at),
+                )
+
+    def test_projection_sql_validates_initial_source_time_and_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            event_ids, posting_ids, updated_at, _ = self._seed_projection_chronology(
+                path, include_projections=False
+            )
+            too_early = "2026-08-14T14:00:09.999999Z"
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_projection_write_allowed", 0, lambda: 1
+                )
+
+                position_sql = (
+                    "INSERT INTO actual_positions("
+                    "signal_id, symbol, shares, cost_basis_micros, "
+                    "recommended_stop_micros, user_confirmed_stop_micros, "
+                    "target_micros, last_execution_event_id, updated_at, revision"
+                    ") VALUES ('signal-sql-chronology', 'SPY', 2, 200000000, "
+                    "NULL, NULL, NULL, ?, ?, ?)"
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(position_sql, (event_ids[2], too_early, 1))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(position_sql, (event_ids[2], updated_at, 7))
+                connection.execute(position_sql, (event_ids[2], updated_at, 1))
+
+                cash_sql = (
+                    "INSERT INTO actual_cash_projection VALUES "
+                    "(1, 5100000000, NULL, 0, 0, 0, 5100000000, "
+                    "5100000000, ?, ?, ?)"
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(cash_sql, (posting_ids[2], too_early, 1))
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(cash_sql, (posting_ids[2], updated_at, 7))
+                connection.execute(cash_sql, (posting_ids[2], updated_at, 1))
+
+                reconciliation_sql = (
+                    "INSERT INTO reconciliation_projection VALUES "
+                    "(1, 1, 'VALID', ?, ?, ?)"
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        reconciliation_sql, (event_ids[2], too_early, 1)
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        reconciliation_sql, (event_ids[2], updated_at, 7)
+                    )
+                connection.execute(
+                    reconciliation_sql, (event_ids[2], updated_at, 1)
+                )
+
+    def test_projection_history_rejects_delete_and_insert_or_replace(self) -> None:
+        cases = {
+            "actual_positions": (
+                "INSERT OR REPLACE INTO actual_positions("
+                "id, signal_id, symbol, shares, cost_basis_micros, "
+                "recommended_stop_micros, user_confirmed_stop_micros, "
+                "target_micros, last_execution_event_id, updated_at, revision"
+                ") VALUES (1, 'signal-sql-chronology', 'SPY', 2, "
+                "200000000, NULL, NULL, NULL, ?, ?, 1)",
+                "DELETE FROM actual_positions "
+                "WHERE signal_id = 'signal-sql-chronology'",
+            ),
+            "actual_cash_projection": (
+                "INSERT OR REPLACE INTO actual_cash_projection VALUES "
+                "(1, 5100000000, NULL, 0, 0, 0, 5100000000, "
+                "5100000000, ?, ?, 1)",
+                "DELETE FROM actual_cash_projection WHERE id = 1",
+            ),
+            "reconciliation_projection": (
+                "INSERT OR REPLACE INTO reconciliation_projection VALUES "
+                "(1, 1, 'DELAYED', ?, ?, 1)",
+                "DELETE FROM reconciliation_projection WHERE id = 1",
+            ),
+        }
+        for recursive_triggers in (0, 1):
+            for table, (replace_sql, delete_sql) in cases.items():
+                for operation in ("replace", "delete"):
+                    with self.subTest(
+                        table=table,
+                        operation=operation,
+                        recursive_triggers=recursive_triggers,
+                    ), tempfile.TemporaryDirectory() as temporary_directory:
+                        path = Path(temporary_directory) / "journal.db"
+                        event_ids, posting_ids, _, _ = (
+                            self._seed_projection_chronology(path)
+                        )
+                        source_id = (
+                            posting_ids[1]
+                            if table == "actual_cash_projection"
+                            else event_ids[1]
+                        )
+                        with closing(
+                            sqlite3.connect(path, isolation_level=None)
+                        ) as connection:
+                            connection.execute("PRAGMA foreign_keys = ON")
+                            connection.execute(
+                                f"PRAGMA recursive_triggers = {recursive_triggers}"
+                            )
+                            connection.create_function(
+                                "journal_projection_write_allowed", 0, lambda: 1
+                            )
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                if operation == "replace":
+                                    connection.execute(
+                                        replace_sql,
+                                        (
+                                            source_id,
+                                            "2026-08-14T14:00:21.000000Z",
+                                        ),
+                                    )
+                                else:
+                                    connection.execute(delete_sql)
+
     def test_actual_ledger_sql_requires_cash_mutating_event_action(self) -> None:
         instant = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
         timestamp = "2026-08-14T14:00:00.000000Z"
@@ -1625,6 +1996,32 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                     )
 
+    def test_report_claim_creation_cannot_follow_its_lease_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_report_claim_write_allowed", 0, lambda: 1
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO report_claims("
+                        "session_date, report_kind, claim_token, status, created_at, "
+                        "lease_started_at, lease_expires_at"
+                        ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?)",
+                        (
+                            "2026-08-14",
+                            "CLOSE",
+                            "future-created-claim",
+                            "2026-08-14T12:46:00.000000Z",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:50:00.000000Z",
+                        ),
+                    )
+
     def test_report_claim_recovery_requires_the_journal_clock_boundary(self) -> None:
         lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1645,6 +2042,37 @@ class JournalMigrationTests(unittest.TestCase):
                             "2026-08-14T12:50:00.000000Z",
                             "2026-08-14T12:55:00.000000Z",
                             claim.claim_id,
+                        ),
+                    )
+
+    def test_report_schema_rejects_creation_before_the_original_claim(self) -> None:
+        claim_time = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        report_time = "2026-08-14T12:44:59.999999Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with patch.object(
+                journal_module, "_utc_now", return_value=claim_time
+            ), Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
+
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            "1" * 64,
+                            claim.claim_id,
+                            "2026-08-14",
+                            "CLOSE",
+                            "# Close\n",
+                            "a" * 64,
+                            "b" * 64,
+                            "c" * 64,
+                            "reports/2026/08/14/close-2026-08-14-111111111111.md",
+                            report_time,
                         ),
                     )
 

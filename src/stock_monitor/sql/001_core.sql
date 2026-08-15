@@ -218,6 +218,7 @@ CREATE TABLE report_claims (
         CHECK(finalized_at IS NULL OR (length(finalized_at) = 27 AND substr(finalized_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', finalized_at) AND substr(finalized_at, 20, 1) = '.' AND substr(finalized_at, 21, 6) NOT GLOB '*[^0-9]*' AND substr(finalized_at, 27, 1) = 'Z' AND CAST(substr(finalized_at, 1, 4) AS INTEGER) BETWEEN 1 AND 9999 AND CAST(substr(finalized_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23 AND strftime('%Y-%m-%dT%H:%M:%S', finalized_at) IS NOT NULL)),
     report_id INTEGER
         CHECK(report_id IS NULL OR (typeof(report_id) = 'integer' AND report_id > 0)),
+    CHECK(created_at <= lease_started_at),
     CHECK(lease_expires_at > lease_started_at),
     CHECK(
         (status = 'IN_PROGRESS' AND finalized_at IS NULL AND report_id IS NULL)
@@ -481,7 +482,7 @@ CREATE TABLE reconciliation_projection (
     revision INTEGER NOT NULL
         CHECK(typeof(revision) = 'integer' AND revision > 0),
     CHECK(
-        (reconciliation_required = 1 AND reason IS NOT NULL)
+        (reconciliation_required = 1 AND reason IS NOT NULL AND length(reason) > 0)
         OR (reconciliation_required = 0 AND reason IS NULL)
     ),
     FOREIGN KEY(last_execution_event_id) REFERENCES execution_events(id)
@@ -608,6 +609,7 @@ WHEN NOT EXISTS (
       AND session_date = NEW.session_date
       AND report_kind = NEW.report_kind
       AND status = 'IN_PROGRESS'
+      AND NEW.created_at >= created_at
       AND NEW.created_at < lease_expires_at
 )
 BEGIN
@@ -900,6 +902,7 @@ WHEN journal_report_claim_write_allowed() != 1 OR NOT (
                   AND claim_id = OLD.id
                   AND session_date = OLD.session_date
                   AND report_kind = OLD.report_kind
+                  AND created_at >= OLD.created_at
                   AND created_at <= NEW.finalized_at
             )
             AND EXISTS (
@@ -977,18 +980,28 @@ END;
 
 CREATE TRIGGER actual_positions_guard_delete
 BEFORE DELETE ON actual_positions
-WHEN journal_projection_write_allowed() != 1
 BEGIN
-    SELECT RAISE(ABORT, 'actual_positions requires journal transaction API');
+    SELECT RAISE(ABORT, 'actual_positions history cannot be deleted');
+END;
+
+CREATE TRIGGER actual_positions_no_conflicting_insert
+BEFORE INSERT ON actual_positions
+WHEN EXISTS (
+    SELECT 1 FROM actual_positions
+    WHERE id = NEW.id OR signal_id = NEW.signal_id COLLATE BINARY
+)
+BEGIN
+    SELECT RAISE(ABORT, 'actual_positions rejects conflicting inserts');
 END;
 
 CREATE TRIGGER actual_positions_validate_event_insert
 BEFORE INSERT ON actual_positions
-WHEN NOT EXISTS (
+WHEN NEW.revision != 1 OR NOT EXISTS (
     SELECT 1 FROM execution_events
     WHERE id = NEW.last_execution_event_id
       AND signal_id = NEW.signal_id COLLATE BINARY
       AND symbol = NEW.symbol COLLATE BINARY
+      AND event_time <= NEW.updated_at
       AND parsed_action IN (
           'BOUGHT',
           'PARTIAL_FILL',
@@ -1004,14 +1017,18 @@ END;
 
 CREATE TRIGGER actual_positions_validate_event_update
 BEFORE UPDATE ON actual_positions
-WHEN NEW.signal_id != OLD.signal_id COLLATE BINARY
+WHEN NEW.id != OLD.id
+   OR NEW.signal_id != OLD.signal_id COLLATE BINARY
    OR NEW.symbol != OLD.symbol COLLATE BINARY
    OR NOT EXISTS (
-       SELECT 1 FROM execution_events
-       WHERE id = NEW.last_execution_event_id
-         AND signal_id = NEW.signal_id COLLATE BINARY
-         AND symbol = NEW.symbol COLLATE BINARY
-         AND parsed_action IN (
+       SELECT 1
+       FROM execution_events AS new_event
+       JOIN execution_events AS old_event
+         ON old_event.id = OLD.last_execution_event_id
+       WHERE new_event.id = NEW.last_execution_event_id
+         AND new_event.signal_id = NEW.signal_id COLLATE BINARY
+         AND new_event.symbol = NEW.symbol COLLATE BINARY
+         AND new_event.parsed_action IN (
              'BOUGHT',
              'PARTIAL_FILL',
              'RECONCILE_UNRELATED_POSITION',
@@ -1019,6 +1036,11 @@ WHEN NEW.signal_id != OLD.signal_id COLLATE BINARY
              'STOP_FILLED',
              'STOP_UPDATED'
          )
+         AND NEW.last_execution_event_id > OLD.last_execution_event_id
+         AND new_event.event_time >= old_event.event_time
+         AND new_event.event_time <= NEW.updated_at
+         AND NEW.updated_at >= OLD.updated_at
+         AND NEW.revision = OLD.revision + 1
    )
 BEGIN
     SELECT RAISE(ABORT, 'actual_positions requires its matching position event');
@@ -1040,14 +1062,22 @@ END;
 
 CREATE TRIGGER actual_cash_projection_guard_delete
 BEFORE DELETE ON actual_cash_projection
-WHEN journal_projection_write_allowed() != 1
 BEGIN
-    SELECT RAISE(ABORT, 'actual_cash_projection requires journal transaction API');
+    SELECT RAISE(ABORT, 'actual_cash_projection history cannot be deleted');
+END;
+
+CREATE TRIGGER actual_cash_projection_no_conflicting_insert
+BEFORE INSERT ON actual_cash_projection
+WHEN EXISTS (
+    SELECT 1 FROM actual_cash_projection WHERE id = NEW.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'actual_cash_projection rejects conflicting inserts');
 END;
 
 CREATE TRIGGER actual_cash_projection_validate_posting_insert
 BEFORE INSERT ON actual_cash_projection
-WHEN NOT EXISTS (
+WHEN NEW.revision != 1 OR NOT EXISTS (
     SELECT 1 FROM ledger_postings
     WHERE id = NEW.last_ledger_posting_id
       AND ledger_name = 'ACTUAL'
@@ -1060,10 +1090,17 @@ END;
 CREATE TRIGGER actual_cash_projection_validate_posting_update
 BEFORE UPDATE ON actual_cash_projection
 WHEN NOT EXISTS (
-    SELECT 1 FROM ledger_postings
-    WHERE id = NEW.last_ledger_posting_id
-      AND ledger_name = 'ACTUAL'
-      AND occurred_at <= NEW.updated_at
+    SELECT 1
+    FROM ledger_postings AS new_posting
+    JOIN ledger_postings AS old_posting
+      ON old_posting.id = OLD.last_ledger_posting_id
+    WHERE new_posting.id = NEW.last_ledger_posting_id
+      AND new_posting.ledger_name = 'ACTUAL'
+      AND NEW.last_ledger_posting_id > OLD.last_ledger_posting_id
+      AND new_posting.occurred_at >= old_posting.occurred_at
+      AND new_posting.occurred_at <= NEW.updated_at
+      AND NEW.updated_at >= OLD.updated_at
+      AND NEW.revision = OLD.revision + 1
 )
 BEGIN
     SELECT RAISE(ABORT, 'actual_cash_projection requires prior ACTUAL posting');
@@ -1085,16 +1122,25 @@ END;
 
 CREATE TRIGGER reconciliation_projection_guard_delete
 BEFORE DELETE ON reconciliation_projection
-WHEN journal_projection_write_allowed() != 1
 BEGIN
-    SELECT RAISE(ABORT, 'reconciliation_projection requires journal transaction API');
+    SELECT RAISE(ABORT, 'reconciliation_projection history cannot be deleted');
+END;
+
+CREATE TRIGGER reconciliation_projection_no_conflicting_insert
+BEFORE INSERT ON reconciliation_projection
+WHEN EXISTS (
+    SELECT 1 FROM reconciliation_projection WHERE id = NEW.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation_projection rejects conflicting inserts');
 END;
 
 CREATE TRIGGER reconciliation_projection_validate_event_insert
 BEFORE INSERT ON reconciliation_projection
-WHEN NOT EXISTS (
+WHEN NEW.revision != 1 OR NOT EXISTS (
     SELECT 1 FROM execution_events
     WHERE id = NEW.last_execution_event_id
+      AND event_time <= NEW.updated_at
       AND parsed_action IN (
           'ACCOUNT_CHECK',
           'BOUGHT',
@@ -1121,9 +1167,12 @@ END;
 CREATE TRIGGER reconciliation_projection_validate_event_update
 BEFORE UPDATE ON reconciliation_projection
 WHEN NOT EXISTS (
-    SELECT 1 FROM execution_events
-    WHERE id = NEW.last_execution_event_id
-      AND parsed_action IN (
+    SELECT 1
+    FROM execution_events AS new_event
+    JOIN execution_events AS old_event
+      ON old_event.id = OLD.last_execution_event_id
+    WHERE new_event.id = NEW.last_execution_event_id
+      AND new_event.parsed_action IN (
           'ACCOUNT_CHECK',
           'BOUGHT',
           'FEE',
@@ -1137,10 +1186,15 @@ WHEN NOT EXISTS (
       )
       AND (
           (NEW.reconciliation_required = 1
-              AND reconciliation_state IN ('REQUIRED', 'PENDING'))
+              AND new_event.reconciliation_state IN ('REQUIRED', 'PENDING'))
           OR (NEW.reconciliation_required = 0
-              AND reconciliation_state = 'CLEAR')
+              AND new_event.reconciliation_state = 'CLEAR')
       )
+      AND NEW.last_execution_event_id > OLD.last_execution_event_id
+      AND new_event.event_time >= old_event.event_time
+      AND new_event.event_time <= NEW.updated_at
+      AND NEW.updated_at >= OLD.updated_at
+      AND NEW.revision = OLD.revision + 1
 )
 BEGIN
     SELECT RAISE(ABORT, 'reconciliation_projection requires an authoritative event');

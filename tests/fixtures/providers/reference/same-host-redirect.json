@@ -1,0 +1,19 @@
+{
+  "responses": [
+    {
+      "url": "https://www.nyse.com/trade/hours-calendars",
+      "status": 302,
+      "headers": {"Location": "/trade/hours-calendars-current"},
+      "body": ""
+    },
+    {
+      "url": "https://www.nyse.com/trade/hours-calendars-current",
+      "status": 200,
+      "headers": {
+        "Content-Type": "text/html",
+        "Last-Modified": "Fri, 01 Jan 1999 00:00:00 GMT"
+      },
+      "body": "<html><body>Reviewed calendar.</body></html>"
+    }
+  ]
+}

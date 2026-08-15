@@ -5,3 +5,6 @@ alpaca_market_data_url = "https://data.alpaca.markets"
 sec_submissions_url = "https://data.sec.gov/submissions/"
 sec_archives_url = "https://www.sec.gov/Archives/"
 reference_hosts = ["www.nyse.com", "www.nasdaqtrader.com"]
+reference_urls = ["https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts", "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines", "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar", "https://www.nyse.com/api/notifications/public/alerts?2=3", "https://www.nyse.com/trade/hours-calendars"]
+reference_roles = ["PRIMARY_HALT_FEED", "TRADER_ALERT_HALT", "CROSS_CHECK_CALENDAR", "OPERATIONAL_STATUS", "PRIMARY_CALENDAR"]
+reference_feeds = ["primary-halt-feed", "trader-alert-halt", "cross-check-calendar", "operational-status", "primary-calendar"]

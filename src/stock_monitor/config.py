@@ -9,7 +9,7 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 from .domain import ConfigurationError
 from .policy import Policy
@@ -27,9 +27,14 @@ _SOURCE_FIELDS = frozenset(
         "sec_submissions_url",
         "sec_archives_url",
         "reference_hosts",
+        "reference_feeds",
+        "reference_roles",
+        "reference_urls",
     }
 )
 _APPROVED_ALPACA_MARKET_DATA_HOST = "data.alpaca.markets"
+_APPROVED_SEC_SUBMISSIONS_ORIGIN = "https://data.sec.gov/submissions/"
+_APPROVED_SEC_ARCHIVES_ORIGIN = "https://www.sec.gov/Archives/"
 _ALPACA_DOMAIN = "alpaca.markets"
 _PROHIBITED_BROKER_TOKEN = "robinhood"
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -44,6 +49,39 @@ _EMAIL_CONTACT = re.compile(
 )
 _ALPACA_CREDENTIAL_MAX_LENGTH = 256
 _SEC_USER_AGENT_MAX_LENGTH = 512
+_BASE_REFERENCE_ROLES = {
+    "PRIMARY_HALT_FEED": (
+        "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts",
+        "primary-halt-feed",
+    ),
+    "TRADER_ALERT_HALT": (
+        "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines",
+        "trader-alert-halt",
+    ),
+    "CROSS_CHECK_CALENDAR": (
+        "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+        "cross-check-calendar",
+    ),
+    "OPERATIONAL_STATUS": (
+        "https://www.nyse.com/api/notifications/public/alerts?2=3",
+        "operational-status",
+    ),
+    "PRIMARY_CALENDAR": (
+        "https://www.nyse.com/trade/hours-calendars",
+        "primary-calendar",
+    ),
+}
+_SCOPED_REFERENCE_ROLE = re.compile(
+    r"(?:ISSUER_IR|CORPORATE_ACTION):[A-Z][A-Z0-9.-]{0,14}\Z"
+)
+_REFERENCE_FEED = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+
+@dataclass(frozen=True)
+class ReferenceSource:
+    url: str
+    role: str
+    feed: str
 
 
 @dataclass(frozen=True)
@@ -52,6 +90,8 @@ class Sources:
     sec_submissions_url: str
     sec_archives_url: str
     reference_hosts: tuple[str, ...]
+    reference_urls: tuple[str, ...]
+    reference_sources: tuple[ReferenceSource, ...]
 
 
 @dataclass(frozen=True)
@@ -168,6 +208,100 @@ def _alpaca_market_data_url(value: object) -> str:
     return f"https://{_APPROVED_ALPACA_MARKET_DATA_HOST}"
 
 
+def _pinned_origin(name: str, value: object, expected: str) -> str:
+    canonical = _https_url(name, value)
+    if canonical != expected:
+        raise ConfigurationError(f"sources field {name} must use its official exact origin")
+    return canonical
+
+
+def _reference_url(
+    value: object,
+    reference_hosts: tuple[str, ...],
+    *,
+    allow_root: bool,
+) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or any(
+        ord(character) <= 32 for character in value
+    ):
+        raise ConfigurationError("sources field reference_urls must contain safe URLs")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ConfigurationError(
+            "sources field reference_urls contains an invalid URL"
+        ) from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not parsed.path.startswith("/")
+        or (parsed.path == "/" and not allow_root)
+        or parsed.path.startswith("//")
+        or parsed.fragment
+    ):
+        raise ConfigurationError(
+            "sources field reference_urls requires credential-free exact HTTPS URLs"
+        )
+    hostname = _canonical_dns_hostname("reference_urls", parsed.hostname)
+    if hostname not in reference_hosts:
+        raise ConfigurationError(
+            "sources field reference_urls contains a host outside reference_hosts"
+        )
+    try:
+        query = urlsplit(value).query
+        query_pairs = parse_qsl(
+            query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+        if query and (
+            any(not name or not item for name, item in query_pairs)
+            or any(
+                name.casefold().endswith("key")
+                or any(
+                    part in name.casefold()
+                    for part in (
+                        "authorization",
+                        "credential",
+                        "password",
+                        "secret",
+                        "signature",
+                        "token",
+                    )
+                )
+                or any(
+                    re.sub(r"[^a-z0-9]", "", name.casefold()).endswith(part)
+                    for part in (
+                        "apikey",
+                        "authorization",
+                        "credential",
+                        "keyid",
+                        "password",
+                        "secret",
+                        "signature",
+                        "token",
+                    )
+                )
+                for name, _ in query_pairs
+            )
+        ):
+            raise ValueError
+        if not (allow_root and parsed.path == "/") and any(
+            unquote(segment).casefold() in {"", ".", ".."}
+            for segment in parsed.path.split("/")[1:]
+        ):
+            raise ValueError
+    except ValueError:
+        raise ConfigurationError(
+            "sources field reference_urls contains a malformed query"
+        ) from None
+    return urlunsplit(("https", hostname, parsed.path, query, ""))
+
+
 def _load_sources(path: Path) -> Sources:
     document = _load_toml(path, "sources.toml")
     if document.get("schema_version") != 1:
@@ -203,15 +337,84 @@ def _load_sources(path: Path) -> Sources:
     if len(reference_hosts) != len(set(reference_hosts)):
         raise ConfigurationError("sources field reference_hosts contains duplicates")
 
+    configured_reference_urls = table["reference_urls"]
+    configured_reference_roles = table["reference_roles"]
+    configured_reference_feeds = table["reference_feeds"]
+    if (
+        not isinstance(configured_reference_urls, list)
+        or not configured_reference_urls
+        or not isinstance(configured_reference_roles, list)
+        or not isinstance(configured_reference_feeds, list)
+        or len(configured_reference_urls) != len(configured_reference_roles)
+        or len(configured_reference_urls) != len(configured_reference_feeds)
+    ):
+        raise ConfigurationError(
+            "reference URLs, roles, and feeds must be aligned non-empty lists"
+        )
+    roles: list[str] = []
+    feeds: list[str] = []
+    for role, feed in zip(
+        configured_reference_roles,
+        configured_reference_feeds,
+        strict=True,
+    ):
+        if not isinstance(role, str) or (
+            role not in _BASE_REFERENCE_ROLES
+            and not _SCOPED_REFERENCE_ROLE.fullmatch(role)
+        ):
+            raise ConfigurationError("sources field reference_roles is unsupported")
+        if role not in _BASE_REFERENCE_ROLES:
+            raise ConfigurationError(
+                "scoped reference roles require a separately reviewed pinned manifest"
+            )
+        if not isinstance(feed, str) or not _REFERENCE_FEED.fullmatch(feed):
+            raise ConfigurationError("sources field reference_feeds is malformed")
+        roles.append(role)
+        feeds.append(feed)
+    if len(roles) != len(set(roles)):
+        raise ConfigurationError("sources field reference_roles contains duplicates")
+    if not set(_BASE_REFERENCE_ROLES).issubset(roles):
+        raise ConfigurationError("sources field reference_roles is incomplete")
+    reference_urls = tuple(
+        _reference_url(
+            url,
+            reference_hosts,
+            allow_root=role.startswith(("ISSUER_IR:", "CORPORATE_ACTION:")),
+        )
+        for url, role in zip(configured_reference_urls, roles, strict=True)
+    )
+    if len(reference_urls) != len(set(reference_urls)):
+        raise ConfigurationError("sources field reference_urls contains duplicates")
+    for url, role, feed in zip(reference_urls, roles, feeds, strict=True):
+        if role in _BASE_REFERENCE_ROLES and _BASE_REFERENCE_ROLES[role] != (
+            url,
+            feed,
+        ):
+            raise ConfigurationError(
+                "base reference role must use its exact official URL and feed"
+            )
+    reference_sources = tuple(
+        ReferenceSource(url=url, role=role, feed=feed)
+        for url, role, feed in zip(reference_urls, roles, feeds, strict=True)
+    )
+
     return Sources(
         alpaca_market_data_url=_alpaca_market_data_url(
             table["alpaca_market_data_url"]
         ),
-        sec_submissions_url=_https_url(
-            "sec_submissions_url", table["sec_submissions_url"]
+        sec_submissions_url=_pinned_origin(
+            "sec_submissions_url",
+            table["sec_submissions_url"],
+            _APPROVED_SEC_SUBMISSIONS_ORIGIN,
         ),
-        sec_archives_url=_https_url("sec_archives_url", table["sec_archives_url"]),
+        sec_archives_url=_pinned_origin(
+            "sec_archives_url",
+            table["sec_archives_url"],
+            _APPROVED_SEC_ARCHIVES_ORIGIN,
+        ),
         reference_hosts=reference_hosts,
+        reference_urls=reference_urls,
+        reference_sources=reference_sources,
     )
 
 

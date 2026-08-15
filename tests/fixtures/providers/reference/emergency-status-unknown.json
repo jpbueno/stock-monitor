@@ -1,0 +1,6 @@
+{
+  "primary": {"status": "OPEN", "healthy": true, "observed_at": "2026-08-14T12:30:00Z"},
+  "cross_check": {"status": "OPEN", "healthy": true, "observed_at": "2026-08-14T12:30:00Z"},
+  "operational_status": {"status": "UNKNOWN", "healthy": true, "observed_at": "2026-08-14T12:30:00Z"},
+  "trader_alert": {"status": "UNKNOWN", "healthy": true, "observed_at": "2026-08-14T12:30:00Z"}
+}

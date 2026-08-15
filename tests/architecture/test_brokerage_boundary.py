@@ -77,17 +77,63 @@ _ASYNCIO_NETWORK_CALLS = frozenset(
         "asyncio.start_unix_server",
     }
 )
+_ALTERNATE_EGRESS_MODULES = frozenset({"subprocess", "webbrowser"})
+_ALTERNATE_EGRESS_CALLS = frozenset(
+    {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.popen",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.system",
+    }
+)
 _APPROVED_URLLIB_CALLS = frozenset(
-    {"urllib.request.Request", "urllib.request.urlopen"}
+    {"urllib.request.Request"}
 )
 _APPROVED_URLLIB_CONFIGURATION = frozenset(
-    {"urllib.request.HTTPRedirectHandler", "urllib.request.build_opener"}
+    {
+        "urllib.request.HTTPRedirectHandler",
+        "urllib.request.ProxyHandler",
+        "urllib.request.build_opener",
+    }
 )
 _APPROVED_URLLIB_IMPORTS = frozenset(
     {
         "urllib.request",
         *_APPROVED_URLLIB_CALLS,
         *_APPROVED_URLLIB_CONFIGURATION,
+    }
+)
+# No shell launcher is approved in Task 4. A future launcher must be added here
+# with its exact reviewed bytes; the scanner never infers safety from commands.
+_REVIEWED_SHELL_LAUNCHERS: dict[Path, bytes] = {}
+_NON_PRODUCTION_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".venv",
+        ".venvs",
+        ".worktrees",
+        "build",
+        "data",
+        "dist",
+        "docs",
+        "tests",
+        "venv",
     }
 )
 
@@ -217,6 +263,27 @@ def _import_aliases(tree: ast.AST) -> dict[str, str]:
                 aliases[imported.asname or imported.name] = (
                     f"{node.module}.{imported.name}"
                 )
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = [*node.args.posonlyargs, *node.args.args]
+        for argument, default in zip(
+            positional[-len(node.args.defaults) :],
+            node.args.defaults,
+        ):
+            resolved = _qualified_name(default, aliases)
+            if resolved is not None and _could_lead_to_network(resolved):
+                aliases[argument.arg] = resolved
+        for argument, default in zip(
+            node.args.kwonlyargs,
+            node.args.kw_defaults,
+            strict=True,
+        ):
+            if default is None:
+                continue
+            resolved = _qualified_name(default, aliases)
+            if resolved is not None and _could_lead_to_network(resolved):
+                aliases[argument.arg] = resolved
     changed = True
     while changed:
         changed = False
@@ -264,13 +331,13 @@ def _module_matches(path: str, module: str) -> bool:
 
 def _is_network_path(path: str) -> bool:
     root = path.split(".", 1)[0]
-    if root in _THIRD_PARTY_HTTP_MODULES:
+    if root in _THIRD_PARTY_HTTP_MODULES | _ALTERNATE_EGRESS_MODULES:
         return True
     if any(_module_matches(path, module) for module in _DIRECT_NETWORK_MODULES):
         return True
     if _module_matches(path, "urllib.request"):
         return True
-    return path in _ASYNCIO_NETWORK_CALLS
+    return path in _ASYNCIO_NETWORK_CALLS | _ALTERNATE_EGRESS_CALLS
 
 
 def _could_lead_to_network(path: str) -> bool:
@@ -278,6 +345,7 @@ def _could_lead_to_network(path: str) -> bool:
         return True
     candidates = {
         "urllib.request",
+        *_ALTERNATE_EGRESS_MODULES,
         *_DIRECT_NETWORK_MODULES,
         *_THIRD_PARTY_HTTP_MODULES,
     }
@@ -458,6 +526,95 @@ def _constructed_names(
     return names
 
 
+def _is_literal_empty_proxy_handler(
+    node: ast.AST,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and _qualified_name(node.func, aliases, provider_exports)
+        == "urllib.request.ProxyHandler"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Dict)
+        and not node.args[0].keys
+        and not node.keywords
+    )
+
+
+def _is_no_automatic_redirects(
+    node: ast.AST,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> bool:
+    name = _qualified_name(node, aliases, provider_exports)
+    return name is not None and (
+        name == "NoAutomaticRedirects" or name.endswith(".NoAutomaticRedirects")
+    )
+
+
+def _safe_opener_construction(
+    call: ast.Call,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> bool:
+    return (
+        _qualified_name(call.func, aliases, provider_exports)
+        == "urllib.request.build_opener"
+        and not _has_dynamic_arguments(call)
+        and len(call.args) == 2
+        and not call.keywords
+        and _is_literal_empty_proxy_handler(
+            call.args[0], aliases, provider_exports
+        )
+        and _is_no_automatic_redirects(
+            call.args[1], aliases, provider_exports
+        )
+    )
+
+
+def _safe_opener_names(
+    tree: ast.AST,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call) or not _safe_opener_construction(
+            value,
+            aliases,
+            provider_exports,
+        ):
+            continue
+        for target in _assigned_targets(node):
+            name = _qualified_name(target, aliases, provider_exports)
+            if name is not None:
+                names.add(name)
+    return names
+
+
+def _direct_safe_opener_calls(
+    tree: ast.AST,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> set[int]:
+    result: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if isinstance(value, ast.Call) and _safe_opener_construction(
+            value,
+            aliases,
+            provider_exports,
+        ):
+            result.add(id(value))
+    return result
+
+
 def _expanded_object_names(
     tree: ast.AST,
     aliases: dict[str, str],
@@ -561,12 +718,33 @@ def _dynamic_network_import(
     return None
 
 
+def _dynamic_network_attribute(
+    call: ast.Call,
+    aliases: dict[str, str],
+    provider_exports: dict[str, str],
+) -> str | None:
+    getter = _qualified_name(call.func, aliases, provider_exports)
+    if getter not in {"getattr", "builtins.getattr"} or len(call.args) < 2:
+        return None
+    owner = _qualified_name(call.args[0], aliases, provider_exports)
+    if owner is None or not _could_lead_to_network(owner):
+        return None
+    attribute = _static_string(call.args[1])
+    if attribute is None:
+        return "dynamic network attribute"
+    candidate = f"{owner}.{attribute}"
+    if _could_lead_to_network(candidate) or _is_network_path(candidate):
+        return candidate
+    return None
+
+
 def _network_call_violation(
     call: ast.Call,
     aliases: dict[str, str],
     relative: Path,
     provider_exports: dict[str, str],
     opener_names: set[str],
+    direct_safe_opener_calls: set[int],
     request_names: set[str],
 ) -> str | None:
     path = _qualified_name(call.func, aliases, provider_exports)
@@ -574,12 +752,11 @@ def _network_call_violation(
         owner = _qualified_name(call.func.value, aliases, provider_exports)
         directly_constructed = (
             isinstance(call.func.value, ast.Call)
-            and _qualified_name(
-                call.func.value.func,
+            and _safe_opener_construction(
+                call.func.value,
                 aliases,
                 provider_exports,
             )
-            == "urllib.request.build_opener"
         )
         approved_opener = owner in opener_names or directly_constructed
         has_body = _attribute_open_has_body(call)
@@ -623,14 +800,21 @@ def _network_call_violation(
     if path == "urllib.request.Request":
         return None if _request_is_get_only(call) else path
     if path == "urllib.request.urlopen":
+        return path
+    if path == "urllib.request.ProxyHandler":
+        if (
+            len(call.args) == 1
+            and isinstance(call.args[0], ast.Dict)
+            and not call.args[0].keys
+            and not call.keywords
+        ):
+            return None
+        return path
+    if path == "urllib.request.build_opener":
         return (
             None
-            if _urlopen_is_get_only(
-                call,
-                aliases,
-                provider_exports,
-                request_names,
-            )
+            if id(call) in direct_safe_opener_calls
+            and _safe_opener_construction(call, aliases, provider_exports)
             else path
         )
     if path in _APPROVED_URLLIB_CONFIGURATION:
@@ -664,9 +848,16 @@ def _static_string(node: ast.AST) -> str | None:
 
 def _boundary_violations(package: Path) -> list[str]:
     violations: list[str] = []
-    provider_exports = _provider_network_exports(package)
-    for path in sorted(package.rglob("*.py")):
-        relative = path.relative_to(package)
+    if package.is_file():
+        scan_root = package.parent
+        paths = (package,)
+        provider_exports: dict[str, str] = {}
+    else:
+        scan_root = package
+        paths = tuple(sorted(package.rglob("*.py")))
+        provider_exports = _provider_network_exports(package)
+    for path in paths:
+        relative = path.relative_to(scan_root)
         module_tokens: set[str] = set()
         for segment in relative.with_suffix("").parts:
             module_tokens.update(_identifier_tokens(segment))
@@ -676,11 +867,11 @@ def _boundary_violations(package: Path) -> list[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(relative))
         docstrings = _docstring_constants(tree)
         aliases = _import_aliases(tree)
-        opener_names = _constructed_names(
+        opener_names = _safe_opener_names(tree, aliases, provider_exports)
+        direct_safe_opener_calls = _direct_safe_opener_calls(
             tree,
             aliases,
             provider_exports,
-            "urllib.request.build_opener",
         )
         request_names = _constructed_names(
             tree,
@@ -730,12 +921,17 @@ def _boundary_violations(package: Path) -> list[str]:
                     node,
                     aliases,
                     provider_exports,
+                ) or _dynamic_network_attribute(
+                    node,
+                    aliases,
+                    provider_exports,
                 ) or _network_call_violation(
                     node,
                     aliases,
                     relative,
                     provider_exports,
                     opener_names,
+                    direct_safe_opener_calls,
                     request_names,
                 )
                 if network_path is not None:
@@ -761,6 +957,124 @@ def _boundary_violations(package: Path) -> list[str]:
                     f"prohibited endpoint:{relative}:{line}:network target"
                 )
     return violations
+
+
+def _relabel_violation(violation: str, relative: Path) -> str:
+    pieces = violation.split(":", 3)
+    if len(pieces) < 3:
+        return violation
+    pieces[1] = relative.as_posix()
+    return ":".join(pieces)
+
+
+def _shell_boundary_violations(path: Path, relative: Path) -> list[str]:
+    reviewed_bytes = _REVIEWED_SHELL_LAUNCHERS.get(relative)
+    if reviewed_bytes is None:
+        return [
+            f"unreviewed executable shell:{relative}:1:shell surface"
+        ]
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        return [
+            f"unscannable executable:{relative}:0:{type(error).__name__}"
+        ]
+    if payload != reviewed_bytes:
+        return [
+            f"unreviewed executable shell:{relative}:1:launcher shape changed"
+        ]
+    return []
+
+
+def _project_boundary_violations(project_root: Path) -> list[str]:
+    root = Path(project_root)
+    package = root / "src" / "stock_monitor"
+    if not package.is_dir():
+        return ["unscannable package:src/stock_monitor:0:missing"]
+    violations = list(_boundary_violations(package))
+
+    python_paths: set[Path] = set()
+    shell_paths: set[Path] = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in _NON_PRODUCTION_DIRECTORIES for part in relative.parts):
+            continue
+        if path.suffix == ".py":
+            if not path.is_relative_to(package):
+                python_paths.add(path)
+            continue
+        if path.suffix in {".sh", ".command"}:
+            shell_paths.add(path)
+            continue
+        try:
+            executable = bool(path.stat().st_mode & 0o111)
+        except OSError:
+            continue
+        try:
+            with path.open("rb") as stream:
+                first_line = stream.readline(256).decode("ascii")
+        except (OSError, UnicodeError):
+            if executable:
+                violations.append(
+                    f"unscannable executable:{relative}:0:read failure"
+                )
+            continue
+        if not (executable or first_line.startswith("#!")):
+            continue
+        if first_line.startswith("#!") and "python" in first_line.casefold():
+            python_paths.add(path)
+        else:
+            shell_paths.add(path)
+
+    for path in sorted(shell_paths):
+        violations.extend(
+            _shell_boundary_violations(path, path.relative_to(root))
+        )
+
+    for path in sorted(python_paths):
+        relative = path.relative_to(root)
+        violations.extend(
+            _relabel_violation(value, relative)
+            for value in _boundary_violations(path)
+        )
+
+    try:
+        document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        scripts = document.get("project", {}).get("scripts", {})
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, AttributeError):
+        violations.append("unscannable console entrypoints:pyproject.toml:0:invalid")
+        scripts = {}
+    if not isinstance(scripts, dict):
+        violations.append("unscannable console entrypoints:pyproject.toml:0:invalid")
+        scripts = {}
+    target_pattern = re.compile(
+        r"(?P<module>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):"
+        r"[A-Za-z_]\w*\Z"
+    )
+    for name, target in sorted(scripts.items()):
+        match = target_pattern.fullmatch(target) if isinstance(target, str) else None
+        if match is None:
+            violations.append(
+                f"unscanned console entrypoint:pyproject.toml:0:{name}"
+            )
+            continue
+        module = match.group("module")
+        if module != "stock_monitor" and not module.startswith("stock_monitor."):
+            violations.append(
+                f"unscanned console entrypoint:pyproject.toml:0:{name}"
+            )
+            continue
+        parts = module.split(".")[1:]
+        candidate = package.joinpath(*parts)
+        module_file = candidate.with_suffix(".py") if parts else package / "__init__.py"
+        package_file = candidate / "__init__.py"
+        if not module_file.is_file() and not package_file.is_file():
+            violations.append(
+                f"unscanned console entrypoint:pyproject.toml:0:{name}"
+            )
+    return sorted(violations)
 
 
 class BrokerageBoundaryTests(unittest.TestCase):
@@ -797,6 +1111,9 @@ class BrokerageBoundaryTests(unittest.TestCase):
         package = PROJECT_ROOT / "src" / "stock_monitor"
 
         self.assertEqual(_boundary_violations(package), [])
+
+    def test_permanent_boundary_covers_every_production_executable_surface(self) -> None:
+        self.assertEqual(_project_boundary_violations(PROJECT_ROOT), [])
 
     def test_boundary_scanner_recurses_and_detects_unsafe_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -994,7 +1311,7 @@ class BrokerageBoundaryTests(unittest.TestCase):
                     )
                 )
 
-    def test_designated_http_provider_allows_structural_get_only(self) -> None:
+    def test_designated_http_provider_rejects_raw_urlopen_even_for_get(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "stock_monitor"
             provider = package / "providers" / "http.py"
@@ -1013,7 +1330,12 @@ class BrokerageBoundaryTests(unittest.TestCase):
 
             violations = _boundary_violations(package)
 
-        self.assertEqual(violations, [])
+        self.assertTrue(
+            any(
+                violation.endswith(":urllib.request.urlopen")
+                for violation in violations
+            )
+        )
 
     def test_designated_http_provider_allows_planned_redirect_safe_opener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1025,7 +1347,9 @@ class BrokerageBoundaryTests(unittest.TestCase):
                 "class NoAutomaticRedirects(url_request.HTTPRedirectHandler):\n"
                 "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
                 "        return None\n"
-                "OPENER = url_request.build_opener(NoAutomaticRedirects)\n"
+                "OPENER = url_request.build_opener(\n"
+                "    url_request.ProxyHandler({}), NoAutomaticRedirects\n"
+                ")\n"
                 "def fetch(url):\n"
                 "    request = url_request.Request(url, method='GET')\n"
                 "    return OPENER.open(request)\n",
@@ -1035,6 +1359,121 @@ class BrokerageBoundaryTests(unittest.TestCase):
             violations = _boundary_violations(package)
 
         self.assertEqual(violations, [])
+
+    def test_designated_http_provider_requires_exact_safe_opener_construction(self) -> None:
+        calls = {
+            "implicit handlers": "url_request.build_opener()",
+            "proxy only": (
+                "url_request.build_opener(url_request.ProxyHandler({}))"
+            ),
+            "redirect only": "url_request.build_opener(NoAutomaticRedirects)",
+            "automatic redirects": (
+                "url_request.build_opener(url_request.ProxyHandler({}), "
+                "url_request.HTTPRedirectHandler())"
+            ),
+            "dynamic handlers": "url_request.build_opener(*handlers)",
+        }
+        for case, call in calls.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                package = Path(directory) / "stock_monitor"
+                provider = package / "providers" / "http.py"
+                provider.parent.mkdir(parents=True)
+                provider.write_text(
+                    "import urllib.request as url_request\n"
+                    "class NoAutomaticRedirects(url_request.HTTPRedirectHandler):\n"
+                    "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+                    "        return None\n"
+                    "def build(handlers=()):\n"
+                    f"    return {call}\n",
+                    encoding="utf-8",
+                )
+
+                violations = _boundary_violations(package)
+
+                self.assertTrue(
+                    any(
+                        violation.endswith(":urllib.request.build_opener")
+                        for violation in violations
+                    )
+                )
+
+    def test_boundary_scanner_rejects_alternate_process_and_browser_egress(self) -> None:
+        sources = {
+            "os system": (
+                "import os\n"
+                "def fetch(url):\n"
+                "    return os.system('curl ' + url)\n"
+            ),
+            "os popen": (
+                "from os import popen\n"
+                "def fetch(url):\n"
+                "    return popen('curl ' + url).read()\n"
+            ),
+            "subprocess": (
+                "import subprocess\n"
+                "def fetch(url):\n"
+                "    return subprocess.run(['curl', url])\n"
+            ),
+            "webbrowser": (
+                "import webbrowser\n"
+                "def fetch(url):\n"
+                "    return webbrowser.open(url)\n"
+            ),
+            "os execv": (
+                "import os\n"
+                "def fetch(url):\n"
+                "    return os.execv('/usr/bin/curl', ['curl', url])\n"
+            ),
+            "os spawnvp": (
+                "import os\n"
+                "def fetch(url):\n"
+                "    return os.spawnvp(os.P_WAIT, 'curl', ['curl', url])\n"
+            ),
+        }
+        for case, source in sources.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                package = Path(directory) / "stock_monitor"
+                package.mkdir()
+                (package / "feature.py").write_text(source, encoding="utf-8")
+
+                violations = _boundary_violations(package)
+
+                self.assertTrue(
+                    any(
+                        violation.startswith("network capability:")
+                        for violation in violations
+                    )
+                )
+
+    def test_designated_http_provider_rejects_environment_or_configured_proxies(self) -> None:
+        calls = {
+            "implicit environment proxies": "url_request.ProxyHandler()",
+            "dynamic proxies": "url_request.ProxyHandler(proxies)",
+            "explicit proxy": (
+                "url_request.ProxyHandler({'https': 'https://proxy.example'})"
+            ),
+            "expanded proxies": "url_request.ProxyHandler(**options)",
+        }
+        for case, call in calls.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                package = Path(directory) / "stock_monitor"
+                provider = package / "providers" / "http.py"
+                provider.parent.mkdir(parents=True)
+                provider.write_text(
+                    "import urllib.request as url_request\n"
+                    "def build(proxies=None, options=None):\n"
+                    f"    return {call}\n",
+                    encoding="utf-8",
+                )
+
+                violations = _boundary_violations(package)
+
+                self.assertTrue(
+                    any(
+                        violation.endswith(":urllib.request.ProxyHandler")
+                        for violation in violations
+                    )
+                )
 
     def test_designated_http_provider_rejects_factory_opener_body(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1285,6 +1724,276 @@ class BrokerageBoundaryTests(unittest.TestCase):
                         for violation in violations
                     )
                 )
+
+    def test_dynamic_getattr_and_opener_factory_provenance_cannot_bypass_guard(self) -> None:
+        fixtures = {
+            "dynamic getattr": (
+                "import urllib.request as url_request\n"
+                "class NoAutomaticRedirects(url_request.HTTPRedirectHandler):\n"
+                "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+                "        return None\n"
+                "def fetch(url):\n"
+                "    return getattr(url_request, 'build_opener')(\n"
+                "        url_request.ProxyHandler({}), NoAutomaticRedirects\n"
+                "    ).open(url)\n"
+            ),
+            "helper factory": (
+                "import urllib.request as url_request\n"
+                "class NoAutomaticRedirects(url_request.HTTPRedirectHandler):\n"
+                "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+                "        return None\n"
+                "def make_opener():\n"
+                "    return url_request.build_opener(\n"
+                "        url_request.ProxyHandler({}), NoAutomaticRedirects\n"
+                "    )\n"
+                "def fetch(url):\n"
+                "    return make_opener().open(url)\n"
+            ),
+            "defaulted factory": (
+                "import urllib.request as url_request\n"
+                "class NoAutomaticRedirects(url_request.HTTPRedirectHandler):\n"
+                "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+                "        return None\n"
+                "def fetch(url, factory=url_request.build_opener):\n"
+                "    return factory(\n"
+                "        url_request.ProxyHandler({}), NoAutomaticRedirects\n"
+                "    ).open(url)\n"
+            ),
+        }
+        for case, source in fixtures.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                package = Path(directory) / "stock_monitor"
+                provider = package / "providers" / "http.py"
+                provider.parent.mkdir(parents=True)
+                provider.write_text(source, encoding="utf-8")
+
+                violations = _boundary_violations(package)
+
+                self.assertTrue(
+                    any(
+                        violation.startswith("network capability:")
+                        for violation in violations
+                    )
+                )
+
+    def test_project_boundary_scans_shell_command_and_top_level_launchers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "src" / "stock_monitor"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "cli.py").write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                "[project]\n"
+                "name = 'fixture'\n"
+                "[project.scripts]\n"
+                "stock-monitor = 'stock_monitor.cli:main'\n"
+                "[tool.setuptools]\n"
+                "package-dir = {'' = 'src'}\n",
+                encoding="utf-8",
+            )
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "run_monitor.sh").write_text(
+                "#!/bin/sh\ncurl https://paper-api.alpaca.markets/v2/orders\n",
+                encoding="utf-8",
+            )
+            (scripts / "future.command").write_text(
+                "#!/bin/sh\nwget https://api.robinhood.com/orders\n",
+                encoding="utf-8",
+            )
+            (root / "launch.py").write_text(
+                "import os\n"
+                "def main():\n"
+                "    os.execv('/usr/bin/curl', ['curl', 'https://example.com'])\n",
+                encoding="utf-8",
+            )
+
+            violations = _project_boundary_violations(root)
+
+        for name in ("scripts/run_monitor.sh", "scripts/future.command", "launch.py"):
+            with self.subTest(name=name):
+                self.assertTrue(any(name in violation for violation in violations))
+
+    def test_project_boundary_recurses_into_nested_python_and_extensionless_executables(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "src" / "stock_monitor"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\n"
+                "name = 'fixture'\n"
+                "[project.scripts]\n"
+                "[tool.setuptools]\n"
+                "package-dir = {'' = 'src'}\n",
+                encoding="utf-8",
+            )
+            monitor = root / "bin" / "monitor"
+            monitor.parent.mkdir()
+            monitor.write_text(
+                "#!/bin/sh\ncurl https://paper-api.alpaca.markets/v2/orders\n",
+                encoding="utf-8",
+            )
+            monitor.chmod(0o755)
+            suffixed_executable = root / "bin" / "monitor.bash"
+            suffixed_executable.write_text(
+                "curl https://paper-api.alpaca.markets/v2/orders\n",
+                encoding="utf-8",
+            )
+            suffixed_executable.chmod(0o755)
+            suffixed_shebang = root / "bin" / "monitor.fish"
+            suffixed_shebang.write_text(
+                "#!/usr/bin/env fish\ncurl https://paper-api.alpaca.markets/v2/orders\n",
+                encoding="utf-8",
+            )
+            nested = root / "ops" / "launch.py"
+            nested.parent.mkdir()
+            nested.write_text(
+                "import os\n"
+                "os.execv('/usr/bin/curl', ['curl', 'https://example.com'])\n",
+                encoding="utf-8",
+            )
+            ignored = root / "data" / "reviewed-example.py"
+            ignored.parent.mkdir()
+            ignored.write_text(
+                "import os\nos.execv('/usr/bin/curl', ['curl'])\n",
+                encoding="utf-8",
+            )
+            harmless = root / "NOTES"
+            harmless.write_text(
+                "curl is named here, but this file has no shebang and is not executable\n",
+                encoding="utf-8",
+            )
+
+            violations = _project_boundary_violations(root)
+
+        self.assertTrue(any("bin/monitor" in value for value in violations))
+        self.assertTrue(any("bin/monitor.bash" in value for value in violations))
+        self.assertTrue(any("bin/monitor.fish" in value for value in violations))
+        self.assertTrue(any("ops/launch.py" in value for value in violations))
+        self.assertFalse(any("data/reviewed-example.py" in value for value in violations))
+        self.assertFalse(any("NOTES" in value for value in violations))
+
+    def test_unreviewed_shell_surfaces_fail_closed_before_command_parsing(self) -> None:
+        cases = {
+            "absolute-curl.bash": "#!/bin/sh\n/usr/bin/curl https://example.com\n",
+            "quoted-curl.zsh": "#!/bin/zsh\n\"curl\" https://example.com\n",
+            "dev-tcp.fish": "#!/usr/bin/env fish\necho probe >/dev/tcp/example.com/443\n",
+            "env-curl.tool": "#!/bin/sh\n/usr/bin/env curl https://example.com\n",
+            "command-curl.tool": "#!/bin/sh\ncommand curl https://example.com\n",
+            "busybox-wget.tool": "#!/bin/sh\nbusybox wget https://example.com\n",
+            "dev-udp.tool": "#!/bin/sh\necho probe >/dev/udp/example.com/53\n",
+            "dynamic-command.tool": "#!/bin/sh\ntool=curl\n\"$tool\" https://example.com\n",
+            "apparently-safe.tool": "#!/bin/sh\nexit 0\n",
+            "node-launcher.js": (
+                "#!/usr/bin/env node\n"
+                "require('https').get('https://example.com')\n"
+            ),
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                package = root / "src" / "stock_monitor"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text("", encoding="utf-8")
+                (root / "pyproject.toml").write_text(
+                    "[project]\nname = 'fixture'\n[project.scripts]\n"
+                    "[tool.setuptools]\npackage-dir = {'' = 'src'}\n",
+                    encoding="utf-8",
+                )
+                surface = root / "bin" / name
+                surface.parent.mkdir()
+                surface.write_text(body, encoding="utf-8")
+                surface.chmod(0o755)
+
+                violations = _project_boundary_violations(root)
+
+                self.assertTrue(
+                    any(
+                        value.startswith("unreviewed executable shell:")
+                        and f"bin/{name}" in value
+                        for value in violations
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "src" / "stock_monitor"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = 'fixture'\n[project.scripts]\n"
+                "[tool.setuptools]\npackage-dir = {'' = 'src'}\n",
+                encoding="utf-8",
+            )
+            documentation = root / "README.txt"
+            documentation.write_text(
+                "/usr/bin/curl and /dev/tcp are documented here only\n",
+                encoding="utf-8",
+            )
+            ignored_data = root / "data" / "fixture.bash"
+            ignored_data.parent.mkdir()
+            ignored_data.write_text(
+                "#!/bin/sh\ncurl https://example.com\n",
+                encoding="utf-8",
+            )
+            ignored_data.chmod(0o755)
+            python_surface = root / "bin" / "python.tool"
+            python_surface.parent.mkdir()
+            python_surface.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "os.execv('/usr/bin/curl', ['curl', 'https://example.com'])\n",
+                encoding="utf-8",
+            )
+            python_surface.chmod(0o755)
+
+            violations = _project_boundary_violations(root)
+
+        self.assertFalse(any("README.txt" in value for value in violations))
+        self.assertFalse(any("data/fixture.bash" in value for value in violations))
+        self.assertTrue(
+            any(
+                value.startswith("network capability:bin/python.tool:")
+                for value in violations
+            )
+        )
+        self.assertFalse(
+            any(
+                value.startswith("unreviewed executable shell:bin/python.tool:")
+                for value in violations
+            )
+        )
+
+    def test_console_entrypoints_must_resolve_inside_the_scanned_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "src" / "stock_monitor"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (root / "rogue_launcher.py").write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                "[project]\n"
+                "name = 'fixture'\n"
+                "[project.scripts]\n"
+                "rogue = 'rogue_launcher:main'\n"
+                "[tool.setuptools]\n"
+                "package-dir = {'' = 'src'}\n",
+                encoding="utf-8",
+            )
+
+            violations = _project_boundary_violations(root)
+
+        self.assertTrue(
+            any(violation.startswith("unscanned console entrypoint:") for violation in violations)
+        )
 
 
 if __name__ == "__main__":

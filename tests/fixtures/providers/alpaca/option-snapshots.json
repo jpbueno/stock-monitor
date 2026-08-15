@@ -1,0 +1,18 @@
+{
+  "responses": [
+    {
+      "url": "https://data.alpaca.markets/v1beta1/options/snapshots/SPY?feed=indicative&limit=1000",
+      "body": {
+        "snapshots": {
+          "SPY260918C00650000": {
+            "latestQuote": {"t": "2026-08-14T12:58:00Z", "bp": "18.10", "ap": "18.30"},
+            "greeks": {"delta": "0.37"},
+            "dailyBar": {"v": 234},
+            "open_interest": 999999
+          }
+        },
+        "next_page_token": null
+      }
+    }
+  ]
+}

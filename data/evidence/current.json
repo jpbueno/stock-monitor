@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "kind": "REVIEWED_EVIDENCE_BUNDLE",
+  "registry_id": "evidence-registry-20260814",
+  "reviewed_at": "2026-08-14T12:00:00Z",
+  "subject": null,
+  "records": [],
+  "source_bindings": [],
+  "coverage_attestations": []
+}

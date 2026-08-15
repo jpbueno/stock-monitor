@@ -232,6 +232,37 @@ class SettingsTests(unittest.TestCase):
             "https://data.alpaca.markets",
         )
 
+    def test_sec_origins_are_pinned_to_official_paths_not_only_safe_hosts(self) -> None:
+        poisoned = {
+            "sec_submissions_url": (
+                "https://www.sec.gov/submissions/",
+                "https://data.sec.gov/other/",
+                "https://data.sec.gov/submissions",
+            ),
+            "sec_archives_url": (
+                "https://data.sec.gov/Archives/",
+                "https://www.sec.gov/other/",
+                "https://www.sec.gov/Archives",
+            ),
+        }
+        for field, values in poisoned.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self._write_sources(**{field: value})
+                    with self.assertRaises(ConfigurationError):
+                        load_settings(self.project_root, ENVIRONMENT)
+
+    def test_sec_origins_load_only_as_exact_official_values(self) -> None:
+        settings = load_settings(self.project_root, ENVIRONMENT)
+        self.assertEqual(
+            settings.sources.sec_submissions_url,
+            "https://data.sec.gov/submissions/",
+        )
+        self.assertEqual(
+            settings.sources.sec_archives_url,
+            "https://www.sec.gov/Archives/",
+        )
+
     def test_source_urls_reject_ip_local_and_prohibited_hosts(self) -> None:
         poisoned_urls = (
             "https://127.0.0.1/submissions/",
@@ -261,6 +292,99 @@ class SettingsTests(unittest.TestCase):
             settings.sources.reference_hosts,
             ("www.nyse.com", "www.nasdaqtrader.com"),
         )
+
+    def test_reference_urls_are_exact_reviewed_https_urls_on_reference_hosts(self) -> None:
+        settings = load_settings(self.project_root, ENVIRONMENT)
+        self.assertEqual(
+            settings.sources.reference_urls,
+            (
+                "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts",
+                "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines",
+                "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+                "https://www.nyse.com/api/notifications/public/alerts?2=3",
+                "https://www.nyse.com/trade/hours-calendars",
+            ),
+        )
+        self.assertEqual(
+            tuple(source.role for source in settings.sources.reference_sources),
+            (
+                "PRIMARY_HALT_FEED",
+                "TRADER_ALERT_HALT",
+                "CROSS_CHECK_CALENDAR",
+                "OPERATIONAL_STATUS",
+                "PRIMARY_CALENDAR",
+            ),
+        )
+        self.assertEqual(
+            tuple(source.url for source in settings.sources.reference_sources),
+            settings.sources.reference_urls,
+        )
+
+        poisoned = (
+            "http://www.nasdaqtrader.com/Trader.aspx?id=TraderAlerts",
+            "https://www.nasdaqtrader.com/Trader.aspx?id=TraderAlerts#fragment",
+            "https://www.nasdaqtrader.com/Trader.aspx?access_token=canary",
+            "https://www.nasdaqtrader.com/Trader.aspx?api-key=canary",
+            "https://www.nasdaqtrader.com/Trader.aspx?key.id=canary",
+            "https://www.nasdaqtrader.com/Trader.aspx?client-secret=canary",
+            "https://www.nasdaqtrader.com//evil.example/path",
+            "https://evil.example/Trader.aspx?id=TraderAlerts",
+            "https://user:secret@www.nasdaqtrader.com/Trader.aspx?id=TraderAlerts",
+        )
+        reviewed_urls = list(settings.sources.reference_urls)
+        for url in poisoned:
+            with self.subTest(url=url):
+                self._write_sources(reference_urls=[url, *reviewed_urls[1:]])
+                with self.assertRaises(ConfigurationError):
+                    load_settings(self.project_root, ENVIRONMENT)
+
+    def test_reference_role_binding_is_complete_unique_and_scoped_roles_need_manifest(self) -> None:
+        settings = load_settings(self.project_root, ENVIRONMENT)
+        urls = list(settings.sources.reference_urls)
+        roles = [source.role for source in settings.sources.reference_sources]
+        feeds = [source.feed for source in settings.sources.reference_sources]
+
+        for poisoned_roles in (
+            roles[:-1],
+            [*roles[:-1], roles[0]],
+            [*roles[:-1], "UNREVIEWED_ROLE"],
+        ):
+            with self.subTest(roles=poisoned_roles):
+                self._write_sources(reference_roles=poisoned_roles)
+                with self.assertRaises(ConfigurationError):
+                    load_settings(self.project_root, ENVIRONMENT)
+
+        self._write_sources(
+            reference_hosts=[
+                "www.nyse.com",
+                "www.nasdaqtrader.com",
+                "ir.example.com",
+            ],
+            reference_urls=[*urls, "https://ir.example.com/"],
+            reference_roles=[*roles, "ISSUER_IR:EXM"],
+            reference_feeds=[*feeds, "issuer-ir-primary"],
+        )
+        with self.assertRaises(ConfigurationError):
+            load_settings(self.project_root, ENVIRONMENT)
+
+    def test_scoped_reference_role_rejects_unreviewed_subject_origin_pair(self) -> None:
+        settings = load_settings(self.project_root, ENVIRONMENT)
+        urls = list(settings.sources.reference_urls)
+        roles = [source.role for source in settings.sources.reference_sources]
+        feeds = [source.feed for source in settings.sources.reference_sources]
+        self._write_sources(
+            reference_hosts=[
+                "www.nyse.com",
+                "www.nasdaqtrader.com",
+                "attacker.example",
+            ],
+            reference_urls=[*urls, "https://attacker.example/"],
+            reference_roles=[*roles, "ISSUER_IR:AAPL"],
+            reference_feeds=[*feeds, "issuer-ir-primary"],
+        )
+
+        with self.assertRaises(ConfigurationError):
+            load_settings(self.project_root, ENVIRONMENT)
 
     def test_reference_hosts_reject_non_dns_and_prohibited_values(self) -> None:
         poisoned_hosts = (

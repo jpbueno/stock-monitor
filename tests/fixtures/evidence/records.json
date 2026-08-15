@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "record_id": "evidence-fixture-001",
+      "primary_url": "https://www.sec.gov/Archives/edgar/data/1/fixture.htm",
+      "publisher": "Example Issuer",
+      "published_at": "2026-08-10T14:30:00Z",
+      "retrieved_at": "2026-08-14T12:30:00Z",
+      "event_type": "material agreement",
+      "fact": "The issuer signed a material customer agreement.",
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_observation_ids": ["source-fixture-001"],
+      "accession": "0000000001-26-000001"
+    }
+  ]
+}

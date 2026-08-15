@@ -1,0 +1,14 @@
+{
+  "responses": [
+    {
+      "url": "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=QQQ%2CSPY&feed=iex",
+      "body": {
+        "quotes": {
+          "SPY": {"t": "2026-08-14T12:59:00Z", "bp": "651.90", "ap": "652.10", "z": "V", "i": "1001"},
+          "QQQ": {"t": "2026-08-14T12:58:30Z", "bp": "583.00", "ap": "583.20", "z": "V", "i": "1002"}
+        },
+        "next_page_token": null
+      }
+    }
+  ]
+}

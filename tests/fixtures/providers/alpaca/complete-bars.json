@@ -1,0 +1,18 @@
+{
+  "responses": [
+    {
+      "url": "https://data.alpaca.markets/v2/stocks/bars?symbols=QQQ%2CSPY&timeframe=1Day&start=2026-05-01T00%3A00%3A00Z&end=2026-08-13T20%3A00%3A00Z&adjustment=split&feed=sip&limit=10000",
+      "body": {
+        "bars": {"SPY": [{"t": "2026-08-13T20:00:00Z", "o": "650.00", "h": "653.00", "l": "648.00", "c": "652.10", "v": 70000000}]},
+        "next_page_token": "page-2"
+      }
+    },
+    {
+      "url": "https://data.alpaca.markets/v2/stocks/bars?symbols=QQQ%2CSPY&timeframe=1Day&start=2026-05-01T00%3A00%3A00Z&end=2026-08-13T20%3A00%3A00Z&adjustment=split&feed=sip&limit=10000&page_token=page-2",
+      "body": {
+        "bars": {"QQQ": [{"t": "2026-08-13T20:00:00Z", "o": "580.00", "h": "584.00", "l": "578.00", "c": "583.20", "v": 45000000}]},
+        "next_page_token": null
+      }
+    }
+  ]
+}

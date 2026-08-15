@@ -1,0 +1,14 @@
+{
+  "responses": [
+    {
+      "url": "https://data.alpaca.markets/v2/stocks/quotes?symbols=QQQ%2CSPY&start=2026-05-01T00%3A00%3A00Z&end=2026-08-13T20%3A00%3A00Z&feed=sip&limit=10000",
+      "body": {
+        "quotes": {
+          "SPY": [{"t": "2026-08-13T19:59:59Z", "bp": "651.90", "ap": "652.10", "z": "C", "i": "123"}],
+          "QQQ": [{"t": "2026-08-13T19:59:58Z", "bp": "583.00", "ap": "583.20", "z": "C", "i": "456"}]
+        },
+        "next_page_token": null
+      }
+    }
+  ]
+}

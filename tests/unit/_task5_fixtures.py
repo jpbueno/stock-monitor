@@ -23,6 +23,12 @@ from stock_monitor.evidence import (
 )
 from stock_monitor.market_calendar import MarketCalendar
 from stock_monitor.providers.cache import SourceDocument
+from stock_monitor.providers.http import EgressPolicy, HttpResponse
+from stock_monitor.providers.reference import (
+    InstrumentStatusDecision,
+    ReferenceClient,
+    classify_instrument_status,
+)
 from stock_monitor.universe import load_current_universe
 
 
@@ -89,6 +95,86 @@ class InstrumentStatusFixture:
     as_of: datetime = RUN_AT
     valid_until: datetime | None = RUN_AT + timedelta(minutes=5)
     source_observation_ids: tuple[str, ...] = ("halt-fixture",)
+
+
+_HALT_SOURCE_RESPONSES = {
+    "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts": (
+        b'<?xml version="1.0"?><rss version="2.0" '
+        b'xmlns:ndaq="http://www.nasdaqtrader.com/"><channel>'
+        b"<ndaq:numItems>0</ndaq:numItems></channel></rss>",
+        "application/xml",
+    ),
+    "https://www.nyse.com/api/notifications/public/alerts?2=3": (
+        b"[]",
+        "application/json",
+    ),
+    "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines": (
+        b'<?xml version="1.0"?><rss version="2.0" '
+        b'xmlns:ndaq="http://www.nasdaqtrader.com/"><channel>'
+        b"<title>Nasdaq Equity Trader Alerts</title>"
+        b"<ndaq:numItems>0</ndaq:numItems></channel></rss>",
+        "application/xml",
+    ),
+}
+_HALT_SOURCE_ROLES = {
+    "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts": (
+        "PRIMARY_HALT_FEED"
+    ),
+    "https://www.nyse.com/api/notifications/public/alerts?2=3": (
+        "OPERATIONAL_STATUS"
+    ),
+    "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines": (
+        "TRADER_ALERT_HALT"
+    ),
+}
+
+
+class _FixtureReferenceTransport:
+    def get(self, url: str, headers: object) -> HttpResponse:
+        body, content_type = _HALT_SOURCE_RESPONSES[url]
+        return HttpResponse(
+            200,
+            (("Content-Type", content_type),),
+            body,
+            url,
+        )
+
+
+def reviewed_instrument_status(
+    symbol: str,
+    listing_venue: str,
+) -> InstrumentStatusDecision:
+    client = ReferenceClient(
+        _FixtureReferenceTransport(),
+        EgressPolicy({"www.nyse.com", "www.nasdaqtrader.com"}),
+        allowed_urls=_HALT_SOURCE_ROLES,
+        source_roles=_HALT_SOURCE_ROLES,
+        now=lambda: RUN_AT,
+    )
+    snapshots = {
+        "primary_halt_feed": client.parse_halt_feed(
+            client.fetch(
+                "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+            )
+        ),
+        "operational_status": client.parse_halt_feed(
+            client.fetch(
+                "https://www.nyse.com/api/notifications/public/alerts?2=3"
+            )
+        ),
+        "cross_check_halt_feed": client.parse_halt_feed(
+            client.fetch(
+                "https://www.nasdaqtrader.com/"
+                "rss.aspx?categorylist=2&feed=currentheadlines"
+            )
+        ),
+    }
+    return classify_instrument_status(
+        symbol,
+        listing_venue,
+        snapshots,
+        as_of=RUN_AT,
+    )
 
 
 def session_dates(count: int = 60, end: date = date(2026, 8, 13)) -> tuple[date, ...]:
@@ -688,7 +774,10 @@ def _raw_candidate_context(symbol: str):
         bars_by_symbol=instruments,
         previous_session_quote=previous_quote(symbol=symbol),
         latest_iex_quote=latest_iex_quote(symbol=symbol),
-        instrument_status=InstrumentStatusFixture(symbol=symbol),
+        instrument_status=reviewed_instrument_status(
+            symbol,
+            record.listing_venue,
+        ),
         evidence=evidence(
             subject_kind="ETF" if is_etf else "STOCK",
             symbol=symbol,

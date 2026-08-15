@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pickle
 import unittest
+from copy import copy, deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -8,6 +10,7 @@ from pathlib import Path
 
 from stock_monitor.evidence import EvidenceDecision
 from stock_monitor.market_calendar import MarketCalendar
+from stock_monitor.providers import reference as reference_module
 from stock_monitor.providers.reference import InstrumentStatusDecision
 from stock_monitor.screening import (
     ScreeningError,
@@ -266,7 +269,63 @@ class EligibilityTests(unittest.TestCase):
             "HALT_STATUS_PROVENANCE_MISSING",
             evaluate_eligibility(missing_provenance).reason_codes,
         )
-        self.assertTrue(evaluate_eligibility(explicitly_valid).eligible)
+        explicitly_valid_decision = evaluate_eligibility(explicitly_valid)
+        self.assertEqual(explicitly_valid_decision.status, "DATA_UNAVAILABLE")
+        self.assertIn(
+            "INSTRUMENT_STATUS_UNREVIEWED",
+            explicitly_valid_decision.reason_codes,
+        )
+
+    def test_only_sealed_classifier_output_can_authorize_clear_status(self) -> None:
+        base = candidate_context()
+        reviewed = base.instrument_status
+        self.assertTrue(
+            reference_module.is_reviewed_instrument_status_decision(reviewed)
+        )
+        self.assertTrue(evaluate_eligibility(base).eligible)
+        direct = InstrumentStatusDecision(
+            symbol=reviewed.symbol,
+            halt_status=reviewed.halt_status,
+            as_of=reviewed.as_of,
+            valid_until=reviewed.valid_until,
+            source_observation_ids=reviewed.source_observation_ids,
+            block_reason=reviewed.block_reason,
+        )
+        for case, forged in (
+            ("direct", direct),
+            ("replace", replace(reviewed)),
+            ("copy", copy(reviewed)),
+            ("deepcopy", deepcopy(reviewed)),
+            ("pickle", pickle.loads(pickle.dumps(reviewed))),
+        ):
+            with self.subTest(case=case):
+                decision = evaluate_eligibility(
+                    replace(base, instrument_status=forged)
+                )
+                self.assertEqual(decision.status, "DATA_UNAVAILABLE")
+                self.assertIn(
+                    "INSTRUMENT_STATUS_UNREVIEWED",
+                    decision.reason_codes,
+                )
+
+        tampered_context = candidate_context()
+        tampered = tampered_context.instrument_status
+        object.__setattr__(
+            tampered,
+            "valid_until",
+            RUN_AT + timedelta(minutes=4),
+        )
+        object.__setattr__(
+            tampered,
+            "_decision_digest",
+            reference_module._instrument_decision_fingerprint(tampered),
+        )
+        tampered_decision = evaluate_eligibility(tampered_context)
+        self.assertEqual(tampered_decision.status, "DATA_UNAVAILABLE")
+        self.assertIn(
+            "INSTRUMENT_STATUS_UNREVIEWED",
+            tampered_decision.reason_codes,
+        )
 
     def test_clear_status_requires_an_unexpired_explicit_validity_window(self) -> None:
         base = candidate_context()
@@ -326,6 +385,7 @@ class EligibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.status, "DATA_UNAVAILABLE")
+        self.assertIn("INSTRUMENT_STATUS_UNREVIEWED", decision.reason_codes)
         self.assertIn("EVIDENCE_DECISION_UNREVIEWED", decision.reason_codes)
 
     def test_tampered_reviewed_evidence_decision_fails_closed(self) -> None:

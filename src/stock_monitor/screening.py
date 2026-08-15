@@ -30,6 +30,7 @@ from .indicators import (
     wilder_atr,
 )
 from .market_calendar import CalendarError, MarketCalendar
+from .providers.reference import is_reviewed_instrument_status_decision
 from .universe import UniverseSnapshot, is_verified_universe_snapshot
 
 
@@ -1124,6 +1125,8 @@ def _validate_instrument_status(
     if status is None:
         _append(data_reasons, "HALT_STATUS_UNKNOWN")
         return
+    if not is_reviewed_instrument_status_decision(status):
+        _append(data_reasons, "INSTRUMENT_STATUS_UNREVIEWED")
     expected_symbol = str(getattr(context.record, "symbol", "")).upper()
     try:
         status_symbol = status.symbol

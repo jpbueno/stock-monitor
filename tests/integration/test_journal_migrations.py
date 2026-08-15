@@ -802,6 +802,9 @@ class JournalMigrationTests(unittest.TestCase):
                 pass
             with closing(sqlite3.connect(path)) as connection:
                 connection.execute("PRAGMA foreign_keys = ON")
+                connection.create_function(
+                    "journal_report_claim_write_allowed", 0, lambda: 1
+                )
                 timestamp = "2026-08-14T14:00:00.000000Z"
                 connection.execute(
                     "INSERT INTO raw_messages VALUES (?, ?, ?, ?, ?)",
@@ -1130,6 +1133,9 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(path):
                 pass
             with closing(sqlite3.connect(path)) as connection:
+                connection.create_function(
+                    "journal_report_claim_write_allowed", 0, lambda: 1
+                )
                 definitions = {
                     str(row[0]): str(row[1]).lower()
                     for row in connection.execute(
@@ -1236,10 +1242,10 @@ class JournalMigrationTests(unittest.TestCase):
         instant = datetime(2026, 8, 14, 12, 45, 0, 139_771, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
-            with Journal.open(path) as journal:
-                claim = journal.claim_report(
-                    date(2026, 8, 14), "CLOSE", now=instant, lease_seconds=300
-                )
+            with patch.object(
+                journal_module, "_utc_now", return_value=instant
+            ), Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
 
             self.assertEqual(claim.status, "ACQUIRED")
 
@@ -1293,23 +1299,120 @@ class JournalMigrationTests(unittest.TestCase):
                         (3, 3, 3, timestamp, "PENDING", None, None, "{}"),
                     )
 
+    def test_outbox_schema_is_effectively_once_per_event_destination(self) -> None:
+        instant = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        timestamp = "2026-08-14T14:00:00.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                raw_id, _ = journal.append_raw_message(
+                    "msg-event-outbox-sql", instant, "SKIPPED SPY"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="SKIPPED",
+                    event_time=instant,
+                    symbol="SPY",
+                )
+                journal.append_outbox(
+                    idempotency_key="event-outbox-sql-primary",
+                    origin_report_id=None,
+                    origin_execution_event_id=event_id,
+                    destination="CODEX_TASK",
+                    payload_text="recorded",
+                    created_at=instant,
+                )
+
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO outbox("
+                        "idempotency_key, origin_report_id, "
+                        "origin_execution_event_id, destination, payload_text, "
+                        "payload_sha256, created_at"
+                        ") VALUES (?, NULL, ?, ?, ?, ?, ?)",
+                        (
+                            "event-outbox-sql-conflict",
+                            event_id,
+                            "CODEX_TASK",
+                            "duplicate",
+                            hashlib.sha256(b"duplicate").hexdigest(),
+                            timestamp,
+                        ),
+                    )
+
+    def test_actual_ledger_and_cash_projection_enforce_origin_chronology_in_sql(self) -> None:
+        instant = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        event_time = "2026-08-14T14:00:00.000000Z"
+        posting_time = "2026-08-14T14:00:01.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                raw_id, _ = journal.append_raw_message(
+                    "msg-actual-sql", instant, "SOLD SPY"
+                )
+                event_id, _ = journal.append_execution_event(
+                    raw_message_id=raw_id,
+                    action_ordinal=0,
+                    parsed_action="SOLD",
+                    event_time=instant,
+                    symbol="SPY",
+                )
+
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_projection_write_allowed", 0, lambda: 1
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO ledger_postings("
+                        "posting_key, ledger_name, account_name, entry_kind, "
+                        "amount_micros, occurred_at, details_json"
+                        ") VALUES (?, 'ACTUAL', 'CASH', 'SALE', ?, ?, '{}')",
+                        ("actual-sql-orphan", 100_000_000, event_time),
+                    )
+
+                cursor = connection.execute(
+                    "INSERT INTO ledger_postings("
+                    "posting_key, ledger_name, account_name, entry_kind, "
+                    "execution_event_id, symbol, amount_micros, occurred_at, details_json"
+                    ") VALUES (?, 'ACTUAL', 'CASH', 'SALE', ?, 'SPY', ?, ?, '{}')",
+                    ("actual-sql-valid", event_id, 100_000_000, posting_time),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO actual_cash_projection VALUES "
+                        "(1, ?, NULL, 0, 0, 0, ?, ?, ?, ?, 1)",
+                        (
+                            5_100_000_000,
+                            5_100_000_000,
+                            5_100_000_000,
+                            int(cursor.lastrowid),
+                            event_time,
+                        ),
+                    )
+
     def test_controlled_claim_and_scheduled_rows_reject_forbidden_mutations(self) -> None:
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
-            with Journal.open(path) as journal:
-                in_progress = journal.claim_report(
-                    date(2026, 8, 15), "CLOSE", now=now, lease_seconds=300
-                )
-                finalized = journal.claim_report(
-                    date(2026, 8, 14), "CLOSE", now=now, lease_seconds=300
-                )
+            with patch.object(
+                journal_module, "_utc_now", return_value=now
+            ) as clock, Journal.open(path) as journal:
+                in_progress = journal.claim_report(date(2026, 8, 15), "CLOSE")
+                finalized = journal.claim_report(date(2026, 8, 14), "CLOSE")
                 assert finalized.claim_token is not None
                 session_date = date(2026, 8, 14)
                 state_sha256 = "a" * 64
                 report_id = stable_report_id(
                     "CLOSE", session_date, (), state_sha256
                 )
+                clock.return_value = now + timedelta(seconds=1)
                 report = journal.finalize_report(
                     claim_id=finalized.claim_id,
                     claim_token=finalized.claim_token,
@@ -1320,7 +1423,6 @@ class JournalMigrationTests(unittest.TestCase):
                         "CLOSE", session_date, report_id
                     ),
                     created_at=now + timedelta(seconds=1),
-                    finalized_at=now + timedelta(seconds=1),
                     outbox_destination="TASK",
                     outbox_payload="close",
                 )
@@ -1374,8 +1476,56 @@ class JournalMigrationTests(unittest.TestCase):
                 )
                 for statement, parameters in forbidden:
                     with self.subTest(statement=statement.split()[0:3]):
-                        with self.assertRaises(sqlite3.IntegrityError):
+                        with self.assertRaises(sqlite3.DatabaseError):
                             connection.execute(statement, parameters)
+
+    def test_report_claim_insert_requires_the_journal_clock_boundary(self) -> None:
+        timestamp = "2026-08-14T12:45:00.000000Z"
+        expires_at = "2026-08-14T12:50:00.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA recursive_triggers = ON")
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(
+                        "INSERT INTO report_claims("
+                        "session_date, report_kind, claim_token, status, created_at, "
+                        "lease_started_at, lease_expires_at"
+                        ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?)",
+                        (
+                            "2026-08-14",
+                            "CLOSE",
+                            "forged-insert-token",
+                            timestamp,
+                            timestamp,
+                            expires_at,
+                        ),
+                    )
+
+    def test_report_claim_recovery_requires_the_journal_clock_boundary(self) -> None:
+        lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with patch.object(
+                journal_module, "_utc_now", return_value=lease_start
+            ), Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
+
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA recursive_triggers = ON")
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(
+                        "UPDATE report_claims SET claim_token = ?, "
+                        "lease_started_at = ?, lease_expires_at = ? WHERE id = ?",
+                        (
+                            "forged-recovery-token",
+                            "2026-08-14T12:50:00.000000Z",
+                            "2026-08-14T12:55:00.000000Z",
+                            claim.claim_id,
+                        ),
+                    )
 
     def test_scheduled_completion_tokens_are_canonical_in_sql(self) -> None:
         timestamp = "2026-08-14T14:00:00.000000Z"
@@ -1411,10 +1561,10 @@ class JournalMigrationTests(unittest.TestCase):
         report_time = now + timedelta(seconds=1)
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
-            with Journal.open(path) as journal:
-                claim = journal.claim_report(
-                    date(2026, 8, 14), "CLOSE", now=now, lease_seconds=300
-                )
+            with patch.object(
+                journal_module, "_utc_now", return_value=now
+            ), Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
                 future_observation_id, _ = journal.append_source_observation(
                     payload=b"future payload",
                     source_uri="https://example.test/future",
@@ -1453,6 +1603,9 @@ class JournalMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as connection:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_report_claim_write_allowed", 0, lambda: 1
+                )
                 report_values = (
                     1,
                     "1" * 64,
@@ -1542,10 +1695,10 @@ class JournalMigrationTests(unittest.TestCase):
         report_time = now + timedelta(seconds=1)
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
-            with Journal.open(path) as journal:
-                claim = journal.claim_report(
-                    date(2026, 8, 14), "CLOSE", now=now, lease_seconds=300
-                )
+            with patch.object(
+                journal_module, "_utc_now", return_value=now
+            ), Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
 
             canonical_report_time = report_time.strftime(
                 "%Y-%m-%dT%H:%M:%S.%fZ"

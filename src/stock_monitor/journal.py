@@ -20,6 +20,7 @@ from typing import Self
 APPLICATION_ID = 0x53544B4D
 BUSY_TIMEOUT_MILLISECONDS = 5_000
 REPORT_ID_PATH_PREFIX_LENGTH = 12
+_REPORT_CLAIM_LEASE_SECONDS = 300
 _POSITION_MUTATING_ACTIONS = frozenset(
     {
         "BOUGHT",
@@ -258,7 +259,6 @@ class JournalTransaction:
         observation_ids: Sequence[int],
         archive_relative_path: str,
         created_at: datetime,
-        finalized_at: datetime | None = None,
         outbox_destination: str,
         outbox_payload: str,
     ) -> FinalizedReport:
@@ -271,7 +271,6 @@ class JournalTransaction:
             observation_ids=observation_ids,
             archive_relative_path=archive_relative_path,
             created_at=created_at,
-            finalized_at=finalized_at,
             outbox_destination=outbox_destination,
             outbox_payload=outbox_payload,
         )
@@ -495,6 +494,7 @@ class Journal:
         self._migration_directory = migration_directory
         self._transaction_active = False
         self._projection_write_allowed = False
+        self._report_claim_write_allowed = False
         self._closed = False
 
     @classmethod
@@ -666,22 +666,13 @@ class Journal:
         self,
         session_date: date,
         kind: str,
-        *,
-        now: datetime | None = None,
-        lease_seconds: int = 300,
     ) -> ReportClaim:
         """Acquire, observe, or explicitly recover a report publication claim."""
         stored_date = _canonical_date(session_date)
-        report_kind = _canonical_token(kind, "report kind")
-        lease_seconds = _require_integer(
-            lease_seconds, "report claim lease", minimum=1
-        )
-        if lease_seconds > 86_400:
-            raise InvalidJournalValue("report claim lease exceeds the supported bound")
-        caller_supplied_now = now is not None
-        stored_now = _canonical_timestamp(now) if now is not None else None
+        report_kind = _require_canonical_report_kind(kind)
 
         with self._immediate_connection() as connection:
+            stored_now = _canonical_timestamp(_utc_now())
             row = _sql(connection,
                 "SELECT claim.id, claim.claim_token, claim.status, "
                 "claim.lease_expires_at, claim.report_id, report.report_id "
@@ -691,25 +682,26 @@ class Journal:
                 (stored_date, report_kind),
             ).fetchone()
             if row is None:
-                acquired_at = stored_now or _canonical_timestamp(
-                    datetime.now(timezone.utc)
+                acquired_at = stored_now
+                expires_at = _add_seconds(
+                    acquired_at, _REPORT_CLAIM_LEASE_SECONDS
                 )
-                expires_at = _add_seconds(acquired_at, lease_seconds)
                 token = secrets.token_urlsafe(32)
-                cursor = _sql(connection,
-                    "INSERT INTO report_claims("
-                    "session_date, report_kind, claim_token, status, created_at, "
-                    "lease_started_at, lease_expires_at, finalized_at, report_id"
-                    ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, NULL, NULL)",
-                    (
-                        stored_date,
-                        report_kind,
-                        token,
-                        acquired_at,
-                        acquired_at,
-                        expires_at,
-                    ),
-                )
+                with self._report_claim_write():
+                    cursor = _sql(connection,
+                        "INSERT INTO report_claims("
+                        "session_date, report_kind, claim_token, status, created_at, "
+                        "lease_started_at, lease_expires_at, finalized_at, report_id"
+                        ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, NULL, NULL)",
+                        (
+                            stored_date,
+                            report_kind,
+                            token,
+                            acquired_at,
+                            acquired_at,
+                            expires_at,
+                        ),
+                    )
                 return ReportClaim(
                     claim_id=int(cursor.lastrowid),
                     session_date=session_date,
@@ -743,21 +735,24 @@ class Journal:
                 )
             if stored_status != "IN_PROGRESS":
                 raise MigrationCorruption("report claim has an invalid stored status")
-            if caller_supplied_now and stored_now is not None and stored_now >= expires_at:
-                recovered_expires_at = _add_seconds(stored_now, lease_seconds)
-                token = secrets.token_urlsafe(32)
-                cursor = _sql(connection,
-                    "UPDATE report_claims SET claim_token = ?, lease_started_at = ?, "
-                    "lease_expires_at = ? WHERE id = ? AND status = 'IN_PROGRESS' "
-                    "AND lease_expires_at <= ?",
-                    (
-                        token,
-                        stored_now,
-                        recovered_expires_at,
-                        claim_id,
-                        stored_now,
-                    ),
+            if stored_now >= expires_at:
+                recovered_expires_at = _add_seconds(
+                    stored_now, _REPORT_CLAIM_LEASE_SECONDS
                 )
+                token = secrets.token_urlsafe(32)
+                with self._report_claim_write():
+                    cursor = _sql(connection,
+                        "UPDATE report_claims SET claim_token = ?, lease_started_at = ?, "
+                        "lease_expires_at = ? WHERE id = ? AND status = 'IN_PROGRESS' "
+                        "AND lease_expires_at <= ?",
+                        (
+                            token,
+                            stored_now,
+                            recovered_expires_at,
+                            claim_id,
+                            stored_now,
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     raise JournalBusy("report claim changed during recovery")
                 return ReportClaim(
@@ -1242,7 +1237,6 @@ class Journal:
         observation_ids: Sequence[int],
         archive_relative_path: str,
         created_at: datetime,
-        finalized_at: datetime | None,
         outbox_destination: str,
         outbox_payload: str,
     ) -> FinalizedReport:
@@ -1252,9 +1246,6 @@ class Journal:
         state_sha256 = _require_sha256(state_sha256, "report state hash")
         archive_relative_path = _canonical_archive_path(archive_relative_path)
         stored_created_at = _canonical_timestamp(created_at)
-        requested_finalized_at = (
-            _canonical_timestamp(finalized_at) if finalized_at is not None else None
-        )
         outbox_destination = _require_nonempty_text(
             outbox_destination, "outbox destination"
         )
@@ -1278,25 +1269,10 @@ class Journal:
         lease_started_at = str(claim[4])
         lease_expires_at = str(claim[5])
         stored_finalized_at = str(claim[7]) if claim[7] is not None else None
-        if stored_status == "FINALIZED":
-            if stored_finalized_at is None:
-                raise MigrationCorruption("finalized report claim lacks a timestamp")
-            if (
-                requested_finalized_at is not None
-                and requested_finalized_at != stored_finalized_at
-            ):
-                raise IdempotencyConflict(
-                    "report finalization time conflicts with stored content"
-                )
-            effective_finalized_at = stored_finalized_at
-        else:
-            effective_finalized_at = requested_finalized_at or _canonical_timestamp(
-                datetime.now(timezone.utc)
-            )
-        if stored_created_at > effective_finalized_at:
-            raise InvalidJournalValue(
-                "report creation time cannot follow finalization"
-            )
+        if stored_status not in {"IN_PROGRESS", "FINALIZED"}:
+            raise MigrationCorruption("report claim has an invalid stored status")
+        if stored_status == "FINALIZED" and stored_finalized_at is None:
+            raise MigrationCorruption("finalized report claim lacks a timestamp")
 
         observations: list[tuple[int, str, str, str]] = []
         if requested_ids:
@@ -1360,6 +1336,12 @@ class Journal:
         ).hexdigest()
 
         if stored_status == "FINALIZED":
+            assert stored_finalized_at is not None
+            effective_finalized_at = stored_finalized_at
+            if stored_created_at > effective_finalized_at:
+                raise InvalidJournalValue(
+                    "report creation time cannot follow finalization"
+                )
             stored_report_id = int(claim[6]) if claim[6] is not None else None
             if stored_report_id is None:
                 raise MigrationCorruption("finalized report claim lacks a report row")
@@ -1401,8 +1383,11 @@ class Journal:
                 duplicate=True,
             )
 
-        if stored_status != "IN_PROGRESS":
-            raise MigrationCorruption("report claim has an invalid stored status")
+        effective_finalized_at = _canonical_timestamp(_utc_now())
+        if stored_created_at > effective_finalized_at:
+            raise InvalidJournalValue(
+                "report creation time cannot follow finalization"
+            )
         if not lease_started_at <= effective_finalized_at < lease_expires_at:
             raise IdempotencyConflict("report claim lease is not active")
         try:
@@ -1438,12 +1423,13 @@ class Journal:
         )
         if outbox_duplicate:
             raise MigrationCorruption("new report collided with an existing outbox row")
-        update = _sql(self._connection,
-            "UPDATE report_claims SET status = 'FINALIZED', finalized_at = ?, "
-            "report_id = ? WHERE id = ? AND claim_token = ? COLLATE BINARY "
-            "AND status = 'IN_PROGRESS'",
-            (effective_finalized_at, report_row_id, claim_id, claim_token),
-        )
+        with self._report_claim_write():
+            update = _sql(self._connection,
+                "UPDATE report_claims SET status = 'FINALIZED', finalized_at = ?, "
+                "report_id = ? WHERE id = ? AND claim_token = ? COLLATE BINARY "
+                "AND status = 'IN_PROGRESS'",
+                (effective_finalized_at, report_row_id, claim_id, claim_token),
+            )
         if update.rowcount != 1:
             raise IdempotencyConflict("report claim token is stale")
         return FinalizedReport(
@@ -1510,6 +1496,17 @@ class Journal:
             if origin_delivery is not None:
                 raise IdempotencyConflict(
                     "report delivery already exists for this destination"
+                )
+        else:
+            origin_delivery = _sql(
+                self._connection,
+                "SELECT 1 FROM outbox WHERE origin_execution_event_id = ? "
+                "AND destination = ?",
+                (origin_execution_event_id, destination),
+            ).fetchone()
+            if origin_delivery is not None:
+                raise IdempotencyConflict(
+                    "execution event delivery already exists for this destination"
                 )
         try:
             cursor = _sql(self._connection,
@@ -1810,6 +1807,40 @@ class Journal:
         )
         stored_occurred_at = _canonical_timestamp(occurred_at)
         details_json = _canonical_details(details)
+        if ledger_name == "ACTUAL":
+            if (execution_event_id is None) == (account_check_id is None):
+                raise InvalidJournalValue(
+                    "ACTUAL ledger posting requires exactly one authoritative origin"
+                )
+            if execution_event_id is not None:
+                origin = _sql(
+                    self._connection,
+                    "SELECT symbol, event_time FROM execution_events WHERE id = ?",
+                    (execution_event_id,),
+                ).fetchone()
+            else:
+                origin = _sql(
+                    self._connection,
+                    "SELECT event.symbol, account.confirmed_at "
+                    "FROM account_checks AS account "
+                    "JOIN execution_events AS event "
+                    "ON event.id = account.execution_event_id "
+                    "WHERE account.id = ?",
+                    (account_check_id,),
+                ).fetchone()
+            if origin is None:
+                raise InvalidJournalValue(
+                    "ACTUAL ledger posting origin does not exist"
+                )
+            origin_symbol = str(origin[0]) if origin[0] is not None else None
+            if symbol != origin_symbol:
+                raise InvalidJournalValue(
+                    "ACTUAL ledger posting symbol conflicts with its origin"
+                )
+            if stored_occurred_at < str(origin[1]):
+                raise InvalidJournalValue(
+                    "ACTUAL ledger posting cannot predate its origin"
+                )
         immutable = (
             posting_key,
             ledger_name,
@@ -2007,16 +2038,20 @@ class Journal:
         last_ledger_posting_id = _require_integer(
             last_ledger_posting_id, "ledger posting row ID", minimum=1
         )
+        stored_updated_at = _canonical_timestamp(updated_at)
         posting = _sql(
             self._connection,
-            "SELECT ledger_name FROM ledger_postings WHERE id = ?",
+            "SELECT ledger_name, occurred_at FROM ledger_postings WHERE id = ?",
             (last_ledger_posting_id,),
         ).fetchone()
         if posting is None or str(posting[0]) != "ACTUAL":
             raise InvalidJournalValue(
                 "actual cash projection requires an ACTUAL ledger posting"
             )
-        stored_updated_at = _canonical_timestamp(updated_at)
+        if str(posting[1]) > stored_updated_at:
+            raise InvalidJournalValue(
+                "actual cash projection cannot predate its ledger posting"
+            )
         desired = (
             estimated_settled_cash_micros,
             user_confirmed_settled_cash_micros,
@@ -2280,6 +2315,16 @@ class Journal:
             self._projection_write_allowed = False
 
     @contextmanager
+    def _report_claim_write(self) -> Iterator[None]:
+        if not self._transaction_active or self._report_claim_write_allowed:
+            raise JournalError("report claim writes require an active journal transaction")
+        self._report_claim_write_allowed = True
+        try:
+            yield
+        finally:
+            self._report_claim_write_allowed = False
+
+    @contextmanager
     def _immediate_connection(self) -> Iterator[sqlite3.Connection]:
         if self._transaction_active:
             raise JournalError("nested journal transactions are not supported")
@@ -2313,6 +2358,11 @@ class Journal:
                 "journal_projection_write_allowed",
                 0,
                 lambda: int(self._projection_write_allowed),
+            )
+            self._connection.create_function(
+                "journal_report_claim_write_allowed",
+                0,
+                lambda: int(self._report_claim_write_allowed),
             )
             _sql(self._connection,
                 f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MILLISECONDS}"
@@ -2672,6 +2722,11 @@ def _schema_sha256(connection: sqlite3.Connection) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def _utc_now() -> datetime:
+    """Return the authority clock; tests may patch this private seam."""
+    return datetime.now(timezone.utc)
+
+
 def _canonical_timestamp(value: datetime) -> str:
     if type(value) is not datetime or value.tzinfo is None:
         raise InvalidJournalValue("timestamp must be a timezone-aware datetime")
@@ -2717,7 +2772,7 @@ def stable_report_id(
     state_hash: str,
 ) -> str:
     """Return the Task 10 report identity from audited state inputs."""
-    canonical_kind = _canonical_token(kind, "report kind")
+    canonical_kind = _require_canonical_report_kind(kind)
     canonical_session = _canonical_date(session_date)
     if isinstance(observation_ids, (str, bytes)) or not isinstance(
         observation_ids, Sequence
@@ -2746,7 +2801,7 @@ def report_archive_relative_path(
     kind: str, session_date: date, report_id: str
 ) -> str:
     """Return the deterministic Task 10 archive path for a report identity."""
-    canonical_kind = _canonical_token(kind, "report kind").lower()
+    canonical_kind = _require_canonical_report_kind(kind).lower()
     canonical_session = _canonical_date(session_date)
     report_id = _require_sha256(report_id, "report ID")
     return (
@@ -2770,6 +2825,13 @@ def _canonical_token(value: object, name: str) -> str:
     if re.fullmatch(r"[A-Z][A-Z0-9_]*", canonical) is None:
         raise InvalidJournalValue(f"{name} is not a canonical token")
     return canonical
+
+
+def _require_canonical_report_kind(value: object) -> str:
+    value = _require_nonempty_text(value, "report kind")
+    if value != value.strip() or re.fullmatch(r"[A-Z][A-Z0-9_]*", value) is None:
+        raise InvalidJournalValue("report kind is not a canonical uppercase token")
+    return value
 
 
 def _optional_text(value: object, name: str) -> str | None:

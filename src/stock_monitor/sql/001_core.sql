@@ -303,6 +303,10 @@ CREATE UNIQUE INDEX outbox_one_report_destination
 ON outbox(origin_report_id, destination)
 WHERE origin_report_id IS NOT NULL;
 
+CREATE UNIQUE INDEX outbox_one_execution_event_destination
+ON outbox(origin_execution_event_id, destination)
+WHERE origin_execution_event_id IS NOT NULL;
+
 CREATE TABLE outbox_delivery_attempts (
     id INTEGER PRIMARY KEY CHECK(typeof(id) = 'integer' AND id > 0),
     outbox_id INTEGER NOT NULL
@@ -575,6 +579,13 @@ BEGIN
     SELECT RAISE(ABORT, 'report_claims rejects conflicting inserts');
 END;
 
+CREATE TRIGGER report_claims_guard_insert
+BEFORE INSERT ON report_claims
+WHEN journal_report_claim_write_allowed() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'report_claims requires journal clock authority');
+END;
+
 CREATE TRIGGER reports_no_conflicting_insert
 BEFORE INSERT ON reports
 WHEN EXISTS (
@@ -641,6 +652,9 @@ WHEN EXISTS (
        OR (NEW.origin_report_id IS NOT NULL
            AND origin_report_id = NEW.origin_report_id
            AND destination = NEW.destination)
+       OR (NEW.origin_execution_event_id IS NOT NULL
+           AND origin_execution_event_id = NEW.origin_execution_event_id
+           AND destination = NEW.destination)
 )
 BEGIN
     SELECT RAISE(ABORT, 'outbox rejects conflicting inserts');
@@ -695,6 +709,43 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'ledger_postings rejects conflicting inserts');
+END;
+
+CREATE TRIGGER ledger_postings_validate_actual_origin
+BEFORE INSERT ON ledger_postings
+WHEN NEW.ledger_name = 'ACTUAL' AND NOT (
+    (
+        NEW.execution_event_id IS NOT NULL
+        AND NEW.account_check_id IS NULL
+        AND EXISTS (
+            SELECT 1 FROM execution_events AS event
+            WHERE event.id = NEW.execution_event_id
+              AND (
+                  NEW.symbol = event.symbol COLLATE BINARY
+                  OR (NEW.symbol IS NULL AND event.symbol IS NULL)
+              )
+              AND NEW.occurred_at >= event.event_time
+        )
+    )
+    OR (
+        NEW.execution_event_id IS NULL
+        AND NEW.account_check_id IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM account_checks AS account
+            JOIN execution_events AS event
+              ON event.id = account.execution_event_id
+            WHERE account.id = NEW.account_check_id
+              AND (
+                  NEW.symbol = event.symbol COLLATE BINARY
+                  OR (NEW.symbol IS NULL AND event.symbol IS NULL)
+              )
+              AND NEW.occurred_at >= account.confirmed_at
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'ACTUAL ledger posting requires authoritative lineage');
 END;
 
 CREATE TRIGGER scheduled_runs_no_conflicting_insert
@@ -799,7 +850,7 @@ END;
 
 CREATE TRIGGER report_claims_controlled_update
 BEFORE UPDATE ON report_claims
-WHEN NOT (
+WHEN journal_report_claim_write_allowed() != 1 OR NOT (
     OLD.status = 'IN_PROGRESS'
     AND NEW.id = OLD.id
     AND NEW.session_date = OLD.session_date
@@ -987,20 +1038,24 @@ CREATE TRIGGER actual_cash_projection_validate_posting_insert
 BEFORE INSERT ON actual_cash_projection
 WHEN NOT EXISTS (
     SELECT 1 FROM ledger_postings
-    WHERE id = NEW.last_ledger_posting_id AND ledger_name = 'ACTUAL'
+    WHERE id = NEW.last_ledger_posting_id
+      AND ledger_name = 'ACTUAL'
+      AND occurred_at <= NEW.updated_at
 )
 BEGIN
-    SELECT RAISE(ABORT, 'actual_cash_projection requires an ACTUAL posting');
+    SELECT RAISE(ABORT, 'actual_cash_projection requires prior ACTUAL posting');
 END;
 
 CREATE TRIGGER actual_cash_projection_validate_posting_update
 BEFORE UPDATE ON actual_cash_projection
 WHEN NOT EXISTS (
     SELECT 1 FROM ledger_postings
-    WHERE id = NEW.last_ledger_posting_id AND ledger_name = 'ACTUAL'
+    WHERE id = NEW.last_ledger_posting_id
+      AND ledger_name = 'ACTUAL'
+      AND occurred_at <= NEW.updated_at
 )
 BEGIN
-    SELECT RAISE(ABORT, 'actual_cash_projection requires an ACTUAL posting');
+    SELECT RAISE(ABORT, 'actual_cash_projection requires prior ACTUAL posting');
 END;
 
 CREATE TRIGGER reconciliation_projection_guard_insert

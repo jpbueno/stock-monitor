@@ -13,6 +13,7 @@ from threading import Barrier
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import stock_monitor.journal as journal_module
 from stock_monitor.journal import (
     IdempotencyConflict,
     InvalidJournalValue,
@@ -315,38 +316,170 @@ class JournalTests(unittest.TestCase):
                 )
             self.assertEqual(journal.count("source_observations"), 0)
 
-    def test_report_claims_serialize_and_require_explicit_time_for_recovery(self) -> None:
+    def test_report_claims_serialize_and_recover_expired_leases(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         with Journal.open(self.db_path) as first, Journal.open(self.db_path) as second:
-            acquired = first.claim_report(
-                session_date, "CLOSE", now=now, lease_seconds=300
-            )
-            in_progress = second.claim_report(
-                session_date,
-                "close",
-                now=now + timedelta(seconds=299),
-                lease_seconds=300,
-            )
-            no_clock_takeover = second.claim_report(session_date, "CLOSE")
-            recovered = second.claim_report(
-                session_date,
-                "CLOSE",
-                now=now + timedelta(seconds=300),
-                lease_seconds=300,
-            )
+            with patch.object(journal_module, "_utc_now", return_value=now):
+                acquired = first.claim_report(session_date, "CLOSE")
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=now + timedelta(seconds=299),
+            ):
+                in_progress = second.claim_report(session_date, "CLOSE")
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=now + timedelta(seconds=300),
+            ):
+                recovered = second.claim_report(session_date, "CLOSE")
 
             self.assertEqual(acquired.status, "ACQUIRED")
             self.assertIsNotNone(acquired.claim_token)
             self.assertEqual(in_progress.status, "IN_PROGRESS")
             self.assertIsNone(in_progress.claim_token)
-            self.assertEqual(no_clock_takeover.status, "IN_PROGRESS")
             self.assertEqual(recovered.status, "RECOVERED_EXPIRED")
             self.assertNotEqual(acquired.claim_token, recovered.claim_token)
             self.assertEqual(first.count("report_claims"), 1)
 
             with self.assertRaises(InvalidJournalValue):
-                first.claim_report(session_date, "CLOSE ", now=now)
+                first.claim_report(session_date, "CLOSE ")
+
+    def test_report_claim_uses_internal_clock_and_recovers_expired_lease(self) -> None:
+        session_date = date(2026, 8, 14)
+        lease_start = datetime(2030, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            with patch.object(
+                journal_module, "_utc_now", return_value=lease_start, create=True
+            ):
+                acquired = journal.claim_report(session_date, "CLOSE")
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=lease_start + timedelta(seconds=299),
+                create=True,
+            ):
+                in_progress = journal.claim_report(session_date, "CLOSE")
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=lease_start + timedelta(seconds=300),
+                create=True,
+            ):
+                recovered = journal.claim_report(session_date, "CLOSE")
+
+        self.assertEqual(acquired.status, "ACQUIRED")
+        self.assertEqual(in_progress.status, "IN_PROGRESS")
+        self.assertEqual(recovered.status, "RECOVERED_EXPIRED")
+        self.assertNotEqual(acquired.claim_token, recovered.claim_token)
+
+    def test_report_claim_authority_clock_is_not_a_public_argument(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            with self.assertRaises(TypeError):
+                journal.claim_report(session_date, "CLOSE", now=now)
+            with self.assertRaises(TypeError):
+                journal.claim_report(session_date, "CLOSE", lease_seconds=1)
+
+    def test_report_claim_samples_authority_clock_after_write_lock(self) -> None:
+        instant = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            def clock_after_lock() -> datetime:
+                self.assertTrue(journal._transaction_active)
+                return instant
+
+            with patch.object(
+                journal_module, "_utc_now", side_effect=clock_after_lock
+            ):
+                claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
+
+        self.assertEqual(claim.status, "ACQUIRED")
+
+    def test_report_finalization_uses_only_the_internal_authority_clock(self) -> None:
+        session_date = date(2026, 8, 14)
+        lease_start = datetime.now(timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        values = {
+            "body": "# Close\n",
+            "state_sha256": state_sha256,
+            "observation_ids": (),
+            "archive_relative_path": report_archive_relative_path(
+                "CLOSE", session_date, report_id
+            ),
+            "created_at": lease_start,
+            "outbox_destination": "CODEX_TASK",
+            "outbox_payload": "close",
+        }
+        with Journal.open(self.db_path) as journal:
+            with patch.object(
+                journal_module, "_utc_now", return_value=lease_start, create=True
+            ):
+                claim = journal.claim_report(session_date, "CLOSE")
+            assert claim.claim_token is not None
+
+            with self.assertRaises(TypeError):
+                journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    finalized_at=lease_start + timedelta(seconds=1),
+                    **values,
+                )
+
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=lease_start + timedelta(seconds=300),
+                create=True,
+            ):
+                with self.assertRaises(IdempotencyConflict):
+                    journal.finalize_report(
+                        claim_id=claim.claim_id,
+                        claim_token=claim.claim_token,
+                        **values,
+                    )
+
+    def test_report_finalization_samples_clock_after_audit_material(self) -> None:
+        session_date = date(2026, 8, 14)
+        now = datetime(2026, 8, 14, 12, 45, 1, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+        order: list[str] = []
+        real_canonical_json = journal_module._canonical_json
+
+        def record_json(value: object) -> str:
+            order.append("audit-material")
+            return real_canonical_json(value)
+
+        def record_clock() -> datetime:
+            order.append("authority-clock")
+            return now
+
+        with patch.object(
+            journal_module, "_canonical_json", side_effect=record_json
+        ), patch.object(
+            journal_module, "_utc_now", side_effect=record_clock
+        ), Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
+            assert claim.claim_token is not None
+            order.clear()
+            journal.finalize_report(
+                claim_id=claim.claim_id,
+                claim_token=claim.claim_token,
+                body="# Close\n",
+                state_sha256=state_sha256,
+                observation_ids=(),
+                archive_relative_path=report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                ),
+                created_at=now,
+                outbox_destination="CODEX_TASK",
+                outbox_payload="close",
+            )
+
+        self.assertEqual(order[-1], "authority-clock")
 
     def test_two_connections_racing_for_a_report_claim_get_one_owner(self) -> None:
         session_date = date(2026, 8, 14)
@@ -358,24 +491,47 @@ class JournalTests(unittest.TestCase):
         def claim() -> str:
             with Journal.open(self.db_path) as journal:
                 barrier.wait()
-                return journal.claim_report(
-                    session_date, "CLOSE", now=now, lease_seconds=300
-                ).status
+                return journal.claim_report(session_date, "CLOSE").status
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            statuses = tuple(executor.map(lambda _: claim(), range(2)))
+        with patch.object(journal_module, "_utc_now", return_value=now):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                statuses = tuple(executor.map(lambda _: claim(), range(2)))
 
         self.assertEqual(sorted(statuses), ["ACQUIRED", "IN_PROGRESS"])
+
+    def test_two_connections_racing_to_recover_one_expired_claim_get_one_owner(self) -> None:
+        session_date = date(2026, 8, 14)
+        lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with patch.object(
+            journal_module, "_utc_now", return_value=lease_start
+        ), Journal.open(self.db_path) as journal:
+            journal.claim_report(session_date, "CLOSE")
+        barrier = Barrier(2)
+
+        def recover() -> str:
+            with Journal.open(self.db_path) as journal:
+                barrier.wait()
+                return journal.claim_report(session_date, "CLOSE").status
+
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=lease_start + timedelta(seconds=300),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                statuses = tuple(executor.map(lambda _: recover(), range(2)))
+
+        self.assertEqual(sorted(statuses), ["IN_PROGRESS", "RECOVERED_EXPIRED"])
 
     def test_report_finalization_requires_the_current_token_and_active_lease(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
         report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(
-                session_date, "CLOSE", now=now, lease_seconds=300
-            )
+        with patch.object(
+            journal_module, "_utc_now", return_value=now
+        ) as clock, Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             values = {
                 "claim_id": claim.claim_id,
@@ -386,22 +542,17 @@ class JournalTests(unittest.TestCase):
                 "archive_relative_path": report_archive_relative_path(
                     "CLOSE", session_date, report_id
                 ),
-                "finalized_at": now + timedelta(seconds=301),
                 "outbox_destination": "CODEX_TASK",
                 "outbox_payload": "close",
             }
 
+            clock.return_value = now + timedelta(seconds=301)
             with self.assertRaises(IdempotencyConflict):
                 journal.finalize_report(
                     **values, created_at=now - timedelta(microseconds=1)
                 )
 
-            recovered = journal.claim_report(
-                session_date,
-                "CLOSE",
-                now=now + timedelta(seconds=300),
-                lease_seconds=300,
-            )
+            recovered = journal.claim_report(session_date, "CLOSE")
             assert recovered.claim_token is not None
             with self.assertRaises(IdempotencyConflict):
                 journal.finalize_report(
@@ -424,7 +575,7 @@ class JournalTests(unittest.TestCase):
             )
             self.assertFalse(finalized.duplicate)
 
-    def test_report_finalization_uses_finalized_at_for_lease_authority(self) -> None:
+    def test_report_finalization_uses_internal_clock_for_lease_authority(self) -> None:
         session_date = date(2026, 8, 14)
         lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
@@ -439,33 +590,28 @@ class JournalTests(unittest.TestCase):
             "outbox_destination": "CODEX_TASK",
             "outbox_payload": "close",
         }
-        with Journal.open(self.db_path) as journal:
-            stale = journal.claim_report(
-                session_date, "CLOSE", now=lease_start, lease_seconds=300
-            )
+        with patch.object(
+            journal_module, "_utc_now", return_value=lease_start
+        ) as clock, Journal.open(self.db_path) as journal:
+            stale = journal.claim_report(session_date, "CLOSE")
             assert stale.claim_token is not None
+            clock.return_value = lease_start + timedelta(seconds=300)
             with self.assertRaises(IdempotencyConflict):
                 journal.finalize_report(
                     claim_id=stale.claim_id,
                     claim_token=stale.claim_token,
                     created_at=lease_start + timedelta(seconds=1),
-                    finalized_at=lease_start + timedelta(seconds=300),
                     **values,
                 )
 
-            recovered = journal.claim_report(
-                session_date,
-                "CLOSE",
-                now=lease_start + timedelta(seconds=300),
-                lease_seconds=300,
-            )
+            recovered = journal.claim_report(session_date, "CLOSE")
             assert recovered.claim_token is not None
+            clock.return_value = lease_start + timedelta(seconds=301)
             with self.assertRaises(InvalidJournalValue):
                 journal.finalize_report(
                     claim_id=recovered.claim_id,
                     claim_token=recovered.claim_token,
                     created_at=lease_start + timedelta(seconds=302),
-                    finalized_at=lease_start + timedelta(seconds=301),
                     **values,
                 )
 
@@ -473,21 +619,21 @@ class JournalTests(unittest.TestCase):
                 claim_id=recovered.claim_id,
                 claim_token=recovered.claim_token,
                 created_at=lease_start + timedelta(seconds=1),
-                finalized_at=lease_start + timedelta(seconds=301),
                 **values,
             )
             self.assertFalse(finalized.duplicate)
 
-    def test_report_finalization_defaults_to_the_current_utc_instant(self) -> None:
+    def test_report_finalization_rejects_the_exact_lease_expiry(self) -> None:
         session_date = date(2026, 8, 14)
-        lease_start = datetime.now(timezone.utc) - timedelta(seconds=5)
+        lease_start = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
         report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(
-                session_date, "CLOSE", now=lease_start, lease_seconds=1
-            )
+        with patch.object(
+            journal_module, "_utc_now", return_value=lease_start
+        ) as clock, Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
+            clock.return_value = lease_start + timedelta(seconds=300)
             with self.assertRaises(IdempotencyConflict):
                 journal.finalize_report(
                     claim_id=claim.claim_id,
@@ -532,9 +678,7 @@ class JournalTests(unittest.TestCase):
                     "retrieved_at": now + timedelta(seconds=2),
                 }
             )
-            claim = journal.claim_report(
-                session_date, "CLOSE", now=now, lease_seconds=300
-            )
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             values = {
                 "claim_id": claim.claim_id,
@@ -543,7 +687,6 @@ class JournalTests(unittest.TestCase):
                 "state_sha256": "a" * 64,
                 "observation_ids": (second_observation, first_observation),
                 "created_at": now + timedelta(seconds=1),
-                "finalized_at": now + timedelta(seconds=1),
                 "outbox_destination": "CODEX_TASK",
                 "outbox_payload": "CLOSE: NO TRADE",
             }
@@ -597,7 +740,11 @@ class JournalTests(unittest.TestCase):
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
-        with Journal.open(self.db_path) as journal:
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
             observation_ids = []
             for suffix in ("a", "b"):
                 observation_id, _ = journal.append_source_observation(
@@ -636,7 +783,7 @@ class JournalTests(unittest.TestCase):
                 "reports/2026/08/14/close-2026-08-14-"
                 f"{expected_report_id[:12]}.md"
             )
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
 
             finalized = journal.finalize_report(
@@ -647,18 +794,64 @@ class JournalTests(unittest.TestCase):
                 observation_ids=tuple(reversed(observation_ids)),
                 archive_relative_path=expected_path,
                 created_at=now + timedelta(seconds=1),
-                finalized_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
 
             self.assertEqual(finalized.report_id, expected_report_id)
 
+    def test_report_identity_helpers_reject_noncanonical_kind(self) -> None:
+        session_date = date(2026, 8, 14)
+        state_sha256 = "a" * 64
+        report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+
+        invalid_kinds: tuple[object, ...] = (
+            "close",
+            "Close",
+            " CLOSE",
+            "CLOSE ",
+            "CLOSÉ",
+            "1CLOSE",
+            "CLOSE-DAY",
+            "",
+            None,
+        )
+        for invalid_kind in invalid_kinds:
+            with self.subTest(invalid_kind=invalid_kind):
+                with self.assertRaises(InvalidJournalValue):
+                    stable_report_id(  # type: ignore[arg-type]
+                        invalid_kind, session_date, (), state_sha256
+                    )
+                with self.assertRaises(InvalidJournalValue):
+                    report_archive_relative_path(  # type: ignore[arg-type]
+                        invalid_kind, session_date, report_id
+                    )
+
+        canonical_id = stable_report_id(
+            "CLOSE_2", session_date, (), state_sha256
+        )
+        self.assertIn(
+            "/close_2-2026-08-14-",
+            report_archive_relative_path("CLOSE_2", session_date, canonical_id),
+        )
+
+    def test_report_claim_requires_canonical_kind(self) -> None:
+        with Journal.open(self.db_path) as journal:
+            for invalid_kind in ("close", "Close", " CLOSE", "CLOSE ", "CLOSÉ"):
+                with self.subTest(invalid_kind=invalid_kind):
+                    with self.assertRaises(InvalidJournalValue):
+                        journal.claim_report(date(2026, 8, 14), invalid_kind)
+            self.assertEqual(journal.count("report_claims"), 0)
+
     def test_report_finalization_rejects_a_nondeterministic_archive_path(self) -> None:
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
 
             with self.assertRaises(InvalidJournalValue):
@@ -678,7 +871,11 @@ class JournalTests(unittest.TestCase):
         session_date = date(2026, 8, 14)
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
-        with Journal.open(self.db_path) as journal:
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
             observation_id, _ = journal.append_source_observation(
                 payload=b"future publication",
                 source_uri="https://example.test/future-publication",
@@ -701,7 +898,7 @@ class JournalTests(unittest.TestCase):
             report_id = stable_report_id(
                 "CLOSE", session_date, (observation_sha256,), state_sha256
             )
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
 
             with self.assertRaises(InvalidJournalValue):
@@ -724,7 +921,11 @@ class JournalTests(unittest.TestCase):
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
         body = "# Close\n\nNO TRADE\n"
-        with Journal.open(self.db_path) as journal:
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
             observation_id, _ = journal.append_source_observation(
                 payload=b"recovery evidence",
                 source_uri="https://example.test/recovery",
@@ -750,7 +951,7 @@ class JournalTests(unittest.TestCase):
             archive_path = report_archive_relative_path(
                 "CLOSE", session_date, report_id
             )
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             finalized = journal.finalize_report(
                 claim_id=claim.claim_id,
@@ -760,7 +961,6 @@ class JournalTests(unittest.TestCase):
                 observation_ids=(observation_id,),
                 archive_relative_path=archive_path,
                 created_at=now,
-                finalized_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -846,8 +1046,12 @@ class JournalTests(unittest.TestCase):
         now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
         state_sha256 = "a" * 64
         report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             report = journal.finalize_report(
                 claim_id=claim.claim_id,
@@ -859,7 +1063,6 @@ class JournalTests(unittest.TestCase):
                     "CLOSE", session_date, report_id
                 ),
                 created_at=now,
-                finalized_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -874,6 +1077,78 @@ class JournalTests(unittest.TestCase):
                     created_at=now + timedelta(seconds=2),
                 )
             self.assertEqual(journal.count("outbox"), 1)
+
+    def test_execution_event_outbox_is_effectively_once_per_destination(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-event-outbox", now, "SKIPPED SPY"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="SPY",
+            )
+            first_id, first_duplicate = journal.append_outbox(
+                idempotency_key="event-outbox-primary",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="recorded",
+                created_at=now,
+            )
+            replay_id, replay_duplicate = journal.append_outbox(
+                idempotency_key="event-outbox-primary",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="CODEX_TASK",
+                payload_text="recorded",
+                created_at=now,
+            )
+
+            self.assertEqual(first_id, replay_id)
+            self.assertFalse(first_duplicate)
+            self.assertTrue(replay_duplicate)
+            with self.assertRaises(IdempotencyConflict):
+                journal.append_outbox(
+                    idempotency_key="event-outbox-conflicting-key",
+                    origin_report_id=None,
+                    origin_execution_event_id=event_id,
+                    destination="CODEX_TASK",
+                    payload_text="duplicate delivery",
+                    created_at=now,
+                )
+            self.assertEqual(journal.count("outbox"), 1)
+
+            journal.append_outbox(
+                idempotency_key="event-outbox-other-destination",
+                origin_report_id=None,
+                origin_execution_event_id=event_id,
+                destination="AUDIT_EXPORT",
+                payload_text="recorded",
+                created_at=now,
+            )
+            second_raw_id, _ = journal.append_raw_message(
+                "msg-event-outbox-two", now, "SKIPPED QQQ"
+            )
+            second_event_id, _ = journal.append_execution_event(
+                raw_message_id=second_raw_id,
+                action_ordinal=0,
+                parsed_action="SKIPPED",
+                event_time=now,
+                symbol="QQQ",
+            )
+            journal.append_outbox(
+                idempotency_key="event-outbox-other-event",
+                origin_report_id=None,
+                origin_execution_event_id=second_event_id,
+                destination="CODEX_TASK",
+                payload_text="recorded",
+                created_at=now,
+            )
+            self.assertEqual(journal.count("outbox"), 3)
 
     def test_pending_outbox_exposes_next_attempt_after_restart(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
@@ -1071,8 +1346,12 @@ class JournalTests(unittest.TestCase):
         archive_path = report_archive_relative_path(
             "CLOSE", session_date, report_id
         )
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+        with patch.object(
+            journal_module,
+            "_utc_now",
+            return_value=now + timedelta(seconds=1),
+        ), Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             report = journal.finalize_report(
                 claim_id=claim.claim_id,
@@ -1082,7 +1361,6 @@ class JournalTests(unittest.TestCase):
                 observation_ids=(),
                 archive_relative_path=archive_path,
                 created_at=now + timedelta(seconds=1),
-                finalized_at=now + timedelta(seconds=1),
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -1137,8 +1415,10 @@ class JournalTests(unittest.TestCase):
         archive_path = report_archive_relative_path(
             "CLOSE", session_date, report_id
         )
-        with Journal.open(self.db_path) as journal:
-            claim = journal.claim_report(session_date, "CLOSE", now=now)
+        with patch.object(
+            journal_module, "_utc_now", return_value=finalized_at
+        ), Journal.open(self.db_path) as journal:
+            claim = journal.claim_report(session_date, "CLOSE")
             assert claim.claim_token is not None
             report = journal.finalize_report(
                 claim_id=claim.claim_id,
@@ -1148,7 +1428,6 @@ class JournalTests(unittest.TestCase):
                 observation_ids=(),
                 archive_relative_path=archive_path,
                 created_at=now + timedelta(seconds=1),
-                finalized_at=finalized_at,
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
@@ -1276,6 +1555,7 @@ class JournalTests(unittest.TestCase):
                         occurred_at=now,
                         amount_micros=-100_000_000,
                         execution_event_id=event_id,
+                        symbol="SPY",
                     )
                     outer.write_actual_cash_projection(
                         estimated_settled_cash_micros=4_900_000_000,
@@ -1450,6 +1730,187 @@ class JournalTests(unittest.TestCase):
                         last_ledger_posting_id=posting_id,
                         updated_at=now,
                     )
+
+    def test_actual_ledger_posting_requires_exactly_one_origin(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.append_ledger_posting(
+                        posting_key="actual-orphan",
+                        ledger_name="ACTUAL",
+                        account_name="CASH",
+                        entry_kind="OPENING_BALANCE",
+                        occurred_at=now,
+                        amount_micros=5_000_000_000,
+                    )
+
+            with journal.transaction() as transaction:
+                canonical_id, duplicate = transaction.append_ledger_posting(
+                    posting_key="canonical-opening",
+                    ledger_name="CANONICAL",
+                    account_name="CASH",
+                    entry_kind="OPENING_BALANCE",
+                    occurred_at=now,
+                    amount_micros=5_000_000_000,
+                )
+            self.assertGreater(canonical_id, 0)
+            self.assertFalse(duplicate)
+
+    def test_actual_ledger_posting_enforces_event_symbol_and_time(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message("msg-ledger-event", now, "BOUGHT SPY")
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="BOUGHT",
+                event_time=now,
+                symbol="SPY",
+            )
+            for posting_key, symbol, occurred_at in (
+                ("actual-wrong-symbol", "QQQ", now),
+                ("actual-missing-symbol", None, now),
+                ("actual-before-event", "SPY", now - timedelta(microseconds=1)),
+            ):
+                with self.subTest(posting_key=posting_key):
+                    with self.assertRaises(InvalidJournalValue):
+                        with journal.transaction() as transaction:
+                            transaction.append_ledger_posting(
+                                posting_key=posting_key,
+                                ledger_name="ACTUAL",
+                                account_name="CASH",
+                                entry_kind="BUY",
+                                occurred_at=occurred_at,
+                                amount_micros=-100_000_000,
+                                execution_event_id=event_id,
+                                symbol=symbol,
+                            )
+
+            with journal.transaction() as transaction:
+                posting_id, duplicate = transaction.append_ledger_posting(
+                    posting_key="actual-t-plus-one",
+                    ledger_name="ACTUAL",
+                    account_name="CASH",
+                    entry_kind="SETTLEMENT",
+                    occurred_at=now + timedelta(days=1),
+                    amount_micros=-100_000_000,
+                    execution_event_id=event_id,
+                    symbol="SPY",
+                )
+            self.assertGreater(posting_id, 0)
+            self.assertFalse(duplicate)
+
+    def test_actual_ledger_posting_enforces_account_check_symbol_and_time(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message(
+                "msg-ledger-account-check", now, "ACCOUNT CHECK SPY"
+            )
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="ACCOUNT_CHECK",
+                event_time=now,
+                symbol="SPY",
+                reconciliation_state="CLEAR",
+            )
+            account_check_id, _ = journal.append_account_check(
+                execution_event_id=event_id,
+                settled_cash_micros=5_000_000_000,
+                pending_order_count=0,
+                unlogged_position_count=0,
+                confirmed_at=now,
+                reconciliation_result="CLEAR",
+            )
+            for posting_key, symbol, occurred_at in (
+                ("actual-check-wrong-symbol", "QQQ", now),
+                ("actual-check-missing-symbol", None, now),
+                ("actual-check-before", "SPY", now - timedelta(microseconds=1)),
+            ):
+                with self.subTest(posting_key=posting_key):
+                    with self.assertRaises(InvalidJournalValue):
+                        with journal.transaction() as transaction:
+                            transaction.append_ledger_posting(
+                                posting_key=posting_key,
+                                ledger_name="ACTUAL",
+                                account_name="CASH",
+                                entry_kind="ACCOUNT_CHECK",
+                                occurred_at=occurred_at,
+                                amount_micros=0,
+                                account_check_id=account_check_id,
+                                symbol=symbol,
+                            )
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.append_ledger_posting(
+                        posting_key="actual-check-both-origins",
+                        ledger_name="ACTUAL",
+                        account_name="CASH",
+                        entry_kind="ACCOUNT_CHECK",
+                        occurred_at=now,
+                        amount_micros=0,
+                        execution_event_id=event_id,
+                        account_check_id=account_check_id,
+                        symbol="SPY",
+                    )
+            with journal.transaction() as transaction:
+                posting_id, _ = transaction.append_ledger_posting(
+                    posting_key="actual-check-valid",
+                    ledger_name="ACTUAL",
+                    account_name="CASH",
+                    entry_kind="ACCOUNT_CHECK",
+                    occurred_at=now,
+                    amount_micros=0,
+                    account_check_id=account_check_id,
+                    symbol="SPY",
+                )
+            self.assertGreater(posting_id, 0)
+
+    def test_actual_cash_projection_cannot_predate_its_posting(self) -> None:
+        now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        posting_time = now + timedelta(seconds=1)
+        with Journal.open(self.db_path) as journal:
+            raw_id, _ = journal.append_raw_message("msg-cash-time", now, "SOLD SPY")
+            event_id, _ = journal.append_execution_event(
+                raw_message_id=raw_id,
+                action_ordinal=0,
+                parsed_action="SOLD",
+                event_time=now,
+                symbol="SPY",
+            )
+            with journal.transaction() as transaction:
+                posting_id, _ = transaction.append_ledger_posting(
+                    posting_key="actual-cash-time",
+                    ledger_name="ACTUAL",
+                    account_name="CASH",
+                    entry_kind="SALE",
+                    occurred_at=posting_time,
+                    amount_micros=100_000_000,
+                    execution_event_id=event_id,
+                    symbol="SPY",
+                )
+
+            projection = {
+                "estimated_settled_cash_micros": 5_100_000_000,
+                "user_confirmed_settled_cash_micros": None,
+                "deployed_capital_micros": 0,
+                "open_planned_risk_micros": 0,
+                "consecutive_losses": 0,
+                "weekly_high_water_micros": 5_100_000_000,
+                "monthly_high_water_micros": 5_100_000_000,
+                "last_ledger_posting_id": posting_id,
+            }
+            with self.assertRaises(InvalidJournalValue):
+                with journal.transaction() as transaction:
+                    transaction.write_actual_cash_projection(
+                        **projection, updated_at=now
+                    )
+            with journal.transaction() as transaction:
+                revision = transaction.write_actual_cash_projection(
+                    **projection, updated_at=posting_time
+                )
+            self.assertEqual(revision, 1)
 
     def test_reconciliation_projection_rejects_non_authoritative_events(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)

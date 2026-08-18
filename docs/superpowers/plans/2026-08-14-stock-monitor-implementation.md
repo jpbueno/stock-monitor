@@ -868,11 +868,18 @@ git commit -m "feat: track prospective phase one validation"
 - Create: `src/stock_monitor/sql/003_phase2_paper.sql`
 - Create: `src/stock_monitor/replay.py`
 - Create: `src/stock_monitor/options_paper.py`
+- Modify: `src/stock_monitor/config.py`
+- Modify: `src/stock_monitor/journal.py`
 - Modify: `tests/support.py`
+- Modify: `tests/architecture/test_brokerage_boundary.py`
+- Modify: `tests/integration/test_journal_migrations.py`
+- Modify: `tests/unit/test_config.py`
 - Test: `tests/unit/test_replay.py`
 - Test: `tests/unit/test_option_selection.py`
 - Test: `tests/unit/test_option_accounting.py`
 - Test: `tests/integration/test_phase2_gate.py`
+- Create: `tests/fixtures/options/`
+- Create: `tests/fixtures/replay/`
 
 - [ ] **Step 1: Write failing replay and option-ranking tests**
 
@@ -902,7 +909,7 @@ class OptionSelectionTests(unittest.TestCase):
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `PYTHONPATH=src python3 -m unittest tests.unit.test_replay tests.unit.test_option_selection tests.unit.test_option_accounting tests.integration.test_phase2_gate -v`
+Run: `PYTHONPATH=src .venv/bin/python -W error -m unittest tests.unit.test_replay tests.unit.test_option_selection tests.unit.test_option_accounting tests.integration.test_phase2_gate tests.integration.test_journal_migrations tests.unit.test_config tests.architecture.test_brokerage_boundary -v`
 
 Expected: missing replay/options modules.
 
@@ -936,7 +943,7 @@ Expected: all Task 9 tests pass.
 - [ ] **Step 5: Commit Task 9**
 
 ```bash
-git add src/stock_monitor/sql/003_phase2_paper.sql src/stock_monitor/replay.py src/stock_monitor/options_paper.py tests/support.py tests/unit/test_replay.py tests/unit/test_option_selection.py tests/unit/test_option_accounting.py tests/integration/test_phase2_gate.py tests/fixtures/options tests/fixtures/replay
+git add docs/superpowers/plans/2026-08-14-stock-monitor-implementation.md src/stock_monitor/config.py src/stock_monitor/journal.py src/stock_monitor/options_paper.py src/stock_monitor/replay.py src/stock_monitor/sql/003_phase2_paper.sql tests/architecture/test_brokerage_boundary.py tests/integration/test_journal_migrations.py tests/integration/test_phase2_gate.py tests/support.py tests/unit/test_config.py tests/unit/test_option_accounting.py tests/unit/test_option_selection.py tests/unit/test_replay.py tests/fixtures/options tests/fixtures/replay
 git commit -m "feat: add replay and paper option validation"
 ```
 

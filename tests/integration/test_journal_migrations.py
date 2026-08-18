@@ -119,9 +119,9 @@ class JournalMigrationTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 1)
+                self.assertEqual(journal.count("schema_migrations"), 2)
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 1)
+                self.assertEqual(journal.count("schema_migrations"), 2)
 
     def test_migration_source_can_be_loaded_independently_of_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -268,7 +268,7 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA application_id").fetchone()[0], 0)
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 1)
+                self.assertEqual(journal.count("schema_migrations"), 2)
 
     def test_migration_transaction_control_cannot_escape_atomic_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -534,7 +534,7 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(wrong_version_path):
                 pass
             with closing(sqlite3.connect(wrong_version_path)) as connection:
-                connection.execute("PRAGMA user_version = 2")
+                connection.execute("PRAGMA user_version = 3")
             with self.assertRaises(MigrationCorruption):
                 Journal.open(wrong_version_path)
 
@@ -574,9 +574,9 @@ class JournalMigrationTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 counts = tuple(executor.map(lambda _: open_and_count(), range(2)))
 
-            self.assertEqual(counts, (1, 1))
+            self.assertEqual(counts, (2, 2))
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 1)
+                self.assertEqual(journal.count("schema_migrations"), 2)
 
     def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -619,10 +619,10 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertTrue(application_id_read.wait(timeout=10))
                 try:
                     with Journal.open(path) as journal:
-                        self.assertEqual(journal.count("schema_migrations"), 1)
+                        self.assertEqual(journal.count("schema_migrations"), 2)
                 finally:
                     release_preflight.set()
-                self.assertEqual(victim.result(timeout=10), 1)
+                self.assertEqual(victim.result(timeout=10), 2)
 
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -681,10 +681,41 @@ class JournalMigrationTests(unittest.TestCase):
                 "actual_positions",
                 "actual_cash_projection",
                 "reconciliation_projection",
+                "phase1_validation_windows",
+                "phase1_source_payloads",
+                "phase1_publication_manifests",
+                "phase1_publication_fetch_pages",
+                "phase1_publication_facts",
+                "phase1_signals",
+                "phase1_signal_evidence_reviews",
+                "phase1_signal_evidence_bindings",
+                "phase1_expiry_deadlines",
+                "phase1_exit_reviews",
+                "phase1_exit_review_manifests",
+                "phase1_exit_review_pages",
+                "phase1_exit_review_facts",
+                "phase1_equity_mark_sets",
+                "phase1_equity_mark_manifests",
+                "phase1_equity_mark_pages",
+                "phase1_equity_mark_facts",
+                "phase1_equity_mark_invalidations",
+                "phase1_equity_mark_invalidation_pages",
+                "phase1_observation_fetch_manifests",
+                "phase1_observation_fetch_pages",
+                "phase1_session_late_evidence",
+                "phase1_session_late_evidence_pages",
+                "phase1_observations",
+                "phase1_session_completions",
+                "phase1_signal_events",
+                "phase1_canonical_postings",
+                "phase1_equity_points",
+                "phase1_equity_point_marks",
+                "phase1_closed_trades",
+                "phase1_adherence_checks",
             },
         )
-        self.assertNotIn("signals", tables)
-        self.assertFalse(any("option" in table or "phase1" in table for table in tables))
+        self.assertIn("phase1_signals", tables)
+        self.assertFalse(any("option" in table for table in tables))
 
     def test_core_tables_are_strict_and_expose_required_audit_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -860,6 +891,437 @@ class JournalMigrationTests(unittest.TestCase):
                 "updated_at",
                 "revision",
             },
+            "phase1_signals": {
+                "signal_id",
+                "validation_window_id",
+                "symbol",
+                "role",
+                "publication_session",
+                "maximum_entry_micros",
+                "recommended_stop_micros",
+                "target_micros",
+                "planned_shares",
+                "tick_size_micros",
+                "trigger_price_micros",
+                "publication_report_id",
+                "publication_rank",
+                "publication_source_digest",
+                "publication_state_digest",
+                "calendar_digest",
+                "published_at",
+                "received_at",
+                "record_sha256",
+            },
+            "phase1_source_payloads": {
+                "source_observation_id",
+                "payload_sha256",
+                "source_payload",
+                "recorded_at",
+                "record_sha256",
+            },
+            "phase1_publication_manifests": {
+                "publication_report_id",
+                "manifest_digest",
+                "candidate_source_observation_ids_json",
+                "candidate_context_digests_json",
+                "source_observation_ids_json",
+                "record_sha256",
+            },
+            "phase1_publication_fetch_pages": {
+                "publication_report_id",
+                "fetch_manifest_ordinal",
+                "fetch_manifest_digest",
+                "collection_name",
+                "requested_symbols_json",
+                "request_digest",
+                "page_ordinal",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "terminal",
+                "record_sha256",
+            },
+            "phase1_publication_facts": {
+                "publication_report_id",
+                "fact_ordinal",
+                "candidate_symbol",
+                "observation_kind",
+                "symbol",
+                "feed",
+                "external_source_observation_id",
+                "page_ordinal",
+                "source_item_ordinal",
+                "source_item_path",
+                "page_payload_sha256",
+                "normalized_fields_digest",
+                "fetch_manifest_digest",
+                "record_sha256",
+            },
+            "phase1_exit_reviews": {
+                "review_id",
+                "signal_id",
+                "review_session",
+                "calendar_digest",
+                "query_cutoff",
+                "expected_manifest_count",
+                "expected_fact_count",
+                "source_observation_highwater",
+                "recorded_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_exit_review_manifests": {
+                "review_id",
+                "purpose",
+                "collection_name",
+                "requested_symbols_json",
+                "request_start",
+                "request_end",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "terminal",
+                "received_through",
+                "expected_page_count",
+                "expected_fact_count",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_exit_review_pages": {
+                "review_id",
+                "purpose",
+                "page_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_exit_review_facts": {
+                "fact_id",
+                "review_id",
+                "purpose",
+                "fact_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "page_ordinal",
+                "source_item_ordinal",
+                "source_item_path",
+                "fact_kind",
+                "symbol",
+                "feed",
+                "source_time",
+                "received_at",
+                "provider_sequence",
+                "payload_sha256",
+                "normalized_fields_digest",
+                "values_json",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_sets": {
+                "mark_set_id",
+                "session_date",
+                "calendar_digest",
+                "query_cutoff",
+                "sealed_at",
+                "requested_symbols_json",
+                "expected_manifest_count",
+                "expected_fact_count",
+                "source_observation_highwater",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_manifests": {
+                "mark_set_id",
+                "purpose",
+                "collection_name",
+                "requested_symbols_json",
+                "request_start",
+                "request_end",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "terminal",
+                "received_through",
+                "expected_page_count",
+                "expected_fact_count",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_pages": {
+                "mark_set_id",
+                "purpose",
+                "page_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_facts": {
+                "fact_id",
+                "mark_set_id",
+                "purpose",
+                "fact_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "page_ordinal",
+                "source_item_ordinal",
+                "source_item_path",
+                "fact_kind",
+                "symbol",
+                "feed",
+                "source_time",
+                "received_at",
+                "provider_sequence",
+                "payload_sha256",
+                "normalized_fields_digest",
+                "values_json",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_invalidations": {
+                "invalidation_id",
+                "mark_set_id",
+                "session_date",
+                "semantic_manifest_digests_json",
+                "received_through",
+                "invalidated_at",
+                "expected_page_count",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_mark_invalidation_pages": {
+                "invalidation_id",
+                "purpose",
+                "page_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "semantic_manifest_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_observation_fetch_manifests": {
+                "cohort_id",
+                "signal_id",
+                "session_date",
+                "purpose",
+                "collection_name",
+                "requested_symbols_json",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "terminal",
+                "request_start",
+                "request_end",
+                "calendar_digest",
+                "received_through",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_observation_fetch_pages": {
+                "cohort_id",
+                "page_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "semantic_page_digest",
+                "record_sha256",
+            },
+            "phase1_session_late_evidence": {
+                "late_evidence_id",
+                "completion_id",
+                "signal_id",
+                "session_date",
+                "collection_name",
+                "request_start",
+                "request_end",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "received_through",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_session_late_evidence_pages": {
+                "late_evidence_id",
+                "page_ordinal",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_type",
+                "request_url",
+                "request_page_token",
+                "next_page_token",
+                "payload_sha256",
+                "semantic_page_digest",
+                "record_sha256",
+            },
+            "phase1_validation_windows": {
+                "window_id",
+                "started_session",
+                "starting_capital_micros",
+                "started_at",
+                "received_at",
+                "calendar_digest",
+                "source_digest",
+            },
+            "phase1_observations": {
+                "observation_id",
+                "signal_id",
+                "source_observation_id",
+                "source_item_ordinal",
+                "source_item_path",
+                "source_payload_sha256",
+                "source_payload",
+                "stream_id",
+                "feed",
+                "observation_kind",
+                "session_date",
+                "source_time",
+                "received_at",
+                "provider_sequence",
+                "source_ordinal",
+                "cohort_ordinal",
+                "trade_price_micros",
+                "bid_micros",
+                "ask_micros",
+                "fresh",
+                "fetch_cohort_id",
+                "fetch_page_ordinal",
+                "source_digest",
+                "details_json",
+            },
+            "phase1_session_completions": {
+                "completion_id",
+                "signal_id",
+                "session_date",
+                "cohort_through_ordinal",
+                "expected_observation_count",
+                "received_through",
+                "completed_at",
+                "source_digest",
+            },
+            "phase1_signal_events": {
+                "lifecycle_event_id",
+                "signal_id",
+                "event_ordinal",
+                "event_kind",
+                "from_status",
+                "to_status",
+                "event_time",
+                "message_time",
+                "received_at",
+                "confirmation_execution_event_id",
+                "trigger_observation_id",
+                "quote_observation_id",
+                "session_completion_id",
+                "exit_observation_id",
+                "exit_authority_digest",
+                "shares",
+                "price_micros",
+                "recommended_stop_micros",
+                "source_digest",
+                "details_json",
+            },
+            "phase1_canonical_postings": {
+                "posting_key",
+                "lifecycle_event_id",
+                "signal_id",
+                "entry_kind",
+                "account_name",
+                "amount_micros",
+                "shares_delta",
+                "unit_price_micros",
+                "occurred_at",
+                "received_at",
+                "settlement_available_session",
+                "fee_schedule_version",
+                "fee_schedule_digest",
+                "source_digest",
+                "record_sha256",
+                "details_json",
+            },
+            "phase1_equity_points": {
+                "point_id",
+                "ledger_name",
+                "session_date",
+                "equity_micros",
+                "cash_micros",
+                "positions_value_micros",
+                "external_cash_flow_micros",
+                "source_cursor",
+                "mark_source_digest",
+                "at",
+                "message_time",
+                "received_at",
+                "source_digest",
+            },
+            "phase1_equity_point_marks": {
+                "equity_point_id",
+                "observation_id",
+                "symbol",
+                "mark_ordinal",
+                "method",
+                "derived_price_micros",
+                "mark_at",
+                "source_digest",
+            },
+            "phase1_closed_trades": {
+                "trade_id",
+                "ledger_name",
+                "signal_id",
+                "lifecycle_event_id",
+                "session_date",
+                "shares",
+                "entry_value_micros",
+                "exit_value_micros",
+                "fee_micros",
+                "pnl_micros",
+                "initial_risk_micros",
+                "net_r_numerator_micros",
+                "at",
+                "message_time",
+                "received_at",
+                "source_digest",
+            },
+            "phase1_adherence_checks": {
+                "check_id",
+                "signal_id",
+                "check_name",
+                "applicable",
+                "passed",
+                "hard_breach",
+                "evaluated_at",
+                "received_at",
+                "terminal_lifecycle_event_id",
+                "evidence_digest",
+                "review_source_digest",
+                "authority_digest",
+                "source_digest",
+                "details_json",
+                "record_sha256",
+            },
         }
         for table, required in expected_columns.items():
             with self.subTest(table=table):
@@ -880,6 +1342,66 @@ class JournalMigrationTests(unittest.TestCase):
                 "observation_set_sha256",
             },
             "outbox": {"payload_sha256"},
+            "phase1_signals": {
+                "publication_source_digest",
+                "publication_state_digest",
+                "calendar_digest",
+                "record_sha256",
+            },
+            "phase1_validation_windows": {
+                "calendar_digest",
+                "source_digest",
+            },
+            "phase1_observation_fetch_manifests": {
+                "cohort_id",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "calendar_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_observation_fetch_pages": {
+                "payload_sha256",
+                "semantic_page_digest",
+                "record_sha256",
+            },
+            "phase1_session_late_evidence": {
+                "late_evidence_id",
+                "request_digest",
+                "manifest_digest",
+                "semantic_manifest_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_session_late_evidence_pages": {
+                "payload_sha256",
+                "semantic_page_digest",
+                "record_sha256",
+            },
+            "phase1_observations": {
+                "source_payload_sha256",
+                "source_digest",
+            },
+            "phase1_session_completions": {"source_digest"},
+            "phase1_signal_events": {"source_digest"},
+            "phase1_canonical_postings": {
+                "fee_schedule_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase1_equity_points": {
+                "mark_source_digest",
+                "source_digest",
+            },
+            "phase1_closed_trades": {"source_digest"},
+            "phase1_adherence_checks": {
+                "evidence_digest",
+                "review_source_digest",
+                "authority_digest",
+                "source_digest",
+                "record_sha256",
+            },
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -918,6 +1440,150 @@ class JournalMigrationTests(unittest.TestCase):
                             "{}",
                         ),
                     )
+
+    def test_phase1_schema_enforces_primary_and_lifecycle_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                indexes = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type = 'index' AND tbl_name = 'phase1_signals' "
+                        "AND sql IS NOT NULL"
+                    )
+                }
+                event_definition = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema "
+                        "WHERE type = 'table' AND name = 'phase1_signal_events'"
+                    ).fetchone()[0]
+                ).lower()
+
+        self.assertTrue(
+            any(
+                "unique" in sql
+                and "publication_session" in sql
+                and "where role = 'primary'" in sql
+                for sql in indexes.values()
+            )
+        )
+        self.assertIn("check(from_status is null or from_status in", event_definition)
+        self.assertIn("check(to_status in", event_definition)
+
+    def test_phase1_closed_trade_lineage_uses_the_close_event_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                trigger_sql = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' "
+                        "AND name = 'phase1_closed_trades_validate_lineage'"
+                    ).fetchone()[0]
+                ).upper()
+
+        self.assertIn("EVENT_KIND = 'CLOSE'", trigger_sql)
+        self.assertNotIn("EVENT_KIND = 'CLOSED'", trigger_sql)
+
+    def test_phase1_lifecycle_shapes_bind_finalizers_and_exit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                table_sql = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type = 'table' "
+                        "AND name = 'phase1_signal_events'"
+                    ).fetchone()[0]
+                ).lower()
+                posting_trigger_sql = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' "
+                        "AND name = 'phase1_canonical_postings_validate_lineage'"
+                    ).fetchone()[0]
+                ).lower()
+                trigger_sql = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' "
+                        "AND name = 'phase1_signal_events_validate_sequence'"
+                    ).fetchone()[0]
+                ).lower()
+
+        for field in (
+            "session_completion_id",
+            "exit_observation_id",
+            "exit_authority_digest",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, table_sql)
+        self.assertIn("event_kind = 'trigger_observed'", table_sql)
+        self.assertIn("event_kind = 'paper_fill'", table_sql)
+        self.assertIn("'partial_exit', 'close'", table_sql)
+        self.assertIn("session_completion_id is not null", table_sql)
+        self.assertIn("exit_observation_id is not null", table_sql)
+        self.assertIn("exit_authority_digest is not null", table_sql)
+        self.assertIn("completion.signal_id = new.signal_id", trigger_sql)
+        self.assertIn(
+            "completion.session_date = signal.publication_session",
+            trigger_sql,
+        )
+        self.assertIn("review.signal_id = new.signal_id", trigger_sql)
+        self.assertIn("fact.fact_kind = 'bar'", trigger_sql)
+        self.assertIn("signal.role != 'primary'", trigger_sql)
+        self.assertIn("signal.role = 'primary'", posting_trigger_sql)
+        self.assertIn("event_kind in ('live_confirm', 'live_skip')", posting_trigger_sql)
+
+    def test_phase1_schema_locks_terminal_marks_observation_shapes_and_net_r(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'index') AND sql IS NOT NULL"
+                    )
+                }
+
+        equity_contract = " ".join(
+            sql
+            for name, sql in definitions.items()
+            if name == "phase1_equity_points"
+            or name.startswith("phase1_equity_points_")
+        )
+        observation_contract = definitions["phase1_observations"]
+        close_contract = definitions["phase1_closed_trades"]
+        self.assertIn(
+            "unique(validation_window_id, ledger_name, session_date)",
+            equity_contract,
+        )
+        self.assertIn("observation_kind = 'bar'", observation_contract)
+        self.assertIn("open_micros is not null", observation_contract)
+        self.assertIn(
+            "observation_kind in ('trade', 'quote', 'bar')",
+            observation_contract,
+        )
+        self.assertNotIn("observation_kind = 'mark'", observation_contract)
+        self.assertIn("bid_micros is not null", observation_contract)
+        self.assertIn("ask_micros is not null", observation_contract)
+        self.assertIn("ask_micros >= bid_micros", observation_contract)
+        self.assertIn("and close_micros is null", observation_contract)
+        self.assertIn("and close_micros is not null", observation_contract)
+        self.assertIn("initial_risk_micros", close_contract)
+        self.assertIn(
+            "net_r_numerator_micros = pnl_micros",
+            close_contract,
+        )
+        self.assertNotIn("equity_micros >= 0", definitions["phase1_equity_points"])
+        self.assertNotIn("cash_micros >= 0", definitions["phase1_equity_points"])
+
     def test_every_immutable_table_rejects_update_delete_and_replace(self) -> None:
         immutable_tables = (
             "schema_migrations",
@@ -930,6 +1596,37 @@ class JournalMigrationTests(unittest.TestCase):
             "outbox",
             "outbox_delivery_attempts",
             "ledger_postings",
+            "phase1_validation_windows",
+            "phase1_source_payloads",
+            "phase1_publication_manifests",
+            "phase1_publication_fetch_pages",
+            "phase1_publication_facts",
+            "phase1_signals",
+            "phase1_signal_evidence_reviews",
+            "phase1_signal_evidence_bindings",
+            "phase1_expiry_deadlines",
+            "phase1_exit_reviews",
+            "phase1_exit_review_manifests",
+            "phase1_exit_review_pages",
+            "phase1_exit_review_facts",
+            "phase1_equity_mark_sets",
+            "phase1_equity_mark_manifests",
+            "phase1_equity_mark_pages",
+            "phase1_equity_mark_facts",
+            "phase1_equity_mark_invalidations",
+            "phase1_equity_mark_invalidation_pages",
+            "phase1_observation_fetch_manifests",
+            "phase1_observation_fetch_pages",
+            "phase1_session_late_evidence",
+            "phase1_session_late_evidence_pages",
+            "phase1_observations",
+            "phase1_session_completions",
+            "phase1_signal_events",
+            "phase1_canonical_postings",
+            "phase1_equity_points",
+            "phase1_equity_point_marks",
+            "phase1_closed_trades",
+            "phase1_adherence_checks",
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -1062,8 +1759,26 @@ class JournalMigrationTests(unittest.TestCase):
                 )
                 connection.commit()
 
+                trigger_names = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'trigger'"
+                    )
+                }
+
                 for table in immutable_tables:
                     primary_key = "version" if table == "schema_migrations" else "id"
+                    with self.subTest(table=table, operation="trigger-matrix"):
+                        self.assertIn(f"{table}_no_update", trigger_names)
+                        self.assertIn(f"{table}_no_delete", trigger_names)
+                        self.assertIn(
+                            f"{table}_no_conflicting_insert",
+                            trigger_names,
+                        )
+                    if connection.execute(
+                        f'SELECT COUNT(*) FROM "{table}"'
+                    ).fetchone()[0] == 0:
+                        continue
                     with self.subTest(table=table, operation="update"):
                         with self.assertRaises(sqlite3.IntegrityError):
                             connection.execute(
@@ -1111,6 +1826,141 @@ class JournalMigrationTests(unittest.TestCase):
             "reconciliation_projection": {
                 ("last_execution_event_id", "execution_events")
             },
+            "phase1_source_payloads": {
+                ("source_observation_id", "source_observations"),
+            },
+            "phase1_publication_manifests": {
+                ("publication_report_id", "reports"),
+            },
+            "phase1_publication_fetch_pages": {
+                ("publication_report_id", "phase1_publication_manifests"),
+            },
+            "phase1_publication_facts": {
+                ("publication_report_id", "phase1_publication_manifests"),
+                ("publication_report_id", "phase1_publication_fetch_pages"),
+                ("external_source_observation_id", "phase1_publication_fetch_pages"),
+                ("fetch_manifest_digest", "phase1_publication_fetch_pages"),
+                ("page_ordinal", "phase1_publication_fetch_pages"),
+            },
+            "phase1_signals": {
+                ("validation_window_id", "phase1_validation_windows"),
+                ("publication_report_id", "reports"),
+            },
+            "phase1_signal_evidence_reviews": {
+                ("signal_id", "phase1_signals"),
+                ("registry_source_row_id", "source_observations"),
+            },
+            "phase1_signal_evidence_bindings": {
+                ("evidence_id", "phase1_signal_evidence_reviews"),
+                ("source_observation_row_id", "source_observations"),
+            },
+            "phase1_expiry_deadlines": {
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_exit_reviews": {
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_exit_review_manifests": {
+                ("review_id", "phase1_exit_reviews"),
+            },
+            "phase1_exit_review_pages": {
+                ("review_id", "phase1_exit_review_manifests"),
+                ("purpose", "phase1_exit_review_manifests"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase1_exit_review_facts": {
+                ("review_id", "phase1_exit_review_pages"),
+                ("purpose", "phase1_exit_review_pages"),
+                ("page_ordinal", "phase1_exit_review_pages"),
+                ("source_observation_id", "phase1_exit_review_pages"),
+            },
+            "phase1_equity_mark_manifests": {
+                ("mark_set_id", "phase1_equity_mark_sets"),
+            },
+            "phase1_equity_mark_pages": {
+                ("mark_set_id", "phase1_equity_mark_manifests"),
+                ("purpose", "phase1_equity_mark_manifests"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase1_equity_mark_facts": {
+                ("mark_set_id", "phase1_equity_mark_pages"),
+                ("purpose", "phase1_equity_mark_pages"),
+                ("page_ordinal", "phase1_equity_mark_pages"),
+                ("source_observation_id", "phase1_equity_mark_pages"),
+            },
+            "phase1_equity_mark_invalidations": {
+                ("mark_set_id", "phase1_equity_mark_sets"),
+            },
+            "phase1_equity_mark_invalidation_pages": {
+                (
+                    "invalidation_id",
+                    "phase1_equity_mark_invalidations",
+                ),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase1_observation_fetch_manifests": {
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_observation_fetch_pages": {
+                ("cohort_id", "phase1_observation_fetch_manifests"),
+                ("source_observation_id", "source_observations"),
+            },
+            "phase1_session_late_evidence": {
+                ("completion_id", "phase1_session_completions"),
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_session_late_evidence_pages": {
+                ("late_evidence_id", "phase1_session_late_evidence"),
+                ("source_observation_id", "source_observations"),
+            },
+            "phase1_observations": {
+                ("signal_id", "phase1_signals"),
+                ("source_observation_id", "source_observations"),
+                ("fetch_cohort_id", "phase1_observation_fetch_manifests"),
+                ("fetch_cohort_id", "phase1_observation_fetch_pages"),
+                ("fetch_page_ordinal", "phase1_observation_fetch_pages"),
+                ("source_observation_id", "phase1_observation_fetch_pages"),
+            },
+            "phase1_session_completions": {
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_signal_events": {
+                ("signal_id", "phase1_signals"),
+                ("confirmation_execution_event_id", "execution_events"),
+                ("trigger_observation_id", "phase1_observations"),
+                ("quote_observation_id", "phase1_observations"),
+                ("session_completion_id", "phase1_session_completions"),
+                ("exit_observation_id", "phase1_exit_review_facts"),
+                ("signal_evidence_id", "phase1_signal_evidence_reviews"),
+                ("expiry_source_id", "phase1_expiry_deadlines"),
+            },
+            "phase1_canonical_postings": {
+                ("lifecycle_event_id", "phase1_signal_events"),
+                ("signal_id", "phase1_signals"),
+            },
+            "phase1_closed_trades": {
+                ("validation_window_id", "phase1_validation_windows"),
+                ("signal_id", "phase1_signals"),
+                ("lifecycle_event_id", "phase1_signal_events"),
+            },
+            "phase1_adherence_checks": {
+                ("validation_window_id", "phase1_validation_windows"),
+                ("signal_id", "phase1_signals"),
+                ("terminal_lifecycle_event_id", "phase1_signal_events"),
+            },
+            "phase1_equity_points": {
+                ("validation_window_id", "phase1_validation_windows"),
+            },
+            "phase1_equity_point_marks": {
+                ("equity_point_id", "phase1_equity_points"),
+                ("observation_id", "phase1_equity_mark_facts"),
+            },
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -1132,6 +1982,44 @@ class JournalMigrationTests(unittest.TestCase):
                                 for row in rows
                             )
                         )
+
+                fact_foreign_keys = connection.execute(
+                    'PRAGMA foreign_key_list("phase1_publication_facts")'
+                ).fetchall()
+                grouped: dict[int, list[tuple[int, str, str, str]]] = {}
+                for row in fact_foreign_keys:
+                    grouped.setdefault(int(row[0]), []).append(
+                        (int(row[1]), str(row[2]), str(row[3]), str(row[4]))
+                    )
+                self.assertIn(
+                    [
+                        (
+                            0,
+                            "phase1_publication_fetch_pages",
+                            "publication_report_id",
+                            "publication_report_id",
+                        ),
+                        (
+                            1,
+                            "phase1_publication_fetch_pages",
+                            "external_source_observation_id",
+                            "external_source_observation_id",
+                        ),
+                        (
+                            2,
+                            "phase1_publication_fetch_pages",
+                            "fetch_manifest_digest",
+                            "fetch_manifest_digest",
+                        ),
+                        (
+                            3,
+                            "phase1_publication_fetch_pages",
+                            "page_ordinal",
+                            "page_ordinal",
+                        ),
+                    ],
+                    [sorted(rows) for rows in grouped.values()],
+                )
 
     def test_numeric_columns_enforce_integer_storage_and_field_signs(self) -> None:
         numeric_fields = {
@@ -1195,6 +2083,77 @@ class JournalMigrationTests(unittest.TestCase):
                 "last_execution_event_id",
                 "revision",
             },
+            "phase1_validation_windows": {"starting_capital_micros"},
+            "phase1_signals": {
+                "maximum_entry_micros",
+                "recommended_stop_micros",
+                "target_micros",
+                "planned_shares",
+                "tick_size_micros",
+                "trigger_price_micros",
+                "publication_rank",
+            },
+            "phase1_observation_fetch_manifests": {"terminal"},
+            "phase1_observation_fetch_pages": {
+                "page_ordinal",
+                "source_observation_id",
+            },
+            "phase1_session_late_evidence_pages": {
+                "page_ordinal",
+                "source_observation_id",
+            },
+            "phase1_observations": {
+                "source_observation_id",
+                "source_item_ordinal",
+                "provider_sequence",
+                "source_ordinal",
+                "cohort_ordinal",
+                "trade_price_micros",
+                "bid_micros",
+                "ask_micros",
+                "open_micros",
+                "high_micros",
+                "low_micros",
+                "close_micros",
+                "volume",
+                "fresh",
+                "fetch_page_ordinal",
+            },
+            "phase1_session_completions": {
+                "cohort_through_ordinal",
+                "expected_observation_count",
+            },
+            "phase1_signal_events": {
+                "event_ordinal",
+                "shares",
+                "price_micros",
+            },
+            "phase1_canonical_postings": {
+                "amount_micros",
+                "shares_delta",
+                "unit_price_micros",
+            },
+            "phase1_equity_points": {
+                "equity_micros",
+                "cash_micros",
+                "positions_value_micros",
+                "external_cash_flow_micros",
+                "source_cursor",
+            },
+            "phase1_closed_trades": {
+                "shares",
+                "entry_value_micros",
+                "exit_value_micros",
+                "fee_micros",
+                "pnl_micros",
+                "initial_risk_micros",
+                "net_r_numerator_micros",
+            },
+            "phase1_adherence_checks": {
+                "applicable",
+                "passed",
+                "hard_breach",
+            },
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -1257,11 +2216,39 @@ class JournalMigrationTests(unittest.TestCase):
             "actual_positions": {"updated_at"},
             "actual_cash_projection": {"updated_at"},
             "reconciliation_projection": {"updated_at"},
+            "phase1_validation_windows": {"started_at", "received_at"},
+            "phase1_signals": {"published_at", "received_at"},
+            "phase1_observation_fetch_manifests": {
+                "request_start",
+                "request_end",
+                "received_through",
+            },
+            "phase1_session_late_evidence": {
+                "request_start",
+                "request_end",
+                "received_through",
+            },
+            "phase1_observations": {"source_time", "received_at"},
+            "phase1_session_completions": {"received_through", "completed_at"},
+            "phase1_signal_events": {"event_time", "message_time", "received_at"},
+            "phase1_canonical_postings": {"occurred_at", "received_at"},
+            "phase1_equity_points": {"at", "message_time", "received_at"},
+            "phase1_closed_trades": {"at", "message_time", "received_at"},
+            "phase1_adherence_checks": {"evaluated_at", "received_at"},
         }
         date_fields = {
             "report_claims": {"session_date"},
             "reports": {"session_date"},
             "scheduled_runs": {"session_date"},
+            "phase1_validation_windows": {"started_session"},
+            "phase1_signals": {"publication_session"},
+            "phase1_observation_fetch_manifests": {"session_date"},
+            "phase1_session_late_evidence": {"session_date"},
+            "phase1_observations": {"session_date"},
+            "phase1_session_completions": {"session_date"},
+            "phase1_canonical_postings": {"settlement_available_session"},
+            "phase1_equity_points": {"session_date"},
+            "phase1_closed_trades": {"session_date"},
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"

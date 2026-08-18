@@ -70,8 +70,8 @@ class JournalTests(unittest.TestCase):
             journal.count("raw_messages")
 
     def test_busy_open_is_translated_and_closes_its_failed_connection(self) -> None:
-        with Journal.open(self.db_path):
-            pass
+        with Journal.open(self.db_path) as journal:
+            migration_count = journal.count("schema_migrations")
         with closing(
             sqlite3.connect(self.db_path, isolation_level=None)
         ) as blocker:
@@ -82,7 +82,7 @@ class JournalTests(unittest.TestCase):
             blocker.rollback()
 
         with Journal.open(self.db_path) as journal:
-            self.assertEqual(journal.count("schema_migrations"), 1)
+            self.assertEqual(journal.count("schema_migrations"), migration_count)
 
     def test_raw_message_identity_is_exact_and_content_is_retained(self) -> None:
         at = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)

@@ -11,6 +11,9 @@ from stock_monitor.providers.alpaca import (
     ProviderDataError,
     ProviderIncompleteError,
     TimeWindow,
+    is_ingestible_provider_fetch_cohort,
+    is_issued_provider_fetch_cohort,
+    recompute_alpaca_page_metadata,
 )
 from stock_monitor.providers.http import HttpResponse, HttpTransportError
 from tests.support import FixtureTransport, credentials
@@ -46,6 +49,32 @@ class RoutingTransport:
 
 
 class AlpacaContractTests(unittest.TestCase):
+    def test_intraday_bar_page_metadata_recomputes_from_exact_raw_page(self) -> None:
+        payload = (
+            b'{"bars":{"AAPL":[{"c":"20.40","h":"20.50",'
+            b'"l":"20.30","o":"20.35","t":"2026-08-17T14:00:00Z",'
+            b'"v":1000}]},"next_page_token":null}'
+        )
+        retrieved_at = datetime(2026, 8, 17, 20, 20, tzinfo=UTC)
+
+        metadata = recompute_alpaca_page_metadata(
+            payload=payload,
+            request_url=(
+                "https://data.alpaca.markets/v2/stocks/bars?"
+                "adjustment=split&end=2026-08-17T20%3A00%3A00Z&feed=sip&"
+                "start=2026-08-17T13%3A30%3A00Z&symbols=AAPL&timeframe=1Min"
+            ),
+            source_type="ALPACA_INTRADAY_BARS",
+            retrieved_at=retrieved_at,
+        )
+
+        self.assertEqual(
+            metadata.source_time,
+            datetime(2026, 8, 17, 14, 0, tzinfo=UTC),
+        )
+        self.assertEqual(metadata.delay_seconds, 22_800)
+        self.assertEqual(len(metadata.payload_sha256), 64)
+
     def test_incomplete_pagination_rejects_entire_cohort(self) -> None:
         transport = FixtureTransport("providers/alpaca/partial-page.json")
         window = TimeWindow(
@@ -216,19 +245,42 @@ class AlpacaContractTests(unittest.TestCase):
         self.assertEqual(bars["SPY"][-1].timestamp, datetime(2026, 8, 13, 4, tzinfo=UTC))
         self.assertEqual(bars["QQQ"][-1].timestamp, datetime(2026, 8, 13, 4, tzinfo=UTC))
 
-    def test_historical_quotes_must_reach_the_terminal_window_boundary(self) -> None:
-        body = (
-            '{"quotes":{'
-            '"SPY":[{"t":"2026-05-01T19:59:59Z","bp":1,"ap":1.01}],'
-            '"QQQ":[{"t":"2026-05-01T19:59:58Z","bp":1,"ap":1.01}]'
-            '},"next_page_token":null}'
+    def test_terminal_quotes_allow_quiet_or_empty_symbol_cohorts(self) -> None:
+        cases = (
+            (
+                "quiet",
+                (
+                    '{"quotes":{'
+                    '"SPY":[{"t":"2026-05-01T19:59:59Z","bp":1,"ap":1.01}],'
+                    '"QQQ":[{"t":"2026-05-01T19:59:58Z","bp":1,"ap":1.01}]'
+                    '},"next_page_token":null}'
+                ),
+                ("SPY", "QQQ"),
+                (1, 1),
+            ),
+            (
+                "empty",
+                '{"quotes":{"AAPL":[]},"next_page_token":null}',
+                ("AAPL",),
+                (0,),
+            ),
         )
-        with self.assertRaises(ProviderIncompleteError):
-            AlpacaMarketData(
-                RoutingTransport(lambda _: (200, body)),
-                credentials(),
-                now=lambda: NOW,
-            ).historical_quotes(["SPY", "QQQ"], WINDOW)
+        for label, body, symbols, expected_counts in cases:
+            with self.subTest(label=label):
+                cohort = AlpacaMarketData(
+                    RoutingTransport(lambda _: (200, body)),
+                    credentials(),
+                    now=lambda: NOW,
+                ).historical_quotes(symbols, WINDOW)
+
+                ordered_symbols = tuple(sorted(symbols))
+                self.assertEqual(tuple(cohort), ordered_symbols)
+                self.assertEqual(
+                    tuple(len(cohort[symbol]) for symbol in ordered_symbols),
+                    expected_counts,
+                )
+                self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+                self.assertTrue(is_ingestible_provider_fetch_cohort(cohort))
 
     def test_symbols_are_validated_before_url_construction(self) -> None:
         transport = RoutingTransport(lambda _: (200, "{}"))

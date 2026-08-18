@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -12,13 +13,15 @@ import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Self
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import ReferenceType, ref
 
-from .domain import money_to_micros, stable_execution_event_identity
+from .domain import money_from_micros, money_to_micros, stable_execution_event_identity
 
 
 APPLICATION_ID = 0x53544B4D
@@ -26,6 +29,28 @@ BUSY_TIMEOUT_MILLISECONDS = 5_000
 REPORT_ID_PATH_PREFIX_LENGTH = 12
 _SQLITE_BIND_BATCH_SIZE = 500
 _REPORT_CLAIM_LEASE_SECONDS = 300
+_PHASE1_ALPACA_SOURCE_CONTRACTS = {
+    "ALPACA_HISTORICAL_TRADES": ("trades", "/v2/stocks/trades", "SIP", True),
+    "ALPACA_HISTORICAL_QUOTES": ("quotes", "/v2/stocks/quotes", "SIP", True),
+    "ALPACA_DAILY_BARS": ("bars", "/v2/stocks/bars", "SIP", True),
+    "ALPACA_LATEST_QUOTES": ("quotes", "/v2/stocks/quotes/latest", "IEX", False),
+}
+_PHASE1_EXIT_FEE_SCHEDULE_VERSION = "PHASE1_US_EQUITY_EXIT_V1"
+_PHASE1_EXIT_FEE_MICROS = 1_000_000
+_PHASE1_EXIT_FEE_SCHEDULE_DIGEST = hashlib.sha256(
+    json.dumps(
+        {
+            "namespace": "stock-monitor/phase1-exit-fee-schedule/v1",
+            "payload": {
+                "fee_micros": _PHASE1_EXIT_FEE_MICROS,
+                "version": _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+            },
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
 _ACTUAL_LEDGER_EVENT_ACTIONS = frozenset(
     {
         "BOUGHT",
@@ -82,6 +107,37 @@ _TABLES = frozenset(
         "actual_positions",
         "actual_cash_projection",
         "reconciliation_projection",
+        "phase1_validation_windows",
+        "phase1_source_payloads",
+        "phase1_publication_manifests",
+        "phase1_publication_fetch_pages",
+        "phase1_publication_facts",
+        "phase1_signals",
+        "phase1_signal_evidence_reviews",
+        "phase1_signal_evidence_bindings",
+        "phase1_observation_fetch_manifests",
+        "phase1_observation_fetch_pages",
+        "phase1_session_late_evidence",
+        "phase1_session_late_evidence_pages",
+        "phase1_expiry_deadlines",
+        "phase1_exit_reviews",
+        "phase1_exit_review_manifests",
+        "phase1_exit_review_pages",
+        "phase1_exit_review_facts",
+        "phase1_equity_mark_sets",
+        "phase1_equity_mark_manifests",
+        "phase1_equity_mark_pages",
+        "phase1_equity_mark_facts",
+        "phase1_equity_mark_invalidations",
+        "phase1_equity_mark_invalidation_pages",
+        "phase1_observations",
+        "phase1_session_completions",
+        "phase1_signal_events",
+        "phase1_canonical_postings",
+        "phase1_equity_points",
+        "phase1_equity_point_marks",
+        "phase1_closed_trades",
+        "phase1_adherence_checks",
     }
 )
 
@@ -149,6 +205,589 @@ _OUTBOX_COLUMNS = (
     "payload_text",
     "payload_sha256",
     "created_at",
+)
+_SOURCE_OBSERVATION_COLUMNS = (
+    "id",
+    "observation_sha256",
+    "payload_sha256",
+    "source_uri",
+    "source_type",
+    "provider",
+    "feed",
+    "source_time",
+    "retrieved_at",
+    "provider_sequence",
+    "delay_seconds",
+    "health_result",
+    "details_json",
+)
+_REPORT_CLAIM_COLUMNS = (
+    "id",
+    "session_date",
+    "report_kind",
+    "claim_token",
+    "status",
+    "created_at",
+    "lease_started_at",
+    "lease_expires_at",
+    "finalized_at",
+    "report_id",
+)
+_REPORT_COLUMNS = (
+    "id",
+    "report_id",
+    "claim_id",
+    "session_date",
+    "report_kind",
+    "body_text",
+    "content_sha256",
+    "state_sha256",
+    "observation_set_sha256",
+    "archive_relative_path",
+    "created_at",
+)
+_REPORT_OBSERVATION_COLUMNS = (
+    "id",
+    "report_id",
+    "source_observation_id",
+    "observation_ordinal",
+)
+_PHASE1_VALIDATION_WINDOW_COLUMNS = (
+    "id",
+    "window_id",
+    "started_session",
+    "starting_capital_micros",
+    "started_at",
+    "received_at",
+    "calendar_digest",
+    "source_digest",
+    "singleton_key",
+)
+_PHASE1_SOURCE_PAYLOAD_COLUMNS = (
+    "id",
+    "source_observation_id",
+    "payload_sha256",
+    "source_payload",
+    "recorded_at",
+    "record_sha256",
+)
+_PHASE1_PUBLICATION_MANIFEST_COLUMNS = (
+    "id",
+    "publication_report_id",
+    "manifest_digest",
+    "candidate_source_observation_ids_json",
+    "candidate_context_digests_json",
+    "candidate_subjects_json",
+    "source_observation_ids_json",
+    "record_sha256",
+)
+_PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS = (
+    "id",
+    "publication_report_id",
+    "fetch_manifest_ordinal",
+    "fetch_manifest_digest",
+    "collection_name",
+    "requested_symbols_json",
+    "request_digest",
+    "page_ordinal",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "terminal",
+    "record_sha256",
+)
+_PHASE1_PUBLICATION_FACT_COLUMNS = (
+    "id",
+    "publication_report_id",
+    "fact_ordinal",
+    "candidate_symbol",
+    "observation_kind",
+    "symbol",
+    "feed",
+    "external_source_observation_id",
+    "page_ordinal",
+    "source_item_ordinal",
+    "source_item_path",
+    "page_payload_sha256",
+    "normalized_fields_digest",
+    "fetch_manifest_digest",
+    "record_sha256",
+)
+_PHASE1_SIGNAL_COLUMNS = (
+    "id",
+    "signal_id",
+    "validation_window_id",
+    "symbol",
+    "subject_kind",
+    "issuer_cik",
+    "role",
+    "publication_session",
+    "maximum_entry_micros",
+    "recommended_stop_micros",
+    "target_micros",
+    "planned_shares",
+    "tick_size_micros",
+    "trigger_price_micros",
+    "publication_report_id",
+    "publication_rank",
+    "publication_source_digest",
+    "publication_state_digest",
+    "publication_content_digest",
+    "publication_observation_set_digest",
+    "publication_decision_digest",
+    "primary_plan_digest",
+    "policy_digest",
+    "calendar_digest",
+    "published_at",
+    "received_at",
+    "record_sha256",
+)
+_PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS = (
+    "id",
+    "evidence_id",
+    "signal_id",
+    "review_at",
+    "registry_source_row_id",
+    "manifest_digest",
+    "manifest_bytes",
+    "registry_id",
+    "registry_content_hash",
+    "registry_release_pin",
+    "bundle_digest",
+    "decision_digest",
+    "calendar_digest",
+    "source_observation_highwater",
+    "expected_source_observation_count",
+    "recorded_at",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS = (
+    "id",
+    "evidence_id",
+    "binding_ordinal",
+    "source_observation_row_id",
+    "external_source_observation_id",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS = (
+    "id",
+    "cohort_id",
+    "signal_id",
+    "session_date",
+    "purpose",
+    "collection_name",
+    "requested_symbols_json",
+    "request_digest",
+    "manifest_digest",
+    "semantic_manifest_digest",
+    "terminal",
+    "request_start",
+    "request_end",
+    "calendar_digest",
+    "received_through",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS = (
+    "id",
+    "cohort_id",
+    "page_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "semantic_page_digest",
+    "record_sha256",
+)
+_PHASE1_SESSION_LATE_EVIDENCE_COLUMNS = (
+    "id",
+    "late_evidence_id",
+    "completion_id",
+    "signal_id",
+    "session_date",
+    "collection_name",
+    "request_start",
+    "request_end",
+    "request_digest",
+    "manifest_digest",
+    "semantic_manifest_digest",
+    "received_through",
+    "invalidated_at",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS = (
+    "id",
+    "late_evidence_id",
+    "page_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "semantic_page_digest",
+    "record_sha256",
+)
+_PHASE1_EXPIRY_DEADLINE_COLUMNS = (
+    "id",
+    "expiry_source_id",
+    "signal_id",
+    "deadline_session",
+    "deadline_at",
+    "observed_at",
+    "calendar_digest",
+    "deadline_session_manifest_json",
+    "completion_terminal_cursor",
+    "completion_source_highwater",
+    "expected_completion_count",
+    "evidence_review_highwater",
+    "expected_positive_evidence_count",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EXIT_REVIEW_COLUMNS = (
+    "id",
+    "review_id",
+    "signal_id",
+    "review_session",
+    "calendar_digest",
+    "query_cutoff",
+    "expected_manifest_count",
+    "expected_fact_count",
+    "source_observation_highwater",
+    "recorded_at",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS = (
+    "id",
+    "review_id",
+    "purpose",
+    "collection_name",
+    "requested_symbols_json",
+    "request_start",
+    "request_end",
+    "request_digest",
+    "manifest_digest",
+    "semantic_manifest_digest",
+    "terminal",
+    "received_through",
+    "expected_page_count",
+    "expected_fact_count",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EXIT_REVIEW_PAGE_COLUMNS = (
+    "id",
+    "review_id",
+    "purpose",
+    "page_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EXIT_REVIEW_FACT_COLUMNS = (
+    "id",
+    "fact_id",
+    "review_id",
+    "purpose",
+    "fact_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "page_ordinal",
+    "source_item_ordinal",
+    "source_item_path",
+    "fact_kind",
+    "symbol",
+    "feed",
+    "source_time",
+    "received_at",
+    "provider_sequence",
+    "payload_sha256",
+    "normalized_fields_digest",
+    "values_json",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_SET_COLUMNS = (
+    "id",
+    "mark_set_id",
+    "session_date",
+    "calendar_digest",
+    "query_cutoff",
+    "sealed_at",
+    "requested_symbols_json",
+    "expected_manifest_count",
+    "expected_fact_count",
+    "source_observation_highwater",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_MANIFEST_COLUMNS = (
+    "id",
+    "mark_set_id",
+    "purpose",
+    "collection_name",
+    "requested_symbols_json",
+    "request_start",
+    "request_end",
+    "request_digest",
+    "manifest_digest",
+    "semantic_manifest_digest",
+    "terminal",
+    "received_through",
+    "expected_page_count",
+    "expected_fact_count",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_PAGE_COLUMNS = (
+    "id",
+    "mark_set_id",
+    "purpose",
+    "page_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_FACT_COLUMNS = (
+    "id",
+    "fact_id",
+    "mark_set_id",
+    "purpose",
+    "fact_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "page_ordinal",
+    "source_item_ordinal",
+    "source_item_path",
+    "fact_kind",
+    "symbol",
+    "feed",
+    "source_time",
+    "received_at",
+    "provider_sequence",
+    "payload_sha256",
+    "normalized_fields_digest",
+    "values_json",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS = (
+    "id",
+    "invalidation_id",
+    "mark_set_id",
+    "session_date",
+    "semantic_manifest_digests_json",
+    "received_through",
+    "invalidated_at",
+    "expected_page_count",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS = (
+    "id",
+    "invalidation_id",
+    "purpose",
+    "page_ordinal",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_type",
+    "request_url",
+    "request_page_token",
+    "next_page_token",
+    "payload_sha256",
+    "semantic_manifest_digest",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE1_EQUITY_POINT_COLUMNS = (
+    "id",
+    "point_id",
+    "validation_window_id",
+    "ledger_name",
+    "session_date",
+    "equity_micros",
+    "cash_micros",
+    "positions_value_micros",
+    "external_cash_flow_micros",
+    "source_cursor",
+    "mark_source_digest",
+    "at",
+    "message_time",
+    "received_at",
+    "source_digest",
+)
+_PHASE1_EQUITY_POINT_MARK_COLUMNS = (
+    "id",
+    "equity_point_id",
+    "observation_id",
+    "symbol",
+    "mark_ordinal",
+    "method",
+    "derived_price_micros",
+    "mark_at",
+    "source_digest",
+)
+_PHASE1_CLOSED_TRADE_COLUMNS = (
+    "id",
+    "trade_id",
+    "validation_window_id",
+    "ledger_name",
+    "signal_id",
+    "lifecycle_event_id",
+    "session_date",
+    "shares",
+    "entry_value_micros",
+    "exit_value_micros",
+    "fee_micros",
+    "pnl_micros",
+    "initial_risk_micros",
+    "net_r_numerator_micros",
+    "at",
+    "message_time",
+    "received_at",
+    "source_digest",
+)
+_PHASE1_ADHERENCE_CHECK_COLUMNS = (
+    "id",
+    "check_id",
+    "validation_window_id",
+    "signal_id",
+    "check_name",
+    "applicable",
+    "passed",
+    "hard_breach",
+    "evaluated_at",
+    "received_at",
+    "terminal_lifecycle_event_id",
+    "evidence_digest",
+    "review_source_digest",
+    "authority_digest",
+    "source_digest",
+    "details_json",
+    "record_sha256",
+)
+_PHASE1_ADHERENCE_CHECK_NAMES = (
+    "DATA_CALENDAR_UNIVERSE_FRESHNESS",
+    "HARD_ELIGIBILITY_GATES",
+    "SCORE_ARITHMETIC_AND_PRIMARY_SELECTION",
+    "VALID_TRIGGER_TIMING",
+    "ENTRY_AND_SPREAD_COMPLIANCE",
+    "POSITION_SIZE_EXPOSURE_AND_RISK",
+    "STOP_STATE",
+    "EXIT_RULE",
+    "CIRCUIT_BREAKER_BEHAVIOR",
+    "RECORD_COMPLETENESS",
+)
+_PHASE1_OBSERVATION_COLUMNS = (
+    "id",
+    "observation_id",
+    "signal_id",
+    "source_observation_id",
+    "source_item_ordinal",
+    "source_item_path",
+    "source_payload_sha256",
+    "source_payload",
+    "stream_id",
+    "feed",
+    "observation_kind",
+    "session_date",
+    "source_time",
+    "received_at",
+    "provider_sequence",
+    "source_ordinal",
+    "cohort_ordinal",
+    "trade_price_micros",
+    "bid_micros",
+    "ask_micros",
+    "open_micros",
+    "high_micros",
+    "low_micros",
+    "close_micros",
+    "volume",
+    "fresh",
+    "fetch_cohort_id",
+    "fetch_page_ordinal",
+    "source_digest",
+    "details_json",
+)
+_PHASE1_SESSION_COMPLETION_COLUMNS = (
+    "id",
+    "completion_id",
+    "signal_id",
+    "session_date",
+    "cohort_through_ordinal",
+    "expected_observation_count",
+    "received_through",
+    "completed_at",
+    "source_digest",
+)
+_PHASE1_SIGNAL_EVENT_COLUMNS = (
+    "id",
+    "lifecycle_event_id",
+    "signal_id",
+    "event_ordinal",
+    "event_kind",
+    "from_status",
+    "to_status",
+    "event_time",
+    "message_time",
+    "received_at",
+    "confirmation_execution_event_id",
+    "trigger_observation_id",
+    "quote_observation_id",
+    "session_completion_id",
+    "exit_observation_id",
+    "exit_authority_digest",
+    "shares",
+    "price_micros",
+    "recommended_stop_micros",
+    "source_digest",
+    "details_json",
+    "signal_evidence_id",
+    "expiry_source_id",
+)
+_PHASE1_CANONICAL_POSTING_COLUMNS = (
+    "id",
+    "posting_key",
+    "lifecycle_event_id",
+    "signal_id",
+    "entry_kind",
+    "account_name",
+    "amount_micros",
+    "shares_delta",
+    "unit_price_micros",
+    "occurred_at",
+    "received_at",
+    "settlement_available_session",
+    "fee_schedule_version",
+    "fee_schedule_digest",
+    "source_digest",
+    "record_sha256",
+    "details_json",
 )
 
 
@@ -392,6 +1031,1839 @@ class JournalActualReplaySource:
     source_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class Phase1PublicationCandidateSource:
+    signal_id: str
+    symbol: str
+    role: str
+    publication_session: date
+    maximum_entry_micros: int
+    recommended_stop_micros: int
+    target_micros: int
+    planned_shares: int
+    tick_size_micros: int
+    trigger_price_micros: int
+    publication_rank: int
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1PublicationObservationSource:
+    row_id: int
+    external_source_observation_id: str
+    observation_sha256: str
+    payload_sha256: str
+    source_payload: bytes
+    source_uri: str
+    source_type: str
+    provider: str
+    feed: str | None
+    source_time: datetime
+    retrieved_at: datetime
+    provider_sequence: int | None
+    delay_seconds: int | None
+    health_result: str
+    details_json: str
+    row_reference: JournalRowReference
+    payload_row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ProviderFetchPageSource:
+    page_ordinal: int
+    source_observation_id: str
+    source_type: str
+    request_url: str
+    request_page_token: str | None
+    next_page_token: str | None
+    payload_sha256: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ProviderFetchManifestSource:
+    collection: str
+    requested_symbols: tuple[str, ...]
+    request_digest: str
+    pages: tuple[Phase1ProviderFetchPageSource, ...]
+    terminal: bool
+    manifest_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1NormalizedMarketFactSource:
+    fact_ordinal: int
+    candidate_symbol: str
+    kind: str
+    symbol: str
+    feed: str
+    source_observation_id: str
+    page_ordinal: int
+    source_item_ordinal: int
+    source_item_path: str
+    page_payload_sha256: str
+    normalized_fields_digest: str
+    fetch_manifest_digest: str
+    fetch_manifest: Phase1ProviderFetchManifestSource
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1PublicationSource:
+    report_row_id: int
+    report_id: str
+    session_date: date
+    report_kind: str
+    state_sha256: str
+    body_sha256: str
+    observation_set_sha256: str
+    observation_ids: tuple[int, ...]
+    observation_sha256s: tuple[str, ...]
+    source_observations: tuple[Phase1PublicationObservationSource, ...]
+    candidate_source_observation_ids: tuple[tuple[str, tuple[str, ...]], ...]
+    candidate_context_digests: tuple[tuple[str, str], ...]
+    candidate_subjects: tuple[tuple[str, str, str | None], ...]
+    normalized_market_fact_sources: tuple[Phase1NormalizedMarketFactSource, ...]
+    provider_fetch_manifests: tuple[Phase1ProviderFetchManifestSource, ...]
+    manifest_digest: str | None
+    manifest_row_references: tuple[JournalRowReference, ...]
+    published_at: datetime
+    received_at: datetime
+    outbox_row_id: int
+    outbox_destination: str
+    outbox_payload_sha256: str
+    outbox_created_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1SignalPlanResolver:
+    """Resolve persisted PRIMARY plans without accepting caller-built signals."""
+
+    journal: object
+
+    def resolve(
+        self,
+        *,
+        symbol: str,
+        economic_at: datetime,
+        query_cutoff: datetime,
+    ) -> object | None:
+        if not isinstance(self.journal, Journal):
+            raise JournalError("Phase 1 signal resolver owner is unavailable")
+        return self.journal._resolve_phase1_signal_plan(
+            symbol=symbol,
+            economic_at=economic_at,
+            query_cutoff=query_cutoff,
+        )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1SignalSource:
+    row_id: int
+    row_sha256: str
+    signal_id: str
+    validation_window_id: str
+    symbol: str
+    subject_kind: str
+    issuer_cik: str | None
+    role: str
+    publication_session: date
+    maximum_entry_micros: int
+    recommended_stop_micros: int
+    target_micros: int
+    planned_shares: int
+    tick_size_micros: int
+    trigger_price_micros: int
+    publication_report_row_id: int
+    publication_report_id: str
+    publication_rank: int
+    publication_source_digest: str
+    publication_state_digest: str
+    publication_content_digest: str
+    publication_observation_set_digest: str
+    publication_decision_digest: str
+    primary_plan_digest: str
+    policy_digest: str
+    calendar_digest: str
+    published_at: datetime
+    received_at: datetime
+    query_cutoff: datetime
+    publication_source: Phase1PublicationSource
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1CohortIngestResult:
+    manifest_ids: tuple[str, ...]
+    observation_ids: tuple[str, ...]
+    duplicate: bool
+    completion_invalidated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1CohortPlan:
+    cohort_id: str
+    collection: str
+    session_date: date
+    bundle: object
+    fact_sources: tuple[tuple[object, object], ...]
+    source_rows_by_external_id: Mapping[str, tuple[object, ...]]
+    duplicate: bool
+    completion_invalidated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1ObservationAppendPlan:
+    authority_token: object
+    signal_id: str
+    source_observation_id: int
+    observation_id: str
+    stream_id: str
+    source_ordinal: int
+    cohort_ordinal: int
+    payload: bytes
+    source_item_ordinal: int
+    source_item_path: str
+    fetch_cohort_id: str
+    fetch_page_ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ObservationSource:
+    row_id: int
+    observation_id: str
+    signal_id: str
+    source_observation_id: int
+    source_item_ordinal: int
+    source_item_path: str
+    source_observation_sha256: str
+    source_payload: bytes
+    source_payload_sha256: str
+    stream_id: str
+    feed: str
+    observation_kind: str
+    session_date: date
+    source_time: datetime
+    received_at: datetime
+    provider_sequence: int | None
+    source_cursor: int
+    source_ordinal: int
+    stream_through_cursor: int
+    cohort_ordinal: int
+    trade_price_micros: int | None
+    bid_micros: int | None
+    ask_micros: int | None
+    open_micros: int | None
+    high_micros: int | None
+    low_micros: int | None
+    close_micros: int | None
+    volume: int | None
+    fresh: bool
+    fetch_cohort_id: str
+    fetch_page_ordinal: int
+    source_digest: str
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1SessionCompletionSource:
+    row_id: int
+    completion_id: str
+    signal_id: str
+    session_date: date
+    cohort_through_ordinal: int
+    expected_observation_count: int
+    received_through: datetime
+    completed_at: datetime
+    source_digest: str
+    row_reference: JournalRowReference
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1LifecycleEventSource:
+    row_id: int
+    lifecycle_event_id: str
+    signal_id: str
+    event_ordinal: int
+    event_kind: str
+    from_status: str | None
+    to_status: str
+    event_time: datetime
+    message_time: datetime
+    received_at: datetime
+    confirmation_execution_event_id: int | None
+    trigger_observation_id: str | None
+    quote_observation_id: str | None
+    session_completion_id: str | None
+    exit_observation_id: str | None
+    exit_authority_digest: str | None
+    shares: int | None
+    price_micros: int | None
+    recommended_stop_micros: int | None
+    source_digest: str
+    row_reference: JournalRowReference
+    signal_evidence_id: str | None = None
+    expiry_source_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1CanonicalPostingSource:
+    row_id: int
+    posting_key: str
+    lifecycle_event_id: str
+    signal_id: str
+    entry_kind: str
+    account_name: str
+    amount_micros: int
+    shares_delta: int | None
+    unit_price_micros: int | None
+    occurred_at: datetime
+    received_at: datetime
+    settlement_available_session: date
+    fee_schedule_version: str
+    fee_schedule_digest: str
+    source_digest: str
+    record_sha256: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ClosedTradeSource:
+    row_id: int
+    trade_id: str
+    validation_window_id: str
+    ledger_name: str
+    signal_id: str
+    lifecycle_event_id: str
+    session_date: date
+    shares: int
+    entry_value_micros: int
+    exit_value_micros: int
+    fee_micros: int
+    pnl_micros: int
+    initial_risk_micros: int
+    net_r_numerator_micros: int
+    at: datetime
+    message_time: datetime
+    received_at: datetime
+    source_digest: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1EquityPointSource:
+    row_id: int
+    point_id: str
+    validation_window_id: str
+    ledger_name: str
+    session_date: date
+    equity_micros: int
+    cash_micros: int
+    positions_value_micros: int
+    external_cash_flow_micros: int
+    source_cursor: int
+    mark_source_digest: str
+    at: datetime
+    message_time: datetime
+    received_at: datetime
+    source_digest: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1EntrySource:
+    signal_source: Phase1SignalSource
+    observations: tuple[Phase1ObservationSource, ...]
+    completion: Phase1SessionCompletionSource
+    lifecycle_event: Phase1LifecycleEventSource
+    buy_posting: Phase1CanonicalPostingSource
+    query_cutoff: datetime
+    observation_source_highwater: int
+    observation_stream_highwaters: tuple[tuple[str, int], ...]
+    expected_observation_count: int
+    calendar_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1ShadowFillSource:
+    signal_source: Phase1SignalSource
+    observations: tuple[Phase1ObservationSource, ...]
+    completion: Phase1SessionCompletionSource
+    trigger_event: Phase1LifecycleEventSource
+    lifecycle_event: Phase1LifecycleEventSource
+    query_cutoff: datetime
+    observation_source_highwater: int
+    observation_stream_highwaters: tuple[tuple[str, int], ...]
+    expected_observation_count: int
+    calendar_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1SignalEvidenceSource:
+    """Exact raw-bound reviewed evidence for one persisted Phase 1 signal."""
+
+    signal_source: Phase1SignalSource
+    reviewed_bundle: object | None = dataclass_field(repr=False, compare=True)
+    evidence_decision: object | None = dataclass_field(repr=False, compare=True)
+    evidence_id: str
+    registry_payload: bytes
+    release_sha256: str
+    source_documents: tuple[object, ...]
+    manifest_bytes: bytes
+    manifest_digest: str
+    registry_source_row_id: int
+    source_observation_row_ids: tuple[int, ...]
+    registry_id: str
+    registry_content_hash: str
+    bundle_digest: str
+    decision_digest: str
+    review_at: datetime
+    query_cutoff: datetime
+    calendar_digest: str
+    source_observation_highwater: int
+    expected_source_observation_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1ExpiryDeadlineSource:
+    """Owner-current proof that no timely completed cohort existed by deadline."""
+
+    signal_source: Phase1SignalSource
+    expiry_evidence: object
+    signal_id: str
+    validation_window_id: str
+    publication_session: date
+    deadline_session: date
+    deadline_at: datetime
+    observed_at: datetime
+    query_cutoff: datetime
+    calendar_digest: str
+    deadline_session_manifest: tuple[tuple[str, str], ...]
+    completion_terminal_cursor: int | None
+    completion_source_highwater: int
+    expected_completion_count: int
+    evidence_review_highwater: int
+    expected_positive_evidence_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ExitReviewFactSource:
+    """One exact provider-normalized BAR or QUOTE retained for exit review."""
+
+    row_id: int
+    fact_id: str
+    review_id: str
+    purpose: str
+    fact_ordinal: int
+    source_observation_id: int
+    provider_source_observation_id: str
+    page_ordinal: int
+    source_item_ordinal: int
+    source_item_path: str
+    observation_kind: str
+    symbol: str
+    feed: str
+    source_time: datetime
+    received_at: datetime
+    provider_sequence: int | None
+    page_payload_sha256: str
+    normalized_fields_digest: str
+    open_micros: int | None
+    high_micros: int | None
+    low_micros: int | None
+    close_micros: int | None
+    volume: int | None
+    bid_micros: int | None
+    ask_micros: int | None
+    adjustment: str | None
+    stream_id: str
+    source_cursor: int
+    source_ordinal: int
+    cohort_ordinal: int
+    fresh: bool
+    source_digest: str
+    row_references: tuple[JournalRowReference, ...]
+
+    @property
+    def observation_id(self) -> str:
+        return self.fact_id
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1ExitReviewIngestResult:
+    review_id: str
+    query_cutoff: datetime
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _Phase1ExitProviderReplaySource:
+    """Journal-owned raw-page capability for exit cohort reissuance."""
+
+    symbol: str
+    role_pages: tuple[
+        tuple[str, tuple[tuple[str, bytes, datetime], ...]], ...
+    ]
+    role_windows: tuple[tuple[str, datetime, datetime], ...]
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1ExitReviewMarketSource:
+    """Replay-independent raw provider and signal-evidence exit authority."""
+
+    signal_source: Phase1SignalSource
+    signal_evidence_source: Phase1SignalEvidenceSource | None
+    daily_bar_cohort: object = dataclass_field(repr=False, compare=False)
+    execution_bar_cohort: object = dataclass_field(repr=False, compare=False)
+    quote_cohort: object = dataclass_field(repr=False, compare=False)
+    daily_bar_facts: tuple[Phase1ExitReviewFactSource, ...]
+    execution_bar_facts: tuple[Phase1ExitReviewFactSource, ...]
+    quote_facts: tuple[Phase1ExitReviewFactSource, ...]
+    observations: tuple[Phase1ExitReviewFactSource, ...]
+    review_id: str
+    signal_id: str
+    validation_window_id: str
+    symbol: str
+    review_session: date
+    query_cutoff: datetime
+    calendar_digest: str
+    expected_manifest_count: int
+    expected_fact_count: int
+    source_observation_highwater: int
+    fee_schedule_version: str
+    fee_schedule_digest: str
+    fee_micros: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1ExitReviewSource:
+    """Exact raw-bound provider and evidence review for one canonical exit."""
+
+    market_source: Phase1ExitReviewMarketSource
+    signal_source: Phase1SignalSource
+    canonical_replay_source: Phase1CanonicalReplaySource
+    position_evidence: object | None = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+    daily_bar_cohort: object = dataclass_field(repr=False, compare=False)
+    execution_bar_cohort: object = dataclass_field(repr=False, compare=False)
+    quote_cohort: object = dataclass_field(repr=False, compare=False)
+    daily_bar_facts: tuple[Phase1ExitReviewFactSource, ...]
+    execution_bar_facts: tuple[Phase1ExitReviewFactSource, ...]
+    quote_facts: tuple[Phase1ExitReviewFactSource, ...]
+    observations: tuple[Phase1ExitReviewFactSource, ...]
+    review_id: str
+    signal_id: str
+    validation_window_id: str
+    symbol: str
+    review_session: date
+    query_cutoff: datetime
+    calendar_digest: str
+    expected_manifest_count: int
+    expected_fact_count: int
+    source_observation_highwater: int
+    fee_schedule_version: str
+    fee_schedule_digest: str
+    fee_micros: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1CanonicalReplaySource:
+    signal_sources: tuple[Phase1SignalSource, ...]
+    entry_sources: tuple[Phase1EntrySource, ...]
+    lifecycle_events: tuple[Phase1LifecycleEventSource, ...]
+    postings: tuple[Phase1CanonicalPostingSource, ...]
+    closed_trades: tuple[Phase1ClosedTradeSource, ...]
+    validation_window_id: str
+    starting_capital_micros: int
+    canonical_cash_micros: int
+    settled_buying_power_micros: int
+    realized_pnl_micros: int
+    query_cutoff: datetime
+    publication_predecessor: bool
+    lifecycle_terminal_cursor: int | None
+    lifecycle_source_highwater: int | None
+    posting_terminal_cursor: int | None
+    posting_source_highwater: int | None
+    expected_lifecycle_count: int
+    expected_posting_count: int
+    expected_closed_trade_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1EquityMarkFactSource:
+    """One raw-bound provider fact retained in a session mark set."""
+
+    row_id: int
+    fact_id: str
+    mark_set_id: str
+    purpose: str
+    fact_ordinal: int
+    source_observation_id: int
+    provider_source_observation_id: str
+    page_ordinal: int
+    source_item_ordinal: int
+    source_item_path: str
+    observation_kind: str
+    symbol: str
+    feed: str
+    source_time: datetime
+    received_at: datetime
+    provider_sequence: int | None
+    page_payload_sha256: str
+    normalized_fields_digest: str
+    source_digest: str
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1EquityMarkIngestResult:
+    mark_set_id: str
+    query_cutoff: datetime
+    duplicate: bool
+    invalidated: bool = False
+    invalidation_id: str | None = None
+    invalidated_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _Phase1EquityProviderReplaySource:
+    """Journal-owned raw-page capability for equity cohort reissuance."""
+
+    symbols: tuple[str, ...]
+    role_pages: tuple[
+        tuple[str, tuple[tuple[str, bytes, datetime], ...]], ...
+    ]
+    role_windows: tuple[tuple[str, datetime, datetime], ...]
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1SessionMark:
+    point_ids: tuple[str, str]
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1EquityPositionMarkSource:
+    """Both complete provider roles plus one derived selected position mark."""
+
+    symbol: str
+    method: str
+    quote_cohort: object = dataclass_field(repr=False, compare=False)
+    daily_bar_cohort: object = dataclass_field(repr=False, compare=False)
+    quote_facts: tuple[object, ...] = dataclass_field(repr=False, compare=False)
+    daily_bar_facts: tuple[object, ...] = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+    selected_observation: object = dataclass_field(repr=False, compare=False)
+    selected_provider_fact_source: object = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+    quote_fact_sources: tuple[Phase1EquityMarkFactSource, ...]
+    daily_bar_fact_sources: tuple[Phase1EquityMarkFactSource, ...]
+    derived_price_micros: int
+    mark_at: datetime
+    mark_ordinal: int
+    source_cursor: int
+    quote_terminal_cursor: int | None
+    quote_source_highwater: int
+    daily_bar_terminal_cursor: int
+    daily_bar_source_highwater: int
+    expected_quote_fact_count: int
+    expected_daily_bar_fact_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1EquityMarkSource:
+    """Moneyless replay-bound source for one ledger/session equity point."""
+
+    validation_window_id: str
+    ledger_name: str
+    session_date: date
+    point_at: datetime
+    query_cutoff: datetime
+    calendar_digest: str
+    canonical_replay_source: Phase1CanonicalReplaySource
+    canonical_replay: object = dataclass_field(repr=False, compare=False)
+    actual_replay_source: JournalActualReplaySource
+    actual_replay: object = dataclass_field(repr=False, compare=False)
+    position_marks: tuple[Phase1EquityPositionMarkSource, ...]
+    expected_position_count: int
+    expected_mark_count: int
+    mark_terminal_cursor: int | None
+    mark_source_highwater: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1BreakerHistorySource:
+    validation_window_id: str
+    window_start_session: date
+    window_start_source_id: str
+    calendar_digest: str
+    ledger_name: str
+    equity_points: tuple[Phase1EquityPointSource, ...]
+    closed_trades: tuple[Phase1ClosedTradeSource, ...]
+    equity_mark_sources: tuple[Phase1EquityMarkSource, ...]
+    equity_authorities: tuple[object, ...] = dataclass_field(
+        repr=False,
+        compare=False,
+    )
+    through_session: date
+    query_cutoff: datetime
+    equity_terminal_cursor: int
+    equity_source_highwater: int
+    close_terminal_cursor: int | None
+    close_source_highwater: int
+    expected_equity_count: int
+    expected_close_count: int
+    expected_mark_source_count: int
+    mark_source_highwater: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1PublishedSignalDispositionSource:
+    """One complete signal lifecycle with exactly one typed terminal proof."""
+
+    signal_source: Phase1SignalSource
+    lifecycle_events: tuple[Phase1LifecycleEventSource, ...]
+    status: str
+    session_completion: Phase1SessionCompletionSource | None
+    expiry_deadline_source: Phase1ExpiryDeadlineSource | None
+    signal_evidence_source: Phase1SignalEvidenceSource | None
+    shadow_fill_source: Phase1ShadowFillSource | None
+    closed_trade: Phase1ClosedTradeSource | None
+    query_cutoff: datetime
+    lifecycle_terminal_cursor: int
+    lifecycle_source_highwater: int
+    expected_lifecycle_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+    @property
+    def signal_id(self) -> str:
+        return self.signal_source.signal_id
+
+    @property
+    def role(self) -> str:
+        return self.signal_source.role
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1AdherenceCheckEvidenceSource:
+    """Derived evidence inputs for one fixed adherence check name."""
+
+    check_name: str
+    failure_codes: tuple[str, ...]
+    hard_breach_codes: tuple[str, ...]
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1AdherenceReviewSource:
+    """Complete owner-bound inputs from which adherence is evaluated."""
+
+    signal_source: Phase1SignalSource
+    disposition_source: Phase1PublishedSignalDispositionSource
+    canonical_replay_source: Phase1CanonicalReplaySource
+    breaker_history_source: Phase1BreakerHistorySource
+    actual_action_sources: tuple[JournalActionSource, ...]
+    check_evidence_sources: tuple[Phase1AdherenceCheckEvidenceSource, ...]
+    query_cutoff: datetime
+    calendar_digest: str
+    policy_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1AdherenceCheckSource:
+    """One immutable persisted fixed-checklist result row."""
+
+    row_id: int
+    check_id: str
+    validation_window_id: str
+    signal_id: str
+    check_name: str
+    applicable: bool
+    passed: bool
+    hard_breach: bool
+    failure_codes: tuple[str, ...]
+    hard_breach_codes: tuple[str, ...]
+    evidence_digest: str
+    authority_digest: str
+    evaluated_at: datetime
+    received_at: datetime
+    source_digest: str
+    row_reference: JournalRowReference
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1ValidationWindowSource:
+    validation_window_id: str
+    started_session: date
+    through_session: date
+    starting_capital_micros: int
+    started_at: datetime
+    received_at: datetime
+    calendar_digest: str
+    expected_open_sessions: tuple[date, ...]
+    signal_sources: tuple[Phase1SignalSource, ...]
+    disposition_sources: tuple[Phase1PublishedSignalDispositionSource, ...]
+    canonical_history: Phase1BreakerHistorySource
+    actual_history: Phase1BreakerHistorySource
+    adherence_check_sources: tuple[Phase1AdherenceCheckSource, ...]
+    adherence_review_sources: tuple[Phase1AdherenceReviewSource, ...]
+    query_cutoff: datetime
+    signal_terminal_cursor: int | None
+    signal_source_highwater: int
+    lifecycle_terminal_cursor: int | None
+    lifecycle_source_highwater: int
+    adherence_terminal_cursor: int | None
+    adherence_source_highwater: int
+    expected_signal_count: int
+    expected_disposition_count: int
+    expected_adherence_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1ValidationWindow:
+    validation_window_id: str
+    started_session: date
+    starting_capital_micros: int
+    calendar_digest: str
+    source_digest: str
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1Adherence:
+    check_ids: tuple[str, ...]
+    authority_digest: str
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1Publication:
+    signal_ids: tuple[str, ...]
+    initial_status: str
+    source_digest: str
+    duplicate: bool
+
+    @property
+    def signal_id(self) -> str:
+        """Compatibility accessor for the unique PRIMARY signal."""
+        if not self.signal_ids:
+            raise JournalError("Phase 1 publication contains no signals")
+        return self.signal_ids[0]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1SignalEvidence:
+    manifest_digest: str
+    source_digest: str
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1TerminalDisposition:
+    event_kind: str
+    to_status: str
+    session_completion_id: str | None
+    source_digest: str
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPhase1CanonicalExit:
+    """Stable identities for one atomic canonical-exit batch."""
+
+    lifecycle_event_ids: tuple[str, ...]
+    posting_keys: tuple[str, ...]
+    closed_trade_id: str | None
+    duplicate: bool
+
+
+def _phase1_evidence_record_document(record: object) -> dict[str, object]:
+    event_date = getattr(record, "event_date")
+    return {
+        "accession": getattr(record, "accession"),
+        "adverse_tags": list(getattr(record, "adverse_tags")),
+        "classification_ambiguous": getattr(
+            record,
+            "classification_ambiguous",
+        ),
+        "conflicts": list(getattr(record, "conflicts")),
+        "content_hash": getattr(record, "content_hash"),
+        "event_date": None if event_date is None else event_date.isoformat(),
+        "event_kind": getattr(record, "event_kind"),
+        "event_type": getattr(record, "event_type"),
+        "fact": getattr(record, "fact"),
+        "issuer_cik": getattr(record, "issuer_cik"),
+        "primary_url": getattr(record, "primary_url"),
+        "published_at": _canonical_timestamp(getattr(record, "published_at")),
+        "publisher": getattr(record, "publisher"),
+        "record_id": getattr(record, "record_id"),
+        "retrieved_at": _canonical_timestamp(getattr(record, "retrieved_at")),
+        "source_observation_ids": list(
+            getattr(record, "source_observation_ids")
+        ),
+        "symbol": getattr(record, "symbol"),
+    }
+
+
+def _phase1_evidence_coverage_document(value: object) -> dict[str, object]:
+    return {
+        "checked_at": _canonical_timestamp(getattr(value, "checked_at")),
+        "complete": getattr(value, "complete"),
+        "conflicts": list(getattr(value, "conflicts")),
+        "coverage": getattr(value, "coverage"),
+        "coverage_kind": getattr(value, "coverage_kind"),
+        "healthy": getattr(value, "healthy"),
+        "issuer_cik": getattr(value, "issuer_cik"),
+        "source_observation_ids": list(
+            getattr(value, "source_observation_ids")
+        ),
+        "subject_kind": getattr(value, "subject_kind"),
+        "symbol": getattr(value, "symbol"),
+        "valid_until": _canonical_timestamp(getattr(value, "valid_until")),
+    }
+
+
+def _phase1_evidence_binding_document(value: object) -> dict[str, object]:
+    document = getattr(value, "document")
+    return {
+        "accession": getattr(document, "accession"),
+        "checked_at": _canonical_timestamp(getattr(value, "checked_at")),
+        "content_hash": getattr(document, "content_hash"),
+        "healthy": getattr(value, "healthy"),
+        "issuer_cik": getattr(value, "issuer_cik"),
+        "primary_url": getattr(document, "url"),
+        "publisher": getattr(document, "publisher"),
+        "retrieved_at": _canonical_timestamp(getattr(document, "retrieved_at")),
+        "source_observation_id": getattr(
+            document,
+            "source_observation_id",
+        ),
+        "source_role": getattr(document, "source_role"),
+        "source_type": getattr(document, "source_type"),
+        "symbol": getattr(value, "symbol"),
+        "timestamp_source": getattr(document, "timestamp_source"),
+        "valid_until": _canonical_timestamp(getattr(value, "valid_until")),
+    }
+
+
+def _phase1_reviewed_registry_document(bundle: object) -> dict[str, object]:
+    subject_kind = getattr(bundle, "subject_kind")
+    subject = (
+        None
+        if subject_kind is None
+        else {
+            "issuer_cik": getattr(bundle, "issuer_cik"),
+            "subject_kind": subject_kind,
+            "symbol": getattr(bundle, "symbol"),
+        }
+    )
+    return {
+        "coverage_attestations": [
+            _phase1_evidence_coverage_document(value)
+            for value in getattr(bundle, "coverage_attestations")
+        ],
+        "kind": "REVIEWED_EVIDENCE_BUNDLE",
+        "records": [
+            _phase1_evidence_record_document(value)
+            for value in getattr(bundle, "records")
+        ],
+        "registry_id": getattr(bundle, "registry_id"),
+        "reviewed_at": _canonical_timestamp(getattr(bundle, "reviewed_at")),
+        "schema_version": 2,
+        "source_bindings": [
+            _phase1_evidence_binding_document(value)
+            for value in getattr(bundle, "source_bindings")
+        ],
+        "subject": subject,
+    }
+
+
+def _phase1_primary_plan_manifest(primary_plan_decision: object) -> dict[str, object]:
+    from .risk import LongPlanDecision
+
+    if not isinstance(primary_plan_decision, LongPlanDecision):
+        raise InvalidJournalValue("primary plan decision is malformed")
+    plan = primary_plan_decision.plan
+    request = primary_plan_decision.request
+    authority = primary_plan_decision.portfolio_authority
+    if (
+        not primary_plan_decision.eligible
+        or plan is None
+        or request is None
+        or authority is None
+        or primary_plan_decision.target is None
+        or primary_plan_decision.as_of is None
+        or primary_plan_decision.authority_digest is None
+        or request.symbol is None
+        or request.published_target is None
+    ):
+        raise InvalidJournalValue("primary plan decision is incomplete")
+    return {
+        "as_of": _canonical_timestamp(primary_plan_decision.as_of),
+        "authority_digest": primary_plan_decision.authority_digest,
+        "calendar_digest": authority.calendar_digest,
+        "exposure_micros": money_to_micros(plan.exposure),
+        "planned_risk_micros": money_to_micros(plan.planned_risk),
+        "policy_digest": authority.policy_digest,
+        "quantity": plan.quantity,
+        "request": {
+            "entry_micros": money_to_micros(request.entry),
+            "published_target_micros": money_to_micros(
+                request.published_target
+            ),
+            "session_date": _canonical_date(request.session_date),
+            "stop_micros": money_to_micros(request.stop),
+            "symbol": request.symbol,
+            "tick_size_micros": money_to_micros(request.tick_size),
+        },
+        "target_micros": money_to_micros(primary_plan_decision.target),
+    }
+
+
+def _phase1_publication_state_manifest(
+    decision: object,
+    primary_plan_decision: object,
+) -> dict[str, object]:
+    from .screening import (
+        PublicationDecision,
+        _canonical_snapshot_value,
+        _normalized_market_fact_source_document,
+        _provider_fetch_manifest_document,
+        _publication_observation_manifest,
+        _scored_candidate_fingerprint,
+    )
+
+    if not isinstance(decision, PublicationDecision):
+        raise InvalidJournalValue("publication decision is malformed")
+    plan_manifest = _phase1_primary_plan_manifest(primary_plan_decision)
+    observation_manifest = _publication_observation_manifest(decision)
+    quantity = int(plan_manifest["quantity"])
+    candidates: list[dict[str, object]] = []
+    for publication in decision.candidates:
+        candidate = publication.candidate
+        if candidate.publication_session is None:
+            raise InvalidJournalValue("publication candidate session is missing")
+        candidates.append(
+            {
+                "candidate": _canonical_snapshot_value(candidate),
+                "candidate_sha256": _scored_candidate_fingerprint(candidate),
+                "planned_shares": quantity if publication.role == "PRIMARY" else 0,
+                "rank": publication.rank,
+                "role": publication.role,
+                "signal_id": (
+                    f"{candidate.publication_session.isoformat()}:"
+                    f"{candidate.symbol}"
+                ),
+            }
+        )
+    return {
+        "candidates": candidates,
+        "observation_manifest": {
+            "candidate_context_digests": (
+                observation_manifest.candidate_context_digests
+            ),
+            "candidate_subjects": observation_manifest.candidate_subjects,
+            "candidate_source_observation_ids": (
+                observation_manifest.candidate_source_observation_ids
+            ),
+            "manifest_digest": observation_manifest.manifest_digest,
+            "normalized_market_fact_sources": [
+                _normalized_market_fact_source_document(symbol, source)
+                for symbol, source in (
+                    observation_manifest.normalized_market_fact_sources
+                )
+            ],
+            "provider_fetch_manifests": [
+                _provider_fetch_manifest_document(manifest)
+                for manifest in observation_manifest.provider_fetch_manifests
+            ],
+            "source_observation_ids": (
+                observation_manifest.source_observation_ids
+            ),
+        },
+        "primary_plan": plan_manifest,
+        "status": decision.status,
+        "version": 1,
+    }
+
+
+def phase1_publication_state_sha256(
+    decision: object,
+    primary_plan_decision: object,
+) -> str:
+    """Hash the canonical structured state behind a rendered morning report."""
+    manifest = _phase1_publication_state_manifest(
+        decision,
+        primary_plan_decision,
+    )
+    return hashlib.sha256(
+        _canonical_audit_json(manifest).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1PayloadItem:
+    path: str
+    symbol: str | None
+    kind: str
+    value: dict[str, object]
+    alpaca_shape: bool
+
+
+def _phase1_payload_items(payload: bytes) -> tuple[_Phase1PayloadItem, ...]:
+    if type(payload) is not bytes or not payload:
+        raise InvalidJournalValue("Phase 1 source payload must be nonempty bytes")
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_float=Decimal,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise InvalidJournalValue(
+            "Phase 1 source payload must be exact JSON"
+        ) from error
+    if isinstance(value, dict) and set(value) == {"items"}:
+        items = value["items"]
+        if not isinstance(items, list) or not items:
+            raise InvalidJournalValue("Phase 1 source payload items are incomplete")
+        if any(not isinstance(item, dict) for item in items):
+            raise InvalidJournalValue("Phase 1 source payload item is malformed")
+        return tuple(
+            _Phase1PayloadItem(
+                path=f"$.items[{ordinal}]",
+                symbol=None,
+                kind=str(item.get("kind", "")).upper(),
+                value=dict(item),
+                alpaca_shape=False,
+            )
+            for ordinal, item in enumerate(items)
+        )
+    if isinstance(value, dict) and "kind" in value:
+        return (
+            _Phase1PayloadItem(
+                path="$",
+                symbol=None,
+                kind=str(value.get("kind", "")).upper(),
+                value=dict(value),
+                alpaca_shape=False,
+            ),
+        )
+    if not isinstance(value, dict):
+        raise InvalidJournalValue("Phase 1 source payload item is malformed")
+    allowed_top_level = {"trades", "quotes", "bars", "next_page_token"}
+    if set(value) - allowed_top_level or not set(value).intersection(
+        {"trades", "quotes", "bars"}
+    ):
+        raise InvalidJournalValue("Phase 1 Alpaca source page is malformed")
+    normalized: list[_Phase1PayloadItem] = []
+    for collection, kind in (
+        ("trades", "TRADE"),
+        ("quotes", "QUOTE"),
+        ("bars", "BAR"),
+    ):
+        raw_collection = value.get(collection)
+        if raw_collection is None:
+            continue
+        if not isinstance(raw_collection, dict):
+            raise InvalidJournalValue("Phase 1 Alpaca collection is malformed")
+        for symbol in sorted(raw_collection):
+            raw_values = raw_collection[symbol]
+            if type(symbol) is not str or not symbol:
+                raise InvalidJournalValue("Phase 1 Alpaca symbol is malformed")
+            if isinstance(raw_values, dict):
+                entries = (raw_values,)
+                suffixes = ("",)
+            elif isinstance(raw_values, list):
+                entries = tuple(raw_values)
+                suffixes = tuple(f"[{index}]" for index in range(len(raw_values)))
+            else:
+                raise InvalidJournalValue("Phase 1 Alpaca item cohort is malformed")
+            for entry, suffix in zip(entries, suffixes, strict=True):
+                if not isinstance(entry, dict):
+                    raise InvalidJournalValue("Phase 1 Alpaca item is malformed")
+                normalized.append(
+                    _Phase1PayloadItem(
+                        path=f"$.{collection}.{symbol}{suffix}",
+                        symbol=symbol,
+                        kind=kind,
+                        value=dict(entry),
+                        alpaca_shape=True,
+                    )
+                )
+    return tuple(normalized)
+
+
+def _phase1_payload_money(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise InvalidJournalValue(f"Phase 1 {label} is malformed")
+    try:
+        decimal_value = Decimal(str(value))
+        micros = money_to_micros(decimal_value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise InvalidJournalValue(f"Phase 1 {label} is malformed") from error
+    if micros <= 0:
+        raise InvalidJournalValue(f"Phase 1 {label} must be positive")
+    return micros
+
+
+def _normalized_phase1_payload_item(
+    payload: bytes,
+    source_item_ordinal: int,
+    source_item_path: str | None = None,
+) -> dict[str, object]:
+    items = _phase1_payload_items(payload)
+    if (
+        type(source_item_ordinal) is not int
+        or source_item_ordinal <= 0
+        or source_item_ordinal > len(items)
+    ):
+        raise InvalidJournalValue("Phase 1 source item ordinal is incomplete")
+    selected = items[source_item_ordinal - 1]
+    expected_path = selected.path
+    if source_item_path is not None and source_item_path != expected_path:
+        raise InvalidJournalValue("Phase 1 source item path conflicts with its ordinal")
+    item = selected.value
+    kind = selected.kind
+    if not kind:
+        raise InvalidJournalValue("Phase 1 observation kind is malformed")
+    common = {"kind", "at", "sequence", "feed"}
+    result: dict[str, object] = {
+        "source_item_path": expected_path,
+        "item_symbol": selected.symbol,
+        "alpaca_shape": selected.alpaca_shape,
+        "observation_kind": kind,
+        "trade_price_micros": None,
+        "bid_micros": None,
+        "ask_micros": None,
+        "open_micros": None,
+        "high_micros": None,
+        "low_micros": None,
+        "close_micros": None,
+        "volume": None,
+        "item_at": item.get("t") if selected.alpaca_shape else item.get("at"),
+        "item_sequence": (
+            item.get("i") if selected.alpaca_shape else item.get("sequence")
+        ),
+        "item_feed": item.get("feed"),
+    }
+    if kind == "TRADE":
+        if selected.alpaca_shape:
+            if "p" not in item or "t" not in item:
+                raise InvalidJournalValue("Phase 1 Alpaca TRADE payload is incomplete")
+            price = item["p"]
+        elif set(item) - common == {"price"}:
+            price = item["price"]
+        else:
+            raise InvalidJournalValue("Phase 1 TRADE payload shape is invalid")
+        result["trade_price_micros"] = _phase1_payload_money(
+            price,
+            "trade price",
+        )
+    elif kind == "QUOTE":
+        if selected.alpaca_shape:
+            if not {"t", "bp", "ap"} <= set(item):
+                raise InvalidJournalValue("Phase 1 Alpaca QUOTE payload is incomplete")
+            bid_value, ask_value = item["bp"], item["ap"]
+        elif set(item) - common == {"bid", "ask"}:
+            bid_value, ask_value = item["bid"], item["ask"]
+        else:
+            raise InvalidJournalValue("Phase 1 QUOTE payload shape is invalid")
+        bid = _phase1_payload_money(bid_value, "bid")
+        ask = _phase1_payload_money(ask_value, "ask")
+        if ask < bid:
+            raise InvalidJournalValue("Phase 1 quote spread is inverted")
+        result["bid_micros"] = bid
+        result["ask_micros"] = ask
+    elif kind == "BAR":
+        if selected.alpaca_shape:
+            if not {"t", "o", "h", "l", "c", "v"} <= set(item):
+                raise InvalidJournalValue("Phase 1 Alpaca BAR payload is incomplete")
+            bar_fields = {
+                "open": item["o"],
+                "high": item["h"],
+                "low": item["l"],
+                "close": item["c"],
+                "volume": item["v"],
+            }
+        else:
+            allowed = common | {"open", "high", "low", "close", "volume", "bid", "ask"}
+            if set(item) - allowed or not {"open", "high", "low", "close"} <= set(item):
+                raise InvalidJournalValue("Phase 1 BAR payload shape is invalid")
+            bar_fields = item
+        if not {"open", "high", "low", "close"} <= set(bar_fields):
+            raise InvalidJournalValue("Phase 1 BAR payload shape is invalid")
+        for source_name, target_name in (
+            ("open", "open_micros"),
+            ("high", "high_micros"),
+            ("low", "low_micros"),
+            ("close", "close_micros"),
+        ):
+            result[target_name] = _phase1_payload_money(
+                bar_fields[source_name],
+                f"bar {source_name}",
+            )
+        if ("bid" in bar_fields) != ("ask" in bar_fields):
+            raise InvalidJournalValue("Phase 1 BAR quote pair is incomplete")
+        if "bid" in bar_fields:
+            result["bid_micros"] = _phase1_payload_money(bar_fields["bid"], "bid")
+            result["ask_micros"] = _phase1_payload_money(bar_fields["ask"], "ask")
+        if "volume" in bar_fields:
+            volume = bar_fields["volume"]
+            if type(volume) is not int or volume < 0:
+                raise InvalidJournalValue("Phase 1 bar volume is malformed")
+            result["volume"] = volume
+    else:
+        raise InvalidJournalValue("Phase 1 observation kind is unsupported")
+    return result
+
+
+def _phase1_item_time(value: object, fallback: datetime) -> datetime:
+    if value is None:
+        return fallback.astimezone(timezone.utc)
+    if type(value) is not str or not value:
+        raise InvalidJournalValue("Phase 1 source item timestamp is malformed")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise InvalidJournalValue(
+            "Phase 1 source item timestamp is malformed"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidJournalValue("Phase 1 source item timestamp lacks an offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_phase1_alpaca_page_contract(
+    source_row: Sequence[object],
+    payload: bytes,
+) -> tuple[str, bool]:
+    source_type = str(source_row[4])
+    contract = _PHASE1_ALPACA_SOURCE_CONTRACTS.get(source_type)
+    if contract is None:
+        raise InvalidJournalValue(
+            "Phase 1 authority requires a supported Alpaca source type"
+        )
+    collection, expected_path, expected_feed, collection_is_list = contract
+    if str(source_row[5]).lower() != "alpaca" or str(source_row[6]).upper() != expected_feed:
+        raise InvalidJournalValue(
+            "Phase 1 Alpaca source provider or feed conflicts with its type"
+        )
+    parsed_uri = urlsplit(str(source_row[3]))
+    if (
+        parsed_uri.scheme != "https"
+        or parsed_uri.hostname != "data.alpaca.markets"
+        or parsed_uri.port not in (None, 443)
+        or parsed_uri.path != expected_path
+        or parsed_uri.username is not None
+        or parsed_uri.password is not None
+        or parsed_uri.fragment
+    ):
+        raise InvalidJournalValue(
+            "Phase 1 Alpaca source URI conflicts with its type"
+        )
+    try:
+        document = json.loads(payload.decode("utf-8"), parse_float=Decimal)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise InvalidJournalValue("Phase 1 Alpaca page is invalid JSON") from error
+    if (
+        not isinstance(document, dict)
+        or set(document) - {collection, "next_page_token"}
+        or collection not in document
+        or not isinstance(document[collection], dict)
+        or (
+            source_type != "ALPACA_LATEST_QUOTES"
+            and "next_page_token" not in document
+        )
+        or (
+            "next_page_token" in document
+            and document["next_page_token"] is not None
+            and (
+                type(document["next_page_token"]) is not str
+                or not document["next_page_token"]
+            )
+        )
+    ):
+        raise InvalidJournalValue(
+            "Phase 1 Alpaca page collection conflicts with its source type"
+        )
+    for values in document[collection].values():
+        if collection_is_list:
+            if not isinstance(values, list) or not values:
+                raise InvalidJournalValue(
+                    "Phase 1 Alpaca historical collection is malformed"
+                )
+        elif not isinstance(values, dict):
+            raise InvalidJournalValue(
+                "Phase 1 Alpaca latest collection is malformed"
+            )
+    return collection, collection_is_list
+
+
+def _phase1_provider_request_digest(
+    *,
+    collection: str,
+    requested_symbols: tuple[str, ...],
+    request_url: str,
+) -> str:
+    from .providers.alpaca import _canonical_digest
+
+    parsed = urlsplit(request_url)
+    token_free_query = tuple(
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if name != "page_token"
+    )
+    return _canonical_digest(
+        "stock-monitor/alpaca-fetch-request/v1",
+        {
+            "collection": collection,
+            "requested_symbols": list(requested_symbols),
+            "origin": f"{parsed.scheme}://{parsed.netloc}",
+            "path": parsed.path,
+            "query": [list(item) for item in token_free_query],
+        },
+    )
+
+
+def _phase1_historical_request_window(
+    request_urls: Sequence[str],
+) -> tuple[datetime, datetime]:
+    """Reparse one exact historical request window from every enrolled page."""
+    windows: set[tuple[datetime, datetime]] = set()
+    for request_url in request_urls:
+        parsed = urlsplit(request_url)
+        values: dict[str, list[str]] = {}
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True):
+            values.setdefault(name, []).append(value)
+        if (
+            len(values.get("start", ())) != 1
+            or len(values.get("end", ())) != 1
+            or values.get("feed") != ["sip"]
+            or len(values.get("symbols", ())) != 1
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle request window is malformed"
+            )
+        try:
+            start = datetime.fromisoformat(
+                values["start"][0].replace("Z", "+00:00")
+            )
+            end = datetime.fromisoformat(
+                values["end"][0].replace("Z", "+00:00")
+            )
+            if (
+                start.tzinfo is None
+                or end.tzinfo is None
+                or start.utcoffset() is None
+                or end.utcoffset() is None
+                or start >= end
+            ):
+                raise ValueError
+        except (OverflowError, ValueError) as error:
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle request window is malformed"
+            ) from error
+        windows.add(
+            (
+                start.astimezone(timezone.utc),
+                end.astimezone(timezone.utc),
+            )
+        )
+    if len(windows) != 1:
+        raise InvalidJournalValue(
+            "Phase 1 lifecycle provider pages disagree on their request window"
+        )
+    return next(iter(windows))
+
+
+def _validate_phase1_observation_chronology(
+    rows: Sequence[Sequence[object]],
+) -> None:
+    """Validate the canonical session merge, including conservative ties."""
+    for prior, current in zip(rows, rows[1:]):
+        prior_time = _parse_canonical_timestamp(str(prior[12]))
+        current_time = _parse_canonical_timestamp(str(current[12]))
+        same_stream = str(prior[8]) == str(current[8])
+        prior_sequence = prior[14]
+        current_sequence = current[14]
+        sequence_advances = (
+            same_stream
+            and prior_sequence is not None
+            and current_sequence is not None
+            and int(current_sequence) > int(prior_sequence)
+        )
+        conservative_cross_stream_tie = (
+            not same_stream
+            and str(prior[10]) == "QUOTE"
+            and str(current[10]) == "TRADE"
+        )
+        if current_time < prior_time or (
+            current_time == prior_time
+            and not sequence_advances
+            and not conservative_cross_stream_tie
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 observation chronology is ambiguous or regresses"
+            )
+        if (
+            same_stream
+            and prior_sequence is not None
+            and current_sequence is not None
+            and int(current_sequence) <= int(prior_sequence)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 provider sequence chronology regresses"
+            )
+
+
+def _phase1_recompute_alpaca_page_metadata(
+    *,
+    payload: bytes,
+    request_url: str,
+    source_type: str,
+    retrieved_at: datetime,
+) -> object:
+    from .providers.alpaca import recompute_alpaca_page_metadata
+    from .providers.http import ProviderResponseError
+
+    try:
+        return recompute_alpaca_page_metadata(
+            payload=payload,
+            request_url=request_url,
+            source_type=source_type,
+            retrieved_at=retrieved_at,
+        )
+    except ProviderResponseError as error:
+        raise InvalidJournalValue(
+            "Phase 1 Alpaca page identity or chronology is invalid"
+        ) from error
+
+
+def _phase1_reissue_exit_provider_cohorts(
+    source: object,
+) -> tuple[object, object, object]:
+    """Reparse only one owner-current Journal exit replay capability."""
+    from .providers.alpaca import (
+        AlpacaCredentials,
+        AlpacaMarketData,
+        TimeWindow,
+        _mark_provider_fetch_cohort_replay_only,
+    )
+    from .providers.http import HttpResponse
+
+    if not isinstance(source, _Phase1ExitProviderReplaySource) or (
+        _phase1_source_owner(source) is None
+    ):
+        raise InvalidJournalValue(
+            "Phase 1 exit provider replay source is unverified"
+        )
+    symbol = source.symbol
+    role_pages = dict(source.role_pages)
+    role_windows = {
+        purpose: (start, end)
+        for purpose, start, end in source.role_windows
+    }
+    page_values = {
+        url: (payload, retrieved_at)
+        for values in role_pages.values()
+        for url, payload, retrieved_at in values
+    }
+
+    class StoredTransport:
+        def __init__(self) -> None:
+            self.current_retrieved_at: datetime | None = max(
+                (retrieved_at for _payload, retrieved_at in page_values.values()),
+                default=None,
+            )
+
+        def get(self, url: str, headers: object) -> HttpResponse:
+            del headers
+            value = page_values.get(url)
+            if value is None:
+                raise InvalidJournalValue(
+                    "Phase 1 exit provider replay requested an unknown page"
+                )
+            payload, retrieved_at = value
+            self.current_retrieved_at = retrieved_at
+            return HttpResponse(
+                status=200,
+                headers=(("Content-Type", "application/json"),),
+                body=payload,
+                url=url,
+            )
+
+        def now(self) -> datetime:
+            if self.current_retrieved_at is None:
+                raise InvalidJournalValue(
+                    "Phase 1 exit provider replay has no current page"
+                )
+            return self.current_retrieved_at
+
+    transport = StoredTransport()
+    client = AlpacaMarketData(
+        transport,
+        AlpacaCredentials("phase1-replay", "phase1-replay"),
+        now=transport.now,
+    )
+
+    def window(purpose: str) -> TimeWindow:
+        start, end = role_windows[purpose]
+        return TimeWindow(start, end)
+
+    daily = client.daily_bars((symbol,), window("DAILY_BAR"))
+    execution = client.historical_minute_bars(
+        (symbol,),
+        window("EXECUTION_BAR"),
+    )
+    quotes = client.historical_quotes((symbol,), window("QUOTE"))
+    for cohort in (daily, execution, quotes):
+        _mark_provider_fetch_cohort_replay_only(cohort)
+    return daily, execution, quotes
+
+
+def _phase1_reissue_equity_provider_cohorts(
+    source: object,
+) -> tuple[object, object]:
+    """Reparse only one owner-current Journal equity replay capability."""
+    from .providers.alpaca import (
+        AlpacaCredentials,
+        AlpacaMarketData,
+        TimeWindow,
+        _mark_provider_fetch_cohort_replay_only,
+    )
+    from .providers.http import HttpResponse
+
+    if not isinstance(source, _Phase1EquityProviderReplaySource) or (
+        _phase1_source_owner(source) is None
+    ):
+        raise InvalidJournalValue(
+            "Phase 1 equity provider replay source is unverified"
+        )
+    symbols = source.symbols
+    role_pages = dict(source.role_pages)
+    role_windows = {
+        purpose: (start, end)
+        for purpose, start, end in source.role_windows
+    }
+    page_values = {
+        url: (payload, retrieved_at)
+        for values in role_pages.values()
+        for url, payload, retrieved_at in values
+    }
+
+    class StoredTransport:
+        def __init__(self) -> None:
+            self.current_retrieved_at: datetime | None = max(
+                (value[1] for value in page_values.values()),
+                default=None,
+            )
+
+        def get(self, url: str, headers: object) -> HttpResponse:
+            del headers
+            value = page_values.get(url)
+            if value is None:
+                raise InvalidJournalValue(
+                    "Phase 1 equity provider replay requested an unknown page"
+                )
+            payload, retrieved_at = value
+            self.current_retrieved_at = retrieved_at
+            return HttpResponse(
+                status=200,
+                headers=(("Content-Type", "application/json"),),
+                body=payload,
+                url=url,
+            )
+
+        def now(self) -> datetime:
+            if self.current_retrieved_at is None:
+                raise InvalidJournalValue(
+                    "Phase 1 equity provider replay has no current page"
+                )
+            return self.current_retrieved_at
+
+    transport = StoredTransport()
+    client = AlpacaMarketData(
+        transport,
+        AlpacaCredentials("phase1-equity-replay", "phase1-equity-replay"),
+        now=transport.now,
+    )
+
+    def window(purpose: str) -> TimeWindow:
+        start, end = role_windows[purpose]
+        return TimeWindow(start, end)
+
+    quotes = client.historical_quotes(symbols, window("QUOTE"))
+    daily = client.daily_bars(symbols, window("DAILY_BAR"))
+    for cohort in (quotes, daily):
+        _mark_provider_fetch_cohort_replay_only(cohort)
+    return quotes, daily
+
+
+def _phase1_provider_manifest_digest(
+    *,
+    collection: str,
+    requested_symbols: tuple[str, ...],
+    request_digest: str,
+    pages: Sequence[object],
+) -> str:
+    from .providers.alpaca import _canonical_digest
+
+    return _canonical_digest(
+        "stock-monitor/alpaca-fetch-manifest/v1",
+        {
+            "collection": collection,
+            "requested_symbols": list(requested_symbols),
+            "request_digest": request_digest,
+            "pages": [
+                {
+                    "page_ordinal": int(getattr(page, "page_ordinal")),
+                    "source_observation_id": str(
+                        getattr(page, "source_observation_id")
+                    ),
+                    "source_type": str(getattr(page, "source_type")),
+                    "request_url": str(getattr(page, "request_url")),
+                    "request_page_token": getattr(page, "request_page_token"),
+                    "next_page_token": getattr(page, "next_page_token"),
+                    "payload_sha256": str(getattr(page, "payload_sha256")),
+                }
+                for page in pages
+            ],
+            "terminal": True,
+        },
+    )
+
+
+def _phase1_recomputed_normalized_fields_digest(
+    *,
+    item: _Phase1PayloadItem,
+    publication_observation: Phase1PublicationObservationSource,
+    kind: str,
+    symbol: str,
+    feed: str,
+    page_ordinal: int,
+    source_item_ordinal: int,
+    source_item_path: str,
+) -> str:
+    from .providers.alpaca import _canonical_digest, _format_utc
+
+    value = item.value
+    timestamp = _phase1_item_time(
+        value.get("t"),
+        publication_observation.source_time,
+    )
+    normalized_feed = feed.lower()
+    if kind == "BAR":
+        parsed_request = dict(
+            parse_qsl(
+                urlsplit(publication_observation.source_uri).query,
+                keep_blank_values=True,
+            )
+        )
+        adjustment = parsed_request.get("adjustment", "raw")
+        fact: dict[str, object] = {
+            "kind": "BAR",
+            "symbol": symbol,
+            "timestamp": _format_utc(timestamp),
+            "open": str(Decimal(str(value["o"]))),
+            "high": str(Decimal(str(value["h"]))),
+            "low": str(Decimal(str(value["l"]))),
+            "close": str(Decimal(str(value["c"]))),
+            "volume": value["v"],
+            "feed": normalized_feed,
+            "adjustment": adjustment,
+            "source_observation_id": (
+                publication_observation.external_source_observation_id
+            ),
+        }
+    elif kind == "QUOTE":
+        exact_age = (
+            publication_observation.retrieved_at - timestamp
+        ).total_seconds()
+        if exact_age < 0:
+            raise InvalidJournalValue(
+                "Phase 1 provider quote timestamp is in the future"
+            )
+        fact = {
+            "kind": "QUOTE",
+            "symbol": symbol,
+            "timestamp": _format_utc(timestamp),
+            "bid": str(Decimal(str(value["bp"]))),
+            "ask": str(Decimal(str(value["ap"]))),
+            "feed": normalized_feed,
+            "sequence": value.get("i"),
+            "age_seconds": math.ceil(exact_age),
+            "source_observation_id": (
+                publication_observation.external_source_observation_id
+            ),
+        }
+    elif kind == "TRADE":
+        fact = {
+            "kind": "TRADE",
+            "symbol": symbol,
+            "timestamp": _format_utc(timestamp),
+            "price": str(Decimal(str(value["p"]))),
+            "size": value["s"],
+            "feed": normalized_feed,
+            "sequence": value["i"],
+            "source_observation_id": (
+                publication_observation.external_source_observation_id
+            ),
+        }
+    else:
+        raise InvalidJournalValue(
+            "Phase 1 publication normalized fact kind is unsupported"
+        )
+    return _canonical_digest(
+        "stock-monitor/alpaca-normalized-fields/v1",
+        {
+            "fact": fact,
+            "page_ordinal": page_ordinal,
+            "source_item_ordinal": source_item_ordinal,
+            "source_item_path": source_item_path,
+        },
+    )
+
+
 _JOURNAL_SOURCE_LOCK = threading.RLock()
 _ACTION_SOURCE_AUTHORITIES: dict[
     int,
@@ -423,6 +2895,187 @@ _REPLAY_SOURCE_AUTHORITIES: dict[
         int,
     ],
 ] = {}
+_PHASE1_PUBLICATION_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_SIGNAL_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_ENTRY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+
+_JournalSourceRegistry = dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+]
 
 
 def _row_reference_fingerprint(
@@ -574,6 +3227,278 @@ def _replay_source_fingerprint(
     )
 
 
+_Phase1FingerprintReadCache = dict[int, tuple[object, object]]
+
+
+def _phase1_fingerprint_value(
+    value: object,
+    *,
+    read_cache: _Phase1FingerprintReadCache | None = None,
+) -> object:
+    """Freeze nested Phase 1 DTO material without relying on repr/str hooks."""
+    if is_dataclass(value) and not isinstance(value, type):
+        if read_cache is not None:
+            cached = read_cache.get(id(value))
+            if cached is not None and cached[0] is value:
+                return cached[1]
+        fingerprint = (
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple(
+                (
+                    field.name,
+                    _phase1_fingerprint_value(
+                        getattr(value, field.name),
+                        read_cache=read_cache,
+                    ),
+                )
+                for field in fields(value)
+                if field.compare
+            ),
+        )
+        if read_cache is not None:
+            # The scope retaining this strong reference is private to one
+            # synchronous reconstruction.  Once its source escapes to the
+            # caller the cache is cleared and mutation checks recompute the
+            # complete structural fingerprint.
+            read_cache[id(value)] = (value, fingerprint)
+        return fingerprint
+    if type(value) is tuple:
+        return tuple(
+            _phase1_fingerprint_value(item, read_cache=read_cache)
+            for item in value
+        )
+    if type(value) is bytes:
+        return bytes(value)
+    if value is None or type(value) in {str, int, bool, date, datetime}:
+        return value
+    raise TypeError("unsupported Phase 1 source fingerprint value")
+
+
+def _phase1_source_fingerprint(
+    source: object,
+    *,
+    read_cache: _Phase1FingerprintReadCache | None = None,
+) -> tuple[object, ...]:
+    # Even outside a private Journal read scope, one verification must walk
+    # the source as an object graph rather than repeatedly expanding shared
+    # subgraphs as a tree.  This memo is deliberately ephemeral: a later
+    # verification recomputes every reachable value and therefore still
+    # detects caller-side ``object.__setattr__`` mutation.
+    effective_cache = {} if read_cache is None else read_cache
+    fingerprint = _phase1_fingerprint_value(
+        source,
+        read_cache=effective_cache,
+    )
+    if type(fingerprint) is not tuple:
+        raise TypeError("Phase 1 source fingerprint is malformed")
+    return fingerprint
+
+
+def _register_journal_source_authority(
+    registry: _JournalSourceRegistry,
+    source: object,
+    owner: Journal,
+) -> None:
+    """Register one exact source object against a live Journal snapshot."""
+    identity = id(source)
+    owner_reference = ref(owner)
+    generation = owner._source_generation
+    data_version = owner._source_authority_data_version()
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _JOURNAL_SOURCE_LOCK:
+            current = registry.get(identity)
+            if current is not None and current[0] is dead:
+                registry.pop(identity, None)
+
+    with _JOURNAL_SOURCE_LOCK:
+        registry[identity] = (
+            ref(source, discard),
+            _phase1_source_fingerprint(
+                source,
+                read_cache=owner._phase1_fingerprint_read_cache,
+            ),
+            owner_reference,
+            generation,
+            data_version,
+        )
+
+
+def _phase1_source_registry(source: object) -> _JournalSourceRegistry | None:
+    if isinstance(source, Phase1PublicationSource):
+        return _PHASE1_PUBLICATION_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1SignalSource):
+        return _PHASE1_SIGNAL_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1EntrySource):
+        return _PHASE1_ENTRY_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1ShadowFillSource):
+        return _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1SignalEvidenceSource):
+        return _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1ExpiryDeadlineSource):
+        return _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1ExitReviewSource):
+        return _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1ExitReviewMarketSource):
+        return _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES
+    if isinstance(source, _Phase1ExitProviderReplaySource):
+        return _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1CanonicalReplaySource):
+        return _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1EquityMarkSource):
+        return _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES
+    if isinstance(source, _Phase1EquityProviderReplaySource):
+        return _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1BreakerHistorySource):
+        return _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1PublishedSignalDispositionSource):
+        return _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1AdherenceCheckEvidenceSource):
+        return _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1AdherenceReviewSource):
+        return _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES
+    if isinstance(source, Phase1ValidationWindowSource):
+        return _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES
+    return None
+
+
+def _phase1_registered_owner_and_read_cache(
+    registry: _JournalSourceRegistry,
+    source: object,
+) -> tuple[object | None, _Phase1FingerprintReadCache | None]:
+    """Resolve cache context only from an exact registered source identity."""
+    with _JOURNAL_SOURCE_LOCK:
+        issued = registry.get(id(source))
+        if issued is None or issued[0]() is not source:
+            return None, None
+        owner = issued[2]()
+    if owner is None:
+        return None, None
+    cache = getattr(owner, "_phase1_fingerprint_read_cache", None)
+    if cache is not None and not isinstance(cache, dict):
+        return owner, None
+    return owner, cache
+
+
+def _phase1_source_owner(source: object) -> object | None:
+    registry = _phase1_source_registry(source)
+    if registry is None:
+        return None
+    owner, read_cache = _phase1_registered_owner_and_read_cache(
+        registry,
+        source,
+    )
+    if owner is None:
+        return None
+    try:
+        fingerprint = _phase1_source_fingerprint(
+            source,
+            read_cache=read_cache,
+        )
+    except Exception:
+        return None
+    if not _has_current_journal_source_authority(
+        registry,
+        source,
+        fingerprint,
+    ):
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = registry.get(id(source))
+        if issued is None or issued[0]() is not source:
+            return None
+        return issued[2]()
+
+
+def _phase1_registered_source_owner(source: object) -> object | None:
+    """Return the original owner for an exact source identity, even if consumed.
+
+    Successful append-only writes intentionally revoke current source authority.
+    Retaining the exact identity-to-owner binding lets an idempotent retry prove
+    that it is replaying the originally issued capability without making copied
+    or reconstructed DTOs into registrars.
+    """
+
+    registry = _phase1_source_registry(source)
+    if registry is None:
+        return None
+    owner, read_cache = _phase1_registered_owner_and_read_cache(
+        registry,
+        source,
+    )
+    if owner is None:
+        return None
+    try:
+        fingerprint = _phase1_source_fingerprint(
+            source,
+            read_cache=read_cache,
+        )
+    except Exception:
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = registry.get(id(source))
+        if (
+            issued is None
+            or issued[0]() is not source
+            or issued[1] != fingerprint
+        ):
+            return None
+        return issued[2]()
+
+
+def _journal_action_source_owner(source: object) -> object | None:
+    if not isinstance(source, JournalActionSource):
+        return None
+    try:
+        fingerprint = _action_source_fingerprint(source)
+    except Exception:
+        return None
+    if not _has_current_journal_source_authority(
+        _ACTION_SOURCE_AUTHORITIES,
+        source,
+        fingerprint,
+    ):
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = _ACTION_SOURCE_AUTHORITIES.get(id(source))
+        if issued is None or issued[0]() is not source:
+            return None
+        return issued[2]()
+
+
+def _journal_replay_source_owner(source: object) -> object | None:
+    """Return the live Journal owner of one exact current ACTUAL replay."""
+    if not isinstance(source, JournalActualReplaySource):
+        return None
+    try:
+        fingerprint = _replay_source_fingerprint(source)
+    except Exception:
+        return None
+    if not _has_current_journal_source_authority(
+        _REPLAY_SOURCE_AUTHORITIES,
+        source,
+        fingerprint,
+    ):
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = _REPLAY_SOURCE_AUTHORITIES.get(id(source))
+        if issued is None or issued[0]() is not source:
+            return None
+        return issued[2]()
+
+
+def phase1_sources_share_owner(left: object, right: object) -> bool:
+    """Return whether two exact current sources came from one Journal instance."""
+    left_owner = _phase1_source_owner(left)
+    right_owner = _phase1_source_owner(right)
+    if right_owner is None:
+        right_owner = _journal_action_source_owner(right)
+    if right_owner is None:
+        right_owner = _journal_replay_source_owner(right)
+    return left_owner is not None and left_owner is right_owner
+
+
 def _has_current_journal_source_authority(
     registry: dict[
         int,
@@ -659,6 +3584,489 @@ def is_verified_journal_replay_source(source: object) -> bool:
         _REPLAY_SOURCE_AUTHORITIES,
         source,
         fingerprint,
+    )
+
+
+def _is_verified_phase1_source(
+    source: object,
+    expected_type: type[object],
+    registry: _JournalSourceRegistry,
+) -> bool:
+    if not isinstance(source, expected_type):
+        return False
+    owner, read_cache = _phase1_registered_owner_and_read_cache(
+        registry,
+        source,
+    )
+    if owner is None:
+        return False
+    try:
+        fingerprint = _phase1_source_fingerprint(
+            source,
+            read_cache=read_cache,
+        )
+    except Exception:
+        return False
+    return _has_current_journal_source_authority(
+        registry,
+        source,
+        fingerprint,
+    )
+
+
+def is_verified_phase1_publication_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1PublicationSource,
+        _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_signal_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1SignalSource,
+        _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_entry_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1EntrySource,
+        _PHASE1_ENTRY_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_shadow_fill_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1ShadowFillSource,
+        _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_signal_evidence_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1SignalEvidenceSource,
+        _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_expiry_deadline_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1ExpiryDeadlineSource,
+        _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES,
+    )
+
+
+def _phase1_exit_cohort_matches_source(
+    source: Phase1ExitReviewMarketSource,
+    cohort: object,
+    expected: tuple[Phase1ExitReviewFactSource, ...],
+) -> bool:
+    from .providers.alpaca import (
+        Bar,
+        Quote,
+        _normalized_market_fact_source,
+        is_issued_normalized_market_fact,
+    )
+
+    values = tuple(cohort[source.symbol])  # type: ignore[index]
+    if len(values) != len(expected):
+        return False
+    for fact, stored in zip(values, expected, strict=True):
+        if not is_issued_normalized_market_fact(fact):
+            return False
+        fact_source = _normalized_market_fact_source(fact)
+        if (
+            fact_source.source_observation_id
+            != stored.provider_source_observation_id
+            or fact_source.page_ordinal != stored.page_ordinal
+            or fact_source.source_item_ordinal != stored.source_item_ordinal
+            or fact_source.source_item_path != stored.source_item_path
+            or fact_source.page_payload_sha256 != stored.page_payload_sha256
+            or fact_source.normalized_fields_digest
+            != stored.normalized_fields_digest
+            or fact.symbol != stored.symbol
+            or fact.timestamp != stored.source_time
+            or str(fact.feed).lower() != stored.feed.lower()
+        ):
+            return False
+        if isinstance(fact, Bar):
+            if (
+                stored.observation_kind != "BAR"
+                or stored.open_micros != money_to_micros(fact.open)
+                or stored.high_micros != money_to_micros(fact.high)
+                or stored.low_micros != money_to_micros(fact.low)
+                or stored.close_micros != money_to_micros(fact.close)
+                or stored.volume != fact.volume
+                or stored.adjustment != fact.adjustment
+            ):
+                return False
+        elif isinstance(fact, Quote):
+            if (
+                stored.observation_kind != "QUOTE"
+                or stored.bid_micros != money_to_micros(fact.bid)
+                or stored.ask_micros != money_to_micros(fact.ask)
+                or stored.provider_sequence != fact.sequence
+            ):
+                return False
+        else:
+            return False
+    return True
+
+
+def is_verified_phase1_exit_review_market_source(source: object) -> bool:
+    if not _is_verified_phase1_source(
+        source,
+        Phase1ExitReviewMarketSource,
+        _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES,
+    ):
+        return False
+    assert isinstance(source, Phase1ExitReviewMarketSource)
+    try:
+        from .providers.alpaca import provider_fetch_cohorts_share_owner
+
+        return (
+            provider_fetch_cohorts_share_owner(
+                source.daily_bar_cohort,
+                source.execution_bar_cohort,
+                source.quote_cohort,
+            )
+            and phase1_sources_share_owner(source, source.signal_source)
+            and _phase1_exit_cohort_matches_source(
+                source,
+                source.daily_bar_cohort,
+                source.daily_bar_facts,
+            )
+            and _phase1_exit_cohort_matches_source(
+                source,
+                source.execution_bar_cohort,
+                source.execution_bar_facts,
+            )
+            and _phase1_exit_cohort_matches_source(
+                source,
+                source.quote_cohort,
+                source.quote_facts,
+            )
+            and source.fee_schedule_version
+            == _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+            and source.fee_schedule_digest == _PHASE1_EXIT_FEE_SCHEDULE_DIGEST
+            and source.fee_micros == _PHASE1_EXIT_FEE_MICROS
+            and (
+                source.signal_evidence_source is None
+                or (
+                    is_verified_phase1_signal_evidence_source(
+                        source.signal_evidence_source
+                    )
+                    and phase1_sources_share_owner(
+                        source,
+                        source.signal_evidence_source,
+                    )
+                    and source.signal_evidence_source.signal_source.signal_id
+                    == source.signal_id
+                )
+            )
+        )
+    except Exception:
+        return False
+
+
+def is_verified_phase1_exit_review_source(source: object) -> bool:
+    if not _is_verified_phase1_source(
+        source,
+        Phase1ExitReviewSource,
+        _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES,
+    ):
+        return False
+    assert isinstance(source, Phase1ExitReviewSource)
+    try:
+        from .providers.alpaca import (
+            Bar,
+            Quote,
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            provider_fetch_cohorts_share_owner,
+        )
+        from .risk import is_issued_phase1_position_evidence_authority
+
+        def cohort_matches(
+            cohort: object,
+            expected: tuple[Phase1ExitReviewFactSource, ...],
+        ) -> bool:
+            values = tuple(cohort[source.symbol])  # type: ignore[index]
+            if len(values) != len(expected):
+                return False
+            for fact, stored in zip(values, expected, strict=True):
+                if not is_issued_normalized_market_fact(fact):
+                    return False
+                fact_source = _normalized_market_fact_source(fact)
+                if (
+                    fact_source.source_observation_id
+                    != stored.provider_source_observation_id
+                    or fact_source.page_ordinal != stored.page_ordinal
+                    or fact_source.source_item_ordinal
+                    != stored.source_item_ordinal
+                    or fact_source.source_item_path != stored.source_item_path
+                    or fact_source.page_payload_sha256
+                    != stored.page_payload_sha256
+                    or fact_source.normalized_fields_digest
+                    != stored.normalized_fields_digest
+                    or fact.symbol != stored.symbol
+                    or fact.timestamp != stored.source_time
+                    or str(fact.feed).lower() != stored.feed.lower()
+                ):
+                    return False
+                if isinstance(fact, Bar):
+                    if (
+                        stored.observation_kind != "BAR"
+                        or stored.open_micros != money_to_micros(fact.open)
+                        or stored.high_micros != money_to_micros(fact.high)
+                        or stored.low_micros != money_to_micros(fact.low)
+                        or stored.close_micros != money_to_micros(fact.close)
+                        or stored.volume != fact.volume
+                        or stored.adjustment != fact.adjustment
+                    ):
+                        return False
+                elif isinstance(fact, Quote):
+                    if (
+                        stored.observation_kind != "QUOTE"
+                        or stored.bid_micros != money_to_micros(fact.bid)
+                        or stored.ask_micros != money_to_micros(fact.ask)
+                        or stored.provider_sequence != fact.sequence
+                    ):
+                        return False
+                else:
+                    return False
+            return True
+
+        nested_signal_source = (
+            None
+            if source.position_evidence is None
+            else source.position_evidence.signal_evidence.signal_source
+        )
+        return (
+            is_verified_phase1_exit_review_market_source(source.market_source)
+            and phase1_sources_share_owner(source, source.market_source)
+            and source.signal_source is source.market_source.signal_source
+            and source.daily_bar_cohort is source.market_source.daily_bar_cohort
+            and source.execution_bar_cohort
+            is source.market_source.execution_bar_cohort
+            and source.quote_cohort is source.market_source.quote_cohort
+            and source.daily_bar_facts == source.market_source.daily_bar_facts
+            and source.execution_bar_facts
+            == source.market_source.execution_bar_facts
+            and source.quote_facts == source.market_source.quote_facts
+            and source.observations == source.market_source.observations
+            and source.review_id == source.market_source.review_id
+            and source.signal_id == source.market_source.signal_id
+            and source.validation_window_id
+            == source.market_source.validation_window_id
+            and source.symbol == source.market_source.symbol
+            and source.review_session == source.market_source.review_session
+            and source.query_cutoff == source.market_source.query_cutoff
+            and source.calendar_digest == source.market_source.calendar_digest
+            and provider_fetch_cohorts_share_owner(
+                source.daily_bar_cohort,
+                source.execution_bar_cohort,
+                source.quote_cohort,
+            )
+            and phase1_sources_share_owner(
+                source,
+                source.signal_source,
+            )
+            and phase1_sources_share_owner(
+                source,
+                source.canonical_replay_source,
+            )
+            and cohort_matches(
+                source.daily_bar_cohort,
+                source.daily_bar_facts,
+            )
+            and cohort_matches(
+                source.execution_bar_cohort,
+                source.execution_bar_facts,
+            )
+            and cohort_matches(
+                source.quote_cohort,
+                source.quote_facts,
+            )
+            and source.fee_schedule_version
+            == _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+            and source.fee_schedule_digest
+            == _PHASE1_EXIT_FEE_SCHEDULE_DIGEST
+            and source.fee_micros == _PHASE1_EXIT_FEE_MICROS
+            and (
+                source.position_evidence is None
+                or (
+                    is_issued_phase1_position_evidence_authority(
+                        source.position_evidence
+                    )
+                    and isinstance(nested_signal_source, Phase1SignalSource)
+                    and phase1_sources_share_owner(
+                        source,
+                        nested_signal_source,
+                    )
+                    and nested_signal_source.signal_id == source.signal_id
+                )
+            )
+        )
+    except Exception:
+        return False
+
+
+def is_verified_phase1_canonical_replay_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1CanonicalReplaySource,
+        _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_equity_mark_source(source: object) -> bool:
+    """Return whether this exact current Journal source still proves its inputs."""
+    if not _is_verified_phase1_source(
+        source,
+        Phase1EquityMarkSource,
+        _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
+    ):
+        return False
+    assert isinstance(source, Phase1EquityMarkSource)
+    try:
+        from .ledger import Phase1CanonicalLedgerReplay
+        from .providers.alpaca import (
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            is_issued_provider_fetch_cohort,
+            provider_fetch_cohorts_share_owner,
+        )
+        from .reconciliation import is_verified_actual_ledger_state_for_source
+
+        marks = tuple(source.position_marks)
+        cohorts = tuple(
+            cohort
+            for mark in marks
+            for cohort in (mark.quote_cohort, mark.daily_bar_cohort)
+        )
+        if cohorts and (
+            any(not is_issued_provider_fetch_cohort(cohort) for cohort in cohorts)
+            or not provider_fetch_cohorts_share_owner(*cohorts)
+        ):
+            return False
+        if (
+            not phase1_sources_share_owner(
+                source,
+                source.canonical_replay_source,
+            )
+            or _journal_replay_source_owner(source.actual_replay_source)
+            is not _phase1_source_owner(source)
+            or not isinstance(source.canonical_replay, Phase1CanonicalLedgerReplay)
+            or not source.canonical_replay.source_verified
+            or source.canonical_replay.source_digest
+            != source.canonical_replay_source.source_digest
+            or not is_verified_journal_replay_source(source.actual_replay_source)
+            or not is_verified_actual_ledger_state_for_source(
+                source.actual_replay,
+                source.actual_replay_source,
+            )
+            or source.canonical_replay.query_cutoff != source.query_cutoff
+            or source.actual_replay_source.query_cutoff != source.query_cutoff
+            or source.expected_mark_count != len(marks)
+            or source.mark_terminal_cursor
+            != (None if not marks else marks[-1].source_cursor)
+            or source.mark_source_highwater
+            < (0 if not marks else max(mark.source_cursor for mark in marks))
+        ):
+            return False
+        for ordinal, mark in enumerate(marks, start=1):
+            quote_values = tuple(mark.quote_cohort[mark.symbol])
+            daily_values = tuple(mark.daily_bar_cohort[mark.symbol])
+            if (
+                mark.mark_ordinal != ordinal
+                or len(quote_values) != len(mark.quote_facts)
+                or len(daily_values) != len(mark.daily_bar_facts)
+                or any(
+                    left is not right
+                    for left, right in zip(
+                        quote_values,
+                        mark.quote_facts,
+                        strict=True,
+                    )
+                )
+                or any(
+                    left is not right
+                    for left, right in zip(
+                        daily_values,
+                        mark.daily_bar_facts,
+                        strict=True,
+                    )
+                )
+                or not is_issued_normalized_market_fact(
+                    mark.selected_observation
+                )
+                or _normalized_market_fact_source(mark.selected_observation)
+                is not mark.selected_provider_fact_source
+                or mark.expected_quote_fact_count != len(quote_values)
+                or mark.expected_daily_bar_fact_count != len(daily_values)
+                or len(mark.quote_fact_sources) != len(quote_values)
+                or len(mark.daily_bar_fact_sources) != len(daily_values)
+                or mark.quote_terminal_cursor
+                != (
+                    None
+                    if not mark.quote_fact_sources
+                    else mark.quote_fact_sources[-1].row_id
+                )
+                or mark.daily_bar_terminal_cursor
+                != mark.daily_bar_fact_sources[-1].row_id
+                or mark.source_cursor
+                not in {
+                    item.row_id
+                    for item in (
+                        *mark.quote_fact_sources,
+                        *mark.daily_bar_fact_sources,
+                    )
+                }
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def is_verified_phase1_breaker_history_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1BreakerHistorySource,
+        _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_published_signal_disposition_source(
+    source: object,
+) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1PublishedSignalDispositionSource,
+        _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_adherence_review_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1AdherenceReviewSource,
+        _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_phase1_validation_window_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        Phase1ValidationWindowSource,
+        _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES,
     )
 
 
@@ -891,6 +4299,26 @@ class JournalTransaction:
             query_cutoff=query_cutoff,
             through_execution_cursor=through_execution_cursor,
         )
+        return self._register_actual_replay_source(source)
+
+    def _read_phase1_actual_economic_replay(
+        self,
+        *,
+        query_cutoff: datetime,
+    ) -> JournalActualReplaySource:
+        """Read a cutoff-stable immutable replay for Phase 1 equity marks."""
+        self._ensure_post_commit_source_read()
+        source = self._journal._read_actual_replay(
+            query_cutoff=query_cutoff,
+            through_execution_cursor=None,
+            cutoff_stable=True,
+        )
+        return self._register_actual_replay_source(source)
+
+    def _register_actual_replay_source(
+        self,
+        source: JournalActualReplaySource,
+    ) -> JournalActualReplaySource:
         owner = ref(self._journal)
         generation = self._journal._source_generation
         data_version = self._journal._source_authority_data_version()
@@ -963,6 +4391,138 @@ class JournalTransaction:
             health_result=health_result,
             details=details,
         )
+
+    def ingest_phase1_session_cohorts(
+        self,
+        signal_id: str,
+        cohorts: Sequence[object],
+        *,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None = None,
+    ) -> Phase1CohortIngestResult:
+        """Enroll the complete provider-issued lifecycle fetch cohort set."""
+        self._ensure_active()
+        self._mark_dirty()
+        return self._journal._ingest_phase1_session_cohorts(
+            signal_id=signal_id,
+            cohorts=cohorts,
+            core_source_row_ids=core_source_row_ids,
+            calendar_resolver=calendar_resolver,
+            recorded_at=recorded_at,
+        )
+
+    def ingest_phase1_exit_review_cohorts(
+        self,
+        signal_id: str,
+        *,
+        daily_bar_cohort: object,
+        execution_bar_cohort: object,
+        quote_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+    ) -> Phase1ExitReviewIngestResult:
+        """Persist one exact provider-backed canonical-exit review set."""
+        self._ensure_active()
+        self._mark_dirty()
+        return self._journal._ingest_phase1_exit_review_cohorts(
+            signal_id=signal_id,
+            daily_bar_cohort=daily_bar_cohort,
+            execution_bar_cohort=execution_bar_cohort,
+            quote_cohort=quote_cohort,
+            core_source_row_ids=core_source_row_ids,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def ingest_phase1_equity_mark_cohorts(
+        self,
+        session_date: date,
+        *,
+        quote_cohort: object,
+        daily_bar_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None = None,
+    ) -> Phase1EquityMarkIngestResult:
+        """Persist one exact provider-issued quote/daily session mark set."""
+        self._ensure_active()
+        self._mark_dirty()
+        return self._journal._ingest_phase1_equity_mark_cohorts(
+            session_date,
+            quote_cohort=quote_cohort,
+            daily_bar_cohort=daily_bar_cohort,
+            core_source_row_ids=core_source_row_ids,
+            calendar_resolver=calendar_resolver,
+            recorded_at=recorded_at,
+        )
+
+    def complete_phase1_session(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        cohort_through_ordinal: int,
+        expected_observation_count: int,
+        received_through: datetime,
+        completed_at: datetime,
+        calendar_resolver: object,
+    ) -> tuple[int, bool]:
+        """Seal one exact session-local normalized observation cohort."""
+        self._ensure_active()
+        self._mark_dirty()
+        return self._journal._complete_phase1_session(
+            signal_id=signal_id,
+            session_date=session_date,
+            cohort_through_ordinal=cohort_through_ordinal,
+            expected_observation_count=expected_observation_count,
+            received_through=received_through,
+            completed_at=completed_at,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def start_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        self._ensure_active()
+        self._mark_dirty()
+        return self._journal._start_phase1_validation_window(
+            window_id=window_id,
+            started_session=started_session,
+            starting_capital=starting_capital,
+            started_at=started_at,
+            received_at=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def publish_phase1_report(
+        self,
+        *,
+        publication_source: Phase1PublicationSource,
+        decision: object,
+        primary_plan_decision: object,
+        validation_window_id: str,
+        calendar_resolver: object,
+        received_at: datetime,
+    ) -> StoredPhase1Publication:
+        """Atomically persist one complete report cohort and initial events."""
+        self._ensure_active()
+        result = self._journal._publish_phase1_report(
+            publication_source=publication_source,
+            decision=decision,
+            primary_plan_decision=primary_plan_decision,
+            validation_window_id=validation_window_id,
+            calendar_resolver=calendar_resolver,
+            received_at=received_at,
+        )
+        self._mark_dirty()
+        return result
 
     def finalize_report(
         self,
@@ -1253,6 +4813,22 @@ class Journal:
         self._projection_write_allowed = False
         self._report_claim_write_allowed = False
         self._source_generation = 0
+        self._phase1_publication_read_cache: (
+            dict[str, Phase1PublicationSource] | None
+        ) = None
+        self._phase1_fingerprint_read_cache: (
+            _Phase1FingerprintReadCache | None
+        ) = None
+        self._phase1_exit_market_read_cache: (
+            dict[tuple[object, ...], Phase1ExitReviewMarketSource] | None
+        ) = None
+        self._phase1_canonical_replay_read_cache: (
+            dict[tuple[object, ...], Phase1CanonicalReplaySource] | None
+        ) = None
+        self._phase1_exit_material_read_cache: (
+            dict[tuple[object, ...], object] | None
+        ) = None
+        self.__phase1_observation_ingest_token = object()
         self._closed = False
 
     @classmethod
@@ -1401,6 +4977,27 @@ class Journal:
             finally:
                 transaction._deactivate()
 
+    @contextmanager
+    def _phase1_publication_read_scope(self) -> Iterator[None]:
+        """Reuse immutable parsing/fingerprints within one nested read only."""
+        self._ensure_open()
+        created = self._phase1_publication_read_cache is None
+        if created:
+            self._phase1_publication_read_cache = {}
+            self._phase1_fingerprint_read_cache = {}
+            self._phase1_exit_market_read_cache = {}
+            self._phase1_canonical_replay_read_cache = {}
+            self._phase1_exit_material_read_cache = {}
+        try:
+            yield
+        finally:
+            if created:
+                self._phase1_publication_read_cache = None
+                self._phase1_fingerprint_read_cache = None
+                self._phase1_exit_market_read_cache = None
+                self._phase1_canonical_replay_read_cache = None
+                self._phase1_exit_material_read_cache = None
+
     def append_raw_message(
         self, message_id: str, message_time: datetime, text: str
     ) -> tuple[int, bool]:
@@ -1475,6 +5072,4070 @@ class Journal:
                 delay_seconds=delay_seconds,
                 health_result=health_result,
                 details=details,
+            )
+
+    def ingest_phase1_session_cohorts(
+        self,
+        signal_id: str,
+        cohorts: Sequence[object],
+        *,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None = None,
+    ) -> Phase1CohortIngestResult:
+        """Persist the complete provider-issued lifecycle fetch cohort set."""
+        with self.transaction() as transaction:
+            return transaction.ingest_phase1_session_cohorts(
+                signal_id=signal_id,
+                cohorts=cohorts,
+                core_source_row_ids=core_source_row_ids,
+                calendar_resolver=calendar_resolver,
+                recorded_at=recorded_at,
+            )
+
+    def ingest_phase1_exit_review_cohorts(
+        self,
+        signal_id: str,
+        *,
+        daily_bar_cohort: object,
+        execution_bar_cohort: object,
+        quote_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+    ) -> Phase1ExitReviewIngestResult:
+        """Persist only one exact three-role provider exit-review set."""
+        with self.transaction() as transaction:
+            return transaction.ingest_phase1_exit_review_cohorts(
+                signal_id,
+                daily_bar_cohort=daily_bar_cohort,
+                execution_bar_cohort=execution_bar_cohort,
+                quote_cohort=quote_cohort,
+                core_source_row_ids=core_source_row_ids,
+                calendar_resolver=calendar_resolver,
+            )
+
+    def ingest_phase1_equity_mark_cohorts(
+        self,
+        session_date: date,
+        *,
+        quote_cohort: object,
+        daily_bar_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None = None,
+    ) -> Phase1EquityMarkIngestResult:
+        """Persist the one canonical provider mark cohort set for a session."""
+        with self.transaction() as transaction:
+            return transaction.ingest_phase1_equity_mark_cohorts(
+                session_date,
+                quote_cohort=quote_cohort,
+                daily_bar_cohort=daily_bar_cohort,
+                core_source_row_ids=core_source_row_ids,
+                calendar_resolver=calendar_resolver,
+                recorded_at=recorded_at,
+            )
+
+    def read_phase1_equity_mark_source(
+        self,
+        *,
+        ledger_name: str,
+        session_date: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> Phase1EquityMarkSource:
+        """Reissue one moneyless replay/provider-bound equity mark source."""
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_equity_mark_source(
+                ledger_name=ledger_name,
+                session_date=session_date,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+
+    def record_phase1_session_mark(
+        self,
+        *,
+        canonical_authority: object,
+        actual_authority: object,
+        recorded_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1SessionMark:
+        """Atomically persist paired derived canonical and actual points."""
+        return self._record_phase1_session_mark_public(
+            canonical_authority=canonical_authority,
+            actual_authority=actual_authority,
+            recorded_at=recorded_at,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def read_phase1_exit_review_market_source(
+        self,
+        signal_id: str,
+        *,
+        review_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1ExitReviewMarketSource:
+        """Reissue only raw provider and signal-evidence exit authority."""
+        with self._phase1_publication_read_scope():
+            source = self._read_phase1_exit_review_source(
+                signal_id,
+                review_session=review_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=None,
+                market_only=True,
+            )
+        if not isinstance(source, Phase1ExitReviewMarketSource):
+            raise JournalError("Phase 1 exit market source was not reissued")
+        return source
+
+    def read_phase1_exit_review_source(
+        self,
+        signal_id: str,
+        *,
+        review_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object | None = None,
+    ) -> Phase1ExitReviewSource:
+        """Reissue raw exit authority plus its pre-review canonical replay."""
+        with self._phase1_publication_read_scope():
+            source = self._read_phase1_exit_review_source(
+                signal_id,
+                review_session=review_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+                market_only=False,
+            )
+        if not isinstance(source, Phase1ExitReviewSource):
+            raise JournalError("Phase 1 exit review source was not reissued")
+        return source
+
+    def _read_phase1_exit_review_source(
+        self,
+        signal_id: str,
+        *,
+        review_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object | None = None,
+        market_only: bool,
+    ) -> Phase1ExitReviewSource | Phase1ExitReviewMarketSource:
+        """Reparse one exact three-role provider exit-review snapshot."""
+        from zoneinfo import ZoneInfo
+
+        from .ledger import _issue_canonical_ledger_replay_from_phase1_source
+        from .providers.alpaca import (
+            Bar,
+            Quote,
+            _market_fact_payload,
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            provider_fetch_cohorts_share_owner,
+            read_provider_fetch_bundle,
+        )
+        from .providers.http import ProviderResponseError
+        from .risk import (
+            Position,
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+            _issue_phase1_position_evidence_authority,
+            _issue_phase1_signal_evidence_authority_from_source,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 exit review requires a post-commit read"
+            )
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        review_session = date.fromisoformat(_canonical_date(review_session))
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        market_cache_key = (
+            signal_id,
+            review_session,
+            normalized_cutoff,
+            calendar_digest,
+        )
+        market_read_cache = self._phase1_exit_market_read_cache
+        if market_only and market_read_cache is not None:
+            cached_market = market_read_cache.get(market_cache_key)
+            if cached_market is not None and (
+                _phase1_source_owner(cached_market) is self
+                and cached_market.signal_id == signal_id
+                and cached_market.review_session == review_session
+                and cached_market.query_cutoff == normalized_cutoff
+                and cached_market.calendar_digest == calendar_digest
+            ):
+                return cached_market
+            market_read_cache.pop(market_cache_key, None)
+        review_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_COLUMNS)
+            + " FROM phase1_exit_reviews WHERE signal_id = ? COLLATE BINARY "
+            "AND review_session = ?",
+            (signal_id, review_session.isoformat()),
+        ).fetchone()
+        if review_row is None:
+            raise InvalidJournalValue("Phase 1 exit review does not exist")
+        review = dict(
+            zip(_PHASE1_EXIT_REVIEW_COLUMNS, tuple(review_row), strict=True)
+        )
+        stored_cutoff = _parse_canonical_timestamp(str(review["query_cutoff"]))
+        expected_review_hash = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    column: review[column]
+                    for column in _PHASE1_EXIT_REVIEW_COLUMNS[1:-1]
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            stored_cutoff != normalized_cutoff
+            or str(review["calendar_digest"]) != calendar_digest
+            or str(review["review_session"]) != review_session.isoformat()
+            or str(review["recorded_at"]) != str(review["query_cutoff"])
+            or int(review["expected_manifest_count"]) != 3
+            or int(review["expected_fact_count"]) < 15
+            or str(review["record_sha256"]) != expected_review_hash
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 exit review cutoff or integrity conflicts"
+            )
+
+        role_order_sql = (
+            "CASE purpose WHEN 'DAILY_BAR' THEN 1 "
+            "WHEN 'EXECUTION_BAR' THEN 2 WHEN 'QUOTE' THEN 3 END"
+        )
+        manifest_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS)
+            + " FROM phase1_exit_review_manifests WHERE review_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order_sql}, id",
+            (str(review["review_id"]),),
+        ).fetchall()
+        page_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_PAGE_COLUMNS)
+            + " FROM phase1_exit_review_pages WHERE review_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order_sql}, page_ordinal, id",
+            (str(review["review_id"]),),
+        ).fetchall()
+        fact_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_FACT_COLUMNS)
+            + " FROM phase1_exit_review_facts WHERE review_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order_sql}, fact_ordinal, id",
+            (str(review["review_id"]),),
+        ).fetchall()
+        if (
+            tuple(str(row[2]) for row in manifest_rows)
+            != ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+            or len(manifest_rows) != int(review["expected_manifest_count"])
+            or len(fact_rows) != int(review["expected_fact_count"])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit review child manifest is incomplete"
+            )
+
+        review_reference = _journal_row_reference(
+            "phase1_exit_reviews",
+            _PHASE1_EXIT_REVIEW_COLUMNS,
+            review_row,
+        )
+        manifest_references: list[JournalRowReference] = []
+        page_references: list[JournalRowReference] = []
+        fact_references: list[JournalRowReference] = []
+        core_references: list[JournalRowReference] = []
+        role_pages: dict[str, tuple[tuple[str, bytes, datetime], ...]] = {}
+        role_windows: dict[str, tuple[datetime, datetime]] = {}
+        core_by_page: dict[
+            tuple[str, int, str],
+            tuple[
+                tuple[object, ...],
+                tuple[object, ...],
+                JournalRowReference,
+                JournalRowReference,
+            ],
+        ] = {}
+        manifest_by_purpose: dict[str, dict[str, object]] = {}
+
+        for manifest_row in manifest_rows:
+            manifest = dict(
+                zip(
+                    _PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS,
+                    tuple(manifest_row),
+                    strict=True,
+                )
+            )
+            purpose = str(manifest["purpose"])
+            expected_manifest_source_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-exit-manifest/v1",
+                        "values": tuple(manifest_row[1:-2]),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_manifest_record = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        column: manifest[column]
+                        for column in _PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS[1:-1]
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            try:
+                requested_symbols = tuple(
+                    json.loads(str(manifest["requested_symbols_json"]))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise MigrationCorruption(
+                    "Phase 1 exit requested-symbol manifest is malformed"
+                ) from None
+            purpose_pages = tuple(
+                row for row in page_rows if str(row[2]) == purpose
+            )
+            purpose_facts = tuple(
+                row for row in fact_rows if str(row[3]) == purpose
+            )
+            if (
+                str(manifest["review_id"]) != str(review["review_id"])
+                or requested_symbols == ()
+                or int(manifest["terminal"]) != 1
+                or len(purpose_pages) != int(manifest["expected_page_count"])
+                or len(purpose_facts) != int(manifest["expected_fact_count"])
+                or tuple(int(row[3]) for row in purpose_pages)
+                != tuple(range(1, len(purpose_pages) + 1))
+                or tuple(int(row[4]) for row in purpose_facts)
+                != tuple(range(1, len(purpose_facts) + 1))
+                or str(manifest["source_digest"])
+                != expected_manifest_source_digest
+                or str(manifest["record_sha256"])
+                != expected_manifest_record
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit provider manifest integrity failed"
+                )
+            role_windows[purpose] = (
+                _parse_canonical_timestamp(str(manifest["request_start"])),
+                _parse_canonical_timestamp(str(manifest["request_end"])),
+            )
+            manifest_by_purpose[purpose] = manifest
+            manifest_references.append(
+                _journal_row_reference(
+                    "phase1_exit_review_manifests",
+                    _PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS,
+                    manifest_row,
+                )
+            )
+            stored_role_pages: list[tuple[str, bytes, datetime]] = []
+            prior_next_token: str | None = None
+            for ordinal, page_row in enumerate(purpose_pages, start=1):
+                page = dict(
+                    zip(
+                        _PHASE1_EXIT_REVIEW_PAGE_COLUMNS,
+                        tuple(page_row),
+                        strict=True,
+                    )
+                )
+                expected_page_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-exit-page/v1",
+                            "values": tuple(page_row[1:-2]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_page_record = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            column: page[column]
+                            for column in _PHASE1_EXIT_REVIEW_PAGE_COLUMNS[1:-1]
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                if (
+                    int(page["page_ordinal"]) != ordinal
+                    or page["request_page_token"] != prior_next_token
+                    or str(page["source_digest"])
+                    != expected_page_source_digest
+                    or str(page["record_sha256"]) != expected_page_record
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit provider page manifest is malformed"
+                    )
+                prior_next_token = (
+                    None
+                    if page["next_page_token"] is None
+                    else str(page["next_page_token"])
+                )
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=int(page["source_observation_id"])
+                )
+                source_reference = _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                )
+                payload_reference = _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                )
+                payload = bytes(payload_row[3])
+                retrieved_at = _parse_canonical_timestamp(str(source_row[8]))
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=payload,
+                    request_url=str(page["request_url"]),
+                    source_type=str(page["source_type"]),
+                    retrieved_at=retrieved_at,
+                )
+                details = _canonical_stored_details(
+                    source_row[12],
+                    label="Phase 1 exit provider source",
+                )
+                external_id = str(page["external_source_observation_id"])
+                if (
+                    int(source_row[0]) != int(page["source_observation_id"])
+                    or details != {"source_observation_id": external_id}
+                    or str(source_row[2]) != str(page["payload_sha256"])
+                    or str(source_row[3]) != str(page["request_url"])
+                    or str(source_row[4]) != str(page["source_type"])
+                    or str(source_row[5]).lower() != "alpaca"
+                    or str(source_row[6]).lower() != "sip"
+                    or source_row[9] is not None
+                    or str(source_row[11]) != "OK"
+                    or str(getattr(metadata, "source_observation_id"))
+                    != external_id
+                    or getattr(metadata, "source_time")
+                    != _parse_canonical_timestamp(str(source_row[7]))
+                    or getattr(metadata, "retrieved_at") != retrieved_at
+                    or int(getattr(metadata, "delay_seconds"))
+                    != int(source_row[10])
+                    or str(getattr(metadata, "payload_sha256"))
+                    != str(page["payload_sha256"])
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit provider raw-page integrity failed"
+                    )
+                page_reference = _journal_row_reference(
+                    "phase1_exit_review_pages",
+                    _PHASE1_EXIT_REVIEW_PAGE_COLUMNS,
+                    page_row,
+                )
+                page_references.append(page_reference)
+                core_references.extend((source_reference, payload_reference))
+                core_by_page[(purpose, ordinal, external_id)] = (
+                    tuple(source_row),
+                    tuple(payload_row),
+                    source_reference,
+                    payload_reference,
+                )
+                stored_role_pages.append(
+                    (str(page["request_url"]), payload, retrieved_at)
+                )
+            if prior_next_token is not None:
+                raise MigrationCorruption(
+                    "Phase 1 exit provider page chain is not terminal"
+                )
+            if (
+                _parse_canonical_timestamp(str(manifest["received_through"]))
+                != max(value[2] for value in stored_role_pages)
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit provider receipt watermark is inconsistent"
+                )
+            request_start, request_end = role_windows[purpose]
+            role_session = request_end.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            if not calendar_resolver.is_open(role_session):
+                raise MigrationCorruption(
+                    "Phase 1 exit provider role session is not open"
+                )
+            role_schedule = calendar_resolver.session(role_session)
+            role_open = datetime.combine(
+                role_session,
+                role_schedule.open_time,
+                role_schedule.timezone,
+            ).astimezone(timezone.utc)
+            role_close = datetime.combine(
+                role_session,
+                role_schedule.close_time,
+                role_schedule.timezone,
+            ).astimezone(timezone.utc)
+            if (
+                max(value[2] for value in stored_role_pages) < role_close
+                or request_end != role_close
+                or (
+                    purpose in {"EXECUTION_BAR", "QUOTE"}
+                    and request_start != role_open
+                )
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit provider role is not a completed session"
+                )
+            expected_semantic_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": (
+                            "stock-monitor/phase1-exit-semantic-manifest/v1"
+                        ),
+                        "purpose": purpose,
+                        "collection": str(manifest["collection_name"]),
+                        "requested_symbols": list(requested_symbols),
+                        "request_start": _canonical_timestamp(request_start),
+                        "request_end": _canonical_timestamp(request_end),
+                        "pages": [
+                            {
+                                "page_ordinal": int(row[3]),
+                                "source_type": str(row[6]),
+                                "request_url": str(row[7]),
+                                "request_page_token": row[8],
+                                "next_page_token": row[9],
+                                "payload_sha256": str(row[10]),
+                            }
+                            for row in purpose_pages
+                        ],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                str(manifest["semantic_manifest_digest"])
+                != expected_semantic_manifest_digest
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit semantic manifest integrity failed"
+                )
+            role_pages[purpose] = tuple(stored_role_pages)
+
+        replay_signal_row = _sql(
+            self._connection,
+            "SELECT symbol FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if replay_signal_row is None:
+            raise MigrationCorruption("Phase 1 exit signal is missing")
+        symbol = str(replay_signal_row[0])
+        if any(
+            tuple(json.loads(str(item["requested_symbols_json"])))
+            != (symbol,)
+            for item in manifest_by_purpose.values()
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit provider manifest symbol conflicts"
+            )
+        replay_roles = ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+        replay_references = (
+            review_reference,
+            *manifest_references,
+            *page_references,
+            *core_references,
+        )
+        replay_source = _Phase1ExitProviderReplaySource(
+            symbol=symbol,
+            role_pages=tuple(
+                (purpose, role_pages[purpose]) for purpose in replay_roles
+            ),
+            role_windows=tuple(
+                (purpose, *role_windows[purpose]) for purpose in replay_roles
+            ),
+            row_references=replay_references,
+            source_digest=_journal_bundle_digest(
+                "stock-monitor/phase1-exit-provider-replay-source/v1",
+                replay_references,
+                {
+                    "symbol": symbol,
+                    "roles": [
+                        {
+                            "purpose": purpose,
+                            "request_start": _canonical_timestamp(
+                                role_windows[purpose][0]
+                            ),
+                            "request_end": _canonical_timestamp(
+                                role_windows[purpose][1]
+                            ),
+                            "pages": [
+                                {
+                                    "request_url": url,
+                                    "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                                    "retrieved_at": _canonical_timestamp(retrieved_at),
+                                }
+                                for url, payload, retrieved_at in role_pages[purpose]
+                            ],
+                        }
+                        for purpose in replay_roles
+                    ],
+                },
+            ),
+        )
+        _register_journal_source_authority(
+            _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
+            replay_source,
+            self,
+        )
+        try:
+            daily_cohort, execution_cohort, quote_cohort = (
+                _phase1_reissue_exit_provider_cohorts(replay_source)
+            )
+        except (ProviderResponseError, ValueError) as error:
+            raise MigrationCorruption(
+                "Phase 1 exit provider cohort could not be reissued"
+            ) from error
+        if not provider_fetch_cohorts_share_owner(
+            daily_cohort,
+            execution_cohort,
+            quote_cohort,
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit provider cohorts do not share an owner"
+            )
+        cohorts_by_purpose = {
+            "DAILY_BAR": daily_cohort,
+            "EXECUTION_BAR": execution_cohort,
+            "QUOTE": quote_cohort,
+        }
+        descriptors: list[tuple[object, ...]] = []
+        for purpose in ("DAILY_BAR", "EXECUTION_BAR", "QUOTE"):
+            cohort = cohorts_by_purpose[purpose]
+            bundle = read_provider_fetch_bundle(cohort)
+            manifest = manifest_by_purpose[purpose]
+            if (
+                bundle.manifest.collection != str(manifest["collection_name"])
+                or bundle.manifest.requested_symbols != (symbol,)
+                or bundle.manifest.request_digest
+                != str(manifest["request_digest"])
+                or bundle.manifest.manifest_digest
+                != str(manifest["manifest_digest"])
+                or tuple(
+                    (
+                        page.page.page_ordinal,
+                        page.page.source_observation_id,
+                        page.page.source_type,
+                        page.page.request_url,
+                        page.page.request_page_token,
+                        page.page.next_page_token,
+                        page.page.payload_sha256,
+                    )
+                    for page in bundle.pages
+                )
+                != tuple(
+                    (
+                        int(row[3]),
+                        str(row[5]),
+                        str(row[6]),
+                        str(row[7]),
+                        None if row[8] is None else str(row[8]),
+                        None if row[9] is None else str(row[9]),
+                        str(row[10]),
+                    )
+                    for row in page_rows
+                    if str(row[2]) == purpose
+                )
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit provider manifest reissue conflicts"
+                )
+            issued_facts = tuple(cohort[symbol])
+            stored_fact_rows = tuple(
+                row for row in fact_rows if str(row[3]) == purpose
+            )
+            if len(issued_facts) != len(stored_fact_rows):
+                raise MigrationCorruption(
+                    "Phase 1 exit normalized fact cohort is incomplete"
+                )
+            for fact, fact_row in zip(
+                issued_facts,
+                stored_fact_rows,
+                strict=True,
+            ):
+                fact_stored = dict(
+                    zip(
+                        _PHASE1_EXIT_REVIEW_FACT_COLUMNS,
+                        tuple(fact_row),
+                        strict=True,
+                    )
+                )
+                fact_source = _normalized_market_fact_source(fact)
+                expected_fact_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-exit-fact/v1",
+                            "values": tuple(fact_row[1:-2]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_fact_record = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            column: fact_stored[column]
+                            for column in _PHASE1_EXIT_REVIEW_FACT_COLUMNS[1:-1]
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                core = core_by_page.get(
+                    (
+                        purpose,
+                        int(fact_stored["page_ordinal"]),
+                        str(fact_stored["external_source_observation_id"]),
+                    )
+                )
+                if core is None:
+                    raise MigrationCorruption(
+                        "Phase 1 exit fact page lineage is missing"
+                    )
+                source_row, _payload_row, source_reference, payload_reference = core
+                if (
+                    not is_issued_normalized_market_fact(fact)
+                    or fact_source.fetch_manifest is not bundle.manifest
+                    or str(fact_stored["fact_kind"])
+                    != ("QUOTE" if isinstance(fact, Quote) else "BAR")
+                    or str(fact_stored["symbol"]) != symbol
+                    or str(fact_stored["feed"]).lower() != "sip"
+                    or str(fact_stored["external_source_observation_id"])
+                    != fact_source.source_observation_id
+                    or int(fact_stored["page_ordinal"])
+                    != fact_source.page_ordinal
+                    or int(fact_stored["source_item_ordinal"])
+                    != fact_source.source_item_ordinal
+                    or str(fact_stored["source_item_path"])
+                    != fact_source.source_item_path
+                    or str(fact_stored["payload_sha256"])
+                    != fact_source.page_payload_sha256
+                    or str(fact_stored["normalized_fields_digest"])
+                    != fact_source.normalized_fields_digest
+                    or str(fact_stored["values_json"])
+                    != _canonical_audit_json(_market_fact_payload(fact))
+                    or _parse_canonical_timestamp(str(fact_stored["source_time"]))
+                    != fact.timestamp
+                    or _parse_canonical_timestamp(str(fact_stored["received_at"]))
+                    != _parse_canonical_timestamp(str(source_row[8]))
+                    or fact_stored["provider_sequence"]
+                    != getattr(fact, "sequence", None)
+                    or str(fact_stored["source_digest"])
+                    != expected_fact_source_digest
+                    or str(fact_stored["record_sha256"])
+                    != expected_fact_record
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit normalized fact integrity failed"
+                    )
+                fact_reference = _journal_row_reference(
+                    "phase1_exit_review_facts",
+                    _PHASE1_EXIT_REVIEW_FACT_COLUMNS,
+                    fact_row,
+                )
+                page_reference = next(
+                    reference
+                    for reference in page_references
+                    if reference.row_id
+                    == int(
+                        next(
+                            row[0]
+                            for row in page_rows
+                            if str(row[2]) == purpose
+                            and int(row[3]) == fact_source.page_ordinal
+                        )
+                    )
+                )
+                fact_references.append(fact_reference)
+                descriptors.append(
+                    (
+                        purpose,
+                        fact_row,
+                        fact,
+                        fact_source,
+                        fact_reference,
+                        page_reference,
+                        source_reference,
+                        payload_reference,
+                    )
+                )
+
+        observation_descriptors = tuple(
+            sorted(
+                (
+                    descriptor
+                    for descriptor in descriptors
+                    if descriptor[0] in {"EXECUTION_BAR", "QUOTE"}
+                ),
+                key=lambda item: (
+                    getattr(item[2], "timestamp"),
+                    0 if item[0] == "QUOTE" else 1,
+                    getattr(item[3], "page_ordinal"),
+                    getattr(item[3], "source_item_ordinal"),
+                    getattr(item[3], "source_item_path"),
+                ),
+            )
+        )
+        cohort_ordinals = {
+            str(descriptor[1][1]): ordinal
+            for ordinal, descriptor in enumerate(
+                observation_descriptors,
+                start=1,
+            )
+        }
+
+        def fact_source_from_descriptor(
+            descriptor: tuple[object, ...],
+        ) -> Phase1ExitReviewFactSource:
+            purpose = str(descriptor[0])
+            row = descriptor[1]
+            fact = descriptor[2]
+            provider_source = descriptor[3]
+            assert isinstance(row, Sequence)
+            assert isinstance(fact, (Bar, Quote))
+            fact_id = str(row[1])
+            is_bar = isinstance(fact, Bar)
+            return Phase1ExitReviewFactSource(
+                row_id=int(row[0]),
+                fact_id=fact_id,
+                review_id=str(row[2]),
+                purpose=purpose,
+                fact_ordinal=int(row[4]),
+                source_observation_id=int(row[5]),
+                provider_source_observation_id=str(row[6]),
+                page_ordinal=int(row[7]),
+                source_item_ordinal=int(row[8]),
+                source_item_path=str(row[9]),
+                observation_kind=str(row[10]),
+                symbol=str(row[11]),
+                feed=str(row[12]),
+                source_time=_parse_canonical_timestamp(str(row[13])),
+                received_at=_parse_canonical_timestamp(str(row[14])),
+                provider_sequence=(
+                    None if row[15] is None else int(row[15])
+                ),
+                page_payload_sha256=str(row[16]),
+                normalized_fields_digest=str(row[17]),
+                open_micros=(money_to_micros(fact.open) if is_bar else None),
+                high_micros=(money_to_micros(fact.high) if is_bar else None),
+                low_micros=(money_to_micros(fact.low) if is_bar else None),
+                close_micros=(money_to_micros(fact.close) if is_bar else None),
+                volume=(fact.volume if is_bar else None),
+                bid_micros=(
+                    money_to_micros(fact.bid)
+                    if isinstance(fact, Quote)
+                    else None
+                ),
+                ask_micros=(
+                    money_to_micros(fact.ask)
+                    if isinstance(fact, Quote)
+                    else None
+                ),
+                adjustment=(fact.adjustment if is_bar else None),
+                stream_id=(
+                    f"{review['review_id']}:{purpose}:SIP:{symbol}"
+                ),
+                source_cursor=int(row[0]),
+                source_ordinal=int(row[4]),
+                cohort_ordinal=cohort_ordinals.get(fact_id, int(row[4])),
+                fresh=True,
+                source_digest=str(row[19]),
+                row_references=(
+                    descriptor[4],
+                    descriptor[5],
+                    descriptor[6],
+                    descriptor[7],
+                ),
+            )
+
+        typed_facts = tuple(
+            fact_source_from_descriptor(descriptor)
+            for descriptor in descriptors
+        )
+        typed_by_purpose = {
+            purpose: tuple(
+                fact for fact in typed_facts if fact.purpose == purpose
+            )
+            for purpose in ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+        }
+        observations = tuple(
+            sorted(
+                (
+                    fact
+                    for fact in typed_facts
+                    if fact.purpose in {"EXECUTION_BAR", "QUOTE"}
+                ),
+                key=lambda item: item.cohort_ordinal,
+            )
+        )
+
+        expected_daily_end = (
+            review_session
+            if normalized_cutoff
+            >= datetime.combine(
+                review_session,
+                calendar_resolver.session(review_session).close_time,
+                calendar_resolver.session(review_session).timezone,
+            ).astimezone(timezone.utc)
+            else calendar_resolver.previous_session(review_session)
+        )
+        daily_sessions = tuple(
+            fact.source_time.astimezone(ZoneInfo("America/New_York")).date()
+            for fact in typed_by_purpose["DAILY_BAR"]
+        )
+        expected_daily_sessions = [expected_daily_end]
+        while len(expected_daily_sessions) < 14:
+            expected_daily_sessions.append(
+                calendar_resolver.previous_session(expected_daily_sessions[-1])
+            )
+        expected_daily_sessions.reverse()
+        first_daily_schedule = calendar_resolver.session(
+            expected_daily_sessions[0]
+        )
+        expected_daily_start = datetime.combine(
+            expected_daily_sessions[0],
+            first_daily_schedule.open_time,
+            first_daily_schedule.timezone,
+        ).astimezone(timezone.utc)
+        expected_daily_end_schedule = calendar_resolver.session(
+            expected_daily_end
+        )
+        expected_daily_request_end = datetime.combine(
+            expected_daily_end,
+            expected_daily_end_schedule.close_time,
+            expected_daily_end_schedule.timezone,
+        ).astimezone(timezone.utc)
+        if (
+            daily_sessions != tuple(expected_daily_sessions)
+            or role_windows["DAILY_BAR"]
+            != (expected_daily_start, expected_daily_request_end)
+            or any(
+                role_windows[purpose][1].astimezone(
+                    ZoneInfo("America/New_York")
+                ).date()
+                != review_session
+                for purpose in ("EXECUTION_BAR", "QUOTE")
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit daily-session cohort is inconsistent"
+            )
+        if expected_daily_end == review_session:
+            current_daily = typed_by_purpose["DAILY_BAR"][-1]
+            intraday = typed_by_purpose["EXECUTION_BAR"]
+            if (
+                not intraday
+                or current_daily.open_micros != intraday[0].open_micros
+                or current_daily.high_micros
+                != max(int(item.high_micros) for item in intraday)
+                or current_daily.low_micros
+                != min(int(item.low_micros) for item in intraday)
+                or current_daily.close_micros != intraday[-1].close_micros
+                or current_daily.volume
+                != sum(int(item.volume) for item in intraday)
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit daily/intraday aggregate is inconsistent"
+                )
+
+        recomputed_review_source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-exit-review-source/v1",
+                    "signal_id": signal_id,
+                    "review_id": str(review["review_id"]),
+                    "review_session": review_session.isoformat(),
+                    "calendar_digest": calendar_digest,
+                    "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                    "manifest_records": [str(row[-1]) for row in manifest_rows],
+                    "page_records": [str(row[-1]) for row in page_rows],
+                    "fact_records": [str(row[-1]) for row in fact_rows],
+                    "core_references": [
+                        [reference.table, reference.row_id, reference.row_digest]
+                        for reference in core_references
+                    ],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(review["source_digest"]) != recomputed_review_source_digest
+            or int(review["source_observation_highwater"])
+            != max(reference.row_id for reference in core_references[::2])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit review source digest is inconsistent"
+            )
+
+        signal_source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=normalized_cutoff,
+        )
+        if signal_source.role != "PRIMARY" or signal_source.symbol != symbol:
+            raise InvalidJournalValue(
+                "Phase 1 exit review requires one PRIMARY signal"
+            )
+        evidence_rows = _sql(
+            self._connection,
+            "SELECT review_at FROM phase1_signal_evidence_reviews "
+            "WHERE signal_id = ? COLLATE BINARY AND recorded_at <= ? "
+            "AND substr(review_at, 1, 10) = ? "
+            "ORDER BY review_at DESC, id DESC",
+            (
+                signal_id,
+                _canonical_timestamp(normalized_cutoff),
+                review_session.isoformat(),
+            ),
+        ).fetchall()
+        evidence_references: tuple[JournalRowReference, ...] = ()
+        evidence_source: Phase1SignalEvidenceSource | None = None
+        if evidence_rows:
+            evidence_review_at = _parse_canonical_timestamp(
+                str(evidence_rows[0][0])
+            )
+            evidence_source = self.read_phase1_signal_evidence_source(
+                signal_id,
+                review_at=evidence_review_at,
+                query_cutoff=evidence_review_at,
+                calendar_resolver=calendar_resolver,
+            )
+            evidence_references = evidence_source.row_references
+
+        market_references = (
+            review_reference,
+            *manifest_references,
+            *page_references,
+            *fact_references,
+            *core_references,
+            *signal_source.row_references,
+            *evidence_references,
+        )
+        market_source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-exit-review-market-source/v1",
+            market_references,
+            {
+                "review_id": str(review["review_id"]),
+                "signal_id": signal_id,
+                "review_session": review_session.isoformat(),
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "stored_review_source_digest": recomputed_review_source_digest,
+                "signal_source_digest": signal_source.source_digest,
+                "signal_evidence_source_digest": (
+                    None if evidence_source is None else evidence_source.source_digest
+                ),
+                "provider_manifest_digests": [
+                    str(manifest_by_purpose[purpose]["manifest_digest"])
+                    for purpose in ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+                ],
+                "fact_ids": [fact.fact_id for fact in typed_facts],
+                "fee_schedule_version": _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+                "fee_schedule_digest": _PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+                "fee_micros": _PHASE1_EXIT_FEE_MICROS,
+            },
+        )
+        market_source = Phase1ExitReviewMarketSource(
+            signal_source=signal_source,
+            signal_evidence_source=evidence_source,
+            daily_bar_cohort=daily_cohort,
+            execution_bar_cohort=execution_cohort,
+            quote_cohort=quote_cohort,
+            daily_bar_facts=typed_by_purpose["DAILY_BAR"],
+            execution_bar_facts=typed_by_purpose["EXECUTION_BAR"],
+            quote_facts=typed_by_purpose["QUOTE"],
+            observations=observations,
+            review_id=str(review["review_id"]),
+            signal_id=signal_id,
+            validation_window_id=signal_source.validation_window_id,
+            symbol=symbol,
+            review_session=review_session,
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            expected_manifest_count=int(review["expected_manifest_count"]),
+            expected_fact_count=int(review["expected_fact_count"]),
+            source_observation_highwater=int(review["source_observation_highwater"]),
+            fee_schedule_version=_PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+            fee_schedule_digest=_PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+            fee_micros=_PHASE1_EXIT_FEE_MICROS,
+            row_references=tuple(market_references),
+            source_digest=market_source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES,
+            market_source,
+            self,
+        )
+        if market_read_cache is not None:
+            market_read_cache[market_cache_key] = market_source
+        if market_only:
+            return market_source
+
+        replay_source = self._read_phase1_canonical_replay_source(
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        matching_signals = tuple(
+            source
+            for source in replay_source.signal_sources
+            if source.signal_id == signal_id
+        )
+        if len(matching_signals) != 1 or matching_signals[0] != signal_source:
+            raise MigrationCorruption(
+                "Phase 1 exit replay signal lineage is incomplete"
+            )
+        replay = _issue_canonical_ledger_replay_from_phase1_source(replay_source)
+        positions = tuple(
+            position
+            for position in replay.ledger_pair.canonical.open_positions
+            if position.signal_id == signal_id
+        )
+        if len(positions) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 exit review requires one open PRIMARY position"
+            )
+        projected = positions[0]
+        position_evidence: object | None = None
+        if evidence_source is not None:
+            signal_evidence = _issue_phase1_signal_evidence_authority_from_source(
+                evidence_source,
+                calendar_resolver=calendar_resolver,
+            )
+            entered_session = projected.lots[0].at.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            position = Position(
+                signal_id=signal_id,
+                symbol=symbol,
+                entry=projected.entry,
+                shares=projected.shares,
+                initial_stop=money_from_micros(
+                    signal_source.recommended_stop_micros
+                ),
+                recommended_stop=projected.recommended_stop,
+                user_confirmed_stop=None,
+                target=projected.target,
+                tick_size=projected.tick_size,
+                entered_session=entered_session,
+                ledger_name="CANONICAL",
+                profit_target_taken=projected.profit_target_taken,
+            )
+            position_evidence = _issue_phase1_position_evidence_authority(
+                signal_evidence,
+                position=position,
+            )
+
+        references = (
+            *market_source.row_references,
+            *replay_source.row_references,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-exit-review-authority-source/v1",
+            references,
+            {
+                "review_id": str(review["review_id"]),
+                "signal_id": signal_id,
+                "review_session": review_session.isoformat(),
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "stored_review_source_digest": recomputed_review_source_digest,
+                "market_source_digest": market_source.source_digest,
+                "signal_source_digest": signal_source.source_digest,
+                "canonical_replay_source_digest": replay_source.source_digest,
+                "position_evidence_source_digest": (
+                    None
+                    if position_evidence is None
+                    else position_evidence.source_digest
+                ),
+                "provider_manifest_digests": [
+                    str(manifest_by_purpose[purpose]["manifest_digest"])
+                    for purpose in ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+                ],
+                "fact_ids": [fact.fact_id for fact in typed_facts],
+                "fee_schedule_version": _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+                "fee_schedule_digest": _PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+                "fee_micros": _PHASE1_EXIT_FEE_MICROS,
+            },
+        )
+        source = Phase1ExitReviewSource(
+            market_source=market_source,
+            signal_source=signal_source,
+            canonical_replay_source=replay_source,
+            position_evidence=position_evidence,
+            daily_bar_cohort=daily_cohort,
+            execution_bar_cohort=execution_cohort,
+            quote_cohort=quote_cohort,
+            daily_bar_facts=typed_by_purpose["DAILY_BAR"],
+            execution_bar_facts=typed_by_purpose["EXECUTION_BAR"],
+            quote_facts=typed_by_purpose["QUOTE"],
+            observations=observations,
+            review_id=str(review["review_id"]),
+            signal_id=signal_id,
+            validation_window_id=signal_source.validation_window_id,
+            symbol=symbol,
+            review_session=review_session,
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            expected_manifest_count=int(review["expected_manifest_count"]),
+            expected_fact_count=int(review["expected_fact_count"]),
+            source_observation_highwater=int(
+                review["source_observation_highwater"]
+            ),
+            fee_schedule_version=_PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+            fee_schedule_digest=_PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+            fee_micros=_PHASE1_EXIT_FEE_MICROS,
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def _read_phase1_equity_mark_source(
+        self,
+        *,
+        ledger_name: str,
+        session_date: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+        current_query_cutoff: datetime | None = None,
+    ) -> Phase1EquityMarkSource:
+        """Reissue one exact replay-bound provider mark source."""
+        from .ledger import _issue_canonical_ledger_replay_from_phase1_source
+        from .providers.alpaca import (
+            Bar,
+            Quote,
+            _market_fact_payload,
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            provider_fetch_cohorts_share_owner,
+            read_provider_fetch_bundle,
+        )
+        from .reconciliation import UnavailableSignalPlanResolver, replay_actual
+        from .risk import (
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+            _phase1_actual_strategy_positions_from_verified_replay,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 equity mark source requires a post-commit read"
+            )
+        if ledger_name not in {"CANONICAL", "ACTUAL"}:
+            raise InvalidJournalValue("Phase 1 equity ledger is invalid")
+        if type(session_date) is not date:
+            raise InvalidJournalValue("Phase 1 equity session must be a date")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        normalized_current_cutoff = (
+            normalized_cutoff
+            if current_query_cutoff is None
+            else _parse_canonical_timestamp(
+                _canonical_timestamp(current_query_cutoff)
+            )
+        )
+        if normalized_current_cutoff < normalized_cutoff:
+            raise InvalidJournalValue(
+                "Phase 1 equity current cutoff precedes its source cutoff"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        if not calendar_resolver.is_open(session_date):
+            raise InvalidJournalValue("Phase 1 equity session is not open")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        schedule = calendar_resolver.session(session_date)
+        point_at = datetime.combine(
+            session_date,
+            schedule.close_time,
+            schedule.timezone,
+        ).astimezone(timezone.utc)
+        if normalized_cutoff < point_at:
+            raise InvalidJournalValue(
+                "Phase 1 equity mark cutoff precedes session close"
+            )
+
+        canonical_source = self._read_phase1_canonical_replay_source(
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        canonical_replay = _issue_canonical_ledger_replay_from_phase1_source(
+            canonical_source
+        )
+        with self.transaction() as transaction:
+            actual_source = transaction._read_phase1_actual_economic_replay(
+                query_cutoff=normalized_cutoff,
+            )
+        actual_replay = replay_actual(
+            actual_source,
+            plans=UnavailableSignalPlanResolver(),
+            calendar=calendar_resolver,
+            policy=policy,
+        )
+        canonical_positions = tuple(
+            canonical_replay.ledger_pair.canonical.open_positions
+        )
+        actual_positions = _phase1_actual_strategy_positions_from_verified_replay(
+            actual_source,
+            actual_replay,
+        )
+        canonical_symbols = tuple(
+            sorted({position.symbol for position in canonical_positions})
+        )
+        actual_symbols = tuple(
+            sorted({position.symbol for position in actual_positions})
+        )
+        union_symbols = tuple(sorted(set(canonical_symbols) | set(actual_symbols)))
+        ledger_positions = (
+            canonical_positions if ledger_name == "CANONICAL" else actual_positions
+        )
+        ledger_symbols = (
+            canonical_symbols if ledger_name == "CANONICAL" else actual_symbols
+        )
+
+        replay_references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    *canonical_source.row_references,
+                    *actual_source.row_references,
+                )
+            }.values()
+        )
+        if not union_symbols:
+            set_row = _sql(
+                self._connection,
+                "SELECT 1 FROM phase1_equity_mark_sets WHERE session_date = ?",
+                (session_date.isoformat(),),
+            ).fetchone()
+            if set_row is not None:
+                raise MigrationCorruption(
+                    "Phase 1 idle equity session has unexpected provider marks"
+                )
+            source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-equity-authority-source/v1",
+                replay_references,
+                {
+                    "validation_window_id": canonical_source.validation_window_id,
+                    "ledger_name": ledger_name,
+                    "session_date": session_date.isoformat(),
+                    "point_at": _canonical_timestamp(point_at),
+                    "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                    "calendar_digest": calendar_digest,
+                    "canonical_replay_source_digest": canonical_source.source_digest,
+                    "actual_replay_source_digest": actual_source.source_digest,
+                    "mark_set_id": None,
+                    "mark_source_highwater": 0,
+                },
+            )
+            source = Phase1EquityMarkSource(
+                validation_window_id=canonical_source.validation_window_id,
+                ledger_name=ledger_name,
+                session_date=session_date,
+                point_at=point_at,
+                query_cutoff=normalized_cutoff,
+                calendar_digest=calendar_digest,
+                canonical_replay_source=canonical_source,
+                canonical_replay=canonical_replay,
+                actual_replay_source=actual_source,
+                actual_replay=actual_replay,
+                position_marks=(),
+                expected_position_count=0,
+                expected_mark_count=0,
+                mark_terminal_cursor=None,
+                mark_source_highwater=0,
+                row_references=replay_references,
+                source_digest=source_digest,
+            )
+            _register_journal_source_authority(
+                _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
+            return source
+
+        set_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_SET_COLUMNS)
+            + " FROM phase1_equity_mark_sets WHERE session_date = ?",
+            (session_date.isoformat(),),
+        ).fetchone()
+        if set_row is None:
+            raise InvalidJournalValue(
+                "Phase 1 equity provider mark set is missing"
+            )
+        mark_set = dict(
+            zip(_PHASE1_EQUITY_MARK_SET_COLUMNS, tuple(set_row), strict=True)
+        )
+        stored_provider_cutoff = _parse_canonical_timestamp(
+            str(mark_set["query_cutoff"])
+        )
+        expected_set_record = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    column: mark_set[column]
+                    for column in _PHASE1_EQUITY_MARK_SET_COLUMNS[1:-1]
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            requested_symbols = tuple(
+                json.loads(str(mark_set["requested_symbols_json"]))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise MigrationCorruption(
+                "Phase 1 equity requested symbols are malformed"
+            ) from None
+        if (
+            stored_provider_cutoff > normalized_cutoff
+            or str(mark_set["calendar_digest"]) != calendar_digest
+            or requested_symbols != union_symbols
+            or int(mark_set["expected_manifest_count"]) != 2
+            or int(mark_set["expected_fact_count"]) <= 0
+            or str(mark_set["record_sha256"]) != expected_set_record
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 equity provider set conflicts with replay or cutoff"
+            )
+        mark_set_id = str(mark_set["mark_set_id"])
+        invalidation_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS)
+            + " FROM phase1_equity_mark_invalidations "
+            "WHERE mark_set_id = ? COLLATE BINARY AND invalidated_at <= ? "
+            "ORDER BY invalidated_at, id",
+            (mark_set_id, _canonical_timestamp(normalized_current_cutoff)),
+        ).fetchall()
+        for invalidation_row in invalidation_rows:
+            invalidation = dict(
+                zip(
+                    _PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS,
+                    tuple(invalidation_row),
+                    strict=True,
+                )
+            )
+            expected_invalidation_record = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        column: invalidation[column]
+                        for column in _PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS[1:-1]
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            invalidation_pages = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(
+                    _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS
+                )
+                + " FROM phase1_equity_mark_invalidation_pages "
+                "WHERE invalidation_id = ? COLLATE BINARY "
+                "ORDER BY CASE purpose WHEN 'QUOTE' THEN 1 ELSE 2 END, "
+                "page_ordinal, id",
+                (str(invalidation["invalidation_id"]),),
+            ).fetchall()
+            if (
+                str(invalidation["session_date"]) != session_date.isoformat()
+                or _parse_canonical_timestamp(str(invalidation["received_through"]))
+                > _parse_canonical_timestamp(str(invalidation["invalidated_at"]))
+                or len(invalidation_pages)
+                != int(invalidation["expected_page_count"])
+                or str(invalidation["record_sha256"])
+                != expected_invalidation_record
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 equity invalidation integrity failed"
+                )
+            invalidation_core_references: list[JournalRowReference] = []
+            page_record_digests: list[str] = []
+            for page_row in invalidation_pages:
+                page = dict(
+                    zip(
+                        _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS,
+                        tuple(page_row),
+                        strict=True,
+                    )
+                )
+                expected_page_source = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": (
+                                "stock-monitor/phase1-equity-"
+                                "invalidation-page/v1"
+                            ),
+                            "values": tuple(page_row[1:-2]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_page_record = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            column: page[column]
+                            for column in _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS[
+                                1:-1
+                            ]
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=int(page["source_observation_id"])
+                )
+                retrieved_at = _parse_canonical_timestamp(str(source_row[8]))
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=bytes(payload_row[3]),
+                    request_url=str(page["request_url"]),
+                    source_type=str(page["source_type"]),
+                    retrieved_at=retrieved_at,
+                )
+                details = _canonical_stored_details(
+                    source_row[12],
+                    label="Phase 1 equity invalidation source",
+                )
+                if (
+                    str(page["source_digest"]) != expected_page_source
+                    or str(page["record_sha256"]) != expected_page_record
+                    or str(source_row[2]) != str(page["payload_sha256"])
+                    or str(source_row[3]) != str(page["request_url"])
+                    or details
+                    != {
+                        "source_observation_id": str(
+                            page["external_source_observation_id"]
+                        )
+                    }
+                    or str(getattr(metadata, "source_observation_id"))
+                    != str(page["external_source_observation_id"])
+                    or str(getattr(metadata, "payload_sha256"))
+                    != str(page["payload_sha256"])
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 equity invalidation page integrity failed"
+                    )
+                invalidation_core_references.extend(
+                    (
+                        _journal_row_reference(
+                            "source_observations",
+                            _SOURCE_OBSERVATION_COLUMNS,
+                            source_row,
+                        ),
+                        _journal_row_reference(
+                            "phase1_source_payloads",
+                            _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                            payload_row,
+                        ),
+                    )
+                )
+                page_record_digests.append(str(page["record_sha256"]))
+            set_reference_for_invalidation = _journal_row_reference(
+                "phase1_equity_mark_sets",
+                _PHASE1_EQUITY_MARK_SET_COLUMNS,
+                set_row,
+            )
+            semantic_values = json.loads(
+                str(invalidation["semantic_manifest_digests_json"])
+            )
+            expected_invalidation_source = _journal_bundle_digest(
+                "stock-monitor/phase1-equity-mark-invalidation-source/v1",
+                (set_reference_for_invalidation, *invalidation_core_references),
+                {
+                    "invalidation_id": str(invalidation["invalidation_id"]),
+                    "mark_set_id": mark_set_id,
+                    "semantic_manifest_digests": semantic_values,
+                    "page_records": page_record_digests,
+                    "received_through": str(invalidation["received_through"]),
+                    "invalidated_at": str(invalidation["invalidated_at"]),
+                },
+            )
+            if str(invalidation["source_digest"]) != expected_invalidation_source:
+                raise MigrationCorruption(
+                    "Phase 1 equity invalidation source digest failed"
+                )
+        if invalidation_rows:
+            raise InvalidJournalValue("PHASE1_EQUITY_MARK_LATE_EVIDENCE")
+        role_order = "CASE purpose WHEN 'QUOTE' THEN 1 ELSE 2 END"
+        manifest_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_MANIFEST_COLUMNS)
+            + " FROM phase1_equity_mark_manifests WHERE mark_set_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order}, id",
+            (mark_set_id,),
+        ).fetchall()
+        page_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_PAGE_COLUMNS)
+            + " FROM phase1_equity_mark_pages WHERE mark_set_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order}, page_ordinal, id",
+            (mark_set_id,),
+        ).fetchall()
+        fact_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_FACT_COLUMNS)
+            + " FROM phase1_equity_mark_facts WHERE mark_set_id = ? "
+            f"COLLATE BINARY ORDER BY {role_order}, fact_ordinal, id",
+            (mark_set_id,),
+        ).fetchall()
+        if (
+            tuple(str(row[2]) for row in manifest_rows)
+            != ("QUOTE", "DAILY_BAR")
+            or len(fact_rows) != int(mark_set["expected_fact_count"])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 equity provider child manifest is incomplete"
+            )
+
+        set_reference = _journal_row_reference(
+            "phase1_equity_mark_sets",
+            _PHASE1_EQUITY_MARK_SET_COLUMNS,
+            set_row,
+        )
+        manifest_references: list[JournalRowReference] = []
+        page_references: list[JournalRowReference] = []
+        fact_references: list[JournalRowReference] = []
+        core_references: list[JournalRowReference] = []
+        role_pages: dict[str, tuple[tuple[str, bytes, datetime], ...]] = {}
+        role_windows: dict[str, tuple[datetime, datetime]] = {}
+        manifest_by_purpose: dict[str, dict[str, object]] = {}
+        core_by_page: dict[
+            tuple[str, int, str],
+            tuple[tuple[object, ...], tuple[object, ...], JournalRowReference, JournalRowReference],
+        ] = {}
+        for manifest_row in manifest_rows:
+            manifest = dict(
+                zip(
+                    _PHASE1_EQUITY_MARK_MANIFEST_COLUMNS,
+                    tuple(manifest_row),
+                    strict=True,
+                )
+            )
+            purpose = str(manifest["purpose"])
+            purpose_pages = tuple(row for row in page_rows if str(row[2]) == purpose)
+            purpose_facts = tuple(row for row in fact_rows if str(row[3]) == purpose)
+            expected_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-equity-manifest/v1",
+                        "values": tuple(manifest_row[1:-2]),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_manifest_record = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        column: manifest[column]
+                        for column in _PHASE1_EQUITY_MARK_MANIFEST_COLUMNS[1:-1]
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                str(manifest["mark_set_id"]) != mark_set_id
+                or tuple(json.loads(str(manifest["requested_symbols_json"])))
+                != union_symbols
+                or int(manifest["terminal"]) != 1
+                or len(purpose_pages) != int(manifest["expected_page_count"])
+                or len(purpose_facts) != int(manifest["expected_fact_count"])
+                or tuple(int(row[3]) for row in purpose_pages)
+                != tuple(range(1, len(purpose_pages) + 1))
+                or tuple(int(row[4]) for row in purpose_facts)
+                != tuple(range(1, len(purpose_facts) + 1))
+                or str(manifest["source_digest"]) != expected_manifest_digest
+                or str(manifest["record_sha256"]) != expected_manifest_record
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 equity provider manifest integrity failed"
+                )
+            request_start = _parse_canonical_timestamp(str(manifest["request_start"]))
+            request_end = _parse_canonical_timestamp(str(manifest["request_end"]))
+            role_windows[purpose] = (request_start, request_end)
+            manifest_by_purpose[purpose] = manifest
+            manifest_references.append(
+                _journal_row_reference(
+                    "phase1_equity_mark_manifests",
+                    _PHASE1_EQUITY_MARK_MANIFEST_COLUMNS,
+                    manifest_row,
+                )
+            )
+            stored_pages: list[tuple[str, bytes, datetime]] = []
+            prior_next_token: str | None = None
+            for ordinal, page_row in enumerate(purpose_pages, start=1):
+                page = dict(
+                    zip(
+                        _PHASE1_EQUITY_MARK_PAGE_COLUMNS,
+                        tuple(page_row),
+                        strict=True,
+                    )
+                )
+                expected_page_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-equity-page/v1",
+                            "values": tuple(page_row[1:-2]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_page_record = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            column: page[column]
+                            for column in _PHASE1_EQUITY_MARK_PAGE_COLUMNS[1:-1]
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                if (
+                    int(page["page_ordinal"]) != ordinal
+                    or page["request_page_token"] != prior_next_token
+                    or str(page["source_digest"]) != expected_page_digest
+                    or str(page["record_sha256"]) != expected_page_record
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 equity provider page manifest is malformed"
+                    )
+                prior_next_token = (
+                    None
+                    if page["next_page_token"] is None
+                    else str(page["next_page_token"])
+                )
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=int(page["source_observation_id"])
+                )
+                source_reference = _journal_row_reference(
+                    "source_observations", _SOURCE_OBSERVATION_COLUMNS, source_row
+                )
+                payload_reference = _journal_row_reference(
+                    "phase1_source_payloads", _PHASE1_SOURCE_PAYLOAD_COLUMNS, payload_row
+                )
+                payload = bytes(payload_row[3])
+                retrieved_at = _parse_canonical_timestamp(str(source_row[8]))
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=payload,
+                    request_url=str(page["request_url"]),
+                    source_type=str(page["source_type"]),
+                    retrieved_at=retrieved_at,
+                )
+                external_id = str(page["external_source_observation_id"])
+                details = _canonical_stored_details(
+                    source_row[12], label="Phase 1 equity provider source"
+                )
+                if (
+                    int(source_row[0]) != int(page["source_observation_id"])
+                    or details != {"source_observation_id": external_id}
+                    or str(source_row[2]) != str(page["payload_sha256"])
+                    or str(source_row[3]) != str(page["request_url"])
+                    or str(source_row[4]) != str(page["source_type"])
+                    or str(source_row[5]).lower() != "alpaca"
+                    or str(source_row[6]).lower() != "sip"
+                    or source_row[9] is not None
+                    or str(source_row[11]) != "OK"
+                    or str(getattr(metadata, "source_observation_id")) != external_id
+                    or getattr(metadata, "source_time")
+                    != _parse_canonical_timestamp(str(source_row[7]))
+                    or getattr(metadata, "retrieved_at") != retrieved_at
+                    or int(getattr(metadata, "delay_seconds")) != int(source_row[10])
+                    or str(getattr(metadata, "payload_sha256"))
+                    != str(page["payload_sha256"])
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 equity provider raw-page integrity failed"
+                    )
+                page_reference = _journal_row_reference(
+                    "phase1_equity_mark_pages",
+                    _PHASE1_EQUITY_MARK_PAGE_COLUMNS,
+                    page_row,
+                )
+                page_references.append(page_reference)
+                core_references.extend((source_reference, payload_reference))
+                core_by_page[(purpose, ordinal, external_id)] = (
+                    tuple(source_row),
+                    tuple(payload_row),
+                    source_reference,
+                    payload_reference,
+                )
+                stored_pages.append((str(page["request_url"]), payload, retrieved_at))
+            if (
+                prior_next_token is not None
+                or not stored_pages
+                or max(value[2] for value in stored_pages) < point_at
+                or _parse_canonical_timestamp(str(manifest["received_through"]))
+                != max(value[2] for value in stored_pages)
+                or request_end != point_at
+                or (purpose == "QUOTE" and request_start != datetime.combine(
+                    session_date, schedule.open_time, schedule.timezone
+                ).astimezone(timezone.utc))
+                or (purpose == "DAILY_BAR" and request_start > datetime.combine(
+                    session_date, schedule.open_time, schedule.timezone
+                ).astimezone(timezone.utc))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 equity provider role is not a completed session"
+                )
+            expected_semantic_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-equity-semantic-manifest/v1",
+                        "purpose": purpose,
+                        "collection": str(manifest["collection_name"]),
+                        "requested_symbols": list(union_symbols),
+                        "request_start": _canonical_timestamp(request_start),
+                        "request_end": _canonical_timestamp(request_end),
+                        "pages": [
+                            {
+                                "page_ordinal": int(row[3]),
+                                "source_type": str(row[6]),
+                                "request_url": str(row[7]),
+                                "request_page_token": row[8],
+                                "next_page_token": row[9],
+                                "payload_sha256": str(row[10]),
+                            }
+                            for row in purpose_pages
+                        ],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if str(manifest["semantic_manifest_digest"]) != expected_semantic_digest:
+                raise MigrationCorruption(
+                    "Phase 1 equity semantic manifest integrity failed"
+                )
+            role_pages[purpose] = tuple(stored_pages)
+
+        replay_roles = ("QUOTE", "DAILY_BAR")
+        replay_references = (
+            set_reference,
+            *manifest_references,
+            *page_references,
+            *core_references,
+        )
+        replay_source = _Phase1EquityProviderReplaySource(
+            symbols=union_symbols,
+            role_pages=tuple(
+                (purpose, role_pages[purpose]) for purpose in replay_roles
+            ),
+            role_windows=tuple(
+                (purpose, *role_windows[purpose]) for purpose in replay_roles
+            ),
+            row_references=replay_references,
+            source_digest=_journal_bundle_digest(
+                "stock-monitor/phase1-equity-provider-replay-source/v1",
+                replay_references,
+                {
+                    "symbols": list(union_symbols),
+                    "roles": [
+                        {
+                            "purpose": purpose,
+                            "request_start": _canonical_timestamp(
+                                role_windows[purpose][0]
+                            ),
+                            "request_end": _canonical_timestamp(
+                                role_windows[purpose][1]
+                            ),
+                            "pages": [
+                                {
+                                    "request_url": url,
+                                    "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                                    "retrieved_at": _canonical_timestamp(retrieved_at),
+                                }
+                                for url, payload, retrieved_at in role_pages[purpose]
+                            ],
+                        }
+                        for purpose in replay_roles
+                    ],
+                },
+            ),
+        )
+        _register_journal_source_authority(
+            _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
+            replay_source,
+            self,
+        )
+        quote_cohort, daily_cohort = _phase1_reissue_equity_provider_cohorts(
+            replay_source
+        )
+        if not provider_fetch_cohorts_share_owner(quote_cohort, daily_cohort):
+            raise MigrationCorruption(
+                "Phase 1 equity provider cohorts lost common ownership"
+            )
+        reissued_by_purpose = {
+            "QUOTE": quote_cohort,
+            "DAILY_BAR": daily_cohort,
+        }
+        fact_sources_by_purpose_symbol: dict[
+            tuple[str, str], list[Phase1EquityMarkFactSource]
+        ] = {}
+        facts_by_purpose_symbol: dict[tuple[str, str], list[object]] = {}
+        for purpose in ("QUOTE", "DAILY_BAR"):
+            cohort = reissued_by_purpose[purpose]
+            bundle = read_provider_fetch_bundle(cohort)
+            manifest = manifest_by_purpose[purpose]
+            if bundle.manifest.manifest_digest != str(manifest["manifest_digest"]):
+                raise MigrationCorruption(
+                    "Phase 1 equity provider manifest replay conflicts"
+                )
+            retained = tuple(row for row in fact_rows if str(row[3]) == purpose)
+            actual_facts = tuple(
+                fact for symbol in union_symbols for fact in tuple(cohort[symbol])
+            )
+            if len(retained) != len(actual_facts):
+                raise MigrationCorruption(
+                    "Phase 1 equity provider fact replay is incomplete"
+                )
+            for row, fact in zip(retained, actual_facts, strict=True):
+                stored = dict(
+                    zip(_PHASE1_EQUITY_MARK_FACT_COLUMNS, tuple(row), strict=True)
+                )
+                if not is_issued_normalized_market_fact(fact):
+                    raise MigrationCorruption(
+                        "Phase 1 equity provider fact authority was not reissued"
+                    )
+                provider_source = _normalized_market_fact_source(fact)
+                expected_fact_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-equity-fact/v1",
+                            "values": tuple(row[1:-2]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_fact_record = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            column: stored[column]
+                            for column in _PHASE1_EQUITY_MARK_FACT_COLUMNS[1:-1]
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_type = Quote if purpose == "QUOTE" else Bar
+                if (
+                    not isinstance(fact, expected_type)
+                    or str(stored["provider_source_observation_id"] if "provider_source_observation_id" in stored else stored["external_source_observation_id"])
+                    != provider_source.source_observation_id
+                    or int(stored["page_ordinal"]) != provider_source.page_ordinal
+                    or int(stored["source_item_ordinal"])
+                    != provider_source.source_item_ordinal
+                    or str(stored["source_item_path"])
+                    != provider_source.source_item_path
+                    or str(stored["symbol"]) != fact.symbol
+                    or str(stored["values_json"])
+                    != _canonical_audit_json(_market_fact_payload(fact))
+                    or str(stored["normalized_fields_digest"])
+                    != provider_source.normalized_fields_digest
+                    or str(stored["source_digest"]) != expected_fact_digest
+                    or str(stored["record_sha256"]) != expected_fact_record
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 equity normalized fact integrity failed"
+                    )
+                fact_reference = _journal_row_reference(
+                    "phase1_equity_mark_facts",
+                    _PHASE1_EQUITY_MARK_FACT_COLUMNS,
+                    row,
+                )
+                fact_references.append(fact_reference)
+                page_key = (
+                    purpose,
+                    provider_source.page_ordinal,
+                    provider_source.source_observation_id,
+                )
+                page_lineage = core_by_page.get(page_key)
+                if page_lineage is None:
+                    raise MigrationCorruption(
+                        "Phase 1 equity fact page lineage is missing"
+                    )
+                descriptor = Phase1EquityMarkFactSource(
+                    row_id=int(stored["id"]),
+                    fact_id=str(stored["fact_id"]),
+                    mark_set_id=mark_set_id,
+                    purpose=purpose,
+                    fact_ordinal=int(stored["fact_ordinal"]),
+                    source_observation_id=int(stored["source_observation_id"]),
+                    provider_source_observation_id=str(stored["external_source_observation_id"]),
+                    page_ordinal=int(stored["page_ordinal"]),
+                    source_item_ordinal=int(stored["source_item_ordinal"]),
+                    source_item_path=str(stored["source_item_path"]),
+                    observation_kind=str(stored["fact_kind"]),
+                    symbol=str(stored["symbol"]),
+                    feed=str(stored["feed"]),
+                    source_time=_parse_canonical_timestamp(str(stored["source_time"])),
+                    received_at=_parse_canonical_timestamp(str(stored["received_at"])),
+                    provider_sequence=(
+                        None if stored["provider_sequence"] is None else int(stored["provider_sequence"])
+                    ),
+                    page_payload_sha256=str(stored["payload_sha256"]),
+                    normalized_fields_digest=str(stored["normalized_fields_digest"]),
+                    source_digest=str(stored["source_digest"]),
+                    row_references=(fact_reference, page_lineage[2], page_lineage[3]),
+                )
+                key = (purpose, fact.symbol)
+                fact_sources_by_purpose_symbol.setdefault(key, []).append(descriptor)
+                facts_by_purpose_symbol.setdefault(key, []).append(fact)
+
+        all_provider_references = (
+            set_reference,
+            *manifest_references,
+            *page_references,
+            *fact_references,
+            *core_references,
+        )
+        expected_set_source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-equity-mark-source/v1",
+                    "mark_set_id": mark_set_id,
+                    "session_date": session_date.isoformat(),
+                    "calendar_digest": calendar_digest,
+                    "manifest_records": [str(row[-1]) for row in manifest_rows],
+                    "page_records": [str(row[-1]) for row in page_rows],
+                    "fact_records": [str(row[-1]) for row in fact_rows],
+                    "core_references": [
+                        [reference.table, reference.row_id, reference.row_digest]
+                        for reference in core_references
+                    ],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(mark_set["source_digest"]) != expected_set_source_digest
+            or int(mark_set["source_observation_highwater"])
+            != max(reference.row_id for reference in core_references if reference.table == "source_observations")
+        ):
+            raise MigrationCorruption(
+                "Phase 1 equity provider set digest is inconsistent"
+            )
+
+        role_highwaters = {
+            purpose: max(
+                (int(row[0]) for row in fact_rows if str(row[3]) == purpose),
+                default=0,
+            )
+            for purpose in ("QUOTE", "DAILY_BAR")
+        }
+        position_marks: list[Phase1EquityPositionMarkSource] = []
+        session_open = datetime.combine(
+            session_date, schedule.open_time, schedule.timezone
+        ).astimezone(timezone.utc)
+        for ordinal, symbol in enumerate(ledger_symbols, start=1):
+            quote_facts = tuple(facts_by_purpose_symbol.get(("QUOTE", symbol), ()))
+            daily_facts = tuple(facts_by_purpose_symbol.get(("DAILY_BAR", symbol), ()))
+            quote_descriptors = tuple(
+                fact_sources_by_purpose_symbol.get(("QUOTE", symbol), ())
+            )
+            daily_descriptors = tuple(
+                fact_sources_by_purpose_symbol.get(("DAILY_BAR", symbol), ())
+            )
+            current_daily = tuple(
+                fact
+                for fact in daily_facts
+                if fact.timestamp.astimezone(schedule.timezone).date() == session_date
+            )
+            usable_quotes = tuple(
+                fact
+                for fact in quote_facts
+                if session_open <= fact.timestamp <= point_at
+                and 0 <= (point_at - fact.timestamp).total_seconds() <= 60
+                and fact.bid > 0
+                and fact.ask >= fact.bid
+            )
+            selected_quote = (
+                max(
+                    usable_quotes,
+                    key=lambda item: (
+                        item.timestamp,
+                        -1 if item.sequence is None else item.sequence,
+                    ),
+                )
+                if usable_quotes
+                else None
+            )
+            if len(current_daily) != 1:
+                raise MigrationCorruption(
+                    "Phase 1 equity current daily mark is incomplete"
+                )
+            if selected_quote is not None:
+                selected = selected_quote
+                method = "CONSOLIDATED_BID"
+                mark_at = selected.timestamp
+                derived_price_micros = money_to_micros(selected.bid)
+                selected_descriptors = quote_descriptors
+            else:
+                selected = current_daily[0]
+                method = "CLOSE_MINUS_0.10_PERCENT"
+                mark_at = point_at
+                derived_price_micros = money_to_micros(selected.close) * 999 // 1000
+                selected_descriptors = daily_descriptors
+            selected_provider_source = _normalized_market_fact_source(selected)
+            matching_descriptors = tuple(
+                descriptor
+                for descriptor in selected_descriptors
+                if descriptor.provider_source_observation_id
+                == selected_provider_source.source_observation_id
+                and descriptor.source_item_path
+                == selected_provider_source.source_item_path
+            )
+            if len(matching_descriptors) != 1:
+                raise MigrationCorruption(
+                    "Phase 1 equity selected fact lineage is ambiguous"
+                )
+            selected_descriptor = matching_descriptors[0]
+            mark_references = tuple(
+                {
+                    (reference.table, reference.row_id): reference
+                    for descriptor in (*quote_descriptors, *daily_descriptors)
+                    for reference in descriptor.row_references
+                }.values()
+            )
+            mark_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-equity-position-mark-source/v1",
+                mark_references,
+                {
+                    "symbol": symbol,
+                    "method": method,
+                    "derived_price_micros": derived_price_micros,
+                    "mark_at": _canonical_timestamp(mark_at),
+                    "mark_ordinal": ordinal,
+                    "source_cursor": selected_descriptor.row_id,
+                    "quote_manifest_digest": manifest_by_purpose["QUOTE"]["manifest_digest"],
+                    "daily_manifest_digest": manifest_by_purpose["DAILY_BAR"]["manifest_digest"],
+                },
+            )
+            position_marks.append(
+                Phase1EquityPositionMarkSource(
+                    symbol=symbol,
+                    method=method,
+                    quote_cohort=quote_cohort,
+                    daily_bar_cohort=daily_cohort,
+                    quote_facts=quote_facts,
+                    daily_bar_facts=daily_facts,
+                    selected_observation=selected,
+                    selected_provider_fact_source=selected_provider_source,
+                    quote_fact_sources=quote_descriptors,
+                    daily_bar_fact_sources=daily_descriptors,
+                    derived_price_micros=derived_price_micros,
+                    mark_at=mark_at,
+                    mark_ordinal=ordinal,
+                    source_cursor=selected_descriptor.row_id,
+                    quote_terminal_cursor=(
+                        None if not quote_descriptors else quote_descriptors[-1].row_id
+                    ),
+                    quote_source_highwater=role_highwaters["QUOTE"],
+                    daily_bar_terminal_cursor=daily_descriptors[-1].row_id,
+                    daily_bar_source_highwater=role_highwaters["DAILY_BAR"],
+                    expected_quote_fact_count=len(quote_facts),
+                    expected_daily_bar_fact_count=len(daily_facts),
+                    row_references=mark_references,
+                    source_digest=mark_digest,
+                )
+            )
+
+        references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    *all_provider_references,
+                    *replay_references,
+                )
+            }.values()
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-equity-authority-source/v1",
+            references,
+            {
+                "validation_window_id": canonical_source.validation_window_id,
+                "ledger_name": ledger_name,
+                "session_date": session_date.isoformat(),
+                "point_at": _canonical_timestamp(point_at),
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "calendar_digest": calendar_digest,
+                "canonical_replay_source_digest": canonical_source.source_digest,
+                "actual_replay_source_digest": actual_source.source_digest,
+                "mark_set_id": mark_set_id,
+                "mark_source_digests": [mark.source_digest for mark in position_marks],
+            },
+        )
+        source = Phase1EquityMarkSource(
+            validation_window_id=canonical_source.validation_window_id,
+            ledger_name=ledger_name,
+            session_date=session_date,
+            point_at=point_at,
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            canonical_replay_source=canonical_source,
+            canonical_replay=canonical_replay,
+            actual_replay_source=actual_source,
+            actual_replay=actual_replay,
+            position_marks=tuple(position_marks),
+            expected_position_count=len(ledger_positions),
+            expected_mark_count=len(ledger_symbols),
+            mark_terminal_cursor=(
+                None if not position_marks else position_marks[-1].source_cursor
+            ),
+            mark_source_highwater=max(role_highwaters.values()),
+            row_references=references,
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def _record_phase1_session_mark_public(
+        self,
+        *,
+        canonical_authority: object,
+        actual_authority: object,
+        recorded_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1SessionMark:
+        """Validate and atomically append one canonical/actual point pair."""
+        from .risk import (
+            Phase1EquityPointAuthority,
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+            _phase1_bound_sources,
+            is_issued_phase1_equity_point_authority,
+        )
+
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        authorities: dict[str, Phase1EquityPointAuthority] = {}
+        sources: dict[str, Phase1EquityMarkSource] = {}
+        for authority in (canonical_authority, actual_authority):
+            if not isinstance(authority, Phase1EquityPointAuthority) or not (
+                is_issued_phase1_equity_point_authority(authority)
+            ):
+                raise RiskBlock("PHASE1_EQUITY_POINT_AUTHORITY_UNVERIFIED")
+            bindings = _phase1_bound_sources(authority)
+            if len(bindings) != 1 or bindings[0][1] != "EQUITY_MARK":
+                raise RiskBlock("PHASE1_EQUITY_POINT_SOURCE_UNVERIFIED")
+            source = bindings[0][0]
+            if (
+                not isinstance(source, Phase1EquityMarkSource)
+                or not is_verified_phase1_equity_mark_source(source)
+                or _phase1_source_owner(source) is not self
+                or source.ledger_name != authority.ledger_name
+                or source.source_digest != authority.source_digest
+                or source.validation_window_id != authority.validation_window_id
+                or source.session_date != authority.session_date
+                or source.point_at != authority.point_at
+                or source.query_cutoff != authority.query_cutoff
+                or source.calendar_digest != calendar_digest
+            ):
+                raise RiskBlock("PHASE1_EQUITY_POINT_SOURCE_UNVERIFIED")
+            if authority.ledger_name in authorities:
+                raise InvalidJournalValue(
+                    "Phase 1 equity pair repeats one ledger"
+                )
+            authorities[authority.ledger_name] = authority
+            sources[authority.ledger_name] = source
+        if set(authorities) != {"CANONICAL", "ACTUAL"}:
+            raise InvalidJournalValue(
+                "Phase 1 equity pair requires canonical and actual authorities"
+            )
+        canonical = authorities["CANONICAL"]
+        actual = authorities["ACTUAL"]
+        if (
+            canonical.validation_window_id != actual.validation_window_id
+            or canonical.session_date != actual.session_date
+            or canonical.point_at != actual.point_at
+            or canonical.query_cutoff != actual.query_cutoff
+            or normalized_recorded_at != canonical.query_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 equity authorities do not form one session pair"
+            )
+
+        point_ids = tuple(
+            hashlib.sha256(
+                (
+                    "stock-monitor/phase1-session-equity-point/v1\x00"
+                    + authority.validation_window_id
+                    + "\x00"
+                    + authority.ledger_name
+                    + "\x00"
+                    + authority.session_date.isoformat()
+                    + "\x00"
+                    + authority.authority_digest
+                ).encode("utf-8")
+            ).hexdigest()
+            for authority in (canonical, actual)
+        )
+        existing_rows = _sql(
+            self._connection,
+            "SELECT point_id, ledger_name FROM phase1_equity_points "
+            "WHERE validation_window_id = ? COLLATE BINARY AND session_date = ? "
+            "AND ledger_name IN ('CANONICAL', 'ACTUAL') AND source_cursor > 1 "
+            "ORDER BY CASE ledger_name WHEN 'CANONICAL' THEN 1 ELSE 2 END",
+            (
+                canonical.validation_window_id,
+                canonical.session_date.isoformat(),
+            ),
+        ).fetchall()
+        if existing_rows:
+            if tuple(str(row[0]) for row in existing_rows) != point_ids:
+                raise IdempotencyConflict(
+                    "Phase 1 equity session pair conflicts with stored content"
+                )
+            return StoredPhase1SessionMark(point_ids=point_ids, duplicate=True)
+
+        try:
+            with self.transaction():
+                for point_id, authority in zip(
+                    point_ids,
+                    (canonical, actual),
+                    strict=True,
+                ):
+                    source = sources[authority.ledger_name]
+                    cursor_row = _sql(
+                        self._connection,
+                        "SELECT COALESCE(MAX(source_cursor), 0) "
+                        "FROM phase1_equity_points "
+                        "WHERE validation_window_id = ? COLLATE BINARY "
+                        "AND ledger_name = ?",
+                        (authority.validation_window_id, authority.ledger_name),
+                    ).fetchone()
+                    if cursor_row is None:
+                        raise JournalError(
+                            "Phase 1 equity cursor query returned no result"
+                        )
+                    source_cursor = int(cursor_row[0]) + 1
+                    point = authority.point
+                    point_values_without_digest = (
+                        point_id,
+                        authority.validation_window_id,
+                        authority.ledger_name,
+                        authority.session_date.isoformat(),
+                        money_to_micros(point.equity),
+                        money_to_micros(point.cash),
+                        money_to_micros(point.positions_value),
+                        money_to_micros(point.external_cash_flow),
+                        source_cursor,
+                        authority.mark_source_digest,
+                        _canonical_timestamp(authority.point_at),
+                        _canonical_timestamp(normalized_recorded_at),
+                        _canonical_timestamp(normalized_recorded_at),
+                    )
+                    point_source_digest = _journal_bundle_digest(
+                        "stock-monitor/phase1-equity-point/v1",
+                        source.row_references,
+                        {
+                            **dict(
+                                zip(
+                                    _PHASE1_EQUITY_POINT_COLUMNS[1:-1],
+                                    point_values_without_digest,
+                                    strict=True,
+                                )
+                            ),
+                            "authority_digest": authority.authority_digest,
+                            "source_digest": source.source_digest,
+                        },
+                    )
+                    self._transaction_dirty = True
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase1_equity_points("
+                        + ", ".join(_PHASE1_EQUITY_POINT_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in range(len(_PHASE1_EQUITY_POINT_COLUMNS) - 1))
+                        + ")",
+                        (*point_values_without_digest, point_source_digest),
+                    )
+                    for mark in source.position_marks:
+                        selected = tuple(
+                            descriptor
+                            for descriptor in (
+                                *mark.quote_fact_sources,
+                                *mark.daily_bar_fact_sources,
+                            )
+                            if descriptor.row_id == mark.source_cursor
+                        )
+                        if len(selected) != 1:
+                            raise MigrationCorruption(
+                                "Phase 1 equity selected mark row is incomplete"
+                            )
+                        descriptor = selected[0]
+                        mark_values_without_digest = (
+                            point_id,
+                            descriptor.fact_id,
+                            mark.symbol,
+                            mark.mark_ordinal,
+                            mark.method,
+                            mark.derived_price_micros,
+                            _canonical_timestamp(mark.mark_at),
+                        )
+                        mark_source_digest = _journal_bundle_digest(
+                            "stock-monitor/phase1-equity-point-mark/v1",
+                            (*mark.row_references, *source.row_references),
+                            dict(
+                                zip(
+                                    _PHASE1_EQUITY_POINT_MARK_COLUMNS[1:-1],
+                                    mark_values_without_digest,
+                                    strict=True,
+                                )
+                            ),
+                        )
+                        _sql(
+                            self._connection,
+                            "INSERT INTO phase1_equity_point_marks("
+                            + ", ".join(_PHASE1_EQUITY_POINT_MARK_COLUMNS[1:])
+                            + ") VALUES ("
+                            + ", ".join("?" for _ in range(len(_PHASE1_EQUITY_POINT_MARK_COLUMNS) - 1))
+                            + ")",
+                            (*mark_values_without_digest, mark_source_digest),
+                        )
+        except sqlite3.Error as error:
+            raise JournalError(
+                "Phase 1 paired equity point write failed"
+            ) from error
+        return StoredPhase1SessionMark(point_ids=point_ids, duplicate=False)
+
+    def complete_phase1_session(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        cohort_through_ordinal: int,
+        expected_observation_count: int,
+        received_through: datetime,
+        completed_at: datetime,
+        calendar_resolver: object,
+    ) -> tuple[int, bool]:
+        """Seal one exact release-calendar session observation manifest."""
+        with self.transaction() as transaction:
+            return transaction.complete_phase1_session(
+                signal_id=signal_id,
+                session_date=session_date,
+                cohort_through_ordinal=cohort_through_ordinal,
+                expected_observation_count=expected_observation_count,
+                received_through=received_through,
+                completed_at=completed_at,
+                calendar_resolver=calendar_resolver,
+            )
+
+    def read_phase1_observation(
+        self,
+        observation_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> Phase1ObservationSource:
+        """Reparse and authenticate one immutable normalized observation."""
+        return self._read_phase1_observation_source(
+            observation_id=observation_id,
+            query_cutoff=query_cutoff,
+        )
+
+    def record_phase1_entry(
+        self,
+        signal_id: str,
+        *,
+        confirmation_action_source: JournalActionSource | None = None,
+        trigger_observation_id: str | None = None,
+        quote_observation_id: str | None = None,
+        calendar_resolver: object,
+        recorded_at: datetime,
+    ) -> object:
+        """Persist the one canonical entry path and issue its typed authority."""
+        if confirmation_action_source is not None and (
+            not is_verified_journal_action_source(confirmation_action_source)
+            or _journal_action_source_owner(confirmation_action_source) is not self
+        ):
+            from .risk import RiskBlock
+
+            raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
+        with self.transaction():
+            self._record_phase1_entry(
+                signal_id=signal_id,
+                confirmation_action_source=confirmation_action_source,
+                trigger_observation_id=trigger_observation_id,
+                quote_observation_id=quote_observation_id,
+                calendar_resolver=calendar_resolver,
+                recorded_at=recorded_at,
+            )
+            self._transaction_dirty = True
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        role_row = _sql(
+            self._connection,
+            "SELECT role FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if role_row is None:
+            raise MigrationCorruption("Phase 1 entry signal disappeared after commit")
+        if str(role_row[0]) == "WATCHLIST_SHADOW":
+            source = self._read_phase1_shadow_fill_source(
+                signal_id,
+                query_cutoff=normalized_recorded_at,
+            )
+            from .ledger import _issue_shadow_fill_disposition_from_phase1_source
+
+            return _issue_shadow_fill_disposition_from_phase1_source(
+                source,
+                calendar_resolver=calendar_resolver,
+            )
+        source = self._read_phase1_entry_source(
+            signal_id,
+            query_cutoff=normalized_recorded_at,
+        )
+        from .ledger import (
+            _issue_ledger_signal_from_phase1_source,
+            _issue_paper_entry_authority_from_phase1_source,
+        )
+
+        signal = _issue_ledger_signal_from_phase1_source(source.signal_source)
+        return _issue_paper_entry_authority_from_phase1_source(
+            source,
+            signal=signal,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def record_phase1_canonical_exit(
+        self,
+        *,
+        exit_authority: object,
+        recorded_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1CanonicalExit:
+        """Atomically persist every ordered step of one issued exit review."""
+        from .risk import _phase1_bound_sources
+
+        bindings = _phase1_bound_sources(exit_authority)
+        if (
+            len(bindings) != 1
+            or bindings[0][1] != "EXIT_REVIEW"
+            or not isinstance(bindings[0][0], Phase1ExitReviewSource)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit authority is unverified"
+            )
+        source = bindings[0][0]
+        if _phase1_registered_source_owner(source) is not self:
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit belongs to another Journal"
+            )
+        with self.transaction():
+            result = self._record_phase1_canonical_exit(
+                exit_authority=exit_authority,
+                source=source,
+                recorded_at=recorded_at,
+                calendar_resolver=calendar_resolver,
+            )
+            if not result.duplicate:
+                self._transaction_dirty = True
+        return result
+
+    def read_paper_entry_authority(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> object:
+        """Reissue the exact canonical paper-entry authority after restart."""
+        source = self._read_phase1_entry_source(
+            signal_id,
+            query_cutoff=query_cutoff,
+        )
+        from .ledger import (
+            _issue_ledger_signal_from_phase1_source,
+            _issue_paper_entry_authority_from_phase1_source,
+        )
+
+        signal = _issue_ledger_signal_from_phase1_source(source.signal_source)
+        return _issue_paper_entry_authority_from_phase1_source(
+            source,
+            signal=signal,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def read_phase1_shadow_fill(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object | None = None,
+    ) -> object:
+        """Reissue one informational watchlist-shadow fill after restart."""
+        source = self._read_phase1_shadow_fill_source(
+            signal_id,
+            query_cutoff=query_cutoff,
+        )
+        if calendar_resolver is None:
+            raise InvalidJournalValue(
+                "Phase 1 shadow fill reissuance requires a calendar resolver"
+            )
+        from .ledger import _issue_shadow_fill_disposition_from_phase1_source
+
+        return _issue_shadow_fill_disposition_from_phase1_source(
+            source,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def record_phase1_signal_evidence(
+        self,
+        *,
+        authority: object,
+        registry_source_row_id: int,
+        source_observation_row_ids: Sequence[int],
+    ) -> StoredPhase1SignalEvidence:
+        """Persist only an exact current signal-evidence authority and raw pins."""
+        from .risk import (
+            is_issued_phase1_signal_evidence_authority,
+            phase1_signal_evidence_manifest,
+        )
+
+        if not is_issued_phase1_signal_evidence_authority(authority):
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence authority is unverified"
+            )
+        signal_source = getattr(authority, "signal_source", None)
+        if (
+            not is_verified_phase1_signal_source(signal_source)
+            or _phase1_source_owner(signal_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence belongs to another Journal"
+            )
+        manifest_bytes = phase1_signal_evidence_manifest(authority)
+        with self.transaction():
+            result = self._record_phase1_signal_evidence(
+                authority=authority,
+                registry_source_row_id=registry_source_row_id,
+                source_observation_row_ids=source_observation_row_ids,
+                manifest_bytes=manifest_bytes,
+            )
+            self._transaction_dirty = True
+        return result
+
+    def _phase1_nested_signal_sources(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        exact_signal_source: Phase1SignalSource | None,
+    ) -> tuple[Phase1SignalSource, Phase1SignalSource]:
+        """Authenticate history, then reuse an exact current outer capability."""
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        historical_signal_source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=normalized_cutoff,
+        )
+        if exact_signal_source is None:
+            return historical_signal_source, historical_signal_source
+        if not (
+            is_verified_phase1_signal_source(exact_signal_source)
+            and _phase1_source_owner(exact_signal_source) is self
+            and exact_signal_source.signal_id == signal_id
+            and exact_signal_source.row_id == historical_signal_source.row_id
+            and exact_signal_source.row_sha256
+            == historical_signal_source.row_sha256
+            and exact_signal_source.query_cutoff >= normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 nested signal source is unverified"
+            )
+        return historical_signal_source, exact_signal_source
+
+    def _read_phase1_signal_evidence_source(
+        self,
+        signal_id: str,
+        *,
+        review_at: datetime,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        exact_signal_source: Phase1SignalSource | None = None,
+    ) -> Phase1SignalEvidenceSource:
+        """Reparse exact persisted evidence into an owner-current source."""
+        from zoneinfo import ZoneInfo
+
+        from .evidence import DateRange, SourceDocument, classify_evidence
+        from .risk import (
+            MAX_HOLD_SESSIONS,
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 signal evidence source requires a post-commit read"
+            )
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        normalized_review_at = _parse_canonical_timestamp(
+            _canonical_timestamp(review_at)
+        )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if normalized_cutoff < normalized_review_at:
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence is unavailable at the query cutoff"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS)
+            + " FROM phase1_signal_evidence_reviews "
+            "WHERE signal_id = ? COLLATE BINARY AND review_at = ? "
+            "AND recorded_at <= ?",
+            (
+                signal_id,
+                _canonical_timestamp(normalized_review_at),
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence is unavailable at the query cutoff"
+            )
+        stored = dict(
+            zip(
+                _PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS,
+                tuple(row),
+                strict=True,
+            )
+        )
+        manifest_bytes = bytes(stored["manifest_bytes"])
+        if (
+            hashlib.sha256(manifest_bytes).hexdigest()
+            != str(stored["manifest_digest"])
+            or str(stored["calendar_digest"]) != calendar_digest
+            or str(stored["registry_content_hash"])
+            != str(stored["registry_release_pin"])
+            or str(stored["recorded_at"])
+            != _canonical_timestamp(normalized_review_at)
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence review integrity failed"
+            )
+        review_record_material = {
+            **{
+                column: (
+                    manifest_bytes.hex()
+                    if column == "manifest_bytes"
+                    else stored[column]
+                )
+                for column in _PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS[1:-1]
+            },
+            "manifest_bytes_encoding": "hex",
+        }
+        if str(stored["record_sha256"]) != hashlib.sha256(
+            _canonical_audit_json(review_record_material).encode("utf-8")
+        ).hexdigest():
+            raise MigrationCorruption(
+                "Phase 1 signal evidence review record hash failed"
+            )
+
+        historical_signal_source, signal_source = self._phase1_nested_signal_sources(
+            signal_id,
+            query_cutoff=normalized_review_at,
+            exact_signal_source=exact_signal_source,
+        )
+        try:
+            evidence_manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MigrationCorruption(
+                "Phase 1 signal evidence signal lineage failed"
+            ) from error
+        if (
+            signal_source.calendar_digest != calendar_digest
+            or not isinstance(evidence_manifest, dict)
+            or evidence_manifest.get("signal_source_digest")
+            != historical_signal_source.source_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence signal lineage failed"
+            )
+        registry_row, registry_payload_row = self._phase1_core_source_rows(
+            source_observation_id=int(stored["registry_source_row_id"]),
+        )
+        registry_payload = bytes(registry_payload_row[3])
+        if (
+            hashlib.sha256(registry_payload).hexdigest()
+            != str(stored["registry_content_hash"])
+            or str(registry_row[2]) != str(stored["registry_content_hash"])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence registry payload failed"
+            )
+        try:
+            registry_document = json.loads(registry_payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MigrationCorruption(
+                "Phase 1 signal evidence registry JSON failed"
+            ) from error
+        if (
+            type(registry_document) is not dict
+            or _canonical_audit_json(registry_document).encode("utf-8")
+            != registry_payload
+            or registry_document.get("schema_version") != 2
+            or registry_document.get("kind") != "REVIEWED_EVIDENCE_BUNDLE"
+            or registry_document.get("registry_id") != stored["registry_id"]
+            or not isinstance(registry_document.get("source_bindings"), list)
+            or not isinstance(registry_document.get("records"), list)
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence registry schema failed"
+            )
+        reviewed_at = _parse_canonical_timestamp(
+            str(registry_document["reviewed_at"])
+        )
+        registry_details = _canonical_stored_details(
+            registry_row[12],
+            label="Phase 1 evidence registry source",
+        )
+        if (
+            str(registry_row[3])
+            != (
+                "urn:stock-monitor:reviewed-evidence-registry:"
+                + str(stored["registry_id"])
+            )
+            or str(registry_row[4]) != "REVIEWED_EVIDENCE_REGISTRY"
+            or str(registry_row[5]) != "operator-reviewed"
+            or registry_row[6] is not None
+            or _parse_canonical_timestamp(str(registry_row[7])) != reviewed_at
+            or _parse_canonical_timestamp(str(registry_row[8])) != reviewed_at
+            or registry_row[9] is not None
+            or int(registry_row[10]) != 0
+            or str(registry_row[11]) != "REVIEWED"
+            or registry_details
+            != {
+                "content_hash": str(stored["registry_content_hash"]),
+                "registry_id": str(stored["registry_id"]),
+            }
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence registry metadata failed"
+            )
+
+        binding_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS)
+            + " FROM phase1_signal_evidence_bindings "
+            "WHERE evidence_id = ? COLLATE BINARY ORDER BY binding_ordinal",
+            (str(stored["evidence_id"]),),
+        ).fetchall()
+        expected_count = int(stored["expected_source_observation_count"])
+        registry_bindings = tuple(registry_document["source_bindings"])
+        if (
+            len(binding_rows) != expected_count
+            or len(registry_bindings) != expected_count
+            or tuple(int(item[2]) for item in binding_rows)
+            != tuple(range(1, expected_count + 1))
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence binding manifest is incomplete"
+            )
+        published_by_source: dict[str, datetime] = {}
+        for record in registry_document["records"]:
+            if not isinstance(record, dict):
+                raise MigrationCorruption(
+                    "Phase 1 signal evidence record is malformed"
+                )
+            published = _parse_canonical_timestamp(str(record["published_at"]))
+            for identifier in record["source_observation_ids"]:
+                if identifier in published_by_source and (
+                    published_by_source[identifier] != published
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 signal evidence publication times conflict"
+                    )
+                published_by_source[str(identifier)] = published
+
+        source_documents: list[SourceDocument] = []
+        binding_core_references: list[JournalRowReference] = []
+        binding_row_references: list[JournalRowReference] = []
+        binding_row_ids: list[int] = []
+        for binding_row, binding_document in zip(
+            binding_rows,
+            registry_bindings,
+            strict=True,
+        ):
+            if not isinstance(binding_document, dict):
+                raise MigrationCorruption(
+                    "Phase 1 signal evidence binding is malformed"
+                )
+            binding_stored = dict(
+                zip(
+                    _PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS,
+                    tuple(binding_row),
+                    strict=True,
+                )
+            )
+            external_id = str(binding_stored["external_source_observation_id"])
+            if external_id != binding_document.get("source_observation_id"):
+                raise MigrationCorruption(
+                    "Phase 1 signal evidence binding identity failed"
+                )
+            source_row, payload_row = self._phase1_core_source_rows(
+                source_observation_id=int(
+                    binding_stored["source_observation_row_id"]
+                ),
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 evidence source binding",
+            )
+            expected_details = {
+                "accession": binding_document["accession"],
+                "issuer_cik": binding_document["issuer_cik"],
+                "source_observation_id": external_id,
+                "source_role": binding_document["source_role"],
+                "symbol": binding_document["symbol"],
+                "timestamp_source": binding_document["timestamp_source"],
+            }
+            retrieved_at = _parse_canonical_timestamp(
+                str(binding_document["retrieved_at"])
+            )
+            published_at = published_by_source.get(
+                external_id,
+                _parse_canonical_timestamp(str(source_row[7])),
+            )
+            source_document = SourceDocument(
+                url=str(binding_document["primary_url"]),
+                published_at=published_at,
+                retrieved_at=retrieved_at,
+                content_hash=str(binding_document["content_hash"]),
+                body=bytes(payload_row[3]),
+                source_observation_id=external_id,
+                publisher=str(binding_document["publisher"]),
+                source_type=str(binding_document["source_type"]),
+                timestamp_source=str(binding_document["timestamp_source"]),
+                accession=(
+                    None
+                    if binding_document["accession"] is None
+                    else str(binding_document["accession"])
+                ),
+                source_role=(
+                    None
+                    if binding_document["source_role"] is None
+                    else str(binding_document["source_role"])
+                ),
+            )
+            expected_delay = int(
+                (retrieved_at - published_at).total_seconds()
+            )
+            if (
+                str(source_row[3]) != source_document.url
+                or str(source_row[4]) != source_document.source_type
+                or str(source_row[5]) != source_document.publisher
+                or str(source_row[6]) != source_document.timestamp_source
+                or _parse_canonical_timestamp(str(source_row[7])) != published_at
+                or _parse_canonical_timestamp(str(source_row[8])) != retrieved_at
+                or source_row[9] is not None
+                or int(source_row[10]) != expected_delay
+                or str(source_row[11])
+                != ("OK" if binding_document["healthy"] else "UNHEALTHY")
+                or details != expected_details
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 signal evidence binding metadata failed"
+                )
+            source_reference = _journal_row_reference(
+                "source_observations",
+                _SOURCE_OBSERVATION_COLUMNS,
+                source_row,
+            )
+            payload_reference = _journal_row_reference(
+                "phase1_source_payloads",
+                _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                payload_row,
+            )
+            expected_binding_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-signal-evidence-binding/v1",
+                (source_reference, payload_reference),
+                {
+                    "external_source_observation_id": external_id,
+                    "binding_ordinal": int(binding_stored["binding_ordinal"]),
+                },
+            )
+            binding_record_material = {
+                column: binding_stored[column]
+                for column in _PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS[1:-1]
+            }
+            if (
+                str(binding_stored["source_digest"])
+                != expected_binding_source_digest
+                or str(binding_stored["record_sha256"])
+                != hashlib.sha256(
+                    _canonical_audit_json(binding_record_material).encode("utf-8")
+                ).hexdigest()
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 signal evidence binding digest failed"
+                )
+            source_documents.append(source_document)
+            binding_core_references.extend((source_reference, payload_reference))
+            binding_row_references.append(
+                _journal_row_reference(
+                    "phase1_signal_evidence_bindings",
+                    _PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS,
+                    binding_row,
+                )
+            )
+            binding_row_ids.append(int(source_row[0]))
+
+        if (
+            max(int(stored["registry_source_row_id"]), *binding_row_ids)
+            != int(stored["source_observation_highwater"])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence source highwater failed"
+            )
+        registry_reference = _journal_row_reference(
+            "source_observations",
+            _SOURCE_OBSERVATION_COLUMNS,
+            registry_row,
+        )
+        registry_payload_reference = _journal_row_reference(
+            "phase1_source_payloads",
+            _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+            registry_payload_row,
+        )
+        provenance_references = (
+            *signal_source.row_references,
+            registry_reference,
+            registry_payload_reference,
+            *binding_core_references,
+        )
+        expected_source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-signal-evidence-source/v1",
+            provenance_references,
+            {
+                "evidence_id": str(stored["evidence_id"]),
+                "signal_id": signal_id,
+                "review_at": _canonical_timestamp(normalized_review_at),
+                "manifest_digest": str(stored["manifest_digest"]),
+                "registry_source_row_id": int(stored["registry_source_row_id"]),
+                "source_observation_row_ids": binding_row_ids,
+                "registry_id": str(stored["registry_id"]),
+                "registry_content_hash": str(stored["registry_content_hash"]),
+                "registry_release_pin": str(stored["registry_release_pin"]),
+                "bundle_digest": str(stored["bundle_digest"]),
+                "decision_digest": str(stored["decision_digest"]),
+                "calendar_digest": calendar_digest,
+                "source_observation_highwater": int(
+                    stored["source_observation_highwater"]
+                ),
+                "expected_source_observation_count": expected_count,
+            },
+        )
+        if str(stored["source_digest"]) != expected_source_digest:
+            raise MigrationCorruption(
+                "Phase 1 signal evidence source digest failed"
+            )
+        review_reference = _journal_row_reference(
+            "phase1_signal_evidence_reviews",
+            _PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS,
+            row,
+        )
+        row_references = (
+            *provenance_references,
+            review_reference,
+            *binding_row_references,
+        )
+        raw_source = Phase1SignalEvidenceSource(
+            signal_source=signal_source,
+            reviewed_bundle=None,
+            evidence_decision=None,
+            evidence_id=str(stored["evidence_id"]),
+            registry_payload=registry_payload,
+            release_sha256=str(stored["registry_release_pin"]),
+            source_documents=tuple(source_documents),
+            manifest_bytes=manifest_bytes,
+            manifest_digest=str(stored["manifest_digest"]),
+            registry_source_row_id=int(stored["registry_source_row_id"]),
+            source_observation_row_ids=tuple(binding_row_ids),
+            registry_id=str(stored["registry_id"]),
+            registry_content_hash=str(stored["registry_content_hash"]),
+            bundle_digest=str(stored["bundle_digest"]),
+            decision_digest=str(stored["decision_digest"]),
+            review_at=normalized_review_at,
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            source_observation_highwater=int(
+                stored["source_observation_highwater"]
+            ),
+            expected_source_observation_count=expected_count,
+            row_references=tuple(row_references),
+            source_digest=expected_source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
+            raw_source,
+            self,
+        )
+        from .evidence import _issue_reviewed_bundle_from_phase1_source
+
+        reviewed_bundle = _issue_reviewed_bundle_from_phase1_source(raw_source)
+        review_session = normalized_review_at.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        terminal_session = calendar_resolver.add_sessions(
+            signal_source.publication_session,
+            MAX_HOLD_SESSIONS - 1,
+        )
+        decision = classify_evidence(
+            reviewed_bundle.records,
+            DateRange(review_session, terminal_session),
+            symbol=signal_source.symbol,
+            issuer_cik=signal_source.issuer_cik,
+            source_bindings=reviewed_bundle.source_bindings,
+            as_of=normalized_review_at,
+            subject_kind=signal_source.subject_kind,
+            coverage_attestations=reviewed_bundle.coverage_attestations,
+            reviewed_bundle=reviewed_bundle,
+        )
+        if (
+            getattr(reviewed_bundle, "_bundle_digest", None)
+            != str(stored["bundle_digest"])
+            or getattr(decision, "_decision_digest", None)
+            != str(stored["decision_digest"])
+            or _phase1_reviewed_registry_document(reviewed_bundle)
+            != registry_document
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal evidence reissuance conflicts with storage"
+            )
+        source = Phase1SignalEvidenceSource(
+            **{
+                field.name: getattr(raw_source, field.name)
+                for field in fields(raw_source)
+                if field.name not in {"reviewed_bundle", "evidence_decision"}
+            },
+            reviewed_bundle=reviewed_bundle,
+            evidence_decision=decision,
+        )
+        _register_journal_source_authority(
+            _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_signal_evidence_source(
+        self,
+        signal_id: str,
+        *,
+        review_at: datetime,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1SignalEvidenceSource:
+        """Reparse exact persisted evidence into an owner-current source."""
+        return self._read_phase1_signal_evidence_source(
+            signal_id,
+            review_at=review_at,
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def read_phase1_signal_evidence(
+        self,
+        signal_id: str,
+        *,
+        review_at: datetime,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> object:
+        """Reissue exact Phase 1 signal evidence from persisted raw bindings."""
+        source = self.read_phase1_signal_evidence_source(
+            signal_id,
+            review_at=review_at,
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        from .risk import _issue_phase1_signal_evidence_authority_from_source
+
+        return _issue_phase1_signal_evidence_authority_from_source(
+            source,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def _phase1_current_positive_evidence(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> tuple[Phase1SignalEvidenceSource, object] | None:
+        """Reissue every eligible review before trusting invalidation truth."""
+        from .risk import _issue_phase1_signal_evidence_authority_from_source
+
+        review_rows = _sql(
+            self._connection,
+            "SELECT review_at FROM phase1_signal_evidence_reviews "
+            "WHERE signal_id = ? COLLATE BINARY AND recorded_at <= ? "
+            "ORDER BY review_at DESC, id DESC",
+            (signal_id, _canonical_timestamp(query_cutoff)),
+        ).fetchall()
+        for review_row in review_rows:
+            review_at = _parse_canonical_timestamp(str(review_row[0]))
+            source = self.read_phase1_signal_evidence_source(
+                signal_id,
+                review_at=review_at,
+                query_cutoff=review_at,
+                calendar_resolver=calendar_resolver,
+            )
+            authority = _issue_phase1_signal_evidence_authority_from_source(
+                source,
+                calendar_resolver=calendar_resolver,
+            )
+            if (
+                getattr(authority, "event_exit_required", None) is True
+                or getattr(authority, "thesis_invalidated", None) is True
+            ):
+                return source, authority
+        return None
+
+    def _read_phase1_expiry_deadline_source(
+        self,
+        signal_id: str,
+        *,
+        observed_at: datetime,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        exact_signal_source: Phase1SignalSource | None = None,
+    ) -> Phase1ExpiryDeadlineSource:
+        """Issue current proof that the next-premarket deadline elapsed unsealed."""
+        from zoneinfo import ZoneInfo
+
+        from .phase1 import SignalExpiryDeadlineEvidence
+        from .risk import (
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 expiry source requires a post-commit read"
+            )
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        normalized_observed_at = _parse_canonical_timestamp(
+            _canonical_timestamp(observed_at)
+        )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if normalized_cutoff != normalized_observed_at:
+            raise InvalidJournalValue(
+                "Phase 1 expiry cutoff must equal its observed instant"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        _historical_signal_source, signal_source = (
+            self._phase1_nested_signal_sources(
+                signal_id,
+                query_cutoff=normalized_cutoff,
+                exact_signal_source=exact_signal_source,
+            )
+        )
+        if signal_source.calendar_digest != calendar_digest:
+            raise InvalidJournalValue(
+                "Phase 1 expiry calendar conflicts with signal"
+            )
+        deadline_session = calendar_resolver.add_sessions(
+            signal_source.publication_session,
+            1,
+        )
+        schedule = calendar_resolver.session(deadline_session)
+        deadline_at = datetime(
+            deadline_session.year,
+            deadline_session.month,
+            deadline_session.day,
+            8,
+            45,
+            tzinfo=schedule.timezone,
+        )
+        observed_et = normalized_observed_at.astimezone(
+            ZoneInfo("America/New_York")
+        )
+        if (
+            normalized_observed_at < deadline_at
+            or observed_et.date() != deadline_session
+            or (observed_et.hour, observed_et.minute, observed_et.second)
+            > (9, 35, 0)
+            or observed_et.microsecond != 0
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 expiry observation is outside next premarket"
+            )
+
+        if self._phase1_current_positive_evidence(
+            signal_id,
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+        ) is not None:
+            raise InvalidJournalValue(
+                "Phase 1 positive invalidation evidence takes precedence"
+            )
+
+        completion_rows = _sql(
+            self._connection,
+            "SELECT id FROM phase1_session_completions "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND completed_at <= ? ORDER BY id",
+            (
+                signal_id,
+                signal_source.publication_session.isoformat(),
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        exact_completion_count = 0
+        for _completion_row in completion_rows:
+            try:
+                self._read_phase1_session_completion_source(
+                    signal_id=signal_id,
+                    session_date=signal_source.publication_session,
+                    query_cutoff=normalized_cutoff,
+                )
+            except InvalidJournalValue as error:
+                if "LATE_FACT" not in str(error) and "INCOMPLETE" not in str(error):
+                    raise
+            else:
+                exact_completion_count = 1
+                break
+        if exact_completion_count:
+            raise InvalidJournalValue(
+                "Phase 1 exact completion takes precedence over expiry"
+            )
+        last_event = _sql(
+            self._connection,
+            "SELECT to_status FROM phase1_signal_events "
+            "WHERE signal_id = ? COLLATE BINARY AND received_at <= ? "
+            "ORDER BY event_ordinal DESC LIMIT 1",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchone()
+        if last_event is None or str(last_event[0]) not in {
+            "PUBLISHED",
+            "TRIGGERED_AWAITING_LIMIT",
+            "EXPIRED",
+        }:
+            raise InvalidJournalValue(
+                "Phase 1 signal is not eligible for expiry"
+            )
+        completion_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_session_completions "
+            "WHERE completed_at <= ?",
+            (_canonical_timestamp(normalized_cutoff),),
+        ).fetchone()
+        evidence_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_signal_evidence_reviews "
+            "WHERE review_at <= ?",
+            (_canonical_timestamp(normalized_cutoff),),
+        ).fetchone()
+        completion_source_highwater = int(completion_highwater_row[0])
+        evidence_review_highwater = int(evidence_highwater_row[0])
+        deadline_session_manifest = (
+            ("session_date", deadline_session.isoformat()),
+            ("open_time", schedule.open_time.isoformat()),
+            ("close_time", schedule.close_time.isoformat()),
+            ("review_time", schedule.review_time.isoformat()),
+            ("timezone", getattr(schedule.timezone, "key", str(schedule.timezone))),
+        )
+        source_id = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-expiry-deadline/v1",
+                    "signal_id": signal_id,
+                    "deadline_session": deadline_session.isoformat(),
+                    "deadline_at": _canonical_timestamp(deadline_at),
+                    "observed_at": _canonical_timestamp(normalized_observed_at),
+                    "calendar_digest": calendar_digest,
+                    "completion_source_highwater": completion_source_highwater,
+                    "evidence_review_highwater": evidence_review_highwater,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        expiry_evidence = SignalExpiryDeadlineEvidence(
+            signal_id=signal_id,
+            publication_session=signal_source.publication_session,
+            deadline_session=deadline_session,
+            deadline_at=deadline_at,
+            observed_at=normalized_observed_at,
+            calendar_digest=calendar_digest,
+            source_id=source_id,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-expiry-deadline-source/v1",
+            signal_source.row_references,
+            {
+                "source_id": source_id,
+                "signal_id": signal_id,
+                "validation_window_id": signal_source.validation_window_id,
+                "publication_session": signal_source.publication_session.isoformat(),
+                "deadline_session": deadline_session.isoformat(),
+                "deadline_at": _canonical_timestamp(deadline_at),
+                "observed_at": _canonical_timestamp(normalized_observed_at),
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "calendar_digest": calendar_digest,
+                "deadline_session_manifest": deadline_session_manifest,
+                "completion_terminal_cursor": None,
+                "completion_source_highwater": completion_source_highwater,
+                "expected_completion_count": 0,
+                "evidence_review_highwater": evidence_review_highwater,
+                "expected_positive_evidence_count": 0,
+            },
+        )
+        source = Phase1ExpiryDeadlineSource(
+            signal_source=signal_source,
+            expiry_evidence=expiry_evidence,
+            signal_id=signal_id,
+            validation_window_id=signal_source.validation_window_id,
+            publication_session=signal_source.publication_session,
+            deadline_session=deadline_session,
+            deadline_at=deadline_at,
+            observed_at=normalized_observed_at,
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            deadline_session_manifest=deadline_session_manifest,
+            completion_terminal_cursor=None,
+            completion_source_highwater=completion_source_highwater,
+            expected_completion_count=0,
+            evidence_review_highwater=evidence_review_highwater,
+            expected_positive_evidence_count=0,
+            row_references=signal_source.row_references,
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_expiry_deadline_source(
+        self,
+        signal_id: str,
+        *,
+        observed_at: datetime,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1ExpiryDeadlineSource:
+        """Issue current proof that the next-premarket deadline elapsed unsealed."""
+        return self._read_phase1_expiry_deadline_source(
+            signal_id,
+            observed_at=observed_at,
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+
+    @staticmethod
+    def _phase1_terminal_result_from_row(
+        row: Sequence[object],
+        *,
+        duplicate: bool,
+    ) -> StoredPhase1TerminalDisposition:
+        terminal_kinds = {
+            "FINALIZE_NOT_TRIGGERED",
+            "FINALIZE_NOT_FILLED",
+            "FINALIZE_UNRESOLVED",
+            "EXPIRE",
+            "INVALIDATE",
+        }
+        if len(row) != len(_PHASE1_SIGNAL_EVENT_COLUMNS) or str(row[4]) not in terminal_kinds:
+            raise MigrationCorruption(
+                "Phase 1 terminal lifecycle row is inconsistent"
+            )
+        return StoredPhase1TerminalDisposition(
+            event_kind=str(row[4]),
+            to_status=str(row[6]),
+            session_completion_id=(
+                None if row[13] is None else str(row[13])
+            ),
+            source_digest=str(row[19]),
+            duplicate=duplicate,
+        )
+
+    def _phase1_existing_terminal_disposition(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> StoredPhase1TerminalDisposition | None:
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "AND received_at <= ? ORDER BY event_ordinal DESC LIMIT 1",
+            (signal_id, _canonical_timestamp(query_cutoff)),
+        ).fetchone()
+        if row is None or str(row[4]) not in {
+            "FINALIZE_NOT_TRIGGERED",
+            "FINALIZE_NOT_FILLED",
+            "FINALIZE_UNRESOLVED",
+            "EXPIRE",
+            "INVALIDATE",
+        }:
+            return None
+        return self._phase1_terminal_result_from_row(row, duplicate=True)
+
+    @staticmethod
+    def _phase1_terminal_event_material(
+        values: Mapping[str, object],
+    ) -> dict[str, object]:
+        expected = set(_PHASE1_SIGNAL_EVENT_COLUMNS[1:]) - {"source_digest"}
+        if set(values) != expected:
+            raise JournalError("Phase 1 terminal event material is malformed")
+        return {column: values[column] for column in sorted(expected)}
+
+    def _persist_phase1_expiry_deadline(
+        self,
+        source: Phase1ExpiryDeadlineSource,
+    ) -> Sequence[object]:
+        manifest_json = _canonical_audit_json(
+            dict(source.deadline_session_manifest)
+        )
+        values_without_hash = (
+            getattr(source.expiry_evidence, "source_id"),
+            source.signal_id,
+            source.deadline_session.isoformat(),
+            _canonical_timestamp(source.deadline_at),
+            _canonical_timestamp(source.observed_at),
+            source.calendar_digest,
+            manifest_json,
+            source.completion_terminal_cursor,
+            source.completion_source_highwater,
+            source.expected_completion_count,
+            source.evidence_review_highwater,
+            source.expected_positive_evidence_count,
+            source.source_digest,
+        )
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_EXPIRY_DEADLINE_COLUMNS[1:-1],
+                        values_without_hash,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXPIRY_DEADLINE_COLUMNS)
+            + " FROM phase1_expiry_deadlines WHERE expiry_source_id = ? COLLATE BINARY",
+            (values_without_hash[0],),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:-1]) != values_without_hash or str(
+                existing[-1]
+            ) != record_sha256:
+                raise IdempotencyConflict(
+                    "Phase 1 expiry deadline conflicts with stored content"
+                )
+            return existing
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_expiry_deadlines("
+                + ", ".join(_PHASE1_EXPIRY_DEADLINE_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join("?" for _ in (*values_without_hash, record_sha256))
+                + ")",
+                (*values_without_hash, record_sha256),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 expiry deadline conflicts with stored content"
+            ) from error
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXPIRY_DEADLINE_COLUMNS)
+            + " FROM phase1_expiry_deadlines WHERE expiry_source_id = ? COLLATE BINARY",
+            (values_without_hash[0],),
+        ).fetchone()
+        if row is None:
+            raise JournalError("Phase 1 expiry deadline insert was not readable")
+        return row
+
+    def _insert_phase1_terminal_event(
+        self,
+        *,
+        signal_id: str,
+        event_kind: str,
+        from_status: str,
+        to_status: str,
+        event_ordinal: int,
+        recorded_at: datetime,
+        session_completion_id: str | None,
+        signal_evidence_id: str | None,
+        expiry_source_id: str | None,
+        terminal_source_id: str,
+        terminal_source_digest: str,
+        references: Sequence[JournalRowReference],
+        details: Mapping[str, object],
+    ) -> Sequence[object]:
+        lifecycle_event_id = "phase1-terminal:" + hashlib.sha256(
+            (
+                signal_id
+                + "\x00"
+                + event_kind
+                + "\x00"
+                + terminal_source_id
+                + "\x00"
+                + _canonical_timestamp(recorded_at)
+            ).encode("utf-8")
+        ).hexdigest()
+        details_json = _canonical_details(details)
+        material = {
+            "lifecycle_event_id": lifecycle_event_id,
+            "signal_id": signal_id,
+            "event_ordinal": event_ordinal,
+            "event_kind": event_kind,
+            "from_status": from_status,
+            "to_status": to_status,
+            "event_time": _canonical_timestamp(recorded_at),
+            "message_time": _canonical_timestamp(recorded_at),
+            "received_at": _canonical_timestamp(recorded_at),
+            "confirmation_execution_event_id": None,
+            "trigger_observation_id": None,
+            "quote_observation_id": None,
+            "session_completion_id": session_completion_id,
+            "exit_observation_id": None,
+            "exit_authority_digest": None,
+            "shares": None,
+            "price_micros": None,
+            "recommended_stop_micros": None,
+            "details_json": details_json,
+            "signal_evidence_id": signal_evidence_id,
+            "expiry_source_id": expiry_source_id,
+        }
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-terminal-lifecycle-event/v1",
+            tuple(references),
+            {
+                **self._phase1_terminal_event_material(material),
+                "terminal_source_id": terminal_source_id,
+                "terminal_source_digest": terminal_source_digest,
+            },
+        )
+        insert_values = tuple(
+            source_digest if column == "source_digest" else material[column]
+            for column in _PHASE1_SIGNAL_EVENT_COLUMNS[1:]
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_signal_events("
+                + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join("?" for _ in insert_values)
+                + ")",
+                insert_values,
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 terminal lifecycle conflicts with stored content"
+            ) from error
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE lifecycle_event_id = ? COLLATE BINARY",
+            (lifecycle_event_id,),
+        ).fetchone()
+        if row is None:
+            raise JournalError("Phase 1 terminal lifecycle insert was not readable")
+        return row
+
+    def record_phase1_unentered_terminal(
+        self,
+        signal_id: str,
+        *,
+        recorded_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1TerminalDisposition:
+        """Derive the sole current unentered terminal disposition."""
+        from zoneinfo import ZoneInfo
+
+        from .ledger import _phase1_entry_result_from_observations
+        from .phase1 import SignalStatus
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 terminal disposition requires an outermost transaction"
+            )
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        existing = self._phase1_existing_terminal_disposition(
+            signal_id,
+            query_cutoff=normalized_recorded_at,
+        )
+        if existing is not None:
+            return existing
+
+        signal_source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=normalized_recorded_at,
+        )
+        if signal_source.calendar_digest != _calendar_digest(calendar_resolver):
+            raise RiskBlock("PHASE1_CALENDAR_SOURCE_MISMATCH")
+
+        evidence_pair = self._phase1_current_positive_evidence(
+            signal_id,
+            query_cutoff=normalized_recorded_at,
+            calendar_resolver=calendar_resolver,
+        )
+        completion_source: Phase1SessionCompletionSource | None = None
+        observations: tuple[Phase1ObservationSource, ...] = ()
+        simulated: object | None = None
+        expiry_source: Phase1ExpiryDeadlineSource | None = None
+        if evidence_pair is None:
+            completion_row = _sql(
+                self._connection,
+                "SELECT 1 FROM phase1_session_completions "
+                "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+                "AND completed_at <= ? LIMIT 1",
+                (
+                    signal_id,
+                    signal_source.publication_session.isoformat(),
+                    _canonical_timestamp(normalized_recorded_at),
+                ),
+            ).fetchone()
+            if completion_row is not None:
+                observations, completion_source, _highwater, _stream_highwaters = (
+                    self._phase1_entry_observation_bundle(
+                        signal_source=signal_source,
+                        query_cutoff=normalized_recorded_at,
+                    )
+                )
+                simulated = _phase1_entry_result_from_observations(
+                    observations,
+                    trigger=money_from_micros(signal_source.trigger_price_micros),
+                    limit=money_from_micros(signal_source.maximum_entry_micros),
+                )
+                if getattr(simulated, "status", None) is SignalStatus.TRIGGERED_PAPER:
+                    raise InvalidJournalValue(
+                        "Phase 1 completed cohort requires an entry, not a terminal"
+                    )
+                deadline_session = calendar_resolver.add_sessions(
+                    signal_source.publication_session,
+                    1,
+                )
+                recorded_et = normalized_recorded_at.astimezone(
+                    ZoneInfo("America/New_York")
+                )
+                if (
+                    recorded_et.date() != deadline_session
+                    or (recorded_et.hour, recorded_et.minute) > (9, 35)
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 finalization is outside next premarket"
+                    )
+            else:
+                expiry_source = self.read_phase1_expiry_deadline_source(
+                    signal_id,
+                    observed_at=normalized_recorded_at,
+                    query_cutoff=normalized_recorded_at,
+                    calendar_resolver=calendar_resolver,
+                )
+
+        with self.transaction():
+            concurrent = self._phase1_existing_terminal_disposition(
+                signal_id,
+                query_cutoff=normalized_recorded_at,
+            )
+            if concurrent is not None:
+                return concurrent
+            event_rows = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+                + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+                "ORDER BY event_ordinal",
+                (signal_id,),
+            ).fetchall()
+            if not event_rows:
+                raise MigrationCorruption(
+                    "Phase 1 terminal signal has no publication event"
+                )
+            prior_row = event_rows[-1]
+            current_status = str(prior_row[6])
+            signal_reference = signal_source.row_references[0]
+
+            if evidence_pair is not None:
+                evidence_source, _authority = evidence_pair
+                evidence_row = _sql(
+                    self._connection,
+                    "SELECT "
+                    + ", ".join(_PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS)
+                    + " FROM phase1_signal_evidence_reviews "
+                    "WHERE evidence_id = ? COLLATE BINARY",
+                    (evidence_source.evidence_id,),
+                ).fetchone()
+                if evidence_row is None or str(evidence_row[16]) != evidence_source.source_digest:
+                    raise IdempotencyConflict(
+                        "Phase 1 invalidation evidence changed before persistence"
+                    )
+                event_kind = "INVALIDATE"
+                to_status = "INVALIDATED"
+                session_completion_id = None
+                signal_evidence_id = evidence_source.evidence_id
+                expiry_source_id = None
+                terminal_source_id = evidence_source.evidence_id
+                terminal_source_digest = evidence_source.source_digest
+                source_references = evidence_source.row_references
+                terminal_details = {
+                    "terminal_evidence_kind": "SIGNAL_EVIDENCE",
+                    "terminal_evidence_digest": evidence_source.source_digest,
+                    "terminal_source_id": evidence_source.evidence_id,
+                }
+            elif completion_source is not None and simulated is not None:
+                status = getattr(simulated, "status")
+                mapping = {
+                    SignalStatus.NOT_TRIGGERED: (
+                        "FINALIZE_NOT_TRIGGERED",
+                        "NOT_TRIGGERED",
+                    ),
+                    SignalStatus.NOT_FILLED_LIMIT: (
+                        "FINALIZE_NOT_FILLED",
+                        "NOT_FILLED_LIMIT",
+                    ),
+                    SignalStatus.UNRESOLVED: (
+                        "FINALIZE_UNRESOLVED",
+                        "UNRESOLVED",
+                    ),
+                }
+                if status not in mapping:
+                    raise InvalidJournalValue(
+                        "Phase 1 completed cohort has no terminal disposition"
+                    )
+                trigger_id = getattr(simulated, "trigger_observation_id", None)
+                if trigger_id is not None and current_status == "PUBLISHED":
+                    trigger = next(
+                        (
+                            observation
+                            for observation in observations
+                            if observation.observation_id == trigger_id
+                        ),
+                        None,
+                    )
+                    if trigger is None:
+                        raise MigrationCorruption(
+                            "Phase 1 terminal trigger is absent from its cohort"
+                        )
+                    trigger_row = self._insert_phase1_entry_event(
+                        lifecycle_event_id=(
+                            "phase1-trigger:"
+                            + hashlib.sha256(
+                                (
+                                    signal_id
+                                    + "\x00"
+                                    + completion_source.completion_id
+                                    + "\x00"
+                                    + trigger_id
+                                ).encode("utf-8")
+                            ).hexdigest()
+                        ),
+                        signal_id=signal_id,
+                        event_ordinal=int(prior_row[3]) + 1,
+                        event_kind="TRIGGER_OBSERVED",
+                        from_status="PUBLISHED",
+                        to_status="TRIGGERED_AWAITING_LIMIT",
+                        event_time=trigger.source_time,
+                        message_time=completion_source.completed_at,
+                        received_at=normalized_recorded_at,
+                        confirmation_execution_event_id=None,
+                        trigger_observation_id=trigger_id,
+                        quote_observation_id=None,
+                        session_completion_id=completion_source.completion_id,
+                        shares=None,
+                        price_micros=None,
+                        references=(
+                            signal_reference,
+                            *completion_source.row_references,
+                            _journal_row_reference(
+                                "phase1_signal_events",
+                                _PHASE1_SIGNAL_EVENT_COLUMNS,
+                                prior_row,
+                            ),
+                        ),
+                        details={
+                            "completion_id": completion_source.completion_id,
+                            "trigger_observation_id": trigger_id,
+                        },
+                    )
+                    prior_row = trigger_row
+                    current_status = "TRIGGERED_AWAITING_LIMIT"
+                event_kind, to_status = mapping[status]
+                session_completion_id = completion_source.completion_id
+                signal_evidence_id = None
+                expiry_source_id = None
+                terminal_source_id = completion_source.completion_id
+                terminal_source_digest = completion_source.source_digest
+                source_references = (
+                    *signal_source.row_references,
+                    *completion_source.row_references,
+                )
+                terminal_details = {
+                    "terminal_evidence_kind": "SESSION_COMPLETION",
+                    "terminal_evidence_digest": completion_source.source_digest,
+                    "terminal_source_id": completion_source.completion_id,
+                    "simulated_status": status.value,
+                    "reason_codes": list(getattr(simulated, "reason_codes", ())),
+                }
+            elif expiry_source is not None:
+                expiry_row = self._persist_phase1_expiry_deadline(expiry_source)
+                expiry_reference = _journal_row_reference(
+                    "phase1_expiry_deadlines",
+                    _PHASE1_EXPIRY_DEADLINE_COLUMNS,
+                    expiry_row,
+                )
+                event_kind = "EXPIRE"
+                to_status = "EXPIRED"
+                session_completion_id = None
+                signal_evidence_id = None
+                expiry_source_id = getattr(
+                    expiry_source.expiry_evidence,
+                    "source_id",
+                )
+                terminal_source_id = expiry_source_id
+                terminal_source_digest = expiry_source.source_digest
+                source_references = (
+                    *expiry_source.row_references,
+                    expiry_reference,
+                )
+                terminal_details = {
+                    "terminal_evidence_kind": "EXPIRY_DEADLINE",
+                    "terminal_evidence_digest": expiry_source.source_digest,
+                    "terminal_source_id": expiry_source_id,
+                    "deadline_at": _canonical_timestamp(expiry_source.deadline_at),
+                }
+            else:
+                raise JournalError("Phase 1 terminal derivation was incomplete")
+
+            allowed_from = {
+                "FINALIZE_NOT_TRIGGERED": {"PUBLISHED"},
+                "FINALIZE_NOT_FILLED": {"TRIGGERED_AWAITING_LIMIT"},
+                "FINALIZE_UNRESOLVED": {
+                    "PUBLISHED",
+                    "TRIGGERED_AWAITING_LIMIT",
+                },
+                "EXPIRE": {"PUBLISHED", "TRIGGERED_AWAITING_LIMIT"},
+                "INVALIDATE": {"PUBLISHED", "TRIGGERED_AWAITING_LIMIT"},
+            }
+            if current_status not in allowed_from[event_kind]:
+                raise InvalidJournalValue(
+                    "Phase 1 terminal conflicts with current lifecycle state"
+                )
+            event_row = self._insert_phase1_terminal_event(
+                signal_id=signal_id,
+                event_kind=event_kind,
+                from_status=current_status,
+                to_status=to_status,
+                event_ordinal=int(prior_row[3]) + 1,
+                recorded_at=normalized_recorded_at,
+                session_completion_id=session_completion_id,
+                signal_evidence_id=signal_evidence_id,
+                expiry_source_id=expiry_source_id,
+                terminal_source_id=terminal_source_id,
+                terminal_source_digest=terminal_source_digest,
+                references=(
+                    *source_references,
+                    _journal_row_reference(
+                        "phase1_signal_events",
+                        _PHASE1_SIGNAL_EVENT_COLUMNS,
+                        prior_row,
+                    ),
+                ),
+                details=terminal_details,
+            )
+            self._transaction_dirty = True
+            return self._phase1_terminal_result_from_row(
+                event_row,
+                duplicate=False,
+            )
+
+    def start_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        """Start one fixed-capital validation window and seed both close curves."""
+        with self.transaction() as transaction:
+            return transaction.start_phase1_validation_window(
+                window_id=window_id,
+                started_session=started_session,
+                starting_capital=starting_capital,
+                started_at=started_at,
+                received_at=received_at,
+                calendar_resolver=calendar_resolver,
+            )
+
+    def publish_phase1_report(
+        self,
+        *,
+        publication_source: Phase1PublicationSource,
+        decision: object,
+        primary_plan_decision: object,
+        validation_window_id: str,
+        calendar_resolver: object,
+        received_at: datetime,
+    ) -> StoredPhase1Publication:
+        """Publish the exact finalized report cohort under one transaction."""
+        with self.transaction() as transaction:
+            return transaction.publish_phase1_report(
+                publication_source=publication_source,
+                decision=decision,
+                primary_plan_decision=primary_plan_decision,
+                validation_window_id=validation_window_id,
+                calendar_resolver=calendar_resolver,
+                received_at=received_at,
             )
 
     def claim_report(
@@ -1683,6 +9344,4817 @@ class Journal:
             created_at=_parse_canonical_timestamp(str(row[10])),
             finalized_at=_parse_canonical_timestamp(str(row[11])),
         )
+
+    def _read_phase1_publication_manifest_source(
+        self,
+        *,
+        publication_report_id: int,
+        publication_observations: Sequence[Phase1PublicationObservationSource],
+    ) -> tuple[
+        tuple[tuple[str, tuple[str, ...]], ...],
+        tuple[tuple[str, str], ...],
+        tuple[tuple[str, str, str | None], ...],
+        tuple[Phase1NormalizedMarketFactSource, ...],
+        tuple[Phase1ProviderFetchManifestSource, ...],
+        str | None,
+        tuple[JournalRowReference, ...],
+    ]:
+        manifest_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_PUBLICATION_MANIFEST_COLUMNS)
+            + " FROM phase1_publication_manifests "
+            "WHERE publication_report_id = ?",
+            (publication_report_id,),
+        ).fetchone()
+        page_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS)
+            + " FROM phase1_publication_fetch_pages "
+            "WHERE publication_report_id = ? "
+            "ORDER BY fetch_manifest_ordinal, page_ordinal",
+            (publication_report_id,),
+        ).fetchall()
+        fact_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_PUBLICATION_FACT_COLUMNS)
+            + " FROM phase1_publication_facts "
+            "WHERE publication_report_id = ? ORDER BY fact_ordinal",
+            (publication_report_id,),
+        ).fetchall()
+        if manifest_row is None:
+            if page_rows or fact_rows:
+                raise MigrationCorruption(
+                    "Phase 1 publication manifest children are orphaned"
+                )
+            return (), (), (), (), (), None, ()
+        if not page_rows or not fact_rows:
+            raise MigrationCorruption(
+                "Phase 1 publication provider manifest is incomplete"
+            )
+
+        def canonical_json_value(raw: object, *, label: str) -> object:
+            if type(raw) is not str:
+                raise MigrationCorruption(f"{label} is not stored text")
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise MigrationCorruption(f"{label} is invalid JSON") from error
+            if _canonical_audit_json(value) != raw:
+                raise MigrationCorruption(f"{label} is not canonical JSON")
+            return value
+
+        candidate_source_value = canonical_json_value(
+            manifest_row[3],
+            label="Phase 1 publication candidate source manifest",
+        )
+        candidate_context_value = canonical_json_value(
+            manifest_row[4],
+            label="Phase 1 publication candidate context manifest",
+        )
+        candidate_subject_value = canonical_json_value(
+            manifest_row[5],
+            label="Phase 1 publication candidate subject manifest",
+        )
+        source_ids_value = canonical_json_value(
+            manifest_row[6],
+            label="Phase 1 publication source identity manifest",
+        )
+        try:
+            candidate_source_ids = tuple(
+                (str(item[0]), tuple(str(value) for value in item[1]))
+                for item in candidate_source_value  # type: ignore[union-attr]
+            )
+            candidate_context_digests = tuple(
+                (str(item[0]), str(item[1]))
+                for item in candidate_context_value  # type: ignore[union-attr]
+            )
+            candidate_subjects = tuple(
+                (
+                    str(item[0]),
+                    str(item[1]),
+                    None if item[2] is None else str(item[2]),
+                )
+                for item in candidate_subject_value  # type: ignore[union-attr]
+            )
+            source_ids = tuple(str(value) for value in source_ids_value)  # type: ignore[union-attr]
+        except (TypeError, IndexError) as error:
+            raise MigrationCorruption(
+                "Phase 1 publication manifest structure is malformed"
+            ) from error
+        if (
+            not candidate_source_ids
+            or tuple(symbol for symbol, _ids in candidate_source_ids)
+            != tuple(symbol for symbol, _digest in candidate_context_digests)
+            or tuple(symbol for symbol, _ids in candidate_source_ids)
+            != tuple(symbol for symbol, _kind, _issuer in candidate_subjects)
+            or len({symbol for symbol, _ids in candidate_source_ids})
+            != len(candidate_source_ids)
+            or any(
+                not ids
+                or ids != tuple(sorted(set(ids)))
+                for _symbol, ids in candidate_source_ids
+            )
+            or source_ids != tuple(sorted(set(source_ids)))
+            or source_ids
+            != tuple(
+                sorted(
+                    {
+                        source_id
+                        for _symbol, ids in candidate_source_ids
+                        for source_id in ids
+                    }
+                )
+            )
+            or any(
+                _require_sha256(digest, "candidate context digest") != digest
+                for _symbol, digest in candidate_context_digests
+            )
+            or any(
+                subject_kind not in {"STOCK", "ETF"}
+                or (
+                    subject_kind == "STOCK"
+                    and (
+                        issuer_cik is None
+                        or len(issuer_cik) != 10
+                        or not issuer_cik.isdigit()
+                    )
+                )
+                or (subject_kind == "ETF" and issuer_cik is not None)
+                for _symbol, subject_kind, issuer_cik in candidate_subjects
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 1 publication manifest identity is inconsistent"
+            )
+        manifest_immutable = tuple(manifest_row[1:-1])
+        expected_manifest_record = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_PUBLICATION_MANIFEST_COLUMNS[1:-1],
+                        manifest_immutable,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(manifest_row[-1]) != expected_manifest_record:
+            raise MigrationCorruption(
+                "Phase 1 publication manifest record hash is inconsistent"
+            )
+
+        observations_by_external_id = {
+            item.external_source_observation_id: item
+            for item in publication_observations
+        }
+        if tuple(sorted(observations_by_external_id)) != source_ids:
+            raise MigrationCorruption(
+                "Phase 1 publication manifest conflicts with report pins"
+            )
+        pages_by_manifest: dict[
+            int, list[Phase1ProviderFetchPageSource]
+        ] = {}
+        manifest_metadata: dict[int, tuple[str, tuple[str, ...], str, str, bool]] = {}
+        page_references: list[JournalRowReference] = []
+        for row in page_rows:
+            row_reference = _journal_row_reference(
+                "phase1_publication_fetch_pages",
+                _PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS,
+                row,
+            )
+            row_immutable = tuple(row[1:-1])
+            expected_record = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS[1:-1],
+                            row_immutable,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if str(row[-1]) != expected_record:
+                raise MigrationCorruption(
+                    "Phase 1 publication fetch-page record hash is inconsistent"
+                )
+            manifest_ordinal = int(row[2])
+            requested_value = canonical_json_value(
+                row[5],
+                label="Phase 1 publication requested-symbol manifest",
+            )
+            try:
+                requested_symbols = tuple(str(item) for item in requested_value)  # type: ignore[union-attr]
+            except TypeError as error:
+                raise MigrationCorruption(
+                    "Phase 1 publication requested symbols are malformed"
+                ) from error
+            if (
+                requested_symbols != tuple(sorted(set(requested_symbols)))
+                or not requested_symbols
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication requested symbols are inconsistent"
+                )
+            external_id = str(row[8])
+            observation = observations_by_external_id.get(external_id)
+            if observation is None:
+                raise MigrationCorruption(
+                    "Phase 1 publication provider page is not pinned"
+                )
+            if (
+                str(row[9]) != observation.source_type
+                or str(row[10]) != observation.source_uri
+                or str(row[13]) != observation.payload_sha256
+                or hashlib.sha256(observation.source_payload).hexdigest()
+                != str(row[13])
+                or observation.provider.lower() != "alpaca"
+                or observation.health_result != "OK"
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication provider page conflicts with raw evidence"
+                )
+            try:
+                collection, collection_is_list = (
+                    _validate_phase1_alpaca_page_contract(
+                        (
+                            observation.row_id,
+                            observation.observation_sha256,
+                            observation.payload_sha256,
+                            observation.source_uri,
+                            observation.source_type,
+                            observation.provider,
+                            observation.feed,
+                        ),
+                        observation.source_payload,
+                    )
+                )
+                document = json.loads(
+                    observation.source_payload.decode("utf-8"),
+                    parse_float=Decimal,
+                )
+            except InvalidJournalValue as error:
+                raise MigrationCorruption(
+                    "Phase 1 publication provider page contract is invalid"
+                ) from error
+            if collection != str(row[4]):
+                raise MigrationCorruption(
+                    "Phase 1 publication provider collection is inconsistent"
+                )
+            payload_symbols = tuple(sorted(str(value) for value in document[collection]))
+            if any(symbol not in requested_symbols for symbol in payload_symbols):
+                raise MigrationCorruption(
+                    "Phase 1 publication provider page contains an unrequested symbol"
+                )
+            parsed_url = urlsplit(str(row[10]))
+            page_tokens = [
+                value
+                for name, value in parse_qsl(
+                    parsed_url.query,
+                    keep_blank_values=True,
+                )
+                if name == "page_token"
+            ]
+            request_token = None if not page_tokens else page_tokens[0]
+            next_token = document.get("next_page_token")
+            if (
+                len(page_tokens) > 1
+                or request_token != row[11]
+                or next_token != row[12]
+                or (not collection_is_list and (row[11] is not None or row[12] is not None))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication provider page token chain is inconsistent"
+                )
+            page = Phase1ProviderFetchPageSource(
+                page_ordinal=int(row[7]),
+                source_observation_id=external_id,
+                source_type=str(row[9]),
+                request_url=str(row[10]),
+                request_page_token=None if row[11] is None else str(row[11]),
+                next_page_token=None if row[12] is None else str(row[12]),
+                payload_sha256=str(row[13]),
+                row_reference=row_reference,
+            )
+            pages_by_manifest.setdefault(manifest_ordinal, []).append(page)
+            metadata = (
+                str(row[4]),
+                requested_symbols,
+                str(row[6]),
+                str(row[3]),
+                bool(row[14]),
+            )
+            prior = manifest_metadata.setdefault(manifest_ordinal, metadata)
+            if prior != metadata:
+                raise MigrationCorruption(
+                    "Phase 1 publication fetch manifest metadata conflicts"
+                )
+            page_references.append(row_reference)
+        if tuple(sorted(pages_by_manifest)) != tuple(
+            range(1, len(pages_by_manifest) + 1)
+        ):
+            raise MigrationCorruption(
+                "Phase 1 publication fetch manifest ordinals are incomplete"
+            )
+        fetch_manifests: list[Phase1ProviderFetchManifestSource] = []
+        fetch_by_digest: dict[str, Phase1ProviderFetchManifestSource] = {}
+        for manifest_ordinal in sorted(pages_by_manifest):
+            pages = tuple(pages_by_manifest[manifest_ordinal])
+            collection, requested_symbols, request_digest, manifest_digest, terminal = (
+                manifest_metadata[manifest_ordinal]
+            )
+            if (
+                tuple(page.page_ordinal for page in pages)
+                != tuple(range(1, len(pages) + 1))
+                or pages[0].request_page_token is not None
+                or pages[-1].next_page_token is not None
+                or any(
+                    successor.request_page_token != prior.next_page_token
+                    or prior.next_page_token is None
+                    for prior, successor in zip(pages, pages[1:], strict=False)
+                )
+                or terminal is not True
+                or request_digest
+                != _phase1_provider_request_digest(
+                    collection=collection,
+                    requested_symbols=requested_symbols,
+                    request_url=pages[0].request_url,
+                )
+                or manifest_digest
+                != _phase1_provider_manifest_digest(
+                    collection=collection,
+                    requested_symbols=requested_symbols,
+                    request_digest=request_digest,
+                    pages=pages,
+                )
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication fetch manifest integrity failed"
+                )
+            source = Phase1ProviderFetchManifestSource(
+                collection=collection,
+                requested_symbols=requested_symbols,
+                request_digest=request_digest,
+                pages=pages,
+                terminal=True,
+                manifest_digest=manifest_digest,
+            )
+            if manifest_digest in fetch_by_digest:
+                raise MigrationCorruption(
+                    "Phase 1 publication fetch manifest digest is duplicated"
+                )
+            fetch_by_digest[manifest_digest] = source
+            fetch_manifests.append(source)
+
+        facts: list[Phase1NormalizedMarketFactSource] = []
+        fact_references: list[JournalRowReference] = []
+        for expected_ordinal, row in enumerate(fact_rows, start=1):
+            reference = _journal_row_reference(
+                "phase1_publication_facts",
+                _PHASE1_PUBLICATION_FACT_COLUMNS,
+                row,
+            )
+            row_immutable = tuple(row[1:-1])
+            expected_record = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_PUBLICATION_FACT_COLUMNS[1:-1],
+                            row_immutable,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if str(row[-1]) != expected_record or int(row[2]) != expected_ordinal:
+                raise MigrationCorruption(
+                    "Phase 1 publication fact record integrity failed"
+                )
+            fetch_manifest = fetch_by_digest.get(str(row[13]))
+            observation = observations_by_external_id.get(str(row[7]))
+            if fetch_manifest is None or observation is None:
+                raise MigrationCorruption(
+                    "Phase 1 publication fact source is incomplete"
+                )
+            matching_pages = tuple(
+                page
+                for page in fetch_manifest.pages
+                if page.page_ordinal == int(row[8])
+                and page.source_observation_id == str(row[7])
+            )
+            items = _phase1_payload_items(observation.source_payload)
+            matching_items = tuple(
+                item
+                for ordinal, item in enumerate(items, start=1)
+                if ordinal == int(row[9]) and item.path == str(row[10])
+            )
+            if (
+                len(matching_pages) != 1
+                or len(matching_items) != 1
+                or matching_items[0].kind != str(row[4])
+                or matching_items[0].symbol != str(row[5])
+                or str(row[11]) != observation.payload_sha256
+                or str(row[6]).lower()
+                != (observation.feed or "").lower()
+                or str(row[12])
+                != _phase1_recomputed_normalized_fields_digest(
+                    item=matching_items[0],
+                    publication_observation=observation,
+                    kind=str(row[4]),
+                    symbol=str(row[5]),
+                    feed=str(row[6]),
+                    page_ordinal=int(row[8]),
+                    source_item_ordinal=int(row[9]),
+                    source_item_path=str(row[10]),
+                )
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication normalized fact conflicts with raw evidence"
+                )
+            fact = Phase1NormalizedMarketFactSource(
+                fact_ordinal=expected_ordinal,
+                candidate_symbol=str(row[3]),
+                kind=str(row[4]),
+                symbol=str(row[5]),
+                feed=str(row[6]),
+                source_observation_id=str(row[7]),
+                page_ordinal=int(row[8]),
+                source_item_ordinal=int(row[9]),
+                source_item_path=str(row[10]),
+                page_payload_sha256=str(row[11]),
+                normalized_fields_digest=str(row[12]),
+                fetch_manifest_digest=str(row[13]),
+                fetch_manifest=fetch_manifest,
+                row_reference=reference,
+            )
+            if fact.candidate_symbol not in {
+                symbol for symbol, _ids in candidate_source_ids
+            }:
+                raise MigrationCorruption(
+                    "Phase 1 publication fact candidate is not published"
+                )
+            facts.append(fact)
+            fact_references.append(reference)
+
+        manifest_document = {
+            "candidate_context_digests": [
+                [symbol, digest]
+                for symbol, digest in candidate_context_digests
+            ],
+            "candidate_source_observation_ids": [
+                [symbol, list(ids)]
+                for symbol, ids in candidate_source_ids
+            ],
+            "candidate_subjects": [
+                [symbol, subject_kind, issuer_cik]
+                for symbol, subject_kind, issuer_cik in candidate_subjects
+            ],
+            "normalized_market_fact_sources": [
+                {
+                    "candidate_symbol": fact.candidate_symbol,
+                    "kind": fact.kind,
+                    "symbol": fact.symbol,
+                    "feed": fact.feed,
+                    "source_observation_id": fact.source_observation_id,
+                    "page_ordinal": fact.page_ordinal,
+                    "source_item_ordinal": fact.source_item_ordinal,
+                    "source_item_path": fact.source_item_path,
+                    "page_payload_sha256": fact.page_payload_sha256,
+                    "normalized_fields_digest": fact.normalized_fields_digest,
+                    "fetch_manifest_digest": fact.fetch_manifest_digest,
+                }
+                for fact in facts
+            ],
+            "provider_fetch_manifests": [
+                {
+                    "collection": manifest.collection,
+                    "requested_symbols": list(manifest.requested_symbols),
+                    "request_digest": manifest.request_digest,
+                    "terminal": manifest.terminal,
+                    "manifest_digest": manifest.manifest_digest,
+                    "pages": [
+                        {
+                            "page_ordinal": page.page_ordinal,
+                            "source_observation_id": page.source_observation_id,
+                            "source_type": page.source_type,
+                            "request_url": page.request_url,
+                            "request_page_token": page.request_page_token,
+                            "next_page_token": page.next_page_token,
+                            "payload_sha256": page.payload_sha256,
+                        }
+                        for page in manifest.pages
+                    ],
+                }
+                for manifest in fetch_manifests
+            ],
+            "source_observation_ids": list(source_ids),
+            "version": 3,
+        }
+        expected_manifest_digest = hashlib.sha256(
+            json.dumps(
+                manifest_document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(manifest_row[2]) != expected_manifest_digest:
+            raise MigrationCorruption(
+                "Phase 1 publication manifest digest integrity failed"
+            )
+        manifest_reference = _journal_row_reference(
+            "phase1_publication_manifests",
+            _PHASE1_PUBLICATION_MANIFEST_COLUMNS,
+            manifest_row,
+        )
+        return (
+            candidate_source_ids,
+            candidate_context_digests,
+            candidate_subjects,
+            tuple(facts),
+            tuple(fetch_manifests),
+            expected_manifest_digest,
+            (manifest_reference, *page_references, *fact_references),
+        )
+
+    def read_phase1_publication_source(
+        self,
+        report_id: str,
+    ) -> Phase1PublicationSource:
+        """Reread and authenticate one finalized morning-report evidence bundle."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 publication source requires a post-commit read"
+            )
+        report_id = _require_nonempty_text(
+            report_id,
+            "Phase 1 publication report ID",
+        )
+        read_cache = self._phase1_publication_read_cache
+        if read_cache is not None:
+            cached = read_cache.get(report_id)
+            if cached is not None and (
+                is_verified_phase1_publication_source(cached)
+                and _phase1_source_owner(cached) is self
+            ):
+                return cached
+            read_cache.pop(report_id, None)
+        stored = self.read_report(report_id)
+        if stored.report_kind != "MORNING":
+            raise InvalidJournalValue(
+                "Phase 1 publication source must be a MORNING report"
+            )
+        report_row = _sql(
+            self._connection,
+            "SELECT id, report_id, claim_id, session_date, report_kind, "
+            "body_text, content_sha256, state_sha256, observation_set_sha256, "
+            "archive_relative_path, created_at FROM reports WHERE id = ?",
+            (stored.report_row_id,),
+        ).fetchone()
+        claim_row = _sql(
+            self._connection,
+            "SELECT id, session_date, report_kind, claim_token, status, "
+            "created_at, lease_started_at, lease_expires_at, finalized_at, "
+            "report_id FROM report_claims WHERE id = ?",
+            (stored.claim_id,),
+        ).fetchone()
+        if report_row is None or claim_row is None:
+            raise MigrationCorruption(
+                "Phase 1 publication report lineage is incomplete"
+            )
+        if (
+            str(claim_row[4]) != "FINALIZED"
+            or int(claim_row[9]) != stored.report_row_id
+            or str(claim_row[1]) != stored.session_date.isoformat()
+            or str(claim_row[2]) != stored.report_kind
+        ):
+            raise MigrationCorruption(
+                "Phase 1 publication claim conflicts with its report"
+            )
+        pin_rows = _sql(
+            self._connection,
+            "SELECT id, report_id, source_observation_id, observation_ordinal "
+            "FROM report_observations WHERE report_id = ? "
+            "ORDER BY observation_ordinal",
+            (stored.report_row_id,),
+        ).fetchall()
+        if tuple(int(row[3]) for row in pin_rows) != tuple(range(len(pin_rows))):
+            raise MigrationCorruption(
+                "Phase 1 publication report pins are not contiguous"
+            )
+        source_rows: list[Sequence[object]] = []
+        for pin_row in pin_rows:
+            source_row = _sql(
+                self._connection,
+                "SELECT id, observation_sha256, payload_sha256, source_uri, "
+                "source_type, provider, feed, source_time, retrieved_at, "
+                "provider_sequence, delay_seconds, health_result, details_json "
+                "FROM source_observations WHERE id = ?",
+                (int(pin_row[2]),),
+            ).fetchone()
+            if source_row is None:
+                raise MigrationCorruption(
+                    "Phase 1 publication report pin source is missing"
+                )
+            source_rows.append(source_row)
+        if tuple(int(row[2]) for row in pin_rows) != stored.observation_ids or tuple(
+            str(row[1]) for row in source_rows
+        ) != stored.observation_sha256s:
+            raise MigrationCorruption(
+                "Phase 1 publication report pins conflict with readback"
+            )
+        publication_observations: list[Phase1PublicationObservationSource] = []
+        external_source_ids: set[str] = set()
+        for source_row in source_rows:
+            payload_row = _sql(
+                self._connection,
+                "SELECT id, source_observation_id, payload_sha256, source_payload, "
+                "recorded_at, record_sha256 FROM phase1_source_payloads "
+                "WHERE source_observation_id = ?",
+                (int(source_row[0]),),
+            ).fetchone()
+            if payload_row is None:
+                raise MigrationCorruption(
+                    "Phase 1 publication source payload is missing"
+                )
+            details_json = str(source_row[12])
+            details = _canonical_stored_details(
+                details_json,
+                label="Phase 1 publication source observation",
+            )
+            external_source_id = details.get("source_observation_id")
+            if (
+                type(external_source_id) is not str
+                or not external_source_id
+                or "\x00" in external_source_id
+                or external_source_id in external_source_ids
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication source identity is incomplete or duplicated"
+                )
+            external_source_ids.add(external_source_id)
+            payload_sha256 = str(source_row[2])
+            if re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None:
+                raise MigrationCorruption(
+                    "Phase 1 publication source payload hash is invalid"
+                )
+            source_payload = bytes(payload_row[3])
+            expected_payload_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "version": 1,
+                        "source_observation_id": int(source_row[0]),
+                        "payload_sha256": payload_sha256,
+                        "recorded_at": str(source_row[8]),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                int(payload_row[1]) != int(source_row[0])
+                or str(payload_row[2]) != payload_sha256
+                or hashlib.sha256(source_payload).hexdigest() != payload_sha256
+                or str(payload_row[4]) != str(source_row[8])
+                or str(payload_row[5]) != expected_payload_record_sha256
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 publication source payload is inconsistent"
+                )
+            observation_material = _canonical_json(
+                {
+                    "delay_seconds": source_row[10],
+                    "details": details,
+                    "feed": source_row[6],
+                    "health_result": str(source_row[11]),
+                    "payload_sha256": payload_sha256,
+                    "provider": str(source_row[5]),
+                    "provider_sequence": source_row[9],
+                    "retrieved_at": str(source_row[8]),
+                    "source_time": str(source_row[7]),
+                    "source_type": str(source_row[4]),
+                    "source_uri": str(source_row[3]),
+                }
+            )
+            expected_observation_sha256 = hashlib.sha256(
+                observation_material.encode("utf-8")
+            ).hexdigest()
+            if str(source_row[1]) != expected_observation_sha256:
+                raise MigrationCorruption(
+                    "Phase 1 publication source observation hash is inconsistent"
+                )
+            if str(source_row[5]).lower() == "alpaca":
+                try:
+                    metadata = _phase1_recompute_alpaca_page_metadata(
+                        payload=source_payload,
+                        request_url=str(source_row[3]),
+                        source_type=str(source_row[4]),
+                        retrieved_at=_parse_canonical_timestamp(str(source_row[8])),
+                    )
+                except InvalidJournalValue as error:
+                    raise MigrationCorruption(
+                        "Phase 1 publication Alpaca page metadata is invalid"
+                    ) from error
+                if (
+                    external_source_id
+                    != str(getattr(metadata, "source_observation_id"))
+                    or _parse_canonical_timestamp(str(source_row[7]))
+                    != getattr(metadata, "source_time")
+                    or _parse_canonical_timestamp(str(source_row[8]))
+                    != getattr(metadata, "retrieved_at")
+                    or source_row[10] is None
+                    or int(source_row[10])
+                    != int(getattr(metadata, "delay_seconds"))
+                    or payload_sha256 != str(getattr(metadata, "payload_sha256"))
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 publication Alpaca page metadata conflicts "
+                        "with raw evidence"
+                    )
+            source_reference = _journal_row_reference(
+                "source_observations",
+                _SOURCE_OBSERVATION_COLUMNS,
+                source_row,
+            )
+            payload_reference = _journal_row_reference(
+                "phase1_source_payloads",
+                _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                payload_row,
+            )
+            publication_observations.append(
+                Phase1PublicationObservationSource(
+                    row_id=int(source_row[0]),
+                    external_source_observation_id=external_source_id,
+                    observation_sha256=expected_observation_sha256,
+                    payload_sha256=payload_sha256,
+                    source_payload=source_payload,
+                    source_uri=str(source_row[3]),
+                    source_type=str(source_row[4]),
+                    provider=str(source_row[5]),
+                    feed=None if source_row[6] is None else str(source_row[6]),
+                    source_time=_parse_canonical_timestamp(str(source_row[7])),
+                    retrieved_at=_parse_canonical_timestamp(str(source_row[8])),
+                    provider_sequence=(
+                        None if source_row[9] is None else int(source_row[9])
+                    ),
+                    delay_seconds=(
+                        None if source_row[10] is None else int(source_row[10])
+                    ),
+                    health_result=str(source_row[11]),
+                    details_json=details_json,
+                    row_reference=source_reference,
+                    payload_row_reference=payload_reference,
+                )
+            )
+        publication_observations.sort(
+            key=lambda item: item.external_source_observation_id
+        )
+        (
+            candidate_source_observation_ids,
+            candidate_context_digests,
+            candidate_subjects,
+            normalized_market_fact_sources,
+            provider_fetch_manifests,
+            manifest_digest,
+            manifest_row_references,
+        ) = self._read_phase1_publication_manifest_source(
+            publication_report_id=stored.report_row_id,
+            publication_observations=publication_observations,
+        )
+        outbox_rows = _sql(
+            self._connection,
+            "SELECT id, idempotency_key, origin_report_id, "
+            "origin_execution_event_id, destination, payload_text, "
+            "payload_sha256, created_at FROM outbox WHERE origin_report_id = ? "
+            "ORDER BY id",
+            (stored.report_row_id,),
+        ).fetchall()
+        if len(outbox_rows) != 1:
+            raise MigrationCorruption(
+                "Phase 1 publication report outbox bundle is incomplete"
+            )
+        outbox_row = outbox_rows[0]
+        expected_outbox_key = "report-delivery:" + hashlib.sha256(
+            (stored.report_id + "\x00" + str(outbox_row[4])).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(outbox_row[1]) != expected_outbox_key
+            or int(outbox_row[2]) != stored.report_row_id
+            or outbox_row[3] is not None
+            or not str(outbox_row[4])
+            or str(outbox_row[6])
+            != hashlib.sha256(str(outbox_row[5]).encode("utf-8")).hexdigest()
+            or str(outbox_row[7])
+            != _canonical_timestamp(stored.finalized_at)
+        ):
+            raise MigrationCorruption(
+                "Phase 1 publication report outbox conflicts with its report"
+            )
+        references = (
+            _journal_row_reference("reports", _REPORT_COLUMNS, report_row),
+            _journal_row_reference(
+                "report_claims",
+                _REPORT_CLAIM_COLUMNS,
+                claim_row,
+            ),
+            *(
+                _journal_row_reference(
+                    "report_observations",
+                    _REPORT_OBSERVATION_COLUMNS,
+                    row,
+                )
+                for row in pin_rows
+            ),
+            *(item.row_reference for item in publication_observations),
+            *(item.payload_row_reference for item in publication_observations),
+            *manifest_row_references,
+            _journal_row_reference("outbox", _OUTBOX_COLUMNS, outbox_row),
+        )
+        published_at = stored.created_at
+        received_at = stored.finalized_at
+        if received_at < published_at:
+            raise MigrationCorruption(
+                "Phase 1 publication report receipt precedes publication"
+            )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-publication-source/v1",
+            references,
+            {
+                "report_id": stored.report_id,
+                "session_date": stored.session_date.isoformat(),
+                "report_kind": stored.report_kind,
+                "state_sha256": stored.state_sha256,
+                "content_sha256": stored.content_sha256,
+                "observation_set_sha256": stored.observation_set_sha256,
+                "external_source_observation_ids": [
+                    item.external_source_observation_id
+                    for item in publication_observations
+                ],
+                "candidate_subjects": [
+                    [symbol, subject_kind, issuer_cik]
+                    for symbol, subject_kind, issuer_cik in candidate_subjects
+                ],
+                "publication_manifest_digest": manifest_digest,
+                "published_at": _canonical_timestamp(published_at),
+                "received_at": _canonical_timestamp(received_at),
+                "outbox_row_id": int(outbox_row[0]),
+                "outbox_destination": str(outbox_row[4]),
+                "outbox_payload_sha256": str(outbox_row[6]),
+            },
+        )
+        source = Phase1PublicationSource(
+            report_row_id=stored.report_row_id,
+            report_id=stored.report_id,
+            session_date=stored.session_date,
+            report_kind=stored.report_kind,
+            state_sha256=stored.state_sha256,
+            body_sha256=stored.content_sha256,
+            observation_set_sha256=stored.observation_set_sha256,
+            observation_ids=stored.observation_ids,
+            observation_sha256s=stored.observation_sha256s,
+            source_observations=tuple(publication_observations),
+            candidate_source_observation_ids=(
+                candidate_source_observation_ids
+            ),
+            candidate_context_digests=candidate_context_digests,
+            candidate_subjects=candidate_subjects,
+            normalized_market_fact_sources=normalized_market_fact_sources,
+            provider_fetch_manifests=provider_fetch_manifests,
+            manifest_digest=manifest_digest,
+            manifest_row_references=manifest_row_references,
+            published_at=published_at,
+            received_at=received_at,
+            outbox_row_id=int(outbox_row[0]),
+            outbox_destination=str(outbox_row[4]),
+            outbox_payload_sha256=str(outbox_row[6]),
+            outbox_created_at=_parse_canonical_timestamp(str(outbox_row[7])),
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        if read_cache is not None:
+            read_cache[report_id] = source
+        return source
+
+    def _read_phase1_signal_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> Phase1SignalSource:
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError("Phase 1 signal source requires a post-commit read")
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_SIGNAL_COLUMNS)
+            + " FROM phase1_signals "
+            "WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        stored = dict(zip(_PHASE1_SIGNAL_COLUMNS, tuple(row), strict=True))
+        received_at = _parse_canonical_timestamp(str(stored["received_at"]))
+        if received_at > normalized_cutoff:
+            from .risk import RiskBlock
+
+            raise RiskBlock("PHASE1_SOURCE_LOOKAHEAD")
+        report_row = _sql(
+            self._connection,
+            "SELECT report_id FROM reports WHERE id = ?",
+            (int(stored["publication_report_id"]),),
+        ).fetchone()
+        if report_row is None:
+            raise MigrationCorruption("Phase 1 signal publication report is missing")
+        publication_source = self.read_phase1_publication_source(str(report_row[0]))
+        if (
+            publication_source.report_row_id
+            != int(stored["publication_report_id"])
+            or publication_source.session_date.isoformat()
+            != str(stored["publication_session"])
+            or publication_source.source_digest
+            != str(stored["publication_source_digest"])
+            or publication_source.state_sha256
+            != str(stored["publication_state_digest"])
+            or publication_source.body_sha256
+            != str(stored["publication_content_digest"])
+            or publication_source.observation_set_sha256
+            != str(stored["publication_observation_set_digest"])
+            or publication_source.received_at > received_at
+        ):
+            raise MigrationCorruption(
+                "Phase 1 signal conflicts with publication evidence"
+            )
+        record_material = {
+            column: stored[column]
+            for column in _PHASE1_SIGNAL_COLUMNS[1:-1]
+        }
+        expected_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(record_material).encode("utf-8")
+        ).hexdigest()
+        if str(stored["record_sha256"]) != expected_record_sha256:
+            raise MigrationCorruption("Phase 1 signal record hash is inconsistent")
+        signal_reference = _journal_row_reference(
+            "phase1_signals",
+            _PHASE1_SIGNAL_COLUMNS,
+            row,
+        )
+        references = (signal_reference, *publication_source.row_references)
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-signal-source/v1",
+            references,
+            {
+                "signal_id": signal_id,
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "record_sha256": expected_record_sha256,
+            },
+        )
+        source = Phase1SignalSource(
+            row_id=int(row[0]),
+            row_sha256=expected_record_sha256,
+            signal_id=str(stored["signal_id"]),
+            validation_window_id=str(stored["validation_window_id"]),
+            symbol=str(stored["symbol"]),
+            subject_kind=str(stored["subject_kind"]),
+            issuer_cik=(
+                None if stored["issuer_cik"] is None else str(stored["issuer_cik"])
+            ),
+            role=str(stored["role"]),
+            publication_session=date.fromisoformat(
+                str(stored["publication_session"])
+            ),
+            maximum_entry_micros=int(stored["maximum_entry_micros"]),
+            recommended_stop_micros=int(stored["recommended_stop_micros"]),
+            target_micros=int(stored["target_micros"]),
+            planned_shares=int(stored["planned_shares"]),
+            tick_size_micros=int(stored["tick_size_micros"]),
+            trigger_price_micros=int(stored["trigger_price_micros"]),
+            publication_report_row_id=int(stored["publication_report_id"]),
+            publication_report_id=str(report_row[0]),
+            publication_rank=int(stored["publication_rank"]),
+            publication_source_digest=str(stored["publication_source_digest"]),
+            publication_state_digest=str(stored["publication_state_digest"]),
+            publication_content_digest=str(stored["publication_content_digest"]),
+            publication_observation_set_digest=str(
+                stored["publication_observation_set_digest"]
+            ),
+            publication_decision_digest=str(stored["publication_decision_digest"]),
+            primary_plan_digest=str(stored["primary_plan_digest"]),
+            policy_digest=str(stored["policy_digest"]),
+            calendar_digest=str(stored["calendar_digest"]),
+            published_at=_parse_canonical_timestamp(str(stored["published_at"])),
+            received_at=received_at,
+            query_cutoff=normalized_cutoff,
+            publication_source=publication_source,
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_signal(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> object:
+        source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=query_cutoff,
+        )
+        from .ledger import _issue_ledger_signal_from_phase1_source
+
+        return _issue_ledger_signal_from_phase1_source(source)
+
+    def phase1_signal_plan_resolver(self) -> Phase1SignalPlanResolver:
+        """Return a resolver backed only by current persisted PRIMARY rows."""
+        self._ensure_open()
+        return Phase1SignalPlanResolver(self)
+
+    def _resolve_phase1_signal_plan(
+        self,
+        *,
+        symbol: str,
+        economic_at: datetime,
+        query_cutoff: datetime,
+    ) -> object | None:
+        from zoneinfo import ZoneInfo
+
+        from .ledger import _issue_ledger_signal_from_phase1_source
+        from .reconciliation import ResolvedSignalPlan
+
+        self._ensure_open()
+        symbol = _require_nonempty_text(symbol, "Phase 1 signal symbol").upper()
+        normalized_economic_at = _parse_canonical_timestamp(
+            _canonical_timestamp(economic_at)
+        )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if normalized_cutoff < normalized_economic_at:
+            return None
+        session_date = normalized_economic_at.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        rows = _sql(
+            self._connection,
+            "SELECT signal_id FROM phase1_signals "
+            "WHERE symbol = ? COLLATE BINARY AND role = 'PRIMARY' "
+            "AND publication_session = ? AND published_at <= ? "
+            "AND received_at <= ? ORDER BY publication_rank, id",
+            (
+                symbol,
+                session_date.isoformat(),
+                _canonical_timestamp(normalized_economic_at),
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise MigrationCorruption(
+                "Phase 1 PRIMARY signal resolution is ambiguous"
+            )
+        source = self._read_phase1_signal_source(
+            str(rows[0][0]),
+            query_cutoff=normalized_cutoff,
+        )
+        signal = _issue_ledger_signal_from_phase1_source(source)
+        return ResolvedSignalPlan(
+            signal=signal,
+            report_id=source.publication_report_id,
+            publication_rank=source.publication_rank,
+            publication_source_digest=source.publication_source_digest,
+        )
+
+    def _phase1_verified_exit_fact_row(
+        self,
+        fact_id: str,
+        *,
+        cache: dict[str, Sequence[object]],
+    ) -> Sequence[object]:
+        cached = cache.get(fact_id)
+        if cached is not None:
+            return cached
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_FACT_COLUMNS)
+            + " FROM phase1_exit_review_facts WHERE fact_id = ? COLLATE BINARY",
+            (fact_id,),
+        ).fetchone()
+        if row is None:
+            raise MigrationCorruption(
+                "Phase 1 exit replay fact lineage is missing"
+            )
+        fact_semantic = tuple(row[1:19])
+        expected_fact_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-exit-review-fact/v1\x00"
+                + str(row[2])
+                + "\x00"
+                + str(row[3])
+                + "\x00"
+                + str(row[6])
+                + "\x00"
+                + str(row[9])
+            ).encode("utf-8")
+        ).hexdigest()
+        expected_source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-exit-fact/v1",
+                    "values": fact_semantic,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        expected_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_EXIT_REVIEW_FACT_COLUMNS[1:-1],
+                        (*fact_semantic, expected_source_digest),
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            values = json.loads(str(row[18]))
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                "Phase 1 exit replay fact values are malformed"
+            ) from error
+        if (
+            str(row[1]) != expected_fact_id
+            or str(row[19]) != expected_source_digest
+            or str(row[20]) != expected_record_sha256
+            or _canonical_audit_json(values) != str(row[18])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 exit replay fact integrity failed"
+            )
+        cache[fact_id] = row
+        return row
+
+    def _verify_phase1_exit_replay_rows(
+        self,
+        *,
+        signal_sources: Sequence[Phase1SignalSource],
+        event_rows: Sequence[Sequence[object]],
+        posting_rows: Sequence[Sequence[object]],
+        close_rows: Sequence[Sequence[object]],
+        calendar_resolver: object | None,
+        policy: object | None,
+    ) -> None:
+        """Recompute every exact SALE/FEE/aggregate-close bundle."""
+
+        from zoneinfo import ZoneInfo
+
+        from .policy import Policy
+        from .risk import SessionCalendarResolver, _calendar_digest, _policy_digest
+
+        signal_by_id = {source.signal_id: source for source in signal_sources}
+        events_by_signal: dict[str, list[Sequence[object]]] = {
+            signal_id: [] for signal_id in signal_by_id
+        }
+        for row in event_rows:
+            events_by_signal.setdefault(str(row[2]), []).append(row)
+        postings_by_signal: dict[str, list[Sequence[object]]] = {
+            signal_id: [] for signal_id in signal_by_id
+        }
+        postings_by_event: dict[str, list[Sequence[object]]] = {}
+        for row in posting_rows:
+            postings_by_signal.setdefault(str(row[3]), []).append(row)
+            postings_by_event.setdefault(str(row[2]), []).append(row)
+        closes_by_signal: dict[str, list[Sequence[object]]] = {
+            signal_id: [] for signal_id in signal_by_id
+        }
+        for row in close_rows:
+            closes_by_signal.setdefault(str(row[4]), []).append(row)
+        fact_cache: dict[str, Sequence[object]] = {}
+        review_cache: dict[str, Sequence[object]] = {}
+
+        for signal_id, signal_source in signal_by_id.items():
+            signal_events = sorted(
+                events_by_signal.get(signal_id, ()),
+                key=lambda row: int(row[3]),
+            )
+            if not signal_events or tuple(int(row[3]) for row in signal_events) != tuple(
+                range(len(signal_events))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 lifecycle replay order is inconsistent"
+                )
+            for prior, current in zip(signal_events, signal_events[1:]):
+                if (
+                    str(current[5]) != str(prior[6])
+                    or _parse_canonical_timestamp(str(current[9]))
+                    < _parse_canonical_timestamp(str(prior[9]))
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 lifecycle replay transition is inconsistent"
+                    )
+            signal_postings = sorted(
+                postings_by_signal.get(signal_id, ()),
+                key=lambda row: int(row[0]),
+            )
+            buys = tuple(row for row in signal_postings if str(row[4]) == "BUY")
+            exit_events = tuple(
+                row
+                for row in signal_events
+                if str(row[4]) in {"PARTIAL_EXIT", "CLOSE"}
+            )
+            exit_postings = tuple(
+                row
+                for row in signal_postings
+                if str(row[4]) in {"SALE", "FEE"}
+            )
+            if not exit_events:
+                if exit_postings or closes_by_signal.get(signal_id):
+                    raise MigrationCorruption(
+                        "Phase 1 exit replay has economic rows without an exit"
+                    )
+                continue
+            if signal_source.role != "PRIMARY" or len(buys) != 1:
+                raise MigrationCorruption(
+                    "Phase 1 exit replay requires one canonical entry"
+                )
+            if (
+                not isinstance(calendar_resolver, SessionCalendarResolver)
+                or not calendar_resolver.release_verified
+                or signal_source.calendar_digest
+                != _calendar_digest(calendar_resolver)
+                or not isinstance(policy, Policy)
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 exit replay requires verified calendar and policy"
+                )
+            try:
+                policy.validate()
+            except Exception as error:
+                raise InvalidJournalValue(
+                    "Phase 1 exit replay policy is invalid"
+                ) from error
+            if _policy_digest(policy) != signal_source.policy_digest:
+                raise InvalidJournalValue(
+                    "Phase 1 exit replay policy conflicts with publication"
+                )
+            if (
+                len(tuple(row for row in exit_events if str(row[4]) == "PARTIAL_EXIT"))
+                > 1
+                or len(tuple(row for row in exit_events if str(row[4]) == "CLOSE"))
+                > 1
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 exit replay contains duplicate lifecycle actions"
+                )
+            balance = int(buys[0][7])
+            signal_reference = signal_source.row_references[0]
+            exit_group_rows: dict[
+                tuple[str, str],
+                list[tuple[Sequence[object], dict[str, object]]],
+            ] = {}
+            for event_row in exit_events:
+                event_id = str(event_row[1])
+                event_kind = str(event_row[4])
+                event_time = _parse_canonical_timestamp(str(event_row[7]))
+                event_received = _parse_canonical_timestamp(str(event_row[9]))
+                details = _canonical_stored_details(
+                    event_row[20],
+                    label="Phase 1 exit lifecycle",
+                )
+                review_id = details.get("exit_review_id")
+                quote_fact_id = details.get("execution_quote_observation_id")
+                if type(review_id) is not str or type(quote_fact_id) is not str:
+                    raise MigrationCorruption(
+                        "Phase 1 exit lifecycle details are incomplete"
+                    )
+                execution_row = self._phase1_verified_exit_fact_row(
+                    str(event_row[14]),
+                    cache=fact_cache,
+                )
+                quote_row = self._phase1_verified_exit_fact_row(
+                    quote_fact_id,
+                    cache=fact_cache,
+                )
+                if (
+                    str(execution_row[2]) != review_id
+                    or str(execution_row[3]) != "EXECUTION_BAR"
+                    or str(execution_row[10]) != "BAR"
+                    or str(quote_row[2]) != review_id
+                    or str(quote_row[3]) != "QUOTE"
+                    or str(quote_row[10]) != "QUOTE"
+                    or _parse_canonical_timestamp(str(execution_row[13]))
+                    != event_time
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit lifecycle fact lineage conflicts"
+                    )
+                review_row = review_cache.get(review_id)
+                if review_row is None:
+                    review_row = _sql(
+                        self._connection,
+                        "SELECT "
+                        + ", ".join(_PHASE1_EXIT_REVIEW_COLUMNS)
+                        + " FROM phase1_exit_reviews WHERE review_id = ? COLLATE BINARY",
+                        (review_id,),
+                    ).fetchone()
+                    if review_row is None:
+                        raise MigrationCorruption(
+                            "Phase 1 exit lifecycle review is missing"
+                        )
+                    expected_review_hash = hashlib.sha256(
+                        _canonical_audit_json(
+                            dict(
+                                zip(
+                                    _PHASE1_EXIT_REVIEW_COLUMNS[1:-1],
+                                    tuple(review_row[1:-1]),
+                                    strict=True,
+                                )
+                            )
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        str(review_row[2]) != signal_id
+                        or str(review_row[-1]) != expected_review_hash
+                    ):
+                        raise MigrationCorruption(
+                            "Phase 1 exit lifecycle review integrity failed"
+                        )
+                    review_cache[review_id] = review_row
+                prior_row = signal_events[int(event_row[3]) - 1]
+                references = (
+                    signal_reference,
+                    _journal_row_reference(
+                        "phase1_exit_reviews",
+                        _PHASE1_EXIT_REVIEW_COLUMNS,
+                        review_row,
+                    ),
+                    _journal_row_reference(
+                        "phase1_exit_review_facts",
+                        _PHASE1_EXIT_REVIEW_FACT_COLUMNS,
+                        execution_row,
+                    ),
+                    _journal_row_reference(
+                        "phase1_exit_review_facts",
+                        _PHASE1_EXIT_REVIEW_FACT_COLUMNS,
+                        quote_row,
+                    ),
+                    _journal_row_reference(
+                        "phase1_signal_events",
+                        _PHASE1_SIGNAL_EVENT_COLUMNS,
+                        prior_row,
+                    ),
+                )
+                expected_event_digest = _journal_bundle_digest(
+                    "stock-monitor/phase1-exit-lifecycle-event/v1",
+                    references,
+                    self._phase1_exit_event_material(
+                        tuple(event_row[1:19]),
+                        _canonical_audit_json(details),
+                    ),
+                )
+                step_ordinal = details.get("step_ordinal")
+                step_count = details.get("step_count")
+                remaining = details.get("remaining_shares")
+                if (
+                    str(event_row[19]) != expected_event_digest
+                    or details.get("authority_digest") != str(event_row[15])
+                    or details.get("exit_review_source_digest")
+                    != str(review_row[10])
+                    or type(step_ordinal) is not int
+                    or type(step_count) is not int
+                    or not 1 <= step_ordinal <= step_count <= 2
+                    or type(remaining) is not int
+                    or remaining != balance - int(event_row[16])
+                    or int(event_row[16]) <= 0
+                    or int(event_row[16]) > balance
+                    or (event_kind == "PARTIAL_EXIT")
+                    != (event_row[18] is not None)
+                    or (
+                        event_kind == "PARTIAL_EXIT"
+                        and (
+                            remaining <= 0
+                            or details.get("profit_target_taken") is not True
+                        )
+                    )
+                    or (event_kind == "CLOSE" and remaining != 0)
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit lifecycle authority bundle is inconsistent"
+                    )
+                exit_group_rows.setdefault(
+                    (review_id, str(event_row[15])),
+                    [],
+                ).append((event_row, details))
+                bundle = sorted(
+                    postings_by_event.get(event_id, ()),
+                    key=lambda row: int(row[0]),
+                )
+                if len(bundle) != 2 or tuple(str(row[4]) for row in bundle) != (
+                    "SALE",
+                    "FEE",
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit requires exactly one SALE and one FEE"
+                    )
+                exit_session = event_time.astimezone(
+                    ZoneInfo("America/New_York")
+                ).date()
+                expected_sale_settlement = calendar_resolver.add_sessions(
+                    exit_session,
+                    1,
+                )
+                for posting_row in bundle:
+                    entry_kind = str(posting_row[4])
+                    posting_details = _canonical_stored_details(
+                        posting_row[16],
+                        label="Phase 1 canonical exit posting",
+                    )
+                    expected_amount = (
+                        int(event_row[16]) * int(event_row[17])
+                        if entry_kind == "SALE"
+                        else -_PHASE1_EXIT_FEE_MICROS
+                    )
+                    expected_shares_delta = (
+                        -int(event_row[16]) if entry_kind == "SALE" else None
+                    )
+                    expected_price = (
+                        int(event_row[17]) if entry_kind == "SALE" else None
+                    )
+                    expected_account = "CASH" if entry_kind == "SALE" else "FEE"
+                    posting_references = (
+                        signal_reference,
+                        _journal_row_reference(
+                            "phase1_signal_events",
+                            _PHASE1_SIGNAL_EVENT_COLUMNS,
+                            event_row,
+                        ),
+                        references[1],
+                        references[2],
+                        references[3],
+                    )
+                    expected_source_digest = _journal_bundle_digest(
+                        "stock-monitor/phase1-canonical-exit-posting/v1",
+                        posting_references,
+                        {
+                            **dict(
+                                zip(
+                                    _PHASE1_CANONICAL_POSTING_COLUMNS[1:14],
+                                    tuple(posting_row[1:14]),
+                                    strict=True,
+                                )
+                            ),
+                            "details_json": _canonical_audit_json(
+                                posting_details
+                            ),
+                        },
+                    )
+                    expected_record_sha256 = hashlib.sha256(
+                        _canonical_audit_json(
+                            {
+                                **dict(
+                                    zip(
+                                        _PHASE1_CANONICAL_POSTING_COLUMNS[1:15],
+                                        tuple(posting_row[1:15]),
+                                        strict=True,
+                                    )
+                                ),
+                                "details_json": _canonical_audit_json(
+                                    posting_details
+                                ),
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    settlement_session = date.fromisoformat(str(posting_row[11]))
+                    if (
+                        str(posting_row[3]) != signal_id
+                        or str(posting_row[5]) != expected_account
+                        or int(posting_row[6]) != expected_amount
+                        or (
+                            None if posting_row[7] is None else int(posting_row[7])
+                        )
+                        != expected_shares_delta
+                        or (
+                            None if posting_row[8] is None else int(posting_row[8])
+                        )
+                        != expected_price
+                        or _parse_canonical_timestamp(str(posting_row[9]))
+                        != event_time
+                        or _parse_canonical_timestamp(str(posting_row[10]))
+                        != event_received
+                        or str(posting_row[12])
+                        != _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+                        or str(posting_row[13])
+                        != _PHASE1_EXIT_FEE_SCHEDULE_DIGEST
+                        or str(posting_row[14]) != expected_source_digest
+                        or str(posting_row[15]) != expected_record_sha256
+                        or posting_details.get("authority_digest")
+                        != str(event_row[15])
+                        or posting_details.get("calendar_digest")
+                        != signal_source.calendar_digest
+                        or posting_details.get("exit_review_id") != review_id
+                        or posting_details.get("exit_review_source_digest")
+                        != str(review_row[10])
+                        or posting_details.get("lifecycle_event_source_digest")
+                        != str(event_row[19])
+                        or posting_details.get("step_ordinal") != step_ordinal
+                        or posting_details.get("step_count") != step_count
+                        or posting_details.get("exit_session")
+                        != exit_session.isoformat()
+                        or posting_details.get("settlement_available_session")
+                        != settlement_session.isoformat()
+                        or (
+                            entry_kind == "FEE"
+                            and settlement_session != exit_session
+                        )
+                        or (
+                            entry_kind == "SALE"
+                            and settlement_session != expected_sale_settlement
+                        )
+                    ):
+                        raise MigrationCorruption(
+                            "Phase 1 canonical exit posting bundle is inconsistent"
+                        )
+                balance = remaining
+
+            from .risk import (
+                Position,
+                RiskBlock,
+                _calendar_digest,
+                _derive_phase1_position_exit_material_from_verified_source,
+                _policy_digest,
+            )
+
+            derived_shares = int(buys[0][7])
+            derived_stop = money_from_micros(
+                signal_source.recommended_stop_micros
+            )
+            profit_target_taken = False
+            entered_session = _parse_canonical_timestamp(
+                str(buys[0][9])
+            ).astimezone(ZoneInfo("America/New_York")).date()
+            ordered_groups = tuple(
+                sorted(
+                    exit_group_rows.items(),
+                    key=lambda item: min(int(value[0][3]) for value in item[1]),
+                )
+            )
+            for (review_id, authority_digest), stored_group in ordered_groups:
+                ordered = tuple(
+                    sorted(stored_group, key=lambda value: int(value[0][3]))
+                )
+                step_counts = {value[1].get("step_count") for value in ordered}
+                step_ordinals = tuple(
+                    value[1].get("step_ordinal") for value in ordered
+                )
+                event_times = tuple(
+                    _parse_canonical_timestamp(str(value[0][7]))
+                    for value in ordered
+                )
+                event_kinds = tuple(str(value[0][4]) for value in ordered)
+                if (
+                    len(step_counts) != 1
+                    or next(iter(step_counts)) != len(ordered)
+                    or step_ordinals != tuple(range(1, len(ordered) + 1))
+                    or any(
+                        current <= prior
+                        for prior, current in zip(
+                            event_times,
+                            event_times[1:],
+                        )
+                    )
+                    or (
+                        len(ordered) == 2
+                        and event_kinds != ("PARTIAL_EXIT", "CLOSE")
+                    )
+                    or (
+                        len(ordered) == 1
+                        and event_kinds[0] not in {"PARTIAL_EXIT", "CLOSE"}
+                    )
+                    or any(str(value[0][15]) != authority_digest for value in ordered)
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit review batch cardinality is inconsistent"
+                    )
+                review_row = review_cache.get(review_id)
+                if review_row is None:
+                    raise MigrationCorruption(
+                        "Phase 1 exit replay review source is unavailable"
+                    )
+                review_cutoff = _parse_canonical_timestamp(str(review_row[5]))
+                if any(
+                    _parse_canonical_timestamp(str(value[0][9]))
+                    < review_cutoff
+                    for value in ordered
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 exit lifecycle predates its completed review"
+                    )
+                market_source = self.read_phase1_exit_review_market_source(
+                    signal_id,
+                    review_session=date.fromisoformat(str(review_row[3])),
+                    query_cutoff=review_cutoff,
+                    calendar_resolver=calendar_resolver,
+                )
+                position = Position(
+                    signal_id=signal_id,
+                    symbol=signal_source.symbol,
+                    entry=money_from_micros(
+                        signal_source.maximum_entry_micros
+                    ),
+                    shares=derived_shares,
+                    initial_stop=money_from_micros(
+                        signal_source.recommended_stop_micros
+                    ),
+                    recommended_stop=derived_stop,
+                    user_confirmed_stop=None,
+                    target=money_from_micros(signal_source.target_micros),
+                    tick_size=money_from_micros(
+                        signal_source.tick_size_micros
+                    ),
+                    entered_session=entered_session,
+                    ledger_name="CANONICAL",
+                    profit_target_taken=profit_target_taken,
+                )
+                material_cache_key = (
+                    id(market_source),
+                    market_source.source_digest,
+                    review_id,
+                    authority_digest,
+                    position.signal_id,
+                    position.symbol,
+                    position.entry,
+                    position.shares,
+                    position.initial_stop,
+                    position.recommended_stop,
+                    position.user_confirmed_stop,
+                    position.target,
+                    position.tick_size,
+                    position.entered_session,
+                    position.ledger_name,
+                    position.profit_target_taken,
+                    _calendar_digest(calendar_resolver),
+                    _policy_digest(policy),
+                )
+                material_read_cache = self._phase1_exit_material_read_cache
+                material = (
+                    None
+                    if material_read_cache is None
+                    else material_read_cache.get(material_cache_key)
+                )
+                if material is None:
+                    try:
+                        material = (
+                            _derive_phase1_position_exit_material_from_verified_source(
+                                market_source,
+                                position=position,
+                                calendar_resolver=calendar_resolver,
+                                policy=policy,
+                            )
+                        )
+                    except RiskBlock as error:
+                        raise MigrationCorruption(
+                            "Phase 1 exit review could not be re-simulated"
+                        ) from error
+                    if material_read_cache is not None:
+                        material_read_cache[material_cache_key] = material
+                expected_steps = tuple(material.steps)
+                if len(expected_steps) != len(ordered):
+                    raise MigrationCorruption(
+                        "Phase 1 exit replay step count conflicts with market facts"
+                    )
+                for expected_step, (event_row, details) in zip(
+                    expected_steps,
+                    ordered,
+                    strict=True,
+                ):
+                    expected_result = expected_step.execution_result
+                    expected_action = expected_step.action
+                    expected_stop_micros = (
+                        money_to_micros(expected_action.recommended_stop)
+                        if expected_step.event_kind == "PARTIAL_EXIT"
+                        else None
+                    )
+                    if (
+                        expected_step.position != position
+                        or str(event_row[4]) != expected_step.event_kind
+                        or str(event_row[14])
+                        != expected_result.observation_id
+                        or _parse_canonical_timestamp(str(event_row[7]))
+                        != expected_result.exited_at
+                        or int(event_row[16]) != expected_action.shares_to_exit
+                        or int(event_row[17])
+                        != money_to_micros(expected_result.fill_price)
+                        or (
+                            None if event_row[18] is None else int(event_row[18])
+                        )
+                        != expected_stop_micros
+                        or details.get("execution_quote_observation_id")
+                        != expected_step.execution_quote_observation_id
+                        or details.get("execution_reason")
+                        != expected_result.exit_reason.value
+                        or tuple(details.get("execution_reason_codes", ()))
+                        != tuple(expected_result.reason_codes)
+                        or details.get("remaining_shares")
+                        != expected_action.remaining_shares
+                        or details.get("profit_target_taken")
+                        is not (
+                            expected_step.position.profit_target_taken
+                            or expected_step.event_kind == "PARTIAL_EXIT"
+                        )
+                        or details.get("mark_observation_id")
+                        != material.mark_observation_id
+                        or details.get("position_evidence_digest")
+                        != material.position_evidence_digest
+                    ):
+                        raise MigrationCorruption(
+                            "Phase 1 exit replay conflicts with conservative simulation"
+                        )
+                    derived_shares = expected_action.remaining_shares
+                    if expected_step.event_kind == "PARTIAL_EXIT":
+                        derived_stop = expected_action.recommended_stop
+                        profit_target_taken = True
+                    position = Position(
+                        signal_id=position.signal_id,
+                        symbol=position.symbol,
+                        entry=position.entry,
+                        shares=max(derived_shares, 1),
+                        initial_stop=position.initial_stop,
+                        recommended_stop=derived_stop,
+                        user_confirmed_stop=None,
+                        target=position.target,
+                        tick_size=position.tick_size,
+                        entered_session=position.entered_session,
+                        ledger_name="CANONICAL",
+                        profit_target_taken=profit_target_taken,
+                    )
+
+            attached_exit_ids = {str(row[1]) for row in exit_events}
+            if any(str(row[2]) not in attached_exit_ids for row in exit_postings):
+                raise MigrationCorruption(
+                    "Phase 1 canonical exit has extra economic postings"
+                )
+            close_events = tuple(
+                row for row in exit_events if str(row[4]) == "CLOSE"
+            )
+            stored_closes = tuple(closes_by_signal.get(signal_id, ()))
+            if not close_events:
+                if stored_closes or balance <= 0:
+                    raise MigrationCorruption(
+                        "Phase 1 partial exit closure state is inconsistent"
+                    )
+                continue
+            if len(stored_closes) != 1 or balance != 0:
+                raise MigrationCorruption(
+                    "Phase 1 final close cardinality is inconsistent"
+                )
+            close_event = close_events[0]
+            close_row = stored_closes[0]
+            entry_value = -int(buys[0][6])
+            sale_rows = tuple(row for row in signal_postings if str(row[4]) == "SALE")
+            fee_rows = tuple(row for row in signal_postings if str(row[4]) == "FEE")
+            exit_value = sum(int(row[6]) for row in sale_rows)
+            fee_value = -sum(int(row[6]) for row in fee_rows)
+            pnl = exit_value - entry_value - fee_value
+            initial_risk = (
+                signal_source.maximum_entry_micros
+                - signal_source.recommended_stop_micros
+            ) * signal_source.planned_shares
+            close_references = (
+                signal_reference,
+                *(
+                    _journal_row_reference(
+                        "phase1_canonical_postings",
+                        _PHASE1_CANONICAL_POSTING_COLUMNS,
+                        row,
+                    )
+                    for row in signal_postings
+                ),
+                _journal_row_reference(
+                    "phase1_signal_events",
+                    _PHASE1_SIGNAL_EVENT_COLUMNS,
+                    close_event,
+                ),
+            )
+            expected_close_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-closed-trade/v1",
+                close_references,
+                dict(
+                    zip(
+                        _PHASE1_CLOSED_TRADE_COLUMNS[1:17],
+                        tuple(close_row[1:17]),
+                        strict=True,
+                    )
+                ),
+            )
+            close_at = _parse_canonical_timestamp(str(close_event[7]))
+            if (
+                str(close_row[2]) != signal_source.validation_window_id
+                or str(close_row[3]) != "CANONICAL"
+                or str(close_row[4]) != signal_id
+                or str(close_row[5]) != str(close_event[1])
+                or int(close_row[7]) != signal_source.planned_shares
+                or int(close_row[8]) != entry_value
+                or int(close_row[9]) != exit_value
+                or int(close_row[10]) != fee_value
+                or int(close_row[11]) != pnl
+                or int(close_row[12]) != initial_risk
+                or int(close_row[13]) != pnl
+                or _parse_canonical_timestamp(str(close_row[14])) != close_at
+                or str(close_row[6])
+                != close_at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+                or str(close_row[17]) != expected_close_digest
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 aggregate closed trade is inconsistent"
+                )
+
+    def _read_phase1_canonical_replay_source(
+        self,
+        *,
+        query_cutoff: datetime,
+        publication_predecessor: bool = False,
+        predecessor_publication_source: Phase1PublicationSource | None = None,
+        calendar_resolver: object | None = None,
+        policy: object | None = None,
+    ) -> Phase1CanonicalReplaySource:
+        """Read one complete snapshot in one bounded immutable-read scope."""
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_canonical_replay_source_uncached(
+                query_cutoff=query_cutoff,
+                publication_predecessor=publication_predecessor,
+                predecessor_publication_source=predecessor_publication_source,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+
+    def _read_phase1_canonical_replay_source_uncached(
+        self,
+        *,
+        query_cutoff: datetime,
+        publication_predecessor: bool = False,
+        predecessor_publication_source: Phase1PublicationSource | None = None,
+        calendar_resolver: object | None = None,
+        policy: object | None = None,
+    ) -> Phase1CanonicalReplaySource:
+        """Read one complete canonical Phase 1 lifecycle/posting snapshot."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError("Phase 1 replay requires a post-commit read")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        stored_cutoff = _canonical_timestamp(normalized_cutoff)
+        if type(publication_predecessor) is not bool:
+            raise InvalidJournalValue(
+                "Phase 1 publication predecessor selector must be boolean"
+            )
+        if predecessor_publication_source is not None and (
+            not publication_predecessor
+            or not is_verified_phase1_publication_source(
+                predecessor_publication_source
+            )
+            or _phase1_source_owner(predecessor_publication_source) is not self
+            or predecessor_publication_source.received_at != normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 predecessor publication source is unverified"
+            )
+        excluded_report_row_id = (
+            None
+            if predecessor_publication_source is None
+            else predecessor_publication_source.report_row_id
+        )
+        from .policy import Policy
+        from .risk import SessionCalendarResolver, _calendar_digest, _policy_digest
+
+        replay_cache_key: tuple[object, ...] | None = None
+        cache_configuration_valid = True
+        if calendar_resolver is None:
+            calendar_cache_digest = None
+        elif isinstance(calendar_resolver, SessionCalendarResolver) and (
+            calendar_resolver.release_verified
+        ):
+            calendar_cache_digest = _calendar_digest(calendar_resolver)
+        else:
+            cache_configuration_valid = False
+            calendar_cache_digest = None
+        if policy is None:
+            policy_cache_digest = None
+        elif isinstance(policy, Policy):
+            try:
+                policy.validate()
+                policy_cache_digest = _policy_digest(policy)
+            except Exception:
+                cache_configuration_valid = False
+                policy_cache_digest = None
+        else:
+            cache_configuration_valid = False
+            policy_cache_digest = None
+        if cache_configuration_valid:
+            replay_cache_key = (
+                normalized_cutoff,
+                publication_predecessor,
+                excluded_report_row_id,
+                calendar_cache_digest,
+                policy_cache_digest,
+            )
+        replay_read_cache = self._phase1_canonical_replay_read_cache
+        if replay_read_cache is not None and replay_cache_key is not None:
+            cached_replay = replay_read_cache.get(replay_cache_key)
+            if cached_replay is not None and (
+                _phase1_source_owner(cached_replay) is self
+                and cached_replay.query_cutoff == normalized_cutoff
+                and cached_replay.publication_predecessor
+                is publication_predecessor
+            ):
+                return cached_replay
+            replay_read_cache.pop(replay_cache_key, None)
+        signal_exclusion_sql = (
+            ""
+            if excluded_report_row_id is None
+            else " AND publication_report_id != ?"
+        )
+        joined_signal_exclusion_sql = (
+            ""
+            if excluded_report_row_id is None
+            else " AND signal.publication_report_id != ?"
+        )
+        window_rows = _sql(
+            self._connection,
+            "SELECT id, window_id, started_session, starting_capital_micros, "
+            "started_at, received_at, calendar_digest, source_digest, singleton_key "
+            "FROM phase1_validation_windows WHERE received_at <= ?",
+            (stored_cutoff,),
+        ).fetchall()
+        if len(window_rows) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 replay requires exactly one active validation window"
+            )
+        window_row = window_rows[0]
+        window_id = str(window_row[1])
+        signal_ids = tuple(
+            str(row[0])
+            for row in _sql(
+                self._connection,
+                "SELECT signal_id FROM phase1_signals "
+                "WHERE validation_window_id = ? COLLATE BINARY "
+                "AND received_at <= ? "
+                f"{signal_exclusion_sql} "
+                "ORDER BY publication_session, publication_rank, id",
+                (
+                    (window_id, stored_cutoff)
+                    if excluded_report_row_id is None
+                    else (window_id, stored_cutoff, excluded_report_row_id)
+                ),
+            ).fetchall()
+        )
+        signal_sources = tuple(
+            self._read_phase1_signal_source(
+                signal_id,
+                query_cutoff=normalized_cutoff,
+            )
+            for signal_id in signal_ids
+        )
+        event_rows = _sql(
+            self._connection,
+            "SELECT event.id, event.lifecycle_event_id, event.signal_id, "
+            "event.event_ordinal, event.event_kind, event.from_status, "
+            "event.to_status, event.event_time, event.message_time, "
+            "event.received_at, event.confirmation_execution_event_id, "
+            "event.trigger_observation_id, "
+            "event.quote_observation_id, event.session_completion_id, "
+            "event.exit_observation_id, event.exit_authority_digest, "
+            "event.shares, event.price_micros, event.recommended_stop_micros, "
+            "event.source_digest, event.details_json, "
+            "event.signal_evidence_id, event.expiry_source_id "
+            "FROM phase1_signal_events AS event "
+            "JOIN phase1_signals AS signal ON signal.signal_id = event.signal_id "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.received_at <= ? AND event.received_at <= ?"
+            f"{joined_signal_exclusion_sql} ORDER BY event.id",
+            (
+                (window_id, stored_cutoff, stored_cutoff)
+                if excluded_report_row_id is None
+                else (
+                    window_id,
+                    stored_cutoff,
+                    stored_cutoff,
+                    excluded_report_row_id,
+                )
+            ),
+        ).fetchall()
+        lifecycle_events: list[Phase1LifecycleEventSource] = []
+        for row in event_rows:
+            reference = _journal_row_reference(
+                "phase1_signal_events",
+                _PHASE1_SIGNAL_EVENT_COLUMNS,
+                row,
+            )
+            lifecycle_events.append(
+                Phase1LifecycleEventSource(
+                    row_id=int(row[0]),
+                    lifecycle_event_id=str(row[1]),
+                    signal_id=str(row[2]),
+                    event_ordinal=int(row[3]),
+                    event_kind=str(row[4]),
+                    from_status=None if row[5] is None else str(row[5]),
+                    to_status=str(row[6]),
+                    event_time=_parse_canonical_timestamp(str(row[7])),
+                    message_time=_parse_canonical_timestamp(str(row[8])),
+                    received_at=_parse_canonical_timestamp(str(row[9])),
+                    confirmation_execution_event_id=(
+                        None if row[10] is None else int(row[10])
+                    ),
+                    trigger_observation_id=(
+                        None if row[11] is None else str(row[11])
+                    ),
+                    quote_observation_id=(
+                        None if row[12] is None else str(row[12])
+                    ),
+                    session_completion_id=(
+                        None if row[13] is None else str(row[13])
+                    ),
+                    exit_observation_id=(
+                        None if row[14] is None else str(row[14])
+                    ),
+                    exit_authority_digest=(
+                        None if row[15] is None else str(row[15])
+                    ),
+                    shares=None if row[16] is None else int(row[16]),
+                    price_micros=None if row[17] is None else int(row[17]),
+                    recommended_stop_micros=(
+                        None if row[18] is None else int(row[18])
+                    ),
+                    source_digest=str(row[19]),
+                    row_reference=reference,
+                    signal_evidence_id=(
+                        None if row[21] is None else str(row[21])
+                    ),
+                    expiry_source_id=(
+                        None if row[22] is None else str(row[22])
+                    ),
+                )
+            )
+        posting_rows = _sql(
+            self._connection,
+            "SELECT posting.id, posting.posting_key, "
+            "posting.lifecycle_event_id, posting.signal_id, posting.entry_kind, "
+            "posting.account_name, posting.amount_micros, posting.shares_delta, "
+            "posting.unit_price_micros, posting.occurred_at, posting.received_at, "
+            "posting.settlement_available_session, posting.fee_schedule_version, "
+            "posting.fee_schedule_digest, posting.source_digest, "
+            "posting.record_sha256, posting.details_json "
+            "FROM phase1_canonical_postings AS posting "
+            "JOIN phase1_signals AS signal ON signal.signal_id = posting.signal_id "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.received_at <= ? AND posting.received_at <= ?"
+            f"{joined_signal_exclusion_sql} "
+            "ORDER BY posting.id",
+            (
+                (window_id, stored_cutoff, stored_cutoff)
+                if excluded_report_row_id is None
+                else (
+                    window_id,
+                    stored_cutoff,
+                    stored_cutoff,
+                    excluded_report_row_id,
+                )
+            ),
+        ).fetchall()
+        postings: list[Phase1CanonicalPostingSource] = []
+        for row in posting_rows:
+            reference = _journal_row_reference(
+                "phase1_canonical_postings",
+                _PHASE1_CANONICAL_POSTING_COLUMNS,
+                row,
+            )
+            postings.append(
+                Phase1CanonicalPostingSource(
+                    row_id=int(row[0]),
+                    posting_key=str(row[1]),
+                    lifecycle_event_id=str(row[2]),
+                    signal_id=str(row[3]),
+                    entry_kind=str(row[4]),
+                    account_name=str(row[5]),
+                    amount_micros=int(row[6]),
+                    shares_delta=None if row[7] is None else int(row[7]),
+                    unit_price_micros=None if row[8] is None else int(row[8]),
+                    occurred_at=_parse_canonical_timestamp(str(row[9])),
+                    received_at=_parse_canonical_timestamp(str(row[10])),
+                    settlement_available_session=date.fromisoformat(str(row[11])),
+                    fee_schedule_version=str(row[12]),
+                    fee_schedule_digest=str(row[13]),
+                    source_digest=str(row[14]),
+                    record_sha256=str(row[15]),
+                    row_reference=reference,
+                )
+            )
+        close_rows = _sql(
+            self._connection,
+            "SELECT id, trade_id, validation_window_id, ledger_name, signal_id, "
+            "lifecycle_event_id, session_date, shares, entry_value_micros, "
+            "exit_value_micros, fee_micros, pnl_micros, initial_risk_micros, "
+            "net_r_numerator_micros, at, message_time, received_at, source_digest "
+            "FROM phase1_closed_trades WHERE validation_window_id = ? COLLATE BINARY "
+            "AND ledger_name = 'CANONICAL' AND received_at <= ? ORDER BY id",
+            (window_id, stored_cutoff),
+        ).fetchall()
+        self._verify_phase1_exit_replay_rows(
+            signal_sources=signal_sources,
+            event_rows=event_rows,
+            posting_rows=posting_rows,
+            close_rows=close_rows,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        closed_trades = tuple(
+            Phase1ClosedTradeSource(
+                row_id=int(row[0]),
+                trade_id=str(row[1]),
+                validation_window_id=str(row[2]),
+                ledger_name=str(row[3]),
+                signal_id=str(row[4]),
+                lifecycle_event_id=str(row[5]),
+                session_date=date.fromisoformat(str(row[6])),
+                shares=int(row[7]),
+                entry_value_micros=int(row[8]),
+                exit_value_micros=int(row[9]),
+                fee_micros=int(row[10]),
+                pnl_micros=int(row[11]),
+                initial_risk_micros=int(row[12]),
+                net_r_numerator_micros=int(row[13]),
+                at=_parse_canonical_timestamp(str(row[14])),
+                message_time=_parse_canonical_timestamp(str(row[15])),
+                received_at=_parse_canonical_timestamp(str(row[16])),
+                source_digest=str(row[17]),
+                row_reference=_journal_row_reference(
+                    "phase1_closed_trades",
+                    _PHASE1_CLOSED_TRADE_COLUMNS,
+                    row,
+                ),
+            )
+            for row in close_rows
+        )
+        lifecycle_highwater_row = _sql(
+            self._connection,
+            "SELECT MAX(event.id) FROM phase1_signal_events AS event "
+            "JOIN phase1_signals AS signal ON signal.signal_id = event.signal_id "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.received_at <= ? AND event.received_at <= ?"
+            f"{joined_signal_exclusion_sql}",
+            (
+                (window_id, stored_cutoff, stored_cutoff)
+                if excluded_report_row_id is None
+                else (
+                    window_id,
+                    stored_cutoff,
+                    stored_cutoff,
+                    excluded_report_row_id,
+                )
+            ),
+        ).fetchone()
+        posting_highwater_row = _sql(
+            self._connection,
+            "SELECT MAX(posting.id) FROM phase1_canonical_postings AS posting "
+            "JOIN phase1_signals AS signal ON signal.signal_id = posting.signal_id "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.received_at <= ? AND posting.received_at <= ?"
+            f"{joined_signal_exclusion_sql}",
+            (
+                (window_id, stored_cutoff, stored_cutoff)
+                if excluded_report_row_id is None
+                else (
+                    window_id,
+                    stored_cutoff,
+                    stored_cutoff,
+                    excluded_report_row_id,
+                )
+            ),
+        ).fetchone()
+        if lifecycle_highwater_row is None or posting_highwater_row is None:
+            raise JournalError("Phase 1 replay high-water query failed")
+        lifecycle_highwater = (
+            None
+            if lifecycle_highwater_row[0] is None
+            else int(lifecycle_highwater_row[0])
+        )
+        posting_highwater = (
+            None
+            if posting_highwater_row[0] is None
+            else int(posting_highwater_row[0])
+        )
+        lifecycle_terminal = (
+            None if not lifecycle_events else lifecycle_events[-1].row_id
+        )
+        posting_terminal = None if not postings else postings[-1].row_id
+        starting_capital_micros = int(window_row[3])
+        canonical_cash_micros = starting_capital_micros + sum(
+            posting.amount_micros for posting in postings
+        )
+        from zoneinfo import ZoneInfo
+
+        cutoff_session = normalized_cutoff.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        settled_buying_power_micros = starting_capital_micros + sum(
+            posting.amount_micros
+            for posting in postings
+            if posting.settlement_available_session <= cutoff_session
+        )
+        realized_pnl_micros = sum(trade.pnl_micros for trade in closed_trades)
+        entry_signal_ids = tuple(
+            dict.fromkeys(
+                posting.signal_id
+                for posting in postings
+                if posting.entry_kind == "BUY"
+            )
+        )
+        entry_sources = tuple(
+            self._read_phase1_entry_source(
+                signal_id,
+                query_cutoff=normalized_cutoff,
+            )
+            for signal_id in entry_signal_ids
+        )
+        references = (
+            _journal_row_reference(
+                "phase1_validation_windows",
+                _PHASE1_VALIDATION_WINDOW_COLUMNS,
+                window_row,
+            ),
+            *(
+                reference
+                for signal_source in signal_sources
+                for reference in signal_source.row_references
+            ),
+            *(event.row_reference for event in lifecycle_events),
+            *(posting.row_reference for posting in postings),
+            *(trade.row_reference for trade in closed_trades),
+            *(
+                reference
+                for entry_source in entry_sources
+                for reference in entry_source.row_references
+            ),
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-canonical-replay/v1",
+            references,
+            {
+                "validation_window_id": window_id,
+                "starting_capital_micros": starting_capital_micros,
+                "canonical_cash_micros": canonical_cash_micros,
+                "settled_buying_power_micros": settled_buying_power_micros,
+                "realized_pnl_micros": realized_pnl_micros,
+                "query_cutoff": stored_cutoff,
+                "publication_predecessor": publication_predecessor,
+                "lifecycle_terminal_cursor": lifecycle_terminal,
+                "lifecycle_source_highwater": lifecycle_highwater,
+                "posting_terminal_cursor": posting_terminal,
+                "posting_source_highwater": posting_highwater,
+                "expected_lifecycle_count": len(lifecycle_events),
+                "expected_posting_count": len(postings),
+                "expected_closed_trade_count": len(closed_trades),
+                "entry_source_digests": [
+                    entry_source.source_digest for entry_source in entry_sources
+                ],
+            },
+        )
+        source = Phase1CanonicalReplaySource(
+            signal_sources=signal_sources,
+            entry_sources=entry_sources,
+            lifecycle_events=tuple(lifecycle_events),
+            postings=tuple(postings),
+            closed_trades=closed_trades,
+            validation_window_id=window_id,
+            starting_capital_micros=starting_capital_micros,
+            canonical_cash_micros=canonical_cash_micros,
+            settled_buying_power_micros=settled_buying_power_micros,
+            realized_pnl_micros=realized_pnl_micros,
+            query_cutoff=normalized_cutoff,
+            publication_predecessor=publication_predecessor,
+            lifecycle_terminal_cursor=lifecycle_terminal,
+            lifecycle_source_highwater=lifecycle_highwater,
+            posting_terminal_cursor=posting_terminal,
+            posting_source_highwater=posting_highwater,
+            expected_lifecycle_count=len(lifecycle_events),
+            expected_posting_count=len(postings),
+            expected_closed_trade_count=len(closed_trades),
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        for signal_source in signal_sources:
+            _register_journal_source_authority(
+                _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+                signal_source,
+                self,
+            )
+        _register_journal_source_authority(
+            _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        if replay_read_cache is not None and replay_cache_key is not None:
+            replay_read_cache[replay_cache_key] = source
+        return source
+
+    def read_phase1_canonical_replay(
+        self,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object | None = None,
+        policy: object | None = None,
+    ) -> object:
+        from .ledger import _issue_canonical_ledger_replay_from_phase1_source
+
+        with self._phase1_publication_read_scope():
+            source = self._read_phase1_canonical_replay_source(
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            return _issue_canonical_ledger_replay_from_phase1_source(source)
+
+    def read_phase1_canonical_portfolio_authority(
+        self,
+        *,
+        request: object,
+        as_of: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> object:
+        """Rebuild canonical portfolio capacity from exact persisted cohorts."""
+        from .ledger import _issue_canonical_ledger_replay_from_phase1_source
+        from .risk import (
+            LongPlanRequest,
+            Policy,
+            SessionCalendarResolver,
+            _issue_breaker_history_from_phase1_source,
+            _issue_portfolio_risk_authority,
+            evaluate_authorized_breakers,
+        )
+
+        if not isinstance(request, LongPlanRequest):
+            raise InvalidJournalValue(
+                "Phase 1 canonical portfolio request is invalid"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical portfolio calendar is unverified"
+            )
+        if not isinstance(policy, Policy):
+            raise InvalidJournalValue(
+                "Phase 1 canonical portfolio policy is invalid"
+            )
+        normalized_as_of = _parse_canonical_timestamp(
+            _canonical_timestamp(as_of)
+        )
+        with self._phase1_publication_read_scope():
+            replay_source = self._read_phase1_canonical_replay_source(
+                query_cutoff=normalized_as_of,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            replay = _issue_canonical_ledger_replay_from_phase1_source(
+                replay_source
+            )
+            through_session = calendar_resolver.previous_session(
+                request.session_date
+            )
+            history_source = self._read_phase1_breaker_history_source(
+                ledger_name="CANONICAL",
+                through_session=through_session,
+                query_cutoff=normalized_as_of,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            history = _issue_breaker_history_from_phase1_source(
+                history_source,
+                calendar_resolver=calendar_resolver,
+            )
+        breaker = evaluate_authorized_breakers(history)
+        return _issue_portfolio_risk_authority(
+            request=request,
+            ledger_pair=replay.ledger_pair,
+            ledger_name="CANONICAL",
+            breaker_state=breaker,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+            scope="CANONICAL_PUBLICATION",
+            as_of=normalized_as_of,
+            phase1_canonical_replay=replay,
+        )
+
+    def _read_phase1_breaker_history_source(
+        self,
+        *,
+        ledger_name: str,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object | None = None,
+        policy: object | None = None,
+    ) -> Phase1BreakerHistorySource:
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_breaker_history_source_uncached(
+                ledger_name=ledger_name,
+                through_session=through_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+
+    def _read_phase1_breaker_history_source_uncached(
+        self,
+        *,
+        ledger_name: str,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object | None = None,
+        policy: object | None = None,
+    ) -> Phase1BreakerHistorySource:
+        """Read the complete immutable Phase 1 curve/close streams."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError("Phase 1 history requires a post-commit read")
+        ledger_name = _canonical_token(ledger_name, "Phase 1 ledger name")
+        if ledger_name not in {"CANONICAL", "ACTUAL"}:
+            raise InvalidJournalValue("Phase 1 ledger name is unsupported")
+        stored_through = _canonical_date(through_session)
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        stored_cutoff = _canonical_timestamp(normalized_cutoff)
+        windows = _sql(
+            self._connection,
+            "SELECT id, window_id, started_session, starting_capital_micros, "
+            "started_at, received_at, calendar_digest, source_digest, singleton_key "
+            "FROM phase1_validation_windows WHERE started_session <= ? "
+            "AND received_at <= ? ORDER BY started_session, id",
+            (stored_through, stored_cutoff),
+        ).fetchall()
+        if len(windows) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 history requires exactly one active validation window"
+            )
+        window_row = windows[0]
+        window_id = str(window_row[1])
+        started_session = date.fromisoformat(str(window_row[2]))
+        if through_session < started_session:
+            raise InvalidJournalValue(
+                "Phase 1 history cutoff precedes the validation window"
+            )
+        equity_rows = _sql(
+            self._connection,
+            "SELECT id, point_id, validation_window_id, ledger_name, session_date, "
+            "equity_micros, cash_micros, positions_value_micros, "
+            "external_cash_flow_micros, source_cursor, mark_source_digest, at, "
+            "message_time, received_at, source_digest FROM phase1_equity_points "
+            "WHERE validation_window_id = ? COLLATE BINARY AND ledger_name = ? "
+            "AND session_date <= ? AND received_at <= ? "
+            "ORDER BY source_cursor, id",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchall()
+        late_equity = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_equity_points WHERE validation_window_id = ? "
+            "COLLATE BINARY AND ledger_name = ? AND session_date <= ? "
+            "AND received_at > ? LIMIT 1",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchone()
+        if late_equity is not None:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+        if not equity_rows:
+            raise MigrationCorruption("Phase 1 equity history is empty")
+        equity_points: list[Phase1EquityPointSource] = []
+        prior_cursor = 0
+        seen_sessions: set[date] = set()
+        for row in equity_rows:
+            reference = _journal_row_reference(
+                "phase1_equity_points",
+                _PHASE1_EQUITY_POINT_COLUMNS,
+                row,
+            )
+            session = date.fromisoformat(str(row[4]))
+            cursor = int(row[9])
+            if cursor <= prior_cursor or session in seen_sessions:
+                raise MigrationCorruption(
+                    "Phase 1 equity history cursor/session is inconsistent"
+                )
+            prior_cursor = cursor
+            seen_sessions.add(session)
+            at = _parse_canonical_timestamp(str(row[11]))
+            message_time = _parse_canonical_timestamp(str(row[12]))
+            received_at = _parse_canonical_timestamp(str(row[13]))
+            if not at <= message_time <= received_at <= normalized_cutoff:
+                raise MigrationCorruption(
+                    "Phase 1 equity history chronology is inconsistent"
+                )
+            if int(row[5]) != int(row[6]) + int(row[7]):
+                raise MigrationCorruption(
+                    "Phase 1 equity decomposition is inconsistent"
+                )
+            equity_points.append(
+                Phase1EquityPointSource(
+                    row_id=int(row[0]),
+                    point_id=str(row[1]),
+                    validation_window_id=str(row[2]),
+                    ledger_name=str(row[3]),
+                    session_date=session,
+                    equity_micros=int(row[5]),
+                    cash_micros=int(row[6]),
+                    positions_value_micros=int(row[7]),
+                    external_cash_flow_micros=int(row[8]),
+                    source_cursor=cursor,
+                    mark_source_digest=str(row[10]),
+                    at=at,
+                    message_time=message_time,
+                    received_at=received_at,
+                    source_digest=str(row[14]),
+                    row_reference=reference,
+                )
+            )
+
+        equity_mark_sources: list[Phase1EquityMarkSource] = []
+        equity_authorities: list[object] = []
+        point_mark_references: list[JournalRowReference] = []
+        policy_digest: str | None = None
+        if len(equity_points) > 1:
+            from .market_calendar import load_current_market_calendar
+            from .policy import Policy
+            from .risk import (
+                SessionCalendarResolver,
+                _calendar_digest,
+                _issue_phase1_equity_point_from_source,
+                _policy_digest,
+            )
+
+            project_root = Path(__file__).resolve().parents[2]
+            if calendar_resolver is None:
+                calendar_resolver = SessionCalendarResolver(
+                    (
+                        load_current_market_calendar(
+                            project_root,
+                            as_of=through_session,
+                        ),
+                    )
+                )
+            if policy is None:
+                policy = Policy.from_toml(project_root / "config" / "policy.toml")
+            if (
+                not isinstance(calendar_resolver, SessionCalendarResolver)
+                or not calendar_resolver.release_verified
+                or _calendar_digest(calendar_resolver) != str(window_row[6])
+                or not isinstance(policy, Policy)
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 marked history requires its versioned calendar and policy"
+                )
+            try:
+                policy.validate()
+            except Exception as error:
+                raise InvalidJournalValue(
+                    "Phase 1 marked history policy is invalid"
+                ) from error
+            policy_digest = _policy_digest(policy)
+
+            for point, point_row in zip(
+                equity_points[1:],
+                equity_rows[1:],
+                strict=True,
+            ):
+                mark_source = self._read_phase1_equity_mark_source(
+                    ledger_name=ledger_name,
+                    session_date=point.session_date,
+                    query_cutoff=point.received_at,
+                    current_query_cutoff=normalized_cutoff,
+                    calendar_resolver=calendar_resolver,
+                    policy=policy,
+                )
+                authority = _issue_phase1_equity_point_from_source(
+                    mark_source,
+                    calendar_resolver=calendar_resolver,
+                )
+                expected_point_id = hashlib.sha256(
+                    (
+                        "stock-monitor/phase1-session-equity-point/v1\x00"
+                        + window_id
+                        + "\x00"
+                        + ledger_name
+                        + "\x00"
+                        + point.session_date.isoformat()
+                        + "\x00"
+                        + authority.authority_digest
+                    ).encode("utf-8")
+                ).hexdigest()
+                expected_point_source_digest = _journal_bundle_digest(
+                    "stock-monitor/phase1-equity-point/v1",
+                    mark_source.row_references,
+                    {
+                        **dict(
+                            zip(
+                                _PHASE1_EQUITY_POINT_COLUMNS[1:-1],
+                                tuple(point_row[1:-1]),
+                                strict=True,
+                            )
+                        ),
+                        "authority_digest": authority.authority_digest,
+                        "source_digest": mark_source.source_digest,
+                    },
+                )
+                if (
+                    mark_source.query_cutoff != point.received_at
+                    or authority.query_cutoff != point.received_at
+                    or authority.validation_window_id != window_id
+                    or authority.ledger_name != ledger_name
+                    or authority.session_date != point.session_date
+                    or authority.point_at != point.at
+                    or point.point_id != expected_point_id
+                    or point.mark_source_digest != authority.mark_source_digest
+                    or point.cash_micros != money_to_micros(authority.point.cash)
+                    or point.positions_value_micros
+                    != money_to_micros(authority.point.positions_value)
+                    or point.equity_micros
+                    != money_to_micros(authority.point.equity)
+                    or point.external_cash_flow_micros
+                    != money_to_micros(authority.point.external_cash_flow)
+                    or point.source_digest != expected_point_source_digest
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 equity point conflicts with its derived authority"
+                    )
+
+                point_mark_rows = _sql(
+                    self._connection,
+                    "SELECT "
+                    + ", ".join(_PHASE1_EQUITY_POINT_MARK_COLUMNS)
+                    + " FROM phase1_equity_point_marks "
+                    "WHERE equity_point_id = ? COLLATE BINARY "
+                    "ORDER BY mark_ordinal, id",
+                    (point.point_id,),
+                ).fetchall()
+                if len(point_mark_rows) != len(mark_source.position_marks):
+                    raise MigrationCorruption(
+                        "Phase 1 equity point mark set is incomplete"
+                    )
+                for mark_row, mark in zip(
+                    point_mark_rows,
+                    mark_source.position_marks,
+                    strict=True,
+                ):
+                    mark_reference = _journal_row_reference(
+                        "phase1_equity_point_marks",
+                        _PHASE1_EQUITY_POINT_MARK_COLUMNS,
+                        mark_row,
+                    )
+                    selected_descriptors = tuple(
+                        descriptor
+                        for descriptor in (
+                            *mark.quote_fact_sources,
+                            *mark.daily_bar_fact_sources,
+                        )
+                        if descriptor.row_id == mark.source_cursor
+                    )
+                    if len(selected_descriptors) != 1:
+                        raise MigrationCorruption(
+                            "Phase 1 equity point selected mark is ambiguous"
+                        )
+                    expected_mark_values = (
+                        point.point_id,
+                        selected_descriptors[0].fact_id,
+                        mark.symbol,
+                        mark.mark_ordinal,
+                        mark.method,
+                        mark.derived_price_micros,
+                        _canonical_timestamp(mark.mark_at),
+                    )
+                    expected_mark_digest = _journal_bundle_digest(
+                        "stock-monitor/phase1-equity-point-mark/v1",
+                        (*mark.row_references, *mark_source.row_references),
+                        dict(
+                            zip(
+                                _PHASE1_EQUITY_POINT_MARK_COLUMNS[1:-1],
+                                expected_mark_values,
+                                strict=True,
+                            )
+                        ),
+                    )
+                    if (
+                        tuple(mark_row[1:-1]) != expected_mark_values
+                        or str(mark_row[-1]) != expected_mark_digest
+                    ):
+                        raise MigrationCorruption(
+                            "Phase 1 equity point mark conflicts with provider evidence"
+                        )
+                    point_mark_references.append(mark_reference)
+                equity_mark_sources.append(mark_source)
+                equity_authorities.append(authority)
+        close_rows = _sql(
+            self._connection,
+            "SELECT id, trade_id, validation_window_id, ledger_name, signal_id, "
+            "lifecycle_event_id, session_date, shares, entry_value_micros, "
+            "exit_value_micros, fee_micros, pnl_micros, initial_risk_micros, "
+            "net_r_numerator_micros, at, message_time, received_at, "
+            "source_digest FROM phase1_closed_trades "
+            "WHERE validation_window_id = ? COLLATE BINARY AND ledger_name = ? "
+            "AND session_date <= ? AND received_at <= ? ORDER BY id",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchall()
+        late_close = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_closed_trades WHERE validation_window_id = ? "
+            "COLLATE BINARY AND ledger_name = ? AND session_date <= ? "
+            "AND received_at > ? LIMIT 1",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchone()
+        if late_close is not None:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+        closed_trades: list[Phase1ClosedTradeSource] = []
+        for row in close_rows:
+            reference = _journal_row_reference(
+                "phase1_closed_trades",
+                _PHASE1_CLOSED_TRADE_COLUMNS,
+                row,
+            )
+            at = _parse_canonical_timestamp(str(row[14]))
+            message_time = _parse_canonical_timestamp(str(row[15]))
+            received_at = _parse_canonical_timestamp(str(row[16]))
+            if not at <= message_time <= received_at <= normalized_cutoff:
+                raise MigrationCorruption(
+                    "Phase 1 closed-trade chronology is inconsistent"
+                )
+            if int(row[11]) != int(row[9]) - int(row[8]) - int(row[10]):
+                raise MigrationCorruption(
+                    "Phase 1 closed-trade arithmetic is inconsistent"
+                )
+            closed_trades.append(
+                Phase1ClosedTradeSource(
+                    row_id=int(row[0]),
+                    trade_id=str(row[1]),
+                    validation_window_id=str(row[2]),
+                    ledger_name=str(row[3]),
+                    signal_id=str(row[4]),
+                    lifecycle_event_id=str(row[5]),
+                    session_date=date.fromisoformat(str(row[6])),
+                    shares=int(row[7]),
+                    entry_value_micros=int(row[8]),
+                    exit_value_micros=int(row[9]),
+                    fee_micros=int(row[10]),
+                    pnl_micros=int(row[11]),
+                    initial_risk_micros=int(row[12]),
+                    net_r_numerator_micros=int(row[13]),
+                    at=at,
+                    message_time=message_time,
+                    received_at=received_at,
+                    source_digest=str(row[17]),
+                    row_reference=reference,
+                )
+            )
+        equity_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_equity_points "
+            "WHERE validation_window_id = ? COLLATE BINARY AND ledger_name = ? "
+            "AND session_date <= ? AND received_at <= ?",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchone()
+        close_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_closed_trades "
+            "WHERE validation_window_id = ? COLLATE BINARY AND ledger_name = ? "
+            "AND session_date <= ? AND received_at <= ?",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchone()
+        mark_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(mark.id), 0) "
+            "FROM phase1_equity_point_marks AS mark "
+            "JOIN phase1_equity_points AS point "
+            "ON point.point_id = mark.equity_point_id COLLATE BINARY "
+            "WHERE point.validation_window_id = ? COLLATE BINARY "
+            "AND point.ledger_name = ? AND point.session_date <= ? "
+            "AND point.received_at <= ?",
+            (window_id, ledger_name, stored_through, stored_cutoff),
+        ).fetchone()
+        if (
+            equity_highwater_row is None
+            or close_highwater_row is None
+            or mark_highwater_row is None
+        ):
+            raise JournalError("Phase 1 stream high-water query failed")
+        references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    _journal_row_reference(
+                        "phase1_validation_windows",
+                        _PHASE1_VALIDATION_WINDOW_COLUMNS,
+                        window_row,
+                    ),
+                    *(point.row_reference for point in equity_points),
+                    *(trade.row_reference for trade in closed_trades),
+                    *point_mark_references,
+                    *(
+                        reference
+                        for mark_source in equity_mark_sources
+                        for reference in mark_source.row_references
+                    ),
+                )
+            }.values()
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-breaker-history/v1",
+            references,
+            {
+                "validation_window_id": window_id,
+                "ledger_name": ledger_name,
+                "through_session": stored_through,
+                "query_cutoff": stored_cutoff,
+                "equity_terminal_cursor": equity_points[-1].source_cursor,
+                "equity_source_highwater": int(equity_highwater_row[0]),
+                "close_terminal_cursor": (
+                    None if not closed_trades else closed_trades[-1].row_id
+                ),
+                "close_source_highwater": int(close_highwater_row[0]),
+                "expected_equity_count": len(equity_points),
+                "expected_close_count": len(closed_trades),
+                "expected_mark_source_count": len(equity_mark_sources),
+                "mark_source_highwater": int(mark_highwater_row[0]),
+                "equity_mark_source_digests": [
+                    source.source_digest for source in equity_mark_sources
+                ],
+                "equity_authority_digests": [
+                    authority.authority_digest for authority in equity_authorities
+                ],
+                "policy_digest": policy_digest,
+            },
+        )
+        source = Phase1BreakerHistorySource(
+            validation_window_id=window_id,
+            window_start_session=started_session,
+            window_start_source_id=equity_points[0].point_id,
+            calendar_digest=str(window_row[6]),
+            ledger_name=ledger_name,
+            equity_points=tuple(equity_points),
+            closed_trades=tuple(closed_trades),
+            equity_mark_sources=tuple(equity_mark_sources),
+            equity_authorities=tuple(equity_authorities),
+            through_session=through_session,
+            query_cutoff=normalized_cutoff,
+            equity_terminal_cursor=equity_points[-1].source_cursor,
+            equity_source_highwater=int(equity_highwater_row[0]),
+            close_terminal_cursor=(
+                None if not closed_trades else closed_trades[-1].row_id
+            ),
+            close_source_highwater=int(close_highwater_row[0]),
+            expected_equity_count=len(equity_points),
+            expected_close_count=len(closed_trades),
+            expected_mark_source_count=len(equity_mark_sources),
+            mark_source_highwater=int(mark_highwater_row[0]),
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_breaker_history(
+        self,
+        *,
+        ledger_name: str,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> object:
+        """Issue breaker history only through the narrow verified adapter."""
+        source = self._read_phase1_breaker_history_source(
+            ledger_name=ledger_name,
+            through_session=through_session,
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        from .risk import _issue_breaker_history_from_phase1_source
+
+        return _issue_breaker_history_from_phase1_source(
+            source,
+            calendar_resolver=calendar_resolver,
+        )
+
+    @staticmethod
+    def _phase1_versioned_policy(signal_source: Phase1SignalSource) -> object:
+        """Load the fixed repository policy and bind it to the signal release."""
+        from .policy import Policy
+        from .risk import _policy_digest
+
+        policy = Policy.from_toml(
+            Path(__file__).resolve().parents[2] / "config" / "policy.toml"
+        )
+        try:
+            policy.validate()
+        except Exception as error:
+            raise InvalidJournalValue(
+                "Phase 1 versioned policy is invalid"
+            ) from error
+        if _policy_digest(policy) != signal_source.policy_digest:
+            raise InvalidJournalValue(
+                "Phase 1 signal policy release is unavailable"
+            )
+        return policy
+
+    def _read_phase1_published_signal_disposition_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object | None = None,
+    ) -> Phase1PublishedSignalDispositionSource:
+        """Rebuild one terminal signal disposition from its typed proof."""
+        from .ledger import _phase1_entry_result_from_observations
+        from .phase1 import SignalStatus
+        from .risk import (
+            SessionCalendarResolver,
+            _calendar_digest,
+            _issue_phase1_signal_evidence_authority_from_source,
+            _policy_digest,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 disposition source requires a post-commit read"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        signal_source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=normalized_cutoff,
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 disposition calendar is unverified"
+            )
+        if _calendar_digest(calendar_resolver) != signal_source.calendar_digest:
+            raise InvalidJournalValue(
+                "Phase 1 disposition calendar conflicts with signal"
+            )
+        effective_policy = (
+            self._phase1_versioned_policy(signal_source)
+            if policy is None
+            else policy
+        )
+        if _policy_digest(effective_policy) != signal_source.policy_digest:
+            raise InvalidJournalValue(
+                "Phase 1 disposition policy conflicts with signal"
+            )
+
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "AND received_at <= ? ORDER BY event_ordinal, id",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchall()
+        if (
+            not event_rows
+            or tuple(int(row[3]) for row in event_rows)
+            != tuple(range(len(event_rows)))
+            or str(event_rows[0][4]) != "PUBLISHED"
+            or event_rows[0][5] is not None
+            or str(event_rows[0][6]) != "PUBLISHED"
+        ):
+            raise MigrationCorruption(
+                "Phase 1 disposition lifecycle is incomplete"
+            )
+        for prior, current in zip(event_rows, event_rows[1:], strict=False):
+            if (
+                str(current[5]) != str(prior[6])
+                or _parse_canonical_timestamp(str(current[7]))
+                > _parse_canonical_timestamp(str(current[8]))
+                or _parse_canonical_timestamp(str(current[8]))
+                > _parse_canonical_timestamp(str(current[9]))
+                or _parse_canonical_timestamp(str(prior[9]))
+                > _parse_canonical_timestamp(str(current[9]))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 disposition lifecycle chronology is inconsistent"
+                )
+        highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_signal_events "
+            "WHERE signal_id = ? COLLATE BINARY AND received_at <= ?",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchone()
+        later_row = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "AND received_at > ? LIMIT 1",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchone()
+        if highwater_row is None or later_row is not None:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+
+        published = event_rows[0]
+        published_details = _canonical_stored_details(
+            published[20],
+            label="Phase 1 published lifecycle",
+        )
+        expected_published_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "lifecycle_event_id": str(published[1]),
+                    "signal_id": signal_id,
+                    "event_ordinal": 0,
+                    "event_kind": "PUBLISHED",
+                    "from_status": None,
+                    "to_status": "PUBLISHED",
+                    "event_time": str(published[7]),
+                    "message_time": str(published[8]),
+                    "received_at": str(published[9]),
+                    "publication_source_digest": (
+                        signal_source.publication_source_digest
+                    ),
+                    "publication_rank": signal_source.publication_rank,
+                    "publication_observation_manifest_digest": (
+                        signal_source.publication_source.manifest_digest
+                    ),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(published[1]) != "phase1-published:" + signal_id
+            or _parse_canonical_timestamp(str(published[7]))
+            != signal_source.published_at
+            or _parse_canonical_timestamp(str(published[9]))
+            != signal_source.received_at
+            or str(published[19]) != expected_published_digest
+            or published_details
+            != {
+                "publication_rank": signal_source.publication_rank,
+                "publication_source_digest": (
+                    signal_source.publication_source_digest
+                ),
+                "publication_observation_manifest_digest": (
+                    signal_source.publication_source.manifest_digest
+                ),
+            }
+        ):
+            raise MigrationCorruption(
+                "Phase 1 published lifecycle conflicts with its source"
+            )
+
+        terminal_kind_by_status = {
+            "NOT_TRIGGERED": "FINALIZE_NOT_TRIGGERED",
+            "NOT_FILLED_LIMIT": "FINALIZE_NOT_FILLED",
+            "UNRESOLVED": "FINALIZE_UNRESOLVED",
+            "EXPIRED": "EXPIRE",
+            "INVALIDATED": "INVALIDATE",
+            "SHADOW_FILLED_INFORMATIONAL": "SHADOW_FILL",
+            "CLOSED": "CLOSE",
+        }
+        terminal = event_rows[-1]
+        status = str(terminal[6])
+        if terminal_kind_by_status.get(status) != str(terminal[4]):
+            raise InvalidJournalValue(
+                "Phase 1 signal has no complete terminal disposition"
+            )
+        lifecycle_events = tuple(
+            self._phase1_lifecycle_source_from_row(row) for row in event_rows
+        )
+        prior_reference = lifecycle_events[-2].row_reference
+
+        session_completion: Phase1SessionCompletionSource | None = None
+        expiry_source: Phase1ExpiryDeadlineSource | None = None
+        evidence_source: Phase1SignalEvidenceSource | None = None
+        shadow_source: Phase1ShadowFillSource | None = None
+        closed_trade: Phase1ClosedTradeSource | None = None
+        terminal_source_id: str
+        terminal_source_digest: str
+        terminal_references: tuple[JournalRowReference, ...]
+
+        if status in {"NOT_TRIGGERED", "NOT_FILLED_LIMIT", "UNRESOLVED"}:
+            if terminal[13] is None:
+                raise MigrationCorruption(
+                    "Phase 1 terminal completion reference is missing"
+                )
+            session_completion = self._read_phase1_session_completion_source(
+                signal_id=signal_id,
+                session_date=signal_source.publication_session,
+                query_cutoff=normalized_cutoff,
+            )
+            if str(terminal[13]) != session_completion.completion_id:
+                raise MigrationCorruption(
+                    "Phase 1 terminal completion reference is inconsistent"
+                )
+            observations, _completion, _highwater, _stream_highwaters = (
+                self._phase1_entry_observation_bundle(
+                    signal_source=signal_source,
+                    query_cutoff=normalized_cutoff,
+                )
+            )
+            simulated = _phase1_entry_result_from_observations(
+                observations,
+                trigger=money_from_micros(signal_source.trigger_price_micros),
+                limit=money_from_micros(signal_source.maximum_entry_micros),
+            )
+            expected_status = {
+                "NOT_TRIGGERED": SignalStatus.NOT_TRIGGERED,
+                "NOT_FILLED_LIMIT": SignalStatus.NOT_FILLED_LIMIT,
+                "UNRESOLVED": SignalStatus.UNRESOLVED,
+            }[status]
+            if getattr(simulated, "status", None) is not expected_status:
+                raise MigrationCorruption(
+                    "Phase 1 terminal status conflicts with completed evidence"
+                )
+            terminal_source_id = session_completion.completion_id
+            terminal_source_digest = session_completion.source_digest
+            terminal_references = (
+                *signal_source.row_references,
+                *session_completion.row_references,
+                prior_reference,
+            )
+        elif status == "EXPIRED":
+            if terminal[22] is None:
+                raise MigrationCorruption("Phase 1 expiry source is missing")
+            terminal_observed_at = _parse_canonical_timestamp(str(terminal[7]))
+            expiry_source = self._read_phase1_expiry_deadline_source(
+                signal_id,
+                observed_at=terminal_observed_at,
+                query_cutoff=terminal_observed_at,
+                calendar_resolver=calendar_resolver,
+                exact_signal_source=signal_source,
+            )
+            terminal_source_id = str(
+                getattr(expiry_source.expiry_evidence, "source_id")
+            )
+            terminal_source_digest = expiry_source.source_digest
+            expiry_row = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_PHASE1_EXPIRY_DEADLINE_COLUMNS)
+                + " FROM phase1_expiry_deadlines WHERE expiry_source_id = ? COLLATE BINARY",
+                (terminal_source_id,),
+            ).fetchone()
+            if expiry_row is None or str(terminal[22]) != terminal_source_id:
+                raise MigrationCorruption(
+                    "Phase 1 persisted expiry proof is missing"
+                )
+            expiry_record = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_EXPIRY_DEADLINE_COLUMNS[1:-1],
+                            tuple(expiry_row[1:-1]),
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                str(expiry_row[13]) != terminal_source_digest
+                or str(expiry_row[14]) != expiry_record
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 persisted expiry proof is inconsistent"
+                )
+            expiry_reference = _journal_row_reference(
+                "phase1_expiry_deadlines",
+                _PHASE1_EXPIRY_DEADLINE_COLUMNS,
+                expiry_row,
+            )
+            terminal_references = (
+                *expiry_source.row_references,
+                expiry_reference,
+                prior_reference,
+            )
+        elif status == "INVALIDATED":
+            if terminal[21] is None:
+                raise MigrationCorruption(
+                    "Phase 1 invalidation evidence is missing"
+                )
+            evidence_row = _sql(
+                self._connection,
+                "SELECT review_at FROM phase1_signal_evidence_reviews "
+                "WHERE evidence_id = ? COLLATE BINARY AND recorded_at <= ?",
+                (str(terminal[21]), _canonical_timestamp(normalized_cutoff)),
+            ).fetchone()
+            if evidence_row is None:
+                raise MigrationCorruption(
+                    "Phase 1 invalidation evidence row is missing"
+                )
+            evidence_review_at = _parse_canonical_timestamp(str(evidence_row[0]))
+            evidence_source = self._read_phase1_signal_evidence_source(
+                signal_id,
+                review_at=evidence_review_at,
+                query_cutoff=evidence_review_at,
+                calendar_resolver=calendar_resolver,
+                exact_signal_source=signal_source,
+            )
+            evidence_authority = (
+                _issue_phase1_signal_evidence_authority_from_source(
+                    evidence_source,
+                    calendar_resolver=calendar_resolver,
+                )
+            )
+            if not (
+                getattr(evidence_authority, "event_exit_required", None) is True
+                or getattr(evidence_authority, "thesis_invalidated", None) is True
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 invalidation evidence is not positive"
+                )
+            terminal_source_id = evidence_source.evidence_id
+            terminal_source_digest = evidence_source.source_digest
+            if str(terminal[21]) != terminal_source_id:
+                raise MigrationCorruption(
+                    "Phase 1 invalidation evidence identity conflicts"
+                )
+            terminal_references = (
+                *evidence_source.row_references,
+                prior_reference,
+            )
+        elif status == "SHADOW_FILLED_INFORMATIONAL":
+            shadow_source = self._read_phase1_shadow_fill_source(
+                signal_id,
+                query_cutoff=normalized_cutoff,
+                exact_signal_source=signal_source,
+            )
+            terminal_source_id = shadow_source.lifecycle_event.lifecycle_event_id
+            terminal_source_digest = shadow_source.source_digest
+            terminal_references = shadow_source.row_references
+        else:
+            replay_source = self._read_phase1_canonical_replay_source(
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=effective_policy,
+            )
+            matches = tuple(
+                trade
+                for trade in replay_source.closed_trades
+                if trade.signal_id == signal_id and trade.ledger_name == "CANONICAL"
+            )
+            if len(matches) != 1 or matches[0].lifecycle_event_id != str(terminal[1]):
+                raise MigrationCorruption(
+                    "Phase 1 closed disposition has no aggregate trade"
+                )
+            closed_trade = matches[0]
+            terminal_source_id = closed_trade.trade_id
+            terminal_source_digest = closed_trade.source_digest
+            terminal_references = replay_source.row_references
+
+        if status not in {"SHADOW_FILLED_INFORMATIONAL", "CLOSED"}:
+            details = _canonical_stored_details(
+                terminal[20],
+                label="Phase 1 terminal disposition",
+            )
+            expected_kind = {
+                "NOT_TRIGGERED": "SESSION_COMPLETION",
+                "NOT_FILLED_LIMIT": "SESSION_COMPLETION",
+                "UNRESOLVED": "SESSION_COMPLETION",
+                "EXPIRED": "EXPIRY_DEADLINE",
+                "INVALIDATED": "SIGNAL_EVIDENCE",
+            }[status]
+            if (
+                details.get("terminal_evidence_kind") != expected_kind
+                or details.get("terminal_evidence_digest")
+                != terminal_source_digest
+                or details.get("terminal_source_id") != terminal_source_id
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 terminal evidence manifest is inconsistent"
+                )
+            material = {
+                column: terminal[index]
+                for index, column in enumerate(_PHASE1_SIGNAL_EVENT_COLUMNS)
+                if column not in {"id", "source_digest"}
+            }
+            expected_terminal_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-terminal-lifecycle-event/v1",
+                terminal_references,
+                {
+                    **self._phase1_terminal_event_material(material),
+                    "terminal_source_id": terminal_source_id,
+                    "terminal_source_digest": terminal_source_digest,
+                },
+            )
+            if str(terminal[19]) != expected_terminal_digest:
+                raise MigrationCorruption(
+                    "Phase 1 terminal lifecycle digest is inconsistent"
+                )
+
+        references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    *signal_source.row_references,
+                    *(event.row_reference for event in lifecycle_events),
+                    *terminal_references,
+                )
+            }.values()
+        )
+        lifecycle_highwater = int(highwater_row[0])
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-published-signal-disposition/v1",
+            references,
+            {
+                "signal_id": signal_id,
+                "status": status,
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "lifecycle_terminal_cursor": lifecycle_events[-1].row_id,
+                "lifecycle_source_highwater": lifecycle_highwater,
+                "expected_lifecycle_count": len(lifecycle_events),
+                "terminal_source_id": terminal_source_id,
+                "terminal_source_digest": terminal_source_digest,
+            },
+        )
+        source = Phase1PublishedSignalDispositionSource(
+            signal_source=signal_source,
+            lifecycle_events=lifecycle_events,
+            status=status,
+            session_completion=session_completion,
+            expiry_deadline_source=expiry_source,
+            signal_evidence_source=evidence_source,
+            shadow_fill_source=shadow_source,
+            closed_trade=closed_trade,
+            query_cutoff=normalized_cutoff,
+            lifecycle_terminal_cursor=lifecycle_events[-1].row_id,
+            lifecycle_source_highwater=lifecycle_highwater,
+            expected_lifecycle_count=len(lifecycle_events),
+            row_references=references,
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_published_signal_disposition_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1PublishedSignalDispositionSource:
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_published_signal_disposition_source(
+                signal_id,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+            )
+
+    @staticmethod
+    def _phase1_adherence_through_session(
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> date:
+        from zoneinfo import ZoneInfo
+
+        cutoff_et = query_cutoff.astimezone(ZoneInfo("America/New_York"))
+        candidate = cutoff_et.date()
+        if calendar_resolver.is_open(candidate):  # type: ignore[attr-defined]
+            schedule = calendar_resolver.session(candidate)  # type: ignore[attr-defined]
+            close_at = datetime.combine(
+                candidate,
+                schedule.close_time,
+                schedule.timezone,
+            ).astimezone(timezone.utc)
+            if query_cutoff >= close_at:
+                return candidate
+        return calendar_resolver.previous_session(candidate)  # type: ignore[attr-defined]
+
+    def _read_phase1_adherence_review_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+        disposition_source: (
+            Phase1PublishedSignalDispositionSource | None
+        ) = None,
+        canonical_replay_source: Phase1CanonicalReplaySource | None = None,
+        breaker_history_source: Phase1BreakerHistorySource | None = None,
+        actual_replay_source: JournalActualReplaySource | None = None,
+    ) -> Phase1AdherenceReviewSource:
+        """Build every fixed-check input from exact current Journal sources."""
+        from .policy import Policy
+        from .risk import (
+            SessionCalendarResolver,
+            _calendar_digest,
+            _policy_digest,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 adherence review requires a post-commit read"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence calendar is unverified"
+            )
+        if not isinstance(policy, Policy):
+            raise InvalidJournalValue("Phase 1 adherence policy is invalid")
+        try:
+            policy.validate()
+        except Exception as error:
+            raise InvalidJournalValue(
+                "Phase 1 adherence policy is invalid"
+            ) from error
+
+        if disposition_source is None:
+            disposition_source = (
+                self._read_phase1_published_signal_disposition_source(
+                    signal_id,
+                    query_cutoff=normalized_cutoff,
+                    calendar_resolver=calendar_resolver,
+                    policy=policy,
+                )
+            )
+        elif not (
+            is_verified_phase1_published_signal_disposition_source(
+                disposition_source
+            )
+            and disposition_source.signal_id == signal_id
+            and disposition_source.query_cutoff == normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence disposition source is unverified"
+            )
+        signal_source = disposition_source.signal_source
+        calendar_digest = _calendar_digest(calendar_resolver)
+        policy_digest = _policy_digest(policy)
+        if (
+            signal_source.calendar_digest != calendar_digest
+            or signal_source.policy_digest != policy_digest
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence configuration conflicts with signal"
+            )
+        window_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_VALIDATION_WINDOW_COLUMNS)
+            + " FROM phase1_validation_windows "
+            "WHERE window_id = ? COLLATE BINARY",
+            (signal_source.validation_window_id,),
+        ).fetchone()
+        if window_row is None:
+            raise MigrationCorruption(
+                "Phase 1 adherence validation window is missing"
+            )
+        window = dict(
+            zip(
+                _PHASE1_VALIDATION_WINDOW_COLUMNS,
+                tuple(window_row),
+                strict=True,
+            )
+        )
+        window_started_at = _parse_canonical_timestamp(
+            str(window["started_at"])
+        )
+        window_received_at = _parse_canonical_timestamp(
+            str(window["received_at"])
+        )
+        expected_window_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "window_id": str(window["window_id"]),
+                    "started_session": str(window["started_session"]),
+                    "starting_capital_micros": int(
+                        window["starting_capital_micros"]
+                    ),
+                    "started_at": str(window["started_at"]),
+                    "received_at": str(window["received_at"]),
+                    "calendar_digest": str(window["calendar_digest"]),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(window["window_id"])
+            != signal_source.validation_window_id
+            or date.fromisoformat(str(window["started_session"]))
+            > signal_source.publication_session
+            or int(window["starting_capital_micros"]) != 5_000_000_000
+            or not window_started_at
+            <= window_received_at
+            <= normalized_cutoff
+            or str(window["calendar_digest"]) != calendar_digest
+            or str(window["source_digest"]) != expected_window_digest
+            or int(window["singleton_key"]) != 1
+        ):
+            raise MigrationCorruption(
+                "Phase 1 adherence validation window is inconsistent"
+            )
+        window_reference = _journal_row_reference(
+            "phase1_validation_windows",
+            _PHASE1_VALIDATION_WINDOW_COLUMNS,
+            window_row,
+        )
+        if canonical_replay_source is None:
+            canonical_replay_source = (
+                self._read_phase1_canonical_replay_source(
+                    query_cutoff=normalized_cutoff,
+                    calendar_resolver=calendar_resolver,
+                    policy=policy,
+                )
+            )
+        elif not (
+            is_verified_phase1_canonical_replay_source(
+                canonical_replay_source
+            )
+            and _phase1_source_owner(canonical_replay_source) is self
+            and canonical_replay_source.query_cutoff == normalized_cutoff
+            and canonical_replay_source.validation_window_id
+            == signal_source.validation_window_id
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence canonical replay is unverified"
+            )
+        through_session = self._phase1_adherence_through_session(
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        if breaker_history_source is None:
+            breaker_history_source = (
+                self._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=through_session,
+                    query_cutoff=normalized_cutoff,
+                    calendar_resolver=calendar_resolver,
+                    policy=policy,
+                )
+            )
+        elif not (
+            is_verified_phase1_breaker_history_source(
+                breaker_history_source
+            )
+            and _phase1_source_owner(breaker_history_source) is self
+            and breaker_history_source.validation_window_id
+            == signal_source.validation_window_id
+            and breaker_history_source.ledger_name == "CANONICAL"
+            and breaker_history_source.through_session == through_session
+            and breaker_history_source.query_cutoff == normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence breaker history is unverified"
+            )
+
+        if actual_replay_source is None:
+            with self.transaction() as transaction:
+                actual_replay_source = transaction.read_actual_replay(
+                    query_cutoff=normalized_cutoff,
+                )
+        elif not (
+            is_verified_journal_replay_source(actual_replay_source)
+            and _journal_replay_source_owner(actual_replay_source) is self
+            and actual_replay_source.query_cutoff == normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence actual replay is unverified"
+            )
+        actual_action_sources = tuple(
+            action
+            for action in actual_replay_source.actions
+            if window_started_at <= action.received_at <= normalized_cutoff
+        )
+        if any(
+            action.received_at > normalized_cutoff
+            for action in actual_action_sources
+        ):
+            raise MigrationCorruption(
+                "Phase 1 adherence actual-action lineage is inconsistent"
+            )
+
+        actual_action_references = tuple(
+            reference
+            for action in actual_action_sources
+            for reference in action.row_references
+        )
+        references_by_name: dict[str, tuple[JournalRowReference, ...]] = {
+            "DATA_CALENDAR_UNIVERSE_FRESHNESS": (
+                window_reference,
+                *signal_source.row_references,
+            ),
+            "HARD_ELIGIBILITY_GATES": (
+                window_reference,
+                *signal_source.row_references,
+            ),
+            "SCORE_ARITHMETIC_AND_PRIMARY_SELECTION": (
+                window_reference,
+                *signal_source.row_references,
+            ),
+            "VALID_TRIGGER_TIMING": (
+                window_reference,
+                *disposition_source.row_references,
+            ),
+            "ENTRY_AND_SPREAD_COMPLIANCE": tuple(
+                (
+                    window_reference,
+                    *disposition_source.row_references,
+                    *actual_action_references,
+                )
+            ),
+            "POSITION_SIZE_EXPOSURE_AND_RISK": (
+                window_reference,
+                *canonical_replay_source.row_references,
+                *actual_action_references,
+            ),
+            "STOP_STATE": (
+                window_reference,
+                *canonical_replay_source.row_references,
+                *actual_action_references,
+            ),
+            "EXIT_RULE": (
+                window_reference,
+                *disposition_source.row_references,
+            ),
+            "CIRCUIT_BREAKER_BEHAVIOR": (
+                window_reference,
+                *breaker_history_source.row_references,
+            ),
+            "RECORD_COMPLETENESS": tuple(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in (
+                        window_reference,
+                        *signal_source.row_references,
+                        *disposition_source.row_references,
+                        *canonical_replay_source.row_references,
+                        *breaker_history_source.row_references,
+                        *actual_action_references,
+                    )
+                }.values()
+            ),
+        }
+        failure_codes_by_name: dict[str, tuple[str, ...]] = {
+            name: () for name in _PHASE1_ADHERENCE_CHECK_NAMES
+        }
+        hard_codes_by_name: dict[str, tuple[str, ...]] = {
+            name: () for name in _PHASE1_ADHERENCE_CHECK_NAMES
+        }
+        current_confirmation_ids = frozenset(
+            int(row[0])
+            for row in _sql(
+                self._connection,
+                "SELECT confirmation_execution_event_id "
+                "FROM phase1_signal_events "
+                "WHERE signal_id = ? COLLATE BINARY "
+                "AND confirmation_execution_event_id IS NOT NULL "
+                "AND received_at <= ?",
+                (signal_id, _canonical_timestamp(normalized_cutoff)),
+            ).fetchall()
+        )
+        window_confirmation_ids = frozenset(
+            int(row[0])
+            for row in _sql(
+                self._connection,
+                "SELECT event.confirmation_execution_event_id "
+                "FROM phase1_signal_events AS event "
+                "JOIN phase1_signals AS signal "
+                "ON signal.signal_id = event.signal_id COLLATE BINARY "
+                "WHERE signal.validation_window_id = ? COLLATE BINARY "
+                "AND event.confirmation_execution_event_id IS NOT NULL "
+                "AND event.received_at <= ?",
+                (
+                    signal_source.validation_window_id,
+                    _canonical_timestamp(normalized_cutoff),
+                ),
+            ).fetchall()
+        )
+        linked_actual_actions = tuple(
+            action
+            for action in actual_action_sources
+            if action.execution_event_id in current_confirmation_ids
+        )
+        filled_primary = (
+            signal_source.role == "PRIMARY"
+            and disposition_source.status == "CLOSED"
+        )
+        if filled_primary and any(
+            action.compliance_result != "COMPLIANT"
+            for action in linked_actual_actions
+            if action.domain_kind in {"BOUGHT", "SKIPPED"}
+        ):
+            failure_codes_by_name["ENTRY_AND_SPREAD_COMPLIANCE"] = (
+                "ENTRY_AND_SPREAD_COMPLIANCE_VIOLATION",
+            )
+        account_risk_breach = any(
+            action.account_check is not None
+            and (
+                action.account_check.pending_order_count > 0
+                or action.account_check.unlogged_position_count > 0
+                or action.account_check.reconciliation_result != "CLEAR"
+            )
+            for action in actual_action_sources
+        )
+        unbound_actual_entry = any(
+            action.domain_kind == "BOUGHT"
+            and action.execution_event_id not in window_confirmation_ids
+            for action in actual_action_sources
+        )
+        global_risk_breach = account_risk_breach or unbound_actual_entry
+        carrier_row = _sql(
+            self._connection,
+            "SELECT signal.signal_id FROM phase1_signals AS signal "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.role = 'PRIMARY' "
+            "ORDER BY signal.publication_session, signal.publication_rank, "
+            "signal.id LIMIT 1",
+            (signal_source.validation_window_id,),
+        ).fetchone()
+        global_risk_carrier = (
+            None if carrier_row is None else str(carrier_row[0])
+        )
+        if global_risk_breach and global_risk_carrier is None:
+            raise InvalidJournalValue(
+                "Phase 1 unbound actual risk has no applicable primary"
+            )
+        if global_risk_breach and signal_id == global_risk_carrier:
+            failure_codes_by_name["RECORD_COMPLETENESS"] = (
+                "RECORD_COMPLETENESS_VIOLATION",
+            )
+            hard_codes_by_name["RECORD_COMPLETENESS"] = (
+                "RISK_LIMIT_BREACH",
+            )
+        linked_risk_breach = any(
+            action.domain_kind == "BOUGHT"
+            and action.reconciliation_state != "CLEAR"
+            for action in linked_actual_actions
+        )
+        if filled_primary and linked_risk_breach:
+            failure_codes_by_name["POSITION_SIZE_EXPOSURE_AND_RISK"] = (
+                "POSITION_SIZE_EXPOSURE_AND_RISK_VIOLATION",
+            )
+            hard_codes_by_name["POSITION_SIZE_EXPOSURE_AND_RISK"] = (
+                "RISK_LIMIT_BREACH",
+            )
+        if filled_primary and any(
+            action.domain_kind == "BOUGHT"
+            and action.recommended_stop_micros is None
+            for action in linked_actual_actions
+        ):
+            failure_codes_by_name["STOP_STATE"] = (
+                "STOP_STATE_VIOLATION",
+            )
+            hard_codes_by_name["STOP_STATE"] = (
+                "STOP_PROTECTION_BREACH",
+            )
+        circuit_violation = False
+        for action in actual_action_sources:
+            try:
+                details = json.loads(action.details_json)
+            except (TypeError, ValueError):
+                raise MigrationCorruption(
+                    "Phase 1 actual action details are malformed"
+                ) from None
+            reason_codes = (
+                details.get("reason_codes", ())
+                if isinstance(details, dict)
+                else ()
+            )
+            if (
+                isinstance(reason_codes, list)
+                and "ACTIVE_CIRCUIT_BREAKER" in reason_codes
+                and action.domain_kind == "BOUGHT"
+            ):
+                circuit_violation = True
+        if circuit_violation:
+            failure_codes_by_name["CIRCUIT_BREAKER_BEHAVIOR"] = (
+                "CIRCUIT_BREAKER_BEHAVIOR_VIOLATION",
+            )
+            hard_codes_by_name["CIRCUIT_BREAKER_BEHAVIOR"] = (
+                "ACTIVE_CIRCUIT_BREAKER_VIOLATION",
+            )
+        if signal_source.role == "WATCHLIST_SHADOW":
+            failure_codes_by_name = {
+                name: () for name in _PHASE1_ADHERENCE_CHECK_NAMES
+            }
+            hard_codes_by_name = {
+                name: () for name in _PHASE1_ADHERENCE_CHECK_NAMES
+            }
+
+        evidence_sources: list[Phase1AdherenceCheckEvidenceSource] = []
+        for check_name in _PHASE1_ADHERENCE_CHECK_NAMES:
+            references = tuple(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in references_by_name[check_name]
+                }.values()
+            )
+            if not references:
+                raise MigrationCorruption(
+                    "Phase 1 adherence check evidence is incomplete"
+                )
+            source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-adherence-check-evidence/v1",
+                references,
+                {
+                    "signal_id": signal_id,
+                    "validation_window_id": signal_source.validation_window_id,
+                    "validation_window_started_at": _canonical_timestamp(
+                        window_started_at
+                    ),
+                    "check_name": check_name,
+                    "failure_codes": list(failure_codes_by_name[check_name]),
+                    "hard_breach_codes": list(hard_codes_by_name[check_name]),
+                    "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                    "calendar_digest": calendar_digest,
+                    "policy_digest": policy_digest,
+                },
+            )
+            evidence = Phase1AdherenceCheckEvidenceSource(
+                check_name=check_name,
+                failure_codes=failure_codes_by_name[check_name],
+                hard_breach_codes=hard_codes_by_name[check_name],
+                row_references=references,
+                source_digest=source_digest,
+            )
+            _register_journal_source_authority(
+                _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES,
+                evidence,
+                self,
+            )
+            evidence_sources.append(evidence)
+
+        references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    window_reference,
+                    *signal_source.row_references,
+                    *disposition_source.row_references,
+                    *canonical_replay_source.row_references,
+                    *breaker_history_source.row_references,
+                    *(
+                        reference
+                        for action in actual_action_sources
+                        for reference in action.row_references
+                    ),
+                    *(
+                        reference
+                        for evidence in evidence_sources
+                        for reference in evidence.row_references
+                    ),
+                )
+            }.values()
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-adherence-review-source/v1",
+            references,
+            {
+                "signal_id": signal_id,
+                "validation_window_id": signal_source.validation_window_id,
+                "validation_window_started_at": _canonical_timestamp(
+                    window_started_at
+                ),
+                "validation_window_source_digest": str(
+                    window["source_digest"]
+                ),
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "calendar_digest": calendar_digest,
+                "policy_digest": policy_digest,
+                "signal_source_digest": signal_source.source_digest,
+                "disposition_source_digest": disposition_source.source_digest,
+                "canonical_replay_source_digest": (
+                    canonical_replay_source.source_digest
+                ),
+                "breaker_history_source_digest": (
+                    breaker_history_source.source_digest
+                ),
+                "actual_action_source_digests": [
+                    action.source_digest for action in actual_action_sources
+                ],
+                "check_evidence_source_digests": [
+                    evidence.source_digest for evidence in evidence_sources
+                ],
+            },
+        )
+        source = Phase1AdherenceReviewSource(
+            signal_source=signal_source,
+            disposition_source=disposition_source,
+            canonical_replay_source=canonical_replay_source,
+            breaker_history_source=breaker_history_source,
+            actual_action_sources=actual_action_sources,
+            check_evidence_sources=tuple(evidence_sources),
+            query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            policy_digest=policy_digest,
+            row_references=references,
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_adherence_review_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> Phase1AdherenceReviewSource:
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_adherence_review_source(
+                signal_id,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+
+    def record_phase1_adherence(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> StoredPhase1Adherence:
+        """Derive and atomically persist the exact fixed ten-check set."""
+        from .validation import (
+            _issue_phase1_adherence_from_journal_source,
+            is_issued_phase1_adherence_authority,
+        )
+
+        with self._phase1_publication_read_scope():
+            source = self._read_phase1_adherence_review_source(
+                signal_id,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            authority = _issue_phase1_adherence_from_journal_source(
+                source,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            if not is_issued_phase1_adherence_authority(authority):
+                raise InvalidJournalValue(
+                    "Phase 1 adherence authority is unverified"
+                )
+        checks = tuple(authority.checks)
+        if (
+            tuple(check.check_name for check in checks)
+            != _PHASE1_ADHERENCE_CHECK_NAMES
+            or len(checks) != len(source.check_evidence_sources)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 adherence authority checklist is incomplete"
+            )
+
+        terminal_event_id = (
+            source.disposition_source.lifecycle_events[-1].lifecycle_event_id
+        )
+        prepared: list[
+            tuple[
+                tuple[object, ...],
+                tuple[JournalRowReference, ...],
+            ]
+        ] = []
+        for check, evidence in zip(
+            checks,
+            source.check_evidence_sources,
+            strict=True,
+        ):
+            check_id = hashlib.sha256(
+                (
+                    "stock-monitor/phase1-adherence-check/v1\x00"
+                    + authority.signal_id
+                    + "\x00"
+                    + check.check_name
+                    + "\x00"
+                    + authority.authority_digest
+                ).encode("utf-8")
+            ).hexdigest()
+            details_json = _canonical_details(
+                {
+                    "failure_codes": list(check.failure_codes),
+                    "hard_breach_codes": list(check.hard_breach_codes),
+                    "disposition_source_digest": (
+                        source.disposition_source.source_digest
+                    ),
+                }
+            )
+            values_before_digest = (
+                check_id,
+                authority.validation_window_id,
+                authority.signal_id,
+                check.check_name,
+                int(check.applicable),
+                int(check.passed),
+                int(check.hard_breach),
+                _canonical_timestamp(authority.evaluated_at),
+                _canonical_timestamp(authority.query_cutoff),
+                terminal_event_id,
+                check.evidence_digest,
+                source.source_digest,
+                authority.authority_digest,
+            )
+            references = tuple(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in (
+                        *evidence.row_references,
+                        source.disposition_source.lifecycle_events[-1].row_reference,
+                    )
+                }.values()
+            )
+            row_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-adherence-check-row/v1",
+                references,
+                {
+                    **dict(
+                        zip(
+                            _PHASE1_ADHERENCE_CHECK_COLUMNS[1:14],
+                            values_before_digest,
+                            strict=True,
+                        )
+                    ),
+                    "details_json": details_json,
+                },
+            )
+            values_without_hash = (
+                *values_before_digest,
+                row_source_digest,
+                details_json,
+            )
+            record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_ADHERENCE_CHECK_COLUMNS[1:-1],
+                            values_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            prepared.append(((*values_without_hash, record_sha256), references))
+
+        with self.transaction():
+            existing = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_PHASE1_ADHERENCE_CHECK_COLUMNS)
+                + " FROM phase1_adherence_checks WHERE signal_id = ? COLLATE BINARY "
+                "ORDER BY CASE check_name "
+                + " ".join(
+                    f"WHEN '{name}' THEN {ordinal}"
+                    for ordinal, name in enumerate(
+                        _PHASE1_ADHERENCE_CHECK_NAMES,
+                        start=1,
+                    )
+                )
+                + " END, id",
+                (authority.signal_id,),
+            ).fetchall()
+            if existing:
+                expected_values = tuple(values for values, _refs in prepared)
+                if tuple(tuple(row[1:]) for row in existing) != expected_values:
+                    raise IdempotencyConflict(
+                        "Phase 1 adherence conflicts with stored content"
+                    )
+                return StoredPhase1Adherence(
+                    check_ids=tuple(str(row[1]) for row in existing),
+                    authority_digest=authority.authority_digest,
+                    duplicate=True,
+                )
+            try:
+                for values, _references in prepared:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase1_adherence_checks("
+                        + ", ".join(_PHASE1_ADHERENCE_CHECK_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in values)
+                        + ")",
+                        values,
+                    )
+            except sqlite3.IntegrityError as error:
+                raise IdempotencyConflict(
+                    "Phase 1 adherence conflicts with stored content"
+                ) from error
+            self._transaction_dirty = True
+            return StoredPhase1Adherence(
+                check_ids=tuple(str(values[0]) for values, _refs in prepared),
+                authority_digest=authority.authority_digest,
+                duplicate=False,
+            )
+
+    def _read_phase1_adherence_check_sources(
+        self,
+        signal_source: Phase1SignalSource,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> tuple[Phase1AdherenceCheckSource, ...]:
+        """Reissue and authenticate one persisted fixed ten-check cohort."""
+        from .validation import (
+            _issue_phase1_adherence_from_journal_source,
+            is_issued_phase1_adherence_authority,
+        )
+
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_ADHERENCE_CHECK_COLUMNS)
+            + " FROM phase1_adherence_checks "
+            "WHERE validation_window_id = ? COLLATE BINARY "
+            "AND signal_id = ? COLLATE BINARY AND received_at <= ? "
+            "ORDER BY CASE check_name "
+            + " ".join(
+                f"WHEN '{name}' THEN {ordinal}"
+                for ordinal, name in enumerate(
+                    _PHASE1_ADHERENCE_CHECK_NAMES,
+                    start=1,
+                )
+            )
+            + " END, id",
+            (
+                signal_source.validation_window_id,
+                signal_source.signal_id,
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        later = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_adherence_checks "
+            "WHERE validation_window_id = ? COLLATE BINARY "
+            "AND signal_id = ? COLLATE BINARY AND received_at > ? LIMIT 1",
+            (
+                signal_source.validation_window_id,
+                signal_source.signal_id,
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchone()
+        if later is not None:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+        if (
+            len(rows) != len(_PHASE1_ADHERENCE_CHECK_NAMES)
+            or tuple(str(row[4]) for row in rows)
+            != _PHASE1_ADHERENCE_CHECK_NAMES
+        ):
+            raise MigrationCorruption(
+                "Phase 1 adherence fixed checklist is incomplete"
+            )
+        evaluated_values = {
+            _parse_canonical_timestamp(str(row[8])) for row in rows
+        }
+        received_values = {
+            _parse_canonical_timestamp(str(row[9])) for row in rows
+        }
+        authority_digests = {str(row[13]) for row in rows}
+        review_digests = {str(row[12]) for row in rows}
+        terminal_ids = {str(row[10]) for row in rows}
+        if (
+            len(evaluated_values) != 1
+            or received_values != evaluated_values
+            or len(authority_digests) != 1
+            or len(review_digests) != 1
+            or len(terminal_ids) != 1
+        ):
+            raise MigrationCorruption(
+                "Phase 1 adherence cohort metadata is inconsistent"
+            )
+        evaluated_at = next(iter(evaluated_values))
+        if evaluated_at > normalized_cutoff:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+        review_source = self._read_phase1_adherence_review_source(
+            signal_source.signal_id,
+            query_cutoff=evaluated_at,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        authority = _issue_phase1_adherence_from_journal_source(
+            review_source,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        if (
+            not is_issued_phase1_adherence_authority(authority)
+            or authority.authority_digest not in authority_digests
+            or review_source.source_digest not in review_digests
+            or review_source.signal_source.signal_id
+            != signal_source.signal_id
+        ):
+            raise MigrationCorruption(
+                "Phase 1 adherence authority conflicts with storage"
+            )
+        terminal_event = review_source.disposition_source.lifecycle_events[-1]
+        if terminal_ids != {terminal_event.lifecycle_event_id}:
+            raise MigrationCorruption(
+                "Phase 1 adherence terminal lineage is inconsistent"
+            )
+
+        sources: list[Phase1AdherenceCheckSource] = []
+        for row, decision, evidence in zip(
+            rows,
+            authority.checks,
+            review_source.check_evidence_sources,
+            strict=True,
+        ):
+            check_id = hashlib.sha256(
+                (
+                    "stock-monitor/phase1-adherence-check/v1\x00"
+                    + authority.signal_id
+                    + "\x00"
+                    + decision.check_name
+                    + "\x00"
+                    + authority.authority_digest
+                ).encode("utf-8")
+            ).hexdigest()
+            details_json = _canonical_details(
+                {
+                    "failure_codes": list(decision.failure_codes),
+                    "hard_breach_codes": list(
+                        decision.hard_breach_codes
+                    ),
+                    "disposition_source_digest": (
+                        review_source.disposition_source.source_digest
+                    ),
+                }
+            )
+            values_before_digest = (
+                check_id,
+                authority.validation_window_id,
+                authority.signal_id,
+                decision.check_name,
+                int(decision.applicable),
+                int(decision.passed),
+                int(decision.hard_breach),
+                _canonical_timestamp(authority.evaluated_at),
+                _canonical_timestamp(authority.query_cutoff),
+                terminal_event.lifecycle_event_id,
+                decision.evidence_digest,
+                review_source.source_digest,
+                authority.authority_digest,
+            )
+            provenance_references = tuple(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in (
+                        *evidence.row_references,
+                        terminal_event.row_reference,
+                    )
+                }.values()
+            )
+            row_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-adherence-check-row/v1",
+                provenance_references,
+                {
+                    **dict(
+                        zip(
+                            _PHASE1_ADHERENCE_CHECK_COLUMNS[1:14],
+                            values_before_digest,
+                            strict=True,
+                        )
+                    ),
+                    "details_json": details_json,
+                },
+            )
+            values_without_hash = (
+                *values_before_digest,
+                row_source_digest,
+                details_json,
+            )
+            record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_ADHERENCE_CHECK_COLUMNS[1:-1],
+                            values_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if tuple(row[1:]) != (*values_without_hash, record_sha256):
+                raise MigrationCorruption(
+                    "Phase 1 adherence row integrity failed"
+                )
+            row_reference = _journal_row_reference(
+                "phase1_adherence_checks",
+                _PHASE1_ADHERENCE_CHECK_COLUMNS,
+                row,
+            )
+            sources.append(
+                Phase1AdherenceCheckSource(
+                    row_id=int(row[0]),
+                    check_id=check_id,
+                    validation_window_id=authority.validation_window_id,
+                    signal_id=authority.signal_id,
+                    check_name=decision.check_name,
+                    applicable=decision.applicable,
+                    passed=decision.passed,
+                    hard_breach=decision.hard_breach,
+                    failure_codes=tuple(decision.failure_codes),
+                    hard_breach_codes=tuple(
+                        decision.hard_breach_codes
+                    ),
+                    evidence_digest=decision.evidence_digest,
+                    authority_digest=authority.authority_digest,
+                    evaluated_at=authority.evaluated_at,
+                    received_at=authority.query_cutoff,
+                    source_digest=row_source_digest,
+                    row_reference=row_reference,
+                    row_references=(
+                        *provenance_references,
+                        row_reference,
+                    ),
+                )
+            )
+        return tuple(sources)
+
+    def read_phase1_validation_window_source(
+        self,
+        validation_window_id: str,
+        *,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1ValidationWindowSource:
+        with self._phase1_publication_read_scope():
+            return self._read_phase1_validation_window_source_uncached(
+                validation_window_id,
+                through_session=through_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+            )
+
+    def _read_phase1_validation_window_source_uncached(
+        self,
+        validation_window_id: str,
+        *,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase1ValidationWindowSource:
+        """Rebuild one complete promotion window from typed durable sources."""
+        from .risk import (
+            SessionCalendarResolver,
+            _calendar_digest,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 validation source requires a post-commit read"
+            )
+        validation_window_id = _require_nonempty_text(
+            validation_window_id,
+            "Phase 1 validation window ID",
+        )
+        if type(through_session) is not date:
+            raise InvalidJournalValue(
+                "Phase 1 validation through-session must be a date"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 validation calendar is unverified"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        window_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_VALIDATION_WINDOW_COLUMNS)
+            + " FROM phase1_validation_windows WHERE window_id = ? COLLATE BINARY",
+            (validation_window_id,),
+        ).fetchone()
+        if window_row is None:
+            raise InvalidJournalValue(
+                "Phase 1 validation window does not exist"
+            )
+        window = dict(
+            zip(
+                _PHASE1_VALIDATION_WINDOW_COLUMNS,
+                tuple(window_row),
+                strict=True,
+            )
+        )
+        started_session = date.fromisoformat(str(window["started_session"]))
+        started_at = _parse_canonical_timestamp(str(window["started_at"]))
+        received_at = _parse_canonical_timestamp(str(window["received_at"]))
+        expected_window_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "window_id": validation_window_id,
+                    "started_session": started_session.isoformat(),
+                    "starting_capital_micros": int(
+                        window["starting_capital_micros"]
+                    ),
+                    "started_at": str(window["started_at"]),
+                    "received_at": str(window["received_at"]),
+                    "calendar_digest": str(window["calendar_digest"]),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            int(window["starting_capital_micros"]) != 5_000_000_000
+            or not started_at <= received_at <= normalized_cutoff
+            or str(window["calendar_digest"]) != calendar_digest
+            or str(window["source_digest"]) != expected_window_digest
+            or int(window["singleton_key"]) != 1
+            or through_session < started_session
+            or not calendar_resolver.is_open(started_session)
+            or not calendar_resolver.is_open(through_session)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 validation window source is inconsistent"
+            )
+        through_schedule = calendar_resolver.session(through_session)
+        through_close = datetime.combine(
+            through_session,
+            through_schedule.close_time,
+            through_schedule.timezone,
+        ).astimezone(timezone.utc)
+        if normalized_cutoff < through_close:
+            raise InvalidJournalValue(
+                "Phase 1 validation cutoff precedes the through-session close"
+            )
+        expected_open_sessions = tuple(
+            started_session + timedelta(days=offset)
+            for offset in range(
+                (through_session - started_session).days + 1
+            )
+            if calendar_resolver.is_open(
+                started_session + timedelta(days=offset)
+            )
+        )
+        if (
+            not expected_open_sessions
+            or expected_open_sessions[0] != started_session
+            or expected_open_sessions[-1] != through_session
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 validation open-session manifest is incomplete"
+            )
+
+        stored_cutoff = _canonical_timestamp(normalized_cutoff)
+        signal_rows = _sql(
+            self._connection,
+            "SELECT signal_id FROM phase1_signals "
+            "WHERE validation_window_id = ? COLLATE BINARY "
+            "AND publication_session >= ? AND publication_session <= ? "
+            "AND received_at <= ? "
+            "ORDER BY publication_session, publication_rank, id",
+            (
+                validation_window_id,
+                started_session.isoformat(),
+                through_session.isoformat(),
+                stored_cutoff,
+            ),
+        ).fetchall()
+        late_signal = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_signals "
+            "WHERE validation_window_id = ? COLLATE BINARY "
+            "AND publication_session >= ? AND publication_session <= ? "
+            "AND received_at > ? LIMIT 1",
+            (
+                validation_window_id,
+                started_session.isoformat(),
+                through_session.isoformat(),
+                stored_cutoff,
+            ),
+        ).fetchone()
+        if late_signal is not None:
+            raise InvalidJournalValue("PHASE1_SOURCE_LOOKAHEAD")
+        if not signal_rows:
+            raise InvalidJournalValue(
+                "Phase 1 validation window has no published signals"
+            )
+        candidate_signal_sources = tuple(
+            self._read_phase1_signal_source(
+                str(row[0]),
+                query_cutoff=normalized_cutoff,
+            )
+            for row in signal_rows
+        )
+        policy = self._phase1_versioned_policy(candidate_signal_sources[0])
+        if any(
+            signal.validation_window_id != validation_window_id
+            or signal.publication_session not in expected_open_sessions
+            or signal.calendar_digest != calendar_digest
+            or signal.policy_digest
+            != candidate_signal_sources[0].policy_digest
+            for signal in candidate_signal_sources
+        ):
+            raise MigrationCorruption(
+                "Phase 1 validation signal cohort is inconsistent"
+            )
+        disposition_sources = tuple(
+            self._read_phase1_published_signal_disposition_source(
+                signal.signal_id,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            for signal in candidate_signal_sources
+        )
+        signal_sources = tuple(
+            disposition.signal_source
+            for disposition in disposition_sources
+        )
+        adherence_check_sources = tuple(
+            item
+            for signal in signal_sources
+            for item in self._read_phase1_adherence_check_sources(
+                signal,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+        )
+        canonical_replay_source = self._read_phase1_canonical_replay_source(
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        canonical_history = self._read_phase1_breaker_history_source(
+            ledger_name="CANONICAL",
+            through_session=through_session,
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        actual_history = self._read_phase1_breaker_history_source(
+            ledger_name="ACTUAL",
+            through_session=through_session,
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        with self.transaction() as transaction:
+            actual_replay_source = transaction.read_actual_replay(
+                query_cutoff=normalized_cutoff,
+            )
+        adherence_review_sources = tuple(
+            self._read_phase1_adherence_review_source(
+                disposition.signal_id,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+                disposition_source=disposition,
+                canonical_replay_source=canonical_replay_source,
+                breaker_history_source=canonical_history,
+                actual_replay_source=actual_replay_source,
+            )
+            for disposition in disposition_sources
+        )
+
+        lifecycle_events = tuple(
+            event
+            for disposition in disposition_sources
+            for event in disposition.lifecycle_events
+        )
+        signal_terminal_cursor = max(
+            signal.row_id for signal in signal_sources
+        )
+        lifecycle_terminal_cursor = max(
+            event.row_id for event in lifecycle_events
+        )
+        adherence_terminal_cursor = max(
+            item.row_id for item in adherence_check_sources
+        )
+        signal_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM phase1_signals "
+            "WHERE validation_window_id = ? COLLATE BINARY "
+            "AND publication_session >= ? AND publication_session <= ? "
+            "AND received_at <= ?",
+            (
+                validation_window_id,
+                started_session.isoformat(),
+                through_session.isoformat(),
+                stored_cutoff,
+            ),
+        ).fetchone()
+        lifecycle_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(event.id), 0) "
+            "FROM phase1_signal_events AS event "
+            "JOIN phase1_signals AS signal "
+            "ON signal.signal_id = event.signal_id COLLATE BINARY "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.publication_session >= ? "
+            "AND signal.publication_session <= ? AND event.received_at <= ?",
+            (
+                validation_window_id,
+                started_session.isoformat(),
+                through_session.isoformat(),
+                stored_cutoff,
+            ),
+        ).fetchone()
+        adherence_highwater_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(checkrow.id), 0) "
+            "FROM phase1_adherence_checks AS checkrow "
+            "JOIN phase1_signals AS signal "
+            "ON signal.signal_id = checkrow.signal_id COLLATE BINARY "
+            "WHERE checkrow.validation_window_id = ? COLLATE BINARY "
+            "AND signal.publication_session >= ? "
+            "AND signal.publication_session <= ? "
+            "AND checkrow.received_at <= ?",
+            (
+                validation_window_id,
+                started_session.isoformat(),
+                through_session.isoformat(),
+                stored_cutoff,
+            ),
+        ).fetchone()
+        signal_source_highwater = int(signal_highwater_row[0])
+        lifecycle_source_highwater = int(lifecycle_highwater_row[0])
+        adherence_source_highwater = int(adherence_highwater_row[0])
+        if (
+            signal_source_highwater != signal_terminal_cursor
+            or lifecycle_source_highwater != lifecycle_terminal_cursor
+            or adherence_source_highwater != adherence_terminal_cursor
+        ):
+            raise MigrationCorruption(
+                "Phase 1 validation source cursor is incomplete"
+            )
+
+        window_reference = _journal_row_reference(
+            "phase1_validation_windows",
+            _PHASE1_VALIDATION_WINDOW_COLUMNS,
+            window_row,
+        )
+        references = tuple(
+            {
+                (reference.table, reference.row_id): reference
+                for reference in (
+                    window_reference,
+                    *(
+                        reference
+                        for signal in signal_sources
+                        for reference in signal.row_references
+                    ),
+                    *(
+                        reference
+                        for disposition in disposition_sources
+                        for reference in disposition.row_references
+                    ),
+                    *(
+                        reference
+                        for item in adherence_check_sources
+                        for reference in item.row_references
+                    ),
+                    *(
+                        reference
+                        for review in adherence_review_sources
+                        for reference in review.row_references
+                    ),
+                    *canonical_history.row_references,
+                    *actual_history.row_references,
+                )
+            }.values()
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-validation-window-source/v1",
+            references,
+            {
+                "validation_window_id": validation_window_id,
+                "started_session": started_session.isoformat(),
+                "through_session": through_session.isoformat(),
+                "starting_capital_micros": int(
+                    window["starting_capital_micros"]
+                ),
+                "started_at": _canonical_timestamp(started_at),
+                "received_at": _canonical_timestamp(received_at),
+                "calendar_digest": calendar_digest,
+                "expected_open_sessions": [
+                    session.isoformat() for session in expected_open_sessions
+                ],
+                "signal_source_digests": [
+                    signal.source_digest for signal in signal_sources
+                ],
+                "disposition_source_digests": [
+                    disposition.source_digest
+                    for disposition in disposition_sources
+                ],
+                "adherence_source_digests": [
+                    item.source_digest for item in adherence_check_sources
+                ],
+                "adherence_review_source_digests": [
+                    review.source_digest
+                    for review in adherence_review_sources
+                ],
+                "canonical_history_source_digest": (
+                    canonical_history.source_digest
+                ),
+                "actual_history_source_digest": actual_history.source_digest,
+                "query_cutoff": stored_cutoff,
+                "signal_terminal_cursor": signal_terminal_cursor,
+                "signal_source_highwater": signal_source_highwater,
+                "lifecycle_terminal_cursor": lifecycle_terminal_cursor,
+                "lifecycle_source_highwater": lifecycle_source_highwater,
+                "adherence_terminal_cursor": adherence_terminal_cursor,
+                "adherence_source_highwater": adherence_source_highwater,
+                "expected_signal_count": len(signal_sources),
+                "expected_disposition_count": len(disposition_sources),
+                "expected_adherence_count": len(adherence_check_sources),
+            },
+        )
+        source = Phase1ValidationWindowSource(
+            validation_window_id=validation_window_id,
+            started_session=started_session,
+            through_session=through_session,
+            starting_capital_micros=int(window["starting_capital_micros"]),
+            started_at=started_at,
+            received_at=received_at,
+            calendar_digest=calendar_digest,
+            expected_open_sessions=expected_open_sessions,
+            signal_sources=signal_sources,
+            disposition_sources=disposition_sources,
+            canonical_history=canonical_history,
+            actual_history=actual_history,
+            adherence_check_sources=adherence_check_sources,
+            adherence_review_sources=adherence_review_sources,
+            query_cutoff=normalized_cutoff,
+            signal_terminal_cursor=signal_terminal_cursor,
+            signal_source_highwater=signal_source_highwater,
+            lifecycle_terminal_cursor=lifecycle_terminal_cursor,
+            lifecycle_source_highwater=lifecycle_source_highwater,
+            adherence_terminal_cursor=adherence_terminal_cursor,
+            adherence_source_highwater=adherence_source_highwater,
+            expected_signal_count=len(signal_sources),
+            expected_disposition_count=len(disposition_sources),
+            expected_adherence_count=len(adherence_check_sources),
+            row_references=references,
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def read_phase1_promotion_decision(
+        self,
+        validation_window_id: str,
+        *,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> object:
+        """Issue promotion only from a complete verified window source."""
+        from .validation import _issue_phase1_promotion_from_journal_source
+
+        with self._phase1_publication_read_scope():
+            source = self.read_phase1_validation_window_source(
+                validation_window_id,
+                through_session=through_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+            )
+            return _issue_phase1_promotion_from_journal_source(
+                source,
+                calendar_resolver=calendar_resolver,
+            )
 
     def append_outbox(
         self,
@@ -1954,7 +14426,7 @@ class Journal:
             )
         received_at = first_source.received_at
         state_digest = hashlib.sha256(
-            _canonical_json(
+            _canonical_audit_json(
                 {
                     "version": 1,
                     "raw_row_id": raw_row_id,
@@ -2893,8 +15365,11 @@ class Journal:
         *,
         query_cutoff: datetime,
         through_execution_cursor: int | None,
+        cutoff_stable: bool = False,
     ) -> JournalActualReplaySource:
         """Read one complete received-by-cutoff confirmation replay snapshot."""
+        if type(cutoff_stable) is not bool:
+            raise TypeError("cutoff_stable must be a bool")
         normalized_cutoff = _parse_canonical_timestamp(
             _canonical_timestamp(query_cutoff)
         )
@@ -2943,6 +15418,9 @@ class Journal:
             if requested_through != expected_through:
                 raise InvalidJournalValue("REPLAY_CUTOFF_INCOMPLETE")
         bounded_through = expected_through
+        replay_source_high_water = (
+            bounded_through if cutoff_stable else source_high_water_cursor
+        )
         action_ids = tuple(action.execution_event_id for action in actions)
         check_ids = tuple(
             action.account_check.row_id
@@ -3014,11 +15492,12 @@ class Journal:
         actions_by_cursor = {
             action.execution_event_id: action for action in all_actions
         }
-        for table in (
+        projection_tables = () if cutoff_stable else (
             "actual_positions",
             "actual_cash_projection",
             "reconciliation_projection",
-        ):
+        )
+        for table in projection_tables:
             column_rows = _sql(
                 self._connection,
                 f'PRAGMA table_info("{table}")',
@@ -3063,6 +15542,8 @@ class Journal:
                     raise MigrationCorruption(
                         "projection source execution cursor is missing"
                     )
+                if bounded_through is None or origin_cursor > bounded_through:
+                    continue
                 origin_action = actions_by_cursor.get(origin_cursor)
                 if origin_action is None:
                     raise MigrationCorruption(
@@ -3075,8 +15556,6 @@ class Journal:
                 if (
                     origin_action.received_at > normalized_cutoff
                     or projection_updated_at > normalized_cutoff
-                    or bounded_through is None
-                    or origin_cursor > bounded_through
                 ):
                     continue
                 reference = _journal_row_reference(table, columns, row)
@@ -3141,7 +15620,7 @@ class Journal:
                 "projection_stale": projection_stale,
                 "projection_through_cursor": projection_through_cursor,
                 "query_cutoff": _canonical_timestamp(normalized_cutoff),
-                "source_through_cursor": source_high_water_cursor,
+                "source_through_cursor": replay_source_high_water,
                 "start_cursor": start_cursor,
                 "terminal_cursor": terminal_cursor,
                 "through_execution_cursor": bounded_through,
@@ -3155,7 +15634,7 @@ class Journal:
             start_cursor=start_cursor,
             terminal_cursor=terminal_cursor,
             through_execution_cursor=bounded_through,
-            source_through_cursor=source_high_water_cursor,
+            source_through_cursor=replay_source_high_water,
             projection_through_cursor=projection_through_cursor,
             projection_stale=projection_stale,
             expected_action_count=len(actions),
@@ -3490,6 +15969,12 @@ class Journal:
                 raise IdempotencyConflict(
                     "source observation identity conflicts with stored content"
                 )
+            self._ensure_phase1_source_payload(
+                source_observation_id=int(existing[0]),
+                payload=payload,
+                payload_sha256=payload_sha256,
+                recorded_at=stored_retrieved_at,
+            )
             return int(existing[0]), True
         try:
             cursor = _sql(self._connection,
@@ -3519,7 +16004,7598 @@ class Journal:
             raise IdempotencyConflict(
                 "source observation identity conflicts with stored content"
             )
+        self._ensure_phase1_source_payload(
+            source_observation_id=int(row[0]),
+            payload=payload,
+            payload_sha256=payload_sha256,
+            recorded_at=stored_retrieved_at,
+        )
         return int(row[0]), not inserted
+
+    def _phase1_core_source_rows(
+        self,
+        *,
+        source_observation_id: int,
+    ) -> tuple[sqlite3.Row | tuple[object, ...], sqlite3.Row | tuple[object, ...]]:
+        source_observation_id = _require_integer(
+            source_observation_id,
+            "Phase 1 source observation row ID",
+            minimum=1,
+        )
+        source_row = _sql(
+            self._connection,
+            "SELECT id, observation_sha256, payload_sha256, source_uri, "
+            "source_type, provider, feed, source_time, retrieved_at, "
+            "provider_sequence, delay_seconds, health_result, details_json "
+            "FROM source_observations WHERE id = ?",
+            (source_observation_id,),
+        ).fetchone()
+        payload_row = _sql(
+            self._connection,
+            "SELECT id, source_observation_id, payload_sha256, source_payload, "
+            "recorded_at, record_sha256 FROM phase1_source_payloads "
+            "WHERE source_observation_id = ?",
+            (source_observation_id,),
+        ).fetchone()
+        if source_row is None or payload_row is None:
+            raise InvalidJournalValue(
+                "Phase 1 source observation payload is unavailable"
+            )
+        payload = bytes(payload_row[3])
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        if (
+            int(source_row[0]) != source_observation_id
+            or int(payload_row[1]) != source_observation_id
+            or str(source_row[2]) != payload_sha256
+            or str(payload_row[2]) != payload_sha256
+            or str(payload_row[4]) != str(source_row[8])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 source payload integrity failed"
+            )
+        expected_payload_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "source_observation_id": source_observation_id,
+                    "payload_sha256": payload_sha256,
+                    "recorded_at": str(payload_row[4]),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(payload_row[5]) != expected_payload_record_sha256:
+            raise MigrationCorruption(
+                "Phase 1 source payload record integrity failed"
+            )
+        details = _canonical_stored_details(
+            source_row[12],
+            label="Phase 1 core source observation",
+        )
+        observation_material = _canonical_json(
+            {
+                "delay_seconds": source_row[10],
+                "details": details,
+                "feed": source_row[6],
+                "health_result": source_row[11],
+                "payload_sha256": source_row[2],
+                "provider": source_row[5],
+                "provider_sequence": source_row[9],
+                "retrieved_at": source_row[8],
+                "source_time": source_row[7],
+                "source_type": source_row[4],
+                "source_uri": source_row[3],
+            }
+        )
+        if str(source_row[1]) != hashlib.sha256(
+            observation_material.encode("utf-8")
+        ).hexdigest():
+            raise MigrationCorruption(
+                "Phase 1 core source observation integrity failed"
+            )
+        return source_row, payload_row
+
+    def _phase1_normalized_source_values(
+        self,
+        *,
+        signal_id: str,
+        source_observation_id: int,
+        source_item_ordinal: int,
+        source_item_path: str | None,
+        payload: bytes,
+    ) -> tuple[
+        tuple[object, ...],
+        tuple[object, ...],
+        dict[str, object],
+        str,
+        str,
+    ]:
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        source_item_ordinal = _require_integer(
+            source_item_ordinal,
+            "Phase 1 source item ordinal",
+            minimum=1,
+        )
+        if source_item_path is not None:
+            source_item_path = _require_nonempty_text(
+                source_item_path,
+                "Phase 1 source item path",
+            )
+        if type(payload) is not bytes or not payload:
+            raise InvalidJournalValue("Phase 1 source payload must be nonempty bytes")
+        source_row, payload_row = self._phase1_core_source_rows(
+            source_observation_id=source_observation_id,
+        )
+        stored_payload = bytes(payload_row[3])
+        if payload != stored_payload:
+            raise IdempotencyConflict(
+                "Phase 1 normalized observation payload conflicts with core source"
+            )
+        if source_row[6] is None or str(source_row[11]) != "OK":
+            raise InvalidJournalValue(
+                "Phase 1 normalized observation requires healthy market data"
+            )
+        _validate_phase1_alpaca_page_contract(source_row, payload)
+        signal_row = _sql(
+            self._connection,
+            "SELECT symbol FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        symbol = str(signal_row[0])
+        normalized = _normalized_phase1_payload_item(
+            payload,
+            source_item_ordinal,
+            source_item_path,
+        )
+        selected_path = str(normalized["source_item_path"])
+        item_symbol = normalized["item_symbol"]
+        if item_symbol is not None and item_symbol != symbol:
+            raise InvalidJournalValue(
+                "Phase 1 source item symbol conflicts with its signal"
+            )
+        source_details = _canonical_stored_details(
+            source_row[12],
+            label="Phase 1 core source observation",
+        )
+        try:
+            provider_metadata = _phase1_recompute_alpaca_page_metadata(
+                payload=payload,
+                request_url=str(source_row[3]),
+                source_type=str(source_row[4]),
+                retrieved_at=_parse_canonical_timestamp(str(source_row[8])),
+            )
+        except InvalidJournalValue as error:
+            raise InvalidJournalValue(
+                "Phase 1 core source provider metadata is invalid"
+            ) from error
+        if (
+            source_details
+            != {
+                "source_observation_id": str(
+                    getattr(provider_metadata, "source_observation_id")
+                )
+            }
+            or _parse_canonical_timestamp(str(source_row[7]))
+            != getattr(provider_metadata, "source_time")
+            or source_row[10] is None
+            or int(source_row[10])
+            != int(getattr(provider_metadata, "delay_seconds"))
+            or str(source_row[2])
+            != str(getattr(provider_metadata, "payload_sha256"))
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 core source provider metadata conflicts"
+            )
+        detail_symbol = source_details.get("symbol")
+        if item_symbol is None and detail_symbol != symbol:
+            raise InvalidJournalValue(
+                "Phase 1 core source symbol conflicts with its signal"
+            )
+        core_source_time = _parse_canonical_timestamp(str(source_row[7]))
+        item_time = _phase1_item_time(normalized["item_at"], core_source_time)
+        raw_items = _phase1_payload_items(payload)
+        item_times = tuple(
+            _phase1_item_time(
+                item.value.get("t") if item.alpaca_shape else item.value.get("at"),
+                core_source_time,
+            )
+            for item in raw_items
+        )
+        if any(item.alpaca_shape for item in raw_items) and max(item_times) != core_source_time:
+            raise InvalidJournalValue(
+                "Phase 1 raw page terminal timestamp conflicts with core source"
+            )
+        from zoneinfo import ZoneInfo
+
+        session_date = item_time.astimezone(
+            ZoneInfo("America/New_York")
+        ).date().isoformat()
+        received_at = str(source_row[8])
+        if _canonical_timestamp(item_time) > received_at:
+            raise InvalidJournalValue(
+                "Phase 1 source item postdates its retrieval"
+            )
+        item_sequence = normalized["item_sequence"]
+        if item_sequence is not None and (
+            type(item_sequence) is not int or item_sequence < 0
+        ):
+            raise InvalidJournalValue("Phase 1 source item sequence is malformed")
+        if (
+            item_sequence is not None
+            and not bool(normalized["alpaca_shape"])
+            and item_sequence != source_row[9]
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 source item sequence conflicts with core source"
+            )
+        item_feed = normalized["item_feed"]
+        if item_feed is not None and str(item_feed).upper() != str(source_row[6]).upper():
+            raise InvalidJournalValue(
+                "Phase 1 source item feed conflicts with core source"
+            )
+        details_json = _canonical_details(
+            {
+                "review_fields": normalized.get("review_fields", {}),
+                "source_item_path": selected_path,
+            }
+        )
+        return (
+            tuple(source_row),
+            tuple(payload_row),
+            normalized,
+            session_date,
+            details_json,
+        )
+
+    def _ingest_phase1_session_cohorts(
+        self,
+        *,
+        signal_id: str,
+        cohorts: Sequence[object],
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None,
+    ) -> Phase1CohortIngestResult:
+        from .providers.alpaca import (
+            is_ingestible_provider_fetch_cohort,
+            provider_fetch_cohorts_share_owner,
+            read_provider_fetch_bundle,
+        )
+
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        if isinstance(cohorts, (str, bytes)):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle cohorts must be an exact sequence"
+            )
+        cohort_values = tuple(cohorts)
+        if len(cohort_values) != 2:
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle requires terminal TRADE and QUOTE cohorts"
+            )
+        if any(
+            not is_ingestible_provider_fetch_cohort(value)
+            for value in cohort_values
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle requires live-fetch provider cohorts"
+            )
+        if not provider_fetch_cohorts_share_owner(*cohort_values):
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort authority requires one provider owner"
+            )
+        try:
+            bundles = tuple(
+                (value, read_provider_fetch_bundle(value))
+                for value in cohort_values
+            )
+        except ValueError as error:
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort authority is unverified"
+            ) from error
+        if {bundle.manifest.collection for _value, bundle in bundles} != {
+            "trades",
+            "quotes",
+        }:
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle requires terminal TRADE and QUOTE cohorts"
+            )
+        row_ids = tuple(
+            _require_integer(value, "Phase 1 core source row ID", minimum=1)
+            for value in core_source_row_ids
+        )
+        if len(row_ids) != len(set(row_ids)):
+            raise InvalidJournalValue(
+                "Phase 1 core source row IDs must be unique"
+            )
+        row_id_by_external: dict[str, int] = {}
+        for row_id in row_ids:
+            source_row, _payload_row = self._phase1_core_source_rows(
+                source_observation_id=row_id,
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 provider source observation",
+            )
+            external_id = details.get("source_observation_id")
+            if (
+                type(external_id) is not str
+                or details != {"source_observation_id": external_id}
+                or external_id in row_id_by_external
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 core source row identity is not exact"
+                )
+            row_id_by_external[external_id] = row_id
+        expected_external_ids = {
+            page.page.source_observation_id
+            for _value, bundle in bundles
+            for page in bundle.pages
+        }
+        if set(row_id_by_external) != expected_external_ids:
+            raise InvalidJournalValue(
+                "Phase 1 core source row set conflicts with provider pages"
+            )
+        plans = tuple(
+            self._prepare_phase1_session_cohort(
+                signal_id=signal_id,
+                cohort=value,
+                core_source_row_ids=tuple(
+                    row_id_by_external[page.page.source_observation_id]
+                    for page in bundle.pages
+                ),
+                calendar_resolver=calendar_resolver,
+                recorded_at=recorded_at,
+            )
+            for value, bundle in sorted(
+                bundles,
+                key=lambda item: item[1].manifest.collection,
+            )
+        )
+        if len({plan.session_date for plan in plans}) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle cohorts cross session boundaries"
+            )
+        if any(plan.completion_invalidated for plan in plans):
+            if any(
+                not plan.duplicate and not plan.completion_invalidated
+                for plan in plans
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 late cohort set conflicts with incomplete baseline"
+                )
+            observation_ids = tuple(
+                str(row[0])
+                for row in _sql(
+                    self._connection,
+                    "SELECT observation_id FROM phase1_observations "
+                    "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+                    "ORDER BY cohort_ordinal",
+                    (signal_id, plans[0].session_date.isoformat()),
+                ).fetchall()
+            )
+            return Phase1CohortIngestResult(
+                manifest_ids=tuple(
+                    plan.cohort_id
+                    for plan in sorted(plans, key=lambda item: item.collection)
+                ),
+                observation_ids=observation_ids,
+                duplicate=all(plan.duplicate for plan in plans),
+                completion_invalidated=True,
+            )
+        if any(plan.duplicate for plan in plans):
+            if not all(plan.duplicate for plan in plans):
+                raise IdempotencyConflict(
+                    "Phase 1 lifecycle cohort set is only partially persisted"
+                )
+            observation_ids = tuple(
+                str(row[0])
+                for row in _sql(
+                    self._connection,
+                    "SELECT observation_id FROM phase1_observations "
+                    "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+                    "ORDER BY cohort_ordinal",
+                    (signal_id, plans[0].session_date.isoformat()),
+                ).fetchall()
+            )
+            return Phase1CohortIngestResult(
+                manifest_ids=tuple(
+                    plan.cohort_id
+                    for plan in sorted(plans, key=lambda item: item.collection)
+                ),
+                observation_ids=observation_ids,
+                duplicate=True,
+                completion_invalidated=False,
+            )
+        existing_observations = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_observations "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? LIMIT 1",
+            (signal_id, plans[0].session_date.isoformat()),
+        ).fetchone()
+        if existing_observations is not None:
+            raise IdempotencyConflict(
+                "Phase 1 lifecycle observations predate their cohort set"
+            )
+        ordered: list[tuple[object, object, _Phase1CohortPlan]] = []
+        for plan in plans:
+            ordered.extend(
+                (fact, source, plan) for fact, source in plan.fact_sources
+            )
+        ordered.sort(
+            key=lambda item: (
+                getattr(item[0], "timestamp"),
+                item[2].collection,
+                (
+                    getattr(item[0], "sequence", None)
+                    if getattr(item[0], "sequence", None) is not None
+                    else 2**63 - 1
+                ),
+                item[1].page_ordinal,
+                item[1].source_item_ordinal,
+                item[1].source_item_path,
+            )
+        )
+        stream_ordinals: dict[str, int] = {}
+        observation_ids: list[str] = []
+        for cohort_ordinal, (fact, source, plan) in enumerate(ordered, start=1):
+            page_bundle = next(
+                value
+                for value in getattr(plan.bundle, "pages")
+                if value.page.page_ordinal == source.page_ordinal
+            )
+            source_row = plan.source_rows_by_external_id[
+                page_bundle.page.source_observation_id
+            ]
+            stream_id = (
+                f"{signal_id}:{plan.session_date.isoformat()}:"
+                f"{plan.collection}:{str(source.feed).upper()}:{source.symbol}"
+            )
+            stream_ordinals[stream_id] = stream_ordinals.get(stream_id, 0) + 1
+            observation_id = hashlib.sha256(
+                (
+                    "stock-monitor/phase1-normalized-observation/v2\x00"
+                    + signal_id
+                    + "\x00"
+                    + plan.cohort_id
+                    + "\x00"
+                    + source.source_item_path
+                ).encode("utf-8")
+            ).hexdigest()
+            self._append_phase1_observation(
+                _Phase1ObservationAppendPlan(
+                    authority_token=self.__phase1_observation_ingest_token,
+                    signal_id=signal_id,
+                    source_observation_id=int(source_row[0]),
+                    observation_id=observation_id,
+                    stream_id=stream_id,
+                    source_ordinal=stream_ordinals[stream_id],
+                    cohort_ordinal=cohort_ordinal,
+                    payload=page_bundle.payload,
+                    source_item_ordinal=source.source_item_ordinal,
+                    source_item_path=source.source_item_path,
+                    fetch_cohort_id=plan.cohort_id,
+                    fetch_page_ordinal=source.page_ordinal,
+                )
+            )
+            observation_ids.append(observation_id)
+        return Phase1CohortIngestResult(
+            manifest_ids=tuple(
+                plan.cohort_id
+                for plan in sorted(plans, key=lambda item: item.collection)
+            ),
+            observation_ids=tuple(observation_ids),
+            duplicate=False,
+            completion_invalidated=False,
+        )
+
+    def _ingest_phase1_exit_review_cohorts(
+        self,
+        *,
+        signal_id: str,
+        daily_bar_cohort: object,
+        execution_bar_cohort: object,
+        quote_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+    ) -> Phase1ExitReviewIngestResult:
+        """Persist three exact provider-issued cohorts for one exit review."""
+        from zoneinfo import ZoneInfo
+
+        from .providers.alpaca import (
+            Bar,
+            Quote,
+            _market_fact_payload,
+            _normalized_market_fact_source,
+            is_ingestible_provider_fetch_cohort,
+            is_issued_normalized_market_fact,
+            provider_fetch_cohorts_share_owner,
+            read_provider_fetch_bundle,
+        )
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        cohorts = (daily_bar_cohort, execution_bar_cohort, quote_cohort)
+        if any(
+            not is_ingestible_provider_fetch_cohort(value) for value in cohorts
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 exit review requires live-fetch provider cohorts"
+            )
+        if not provider_fetch_cohorts_share_owner(*cohorts):
+            raise InvalidJournalValue(
+                "Phase 1 exit cohorts require one provider owner"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        try:
+            bundles = tuple(read_provider_fetch_bundle(value) for value in cohorts)
+        except ValueError as error:
+            raise InvalidJournalValue(
+                "Phase 1 exit provider cohort authority is unverified"
+            ) from error
+        signal_row = _sql(
+            self._connection,
+            "SELECT symbol, validation_window_id, calendar_digest "
+            "FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        symbol = str(signal_row[0])
+        calendar_digest = _calendar_digest(calendar_resolver)
+        if str(signal_row[2]) != calendar_digest:
+            raise InvalidJournalValue(
+                "Phase 1 exit calendar conflicts with the published signal"
+            )
+
+        roles = (
+            ("DAILY_BAR", daily_bar_cohort, bundles[0]),
+            ("EXECUTION_BAR", execution_bar_cohort, bundles[1]),
+            ("QUOTE", quote_cohort, bundles[2]),
+        )
+        expected_source_types = {
+            "DAILY_BAR": "ALPACA_DAILY_BARS",
+            "EXECUTION_BAR": "ALPACA_INTRADAY_BARS",
+            "QUOTE": "ALPACA_HISTORICAL_QUOTES",
+        }
+        expected_collections = {
+            "DAILY_BAR": "bars",
+            "EXECUTION_BAR": "bars",
+            "QUOTE": "quotes",
+        }
+        row_ids = tuple(
+            _require_integer(value, "Phase 1 core source row ID", minimum=1)
+            for value in core_source_row_ids
+        )
+        if len(row_ids) != len(set(row_ids)):
+            raise InvalidJournalValue(
+                "Phase 1 core source row IDs must be unique"
+            )
+        core_by_external_id: dict[
+            str,
+            tuple[
+                tuple[object, ...],
+                tuple[object, ...],
+                JournalRowReference,
+                JournalRowReference,
+            ],
+        ] = {}
+        for row_id in row_ids:
+            source_row, payload_row = self._phase1_core_source_rows(
+                source_observation_id=row_id,
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 exit provider source",
+            )
+            external_id = details.get("source_observation_id")
+            if (
+                type(external_id) is not str
+                or details != {"source_observation_id": external_id}
+                or external_id in core_by_external_id
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 exit core source identity is not exact"
+                )
+            core_by_external_id[external_id] = (
+                tuple(source_row),
+                tuple(payload_row),
+                _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                ),
+                _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                ),
+            )
+        expected_external_ids = {
+            page.page.source_observation_id
+            for _purpose, _cohort, bundle in roles
+            for page in bundle.pages
+        }
+        if set(core_by_external_id) != expected_external_ids:
+            raise InvalidJournalValue(
+                "Phase 1 exit core source row set conflicts with provider pages"
+            )
+
+        new_york = ZoneInfo("America/New_York")
+        role_material: list[dict[str, object]] = []
+        review_sessions: set[date] = set()
+        all_received: list[datetime] = []
+        all_core_references: list[JournalRowReference] = []
+        total_fact_count = 0
+        for purpose, cohort, bundle in roles:
+            manifest = bundle.manifest
+            if (
+                manifest.collection != expected_collections[purpose]
+                or manifest.requested_symbols != (symbol,)
+                or manifest.terminal is not True
+                or any(
+                    page.page.source_type != expected_source_types[purpose]
+                    for page in bundle.pages
+                )
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 exit cohort role or symbol is invalid"
+                )
+            try:
+                facts = tuple(cohort[symbol])  # type: ignore[index]
+            except (KeyError, TypeError) as error:
+                raise InvalidJournalValue(
+                    "Phase 1 exit cohort omits the signal symbol"
+                ) from error
+            fact_sources: list[tuple[object, object]] = []
+            for fact in facts:
+                if not is_issued_normalized_market_fact(fact):
+                    raise InvalidJournalValue(
+                        "Phase 1 exit normalized fact authority is unverified"
+                    )
+                source = _normalized_market_fact_source(fact)
+                expected_type = Bar if purpose != "QUOTE" else Quote
+                if (
+                    not isinstance(fact, expected_type)
+                    or source.fetch_manifest is not manifest
+                    or source.symbol != symbol
+                    or source.kind != ("QUOTE" if purpose == "QUOTE" else "BAR")
+                    or str(source.feed).lower() != "sip"
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 exit normalized fact conflicts with its cohort"
+                    )
+                fact_sources.append((fact, source))
+            if purpose == "DAILY_BAR" and len(fact_sources) < 14:
+                raise InvalidJournalValue(
+                    "Phase 1 exit daily cohort requires fourteen sessions"
+                )
+            if purpose == "EXECUTION_BAR" and not fact_sources:
+                raise InvalidJournalValue(
+                    "Phase 1 exit execution cohort is empty"
+                )
+
+            request_start, request_end = _phase1_historical_request_window(
+                tuple(page.page.request_url for page in bundle.pages)
+            )
+            role_session = request_end.astimezone(new_york).date()
+            if purpose != "DAILY_BAR":
+                review_sessions.add(role_session)
+            if not calendar_resolver.is_open(role_session):
+                raise InvalidJournalValue(
+                    "Phase 1 exit review session is not open"
+                )
+            schedule = calendar_resolver.session(role_session)
+            session_open = datetime.combine(
+                role_session,
+                schedule.open_time,
+                schedule.timezone,
+            ).astimezone(timezone.utc)
+            session_close = datetime.combine(
+                role_session,
+                schedule.close_time,
+                schedule.timezone,
+            ).astimezone(timezone.utc)
+            if purpose in {"EXECUTION_BAR", "QUOTE"} and (
+                request_start != session_open or request_end != session_close
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 exit execution fetch must cover the full session"
+                )
+            if purpose == "DAILY_BAR":
+                daily_sessions = tuple(
+                    fact.timestamp.astimezone(new_york).date()
+                    for fact, _source in fact_sources
+                )
+                first_daily_schedule = calendar_resolver.session(
+                    daily_sessions[0]
+                )
+                first_daily_open = datetime.combine(
+                    daily_sessions[0],
+                    first_daily_schedule.open_time,
+                    first_daily_schedule.timezone,
+                ).astimezone(timezone.utc)
+                if (
+                    len(daily_sessions) != 14
+                    or len(set(daily_sessions)) != 14
+                    or tuple(sorted(daily_sessions)) != daily_sessions
+                    or request_start != first_daily_open
+                    or request_end != session_close
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 exit daily fetch is not fourteen exact sessions"
+                    )
+            page_material: list[dict[str, object]] = []
+            for page_bundle in bundle.pages:
+                page = page_bundle.page
+                provider_observation = page_bundle.observation
+                source_row, payload_row, source_reference, payload_reference = (
+                    core_by_external_id[page.source_observation_id]
+                )
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=page_bundle.payload,
+                    request_url=page.request_url,
+                    source_type=page.source_type,
+                    retrieved_at=provider_observation.retrieved_at,
+                )
+                if (
+                    bytes(payload_row[3]) != page_bundle.payload
+                    or str(source_row[2]) != page.payload_sha256
+                    or str(source_row[3]) != page.request_url
+                    or str(source_row[4]) != page.source_type
+                    or str(source_row[5]).lower() != "alpaca"
+                    or str(source_row[6]).lower() != "sip"
+                    or str(source_row[11]) != "OK"
+                    or _parse_canonical_timestamp(str(source_row[7]))
+                    != provider_observation.source_timestamp
+                    or _parse_canonical_timestamp(str(source_row[8]))
+                    != provider_observation.retrieved_at
+                    or source_row[9] is not None
+                    or int(source_row[10]) != provider_observation.delay_seconds
+                    or str(getattr(metadata, "source_observation_id"))
+                    != page.source_observation_id
+                    or str(getattr(metadata, "payload_sha256"))
+                    != page.payload_sha256
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 exit page conflicts with exact core evidence"
+                    )
+                all_received.append(provider_observation.retrieved_at)
+                all_core_references.extend((source_reference, payload_reference))
+                page_material.append(
+                    {
+                        "page": page,
+                        "source_row": source_row,
+                        "payload_row": payload_row,
+                        "source_reference": source_reference,
+                        "payload_reference": payload_reference,
+                    }
+                )
+            received_through = max(
+                page.observation.retrieved_at for page in bundle.pages
+            )
+            if received_through < session_close:
+                raise InvalidJournalValue(
+                    "Phase 1 exit provider role was retrieved before session close"
+                )
+            semantic_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": (
+                            "stock-monitor/phase1-exit-semantic-manifest/v1"
+                        ),
+                        "purpose": purpose,
+                        "collection": manifest.collection,
+                        "requested_symbols": list(manifest.requested_symbols),
+                        "request_start": _canonical_timestamp(request_start),
+                        "request_end": _canonical_timestamp(request_end),
+                        "pages": [
+                            {
+                                "page_ordinal": page.page.page_ordinal,
+                                "source_type": page.page.source_type,
+                                "request_url": page.page.request_url,
+                                "request_page_token": (
+                                    page.page.request_page_token
+                                ),
+                                "next_page_token": page.page.next_page_token,
+                                "payload_sha256": page.page.payload_sha256,
+                            }
+                            for page in bundle.pages
+                        ],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            total_fact_count += len(fact_sources)
+            role_material.append(
+                {
+                    "purpose": purpose,
+                    "cohort": cohort,
+                    "bundle": bundle,
+                    "facts": tuple(fact_sources),
+                    "request_start": request_start,
+                    "request_end": request_end,
+                    "role_session": role_session,
+                    "received_through": received_through,
+                    "semantic_manifest_digest": semantic_manifest_digest,
+                    "pages": tuple(page_material),
+                }
+            )
+        if len(review_sessions) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 exit cohorts cross review sessions"
+            )
+        review_session = next(iter(review_sessions))
+        daily_material = next(
+            material
+            for material in role_material
+            if material["purpose"] == "DAILY_BAR"
+        )
+        if not all_received:
+            raise InvalidJournalValue("Phase 1 exit provider pages are empty")
+        query_cutoff = max(all_received)
+        review_schedule = calendar_resolver.session(review_session)
+        review_close = datetime.combine(
+            review_session,
+            review_schedule.close_time,
+            review_schedule.timezone,
+        ).astimezone(timezone.utc)
+        expected_daily_end = (
+            review_session
+            if query_cutoff >= review_close
+            else calendar_resolver.previous_session(review_session)
+        )
+        expected_daily_sessions = [expected_daily_end]
+        while len(expected_daily_sessions) < 14:
+            expected_daily_sessions.append(
+                calendar_resolver.previous_session(expected_daily_sessions[-1])
+            )
+        expected_daily_sessions.reverse()
+        stored_daily_sessions = tuple(
+            fact.timestamp.astimezone(new_york).date()
+            for fact, _source in daily_material["facts"]
+        )
+        if (
+            daily_material["role_session"] != expected_daily_end
+            or stored_daily_sessions != tuple(expected_daily_sessions)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 exit daily history is not fully closed at cutoff"
+            )
+        if expected_daily_end == review_session:
+            current_daily = daily_material["facts"][-1][0]
+            execution_material = next(
+                material
+                for material in role_material
+                if material["purpose"] == "EXECUTION_BAR"
+            )
+            execution_facts = tuple(
+                fact for fact, _source in execution_material["facts"]
+            )
+            if (
+                current_daily.open != execution_facts[0].open
+                or current_daily.high
+                != max(fact.high for fact in execution_facts)
+                or current_daily.low
+                != min(fact.low for fact in execution_facts)
+                or current_daily.close != execution_facts[-1].close
+                or current_daily.volume
+                != sum(fact.volume for fact in execution_facts)
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 exit daily and intraday OHLC evidence conflicts"
+                )
+        source_highwater = max(
+            int(values[0][0]) for values in core_by_external_id.values()
+        )
+        review_id = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-exit-review/v1",
+                    "payload": {
+                        "signal_id": signal_id,
+                        "review_session": review_session.isoformat(),
+                        "semantic_manifest_digests": [
+                            material["semantic_manifest_digest"]
+                            for material in role_material
+                        ],
+                    },
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+        manifest_rows: list[tuple[object, ...]] = []
+        page_rows: list[tuple[object, ...]] = []
+        fact_rows: list[tuple[object, ...]] = []
+        for material in role_material:
+            purpose = str(material["purpose"])
+            bundle = material["bundle"]
+            manifest = bundle.manifest  # type: ignore[union-attr]
+            facts = material["facts"]
+            pages = material["pages"]
+            received_through = max(
+                _parse_canonical_timestamp(str(page["source_row"][8]))
+                for page in pages
+            )
+            manifest_semantic = (
+                review_id,
+                purpose,
+                manifest.collection,
+                _canonical_audit_json(list(manifest.requested_symbols)),
+                _canonical_timestamp(material["request_start"]),
+                _canonical_timestamp(material["request_end"]),
+                manifest.request_digest,
+                manifest.manifest_digest,
+                material["semantic_manifest_digest"],
+                1,
+                _canonical_timestamp(received_through),
+                len(manifest.pages),
+                len(facts),
+            )
+            manifest_source_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-exit-manifest/v1",
+                        "values": manifest_semantic,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_without_hash = (*manifest_semantic, manifest_source_digest)
+            manifest_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS[1:-1],
+                            manifest_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_rows.append((*manifest_without_hash, manifest_record_sha256))
+            for page_material in pages:
+                page = page_material["page"]
+                source_row = page_material["source_row"]
+                page_semantic = (
+                    review_id,
+                    purpose,
+                    page.page_ordinal,
+                    int(source_row[0]),
+                    page.source_observation_id,
+                    page.source_type,
+                    page.request_url,
+                    page.request_page_token,
+                    page.next_page_token,
+                    page.payload_sha256,
+                )
+                page_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-exit-page/v1",
+                            "values": page_semantic,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                page_without_hash = (*page_semantic, page_source_digest)
+                page_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_EXIT_REVIEW_PAGE_COLUMNS[1:-1],
+                                page_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                page_rows.append((*page_without_hash, page_record_sha256))
+            for fact_ordinal, (fact, fact_source) in enumerate(facts, start=1):
+                source_row = core_by_external_id[
+                    fact_source.source_observation_id
+                ][0]
+                values_json = _canonical_audit_json(_market_fact_payload(fact))
+                fact_id = hashlib.sha256(
+                    (
+                        "stock-monitor/phase1-exit-review-fact/v1\x00"
+                        + review_id
+                        + "\x00"
+                        + purpose
+                        + "\x00"
+                        + fact_source.source_observation_id
+                        + "\x00"
+                        + fact_source.source_item_path
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_semantic = (
+                    fact_id,
+                    review_id,
+                    purpose,
+                    fact_ordinal,
+                    int(source_row[0]),
+                    fact_source.source_observation_id,
+                    fact_source.page_ordinal,
+                    fact_source.source_item_ordinal,
+                    fact_source.source_item_path,
+                    fact_source.kind,
+                    fact_source.symbol,
+                    str(fact_source.feed).lower(),
+                    _canonical_timestamp(fact.timestamp),
+                    str(source_row[8]),
+                    getattr(fact, "sequence", None),
+                    fact_source.page_payload_sha256,
+                    fact_source.normalized_fields_digest,
+                    values_json,
+                )
+                fact_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-exit-fact/v1",
+                            "values": fact_semantic,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_without_hash = (*fact_semantic, fact_source_digest)
+                fact_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_EXIT_REVIEW_FACT_COLUMNS[1:-1],
+                                fact_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_rows.append((*fact_without_hash, fact_record_sha256))
+
+        review_source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-exit-review-source/v1",
+                    "signal_id": signal_id,
+                    "review_id": review_id,
+                    "review_session": review_session.isoformat(),
+                    "calendar_digest": calendar_digest,
+                    "query_cutoff": _canonical_timestamp(query_cutoff),
+                    "manifest_records": [str(row[-1]) for row in manifest_rows],
+                    "page_records": [str(row[-1]) for row in page_rows],
+                    "fact_records": [str(row[-1]) for row in fact_rows],
+                    "core_references": [
+                        [reference.table, reference.row_id, reference.row_digest]
+                        for reference in all_core_references
+                    ],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        review_without_hash = (
+            review_id,
+            signal_id,
+            review_session.isoformat(),
+            calendar_digest,
+            _canonical_timestamp(query_cutoff),
+            3,
+            total_fact_count,
+            source_highwater,
+            _canonical_timestamp(query_cutoff),
+            review_source_digest,
+        )
+        review_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_EXIT_REVIEW_COLUMNS[1:-1],
+                        review_without_hash,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_COLUMNS)
+            + " FROM phase1_exit_reviews WHERE signal_id = ? COLLATE BINARY "
+            "AND review_session = ?",
+            (signal_id, review_session.isoformat()),
+        ).fetchone()
+        immutable = (*review_without_hash, review_record_sha256)
+        if existing is not None:
+            existing_semantics = tuple(
+                (str(row[0]), str(row[1]))
+                for row in _sql(
+                    self._connection,
+                    "SELECT purpose, semantic_manifest_digest "
+                    "FROM phase1_exit_review_manifests "
+                    "WHERE review_id = ? COLLATE BINARY "
+                    "ORDER BY CASE purpose WHEN 'DAILY_BAR' THEN 1 "
+                    "WHEN 'EXECUTION_BAR' THEN 2 WHEN 'QUOTE' THEN 3 END",
+                    (str(existing[1]),),
+                ).fetchall()
+            )
+            requested_semantics = tuple(
+                (
+                    str(material["purpose"]),
+                    str(material["semantic_manifest_digest"]),
+                )
+                for material in role_material
+            )
+            if (
+                str(existing[1]) != review_id
+                or existing_semantics != requested_semantics
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 exit review conflicts with stored content"
+                )
+            return Phase1ExitReviewIngestResult(
+                review_id=str(existing[1]),
+                query_cutoff=_parse_canonical_timestamp(str(existing[5])),
+                duplicate=True,
+            )
+        _sql(
+            self._connection,
+            "INSERT INTO phase1_exit_reviews("
+            + ", ".join(_PHASE1_EXIT_REVIEW_COLUMNS[1:])
+            + ") VALUES ("
+            + ", ".join("?" for _ in immutable)
+            + ")",
+            immutable,
+        )
+        for columns, table, rows in (
+            (
+                _PHASE1_EXIT_REVIEW_MANIFEST_COLUMNS,
+                "phase1_exit_review_manifests",
+                manifest_rows,
+            ),
+            (
+                _PHASE1_EXIT_REVIEW_PAGE_COLUMNS,
+                "phase1_exit_review_pages",
+                page_rows,
+            ),
+            (
+                _PHASE1_EXIT_REVIEW_FACT_COLUMNS,
+                "phase1_exit_review_facts",
+                fact_rows,
+            ),
+        ):
+            for row in rows:
+                _sql(
+                    self._connection,
+                    f"INSERT INTO {table}(" + ", ".join(columns[1:]) + ") "
+                    "VALUES (" + ", ".join("?" for _ in row) + ")",
+                    row,
+                )
+        return Phase1ExitReviewIngestResult(
+            review_id=review_id,
+            query_cutoff=query_cutoff,
+            duplicate=False,
+        )
+
+    def _ingest_phase1_equity_mark_cohorts(
+        self,
+        session_date: date,
+        *,
+        quote_cohort: object,
+        daily_bar_cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None,
+    ) -> Phase1EquityMarkIngestResult:
+        """Persist the exact complete provider mark evidence for one session."""
+        from .providers.alpaca import (
+            Bar,
+            Quote,
+            _market_fact_payload,
+            _normalized_market_fact_source,
+            is_ingestible_provider_fetch_cohort,
+            is_issued_normalized_market_fact,
+            provider_fetch_cohorts_share_owner,
+            read_provider_fetch_bundle,
+        )
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        if type(session_date) is not date:
+            raise InvalidJournalValue("Phase 1 equity session must be a date")
+        cohorts = (quote_cohort, daily_bar_cohort)
+        if any(
+            not is_ingestible_provider_fetch_cohort(value) for value in cohorts
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 equity marks require live-fetch provider cohorts"
+            )
+        if not provider_fetch_cohorts_share_owner(*cohorts):
+            raise InvalidJournalValue(
+                "Phase 1 equity mark cohorts require one provider owner"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        if not calendar_resolver.is_open(session_date):
+            raise InvalidJournalValue(
+                "Phase 1 equity mark session is not open"
+            )
+        try:
+            bundles = tuple(read_provider_fetch_bundle(value) for value in cohorts)
+        except (TypeError, ValueError) as error:
+            raise InvalidJournalValue(
+                "Phase 1 equity mark provider cohort authority is unverified"
+            ) from error
+
+        schedule = calendar_resolver.session(session_date)
+        session_open = datetime.combine(
+            session_date,
+            schedule.open_time,
+            schedule.timezone,
+        ).astimezone(timezone.utc)
+        session_close = datetime.combine(
+            session_date,
+            schedule.close_time,
+            schedule.timezone,
+        ).astimezone(timezone.utc)
+        calendar_digest = _calendar_digest(calendar_resolver)
+        roles = (
+            ("QUOTE", quote_cohort, bundles[0], "quotes", "ALPACA_HISTORICAL_QUOTES"),
+            ("DAILY_BAR", daily_bar_cohort, bundles[1], "bars", "ALPACA_DAILY_BARS"),
+        )
+        requested_symbol_sets = {
+            tuple(bundle.manifest.requested_symbols)
+            for _purpose, _cohort, bundle, _collection, _source_type in roles
+        }
+        if (
+            len(requested_symbol_sets) != 1
+            or not next(iter(requested_symbol_sets), ())
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 equity mark cohorts require one exact nonempty symbol set"
+            )
+        requested_symbols = next(iter(requested_symbol_sets))
+        if (
+            tuple(sorted(set(requested_symbols))) != requested_symbols
+            or any(
+                type(symbol) is not str
+                or not symbol
+                or symbol != symbol.upper()
+                for symbol in requested_symbols
+            )
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 equity mark requested symbols are not canonical"
+            )
+
+        row_ids = tuple(
+            _require_integer(value, "Phase 1 core source row ID", minimum=1)
+            for value in core_source_row_ids
+        )
+        if len(row_ids) != len(set(row_ids)):
+            raise InvalidJournalValue(
+                "Phase 1 core source row IDs must be unique"
+            )
+        core_by_external_id: dict[
+            str,
+            tuple[
+                tuple[object, ...],
+                tuple[object, ...],
+                JournalRowReference,
+                JournalRowReference,
+            ],
+        ] = {}
+        for row_id in row_ids:
+            source_row, payload_row = self._phase1_core_source_rows(
+                source_observation_id=row_id,
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 equity provider source",
+            )
+            external_id = details.get("source_observation_id")
+            if (
+                type(external_id) is not str
+                or details != {"source_observation_id": external_id}
+                or external_id in core_by_external_id
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 equity core source identity is not exact"
+                )
+            core_by_external_id[external_id] = (
+                tuple(source_row),
+                tuple(payload_row),
+                _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                ),
+                _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                ),
+            )
+        expected_external_ids = {
+            page.page.source_observation_id
+            for _purpose, _cohort, bundle, _collection, _source_type in roles
+            for page in bundle.pages
+        }
+        if set(core_by_external_id) != expected_external_ids:
+            raise InvalidJournalValue(
+                "Phase 1 equity core source row set conflicts with provider pages"
+            )
+
+        role_material: list[dict[str, object]] = []
+        all_received: list[datetime] = []
+        all_core_references: list[JournalRowReference] = []
+        total_fact_count = 0
+        for purpose, cohort, bundle, collection, source_type in roles:
+            manifest = bundle.manifest
+            if (
+                manifest.collection != collection
+                or tuple(manifest.requested_symbols) != requested_symbols
+                or manifest.terminal is not True
+                or not bundle.pages
+                or any(page.page.source_type != source_type for page in bundle.pages)
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 equity mark cohort role is invalid"
+                )
+            request_start, request_end = _phase1_historical_request_window(
+                tuple(page.page.request_url for page in bundle.pages)
+            )
+            if purpose == "QUOTE":
+                if request_start != session_open or request_end != session_close:
+                    raise InvalidJournalValue(
+                        "Phase 1 equity quote fetch must cover the full session"
+                    )
+            elif request_start > session_open or request_end != session_close:
+                raise InvalidJournalValue(
+                    "Phase 1 equity daily fetch must cover the completed session"
+                )
+
+            fact_pairs: list[tuple[object, object]] = []
+            for symbol in requested_symbols:
+                try:
+                    facts = tuple(cohort[symbol])  # type: ignore[index]
+                except (KeyError, TypeError) as error:
+                    raise InvalidJournalValue(
+                        "Phase 1 equity cohort omits a requested symbol"
+                    ) from error
+                for fact in facts:
+                    if not is_issued_normalized_market_fact(fact):
+                        raise InvalidJournalValue(
+                            "Phase 1 equity normalized fact authority is unverified"
+                        )
+                    source = _normalized_market_fact_source(fact)
+                    expected_type = Quote if purpose == "QUOTE" else Bar
+                    if (
+                        not isinstance(fact, expected_type)
+                        or source.fetch_manifest is not manifest
+                        or source.symbol != symbol
+                        or source.kind != ("QUOTE" if purpose == "QUOTE" else "BAR")
+                        or str(source.feed).lower() != "sip"
+                        or (
+                            purpose == "DAILY_BAR"
+                            and str(getattr(fact, "adjustment", "")).lower()
+                            != "split"
+                        )
+                    ):
+                        raise InvalidJournalValue(
+                            "Phase 1 equity normalized fact conflicts with its cohort"
+                        )
+                    fact_pairs.append((fact, source))
+            if purpose == "DAILY_BAR":
+                for symbol in requested_symbols:
+                    current = tuple(
+                        fact
+                        for fact, source in fact_pairs
+                        if source.symbol == symbol
+                        and fact.timestamp.astimezone(schedule.timezone).date()
+                        == session_date
+                    )
+                    if len(current) != 1:
+                        raise InvalidJournalValue(
+                            "Phase 1 equity daily cohort lacks one completed session bar"
+                        )
+
+            page_material: list[dict[str, object]] = []
+            for page_bundle in bundle.pages:
+                page = page_bundle.page
+                provider_observation = page_bundle.observation
+                source_row, payload_row, source_reference, payload_reference = (
+                    core_by_external_id[page.source_observation_id]
+                )
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=page_bundle.payload,
+                    request_url=page.request_url,
+                    source_type=page.source_type,
+                    retrieved_at=provider_observation.retrieved_at,
+                )
+                if (
+                    bytes(payload_row[3]) != page_bundle.payload
+                    or str(source_row[2]) != page.payload_sha256
+                    or str(source_row[3]) != page.request_url
+                    or str(source_row[4]) != page.source_type
+                    or str(source_row[5]).lower() != "alpaca"
+                    or str(source_row[6]).lower() != "sip"
+                    or str(source_row[11]) != "OK"
+                    or _parse_canonical_timestamp(str(source_row[7]))
+                    != provider_observation.source_timestamp
+                    or _parse_canonical_timestamp(str(source_row[8]))
+                    != provider_observation.retrieved_at
+                    or source_row[9] is not None
+                    or int(source_row[10]) != provider_observation.delay_seconds
+                    or str(getattr(metadata, "source_observation_id"))
+                    != page.source_observation_id
+                    or str(getattr(metadata, "payload_sha256"))
+                    != page.payload_sha256
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 equity page conflicts with exact core evidence"
+                    )
+                all_received.append(provider_observation.retrieved_at)
+                all_core_references.extend((source_reference, payload_reference))
+                page_material.append(
+                    {
+                        "page": page,
+                        "source_row": source_row,
+                        "payload_row": payload_row,
+                        "source_reference": source_reference,
+                        "payload_reference": payload_reference,
+                    }
+                )
+            received_through = max(
+                page.observation.retrieved_at for page in bundle.pages
+            )
+            if received_through < session_close:
+                raise InvalidJournalValue(
+                    "Phase 1 equity provider role was retrieved before session close"
+                )
+            semantic_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-equity-semantic-manifest/v1",
+                        "purpose": purpose,
+                        "collection": collection,
+                        "requested_symbols": list(requested_symbols),
+                        "request_start": _canonical_timestamp(request_start),
+                        "request_end": _canonical_timestamp(request_end),
+                        "pages": [
+                            {
+                                "page_ordinal": page.page.page_ordinal,
+                                "source_type": page.page.source_type,
+                                "request_url": page.page.request_url,
+                                "request_page_token": page.page.request_page_token,
+                                "next_page_token": page.page.next_page_token,
+                                "payload_sha256": page.page.payload_sha256,
+                            }
+                            for page in bundle.pages
+                        ],
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            total_fact_count += len(fact_pairs)
+            role_material.append(
+                {
+                    "purpose": purpose,
+                    "bundle": bundle,
+                    "facts": tuple(fact_pairs),
+                    "request_start": request_start,
+                    "request_end": request_end,
+                    "received_through": received_through,
+                    "semantic_manifest_digest": semantic_manifest_digest,
+                    "pages": tuple(page_material),
+                }
+            )
+        if total_fact_count <= 0 or not all_received:
+            raise InvalidJournalValue(
+                "Phase 1 equity mark set lacks completed daily evidence"
+            )
+        query_cutoff = max(all_received)
+        sealed_at = (
+            _parse_canonical_timestamp(_canonical_timestamp(_utc_now()))
+            if recorded_at is None
+            else _parse_canonical_timestamp(_canonical_timestamp(recorded_at))
+        )
+        if sealed_at < query_cutoff:
+            raise InvalidJournalValue(
+                "Phase 1 equity mark seal precedes provider evidence"
+            )
+        source_highwater = max(
+            int(values[0][0]) for values in core_by_external_id.values()
+        )
+        mark_set_id = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-equity-mark-set/v1",
+                    "session_date": session_date.isoformat(),
+                    "calendar_digest": calendar_digest,
+                    "semantic_manifest_digests": [
+                        material["semantic_manifest_digest"]
+                        for material in role_material
+                    ],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+        manifest_rows: list[tuple[object, ...]] = []
+        page_rows: list[tuple[object, ...]] = []
+        fact_rows: list[tuple[object, ...]] = []
+        for material in role_material:
+            purpose = str(material["purpose"])
+            bundle = material["bundle"]
+            manifest = bundle.manifest  # type: ignore[union-attr]
+            facts = material["facts"]
+            pages = material["pages"]
+            manifest_semantic = (
+                mark_set_id,
+                purpose,
+                manifest.collection,
+                _canonical_audit_json(list(manifest.requested_symbols)),
+                _canonical_timestamp(material["request_start"]),
+                _canonical_timestamp(material["request_end"]),
+                manifest.request_digest,
+                manifest.manifest_digest,
+                material["semantic_manifest_digest"],
+                1,
+                _canonical_timestamp(material["received_through"]),
+                len(manifest.pages),
+                len(facts),
+            )
+            manifest_source_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-equity-manifest/v1",
+                        "values": manifest_semantic,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_without_hash = (*manifest_semantic, manifest_source_digest)
+            manifest_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_EQUITY_MARK_MANIFEST_COLUMNS[1:-1],
+                            manifest_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            manifest_rows.append((*manifest_without_hash, manifest_record_sha256))
+            for page_material in pages:
+                page = page_material["page"]
+                source_row = page_material["source_row"]
+                page_semantic = (
+                    mark_set_id,
+                    purpose,
+                    page.page_ordinal,
+                    int(source_row[0]),
+                    page.source_observation_id,
+                    page.source_type,
+                    page.request_url,
+                    page.request_page_token,
+                    page.next_page_token,
+                    page.payload_sha256,
+                )
+                page_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-equity-page/v1",
+                            "values": page_semantic,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                page_without_hash = (*page_semantic, page_source_digest)
+                page_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_EQUITY_MARK_PAGE_COLUMNS[1:-1],
+                                page_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                page_rows.append((*page_without_hash, page_record_sha256))
+            for fact_ordinal, (fact, fact_source) in enumerate(facts, start=1):
+                source_row = core_by_external_id[
+                    fact_source.source_observation_id
+                ][0]
+                fact_id = hashlib.sha256(
+                    (
+                        "stock-monitor/phase1-equity-mark-fact/v1\x00"
+                        + mark_set_id
+                        + "\x00"
+                        + purpose
+                        + "\x00"
+                        + fact_source.source_observation_id
+                        + "\x00"
+                        + fact_source.source_item_path
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_semantic = (
+                    fact_id,
+                    mark_set_id,
+                    purpose,
+                    fact_ordinal,
+                    int(source_row[0]),
+                    fact_source.source_observation_id,
+                    fact_source.page_ordinal,
+                    fact_source.source_item_ordinal,
+                    fact_source.source_item_path,
+                    fact_source.kind,
+                    fact_source.symbol,
+                    str(fact_source.feed).lower(),
+                    _canonical_timestamp(fact.timestamp),
+                    str(source_row[8]),
+                    getattr(fact, "sequence", None),
+                    fact_source.page_payload_sha256,
+                    fact_source.normalized_fields_digest,
+                    _canonical_audit_json(_market_fact_payload(fact)),
+                )
+                fact_source_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": "stock-monitor/phase1-equity-fact/v1",
+                            "values": fact_semantic,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_without_hash = (*fact_semantic, fact_source_digest)
+                fact_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_EQUITY_MARK_FACT_COLUMNS[1:-1],
+                                fact_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                fact_rows.append((*fact_without_hash, fact_record_sha256))
+
+        set_source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-equity-mark-source/v1",
+                    "mark_set_id": mark_set_id,
+                    "session_date": session_date.isoformat(),
+                    "calendar_digest": calendar_digest,
+                    "manifest_records": [str(row[-1]) for row in manifest_rows],
+                    "page_records": [str(row[-1]) for row in page_rows],
+                    "fact_records": [str(row[-1]) for row in fact_rows],
+                    "core_references": [
+                        [reference.table, reference.row_id, reference.row_digest]
+                        for reference in all_core_references
+                    ],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        set_without_hash = (
+            mark_set_id,
+            session_date.isoformat(),
+            calendar_digest,
+            _canonical_timestamp(query_cutoff),
+            _canonical_timestamp(sealed_at),
+            _canonical_audit_json(list(requested_symbols)),
+            2,
+            total_fact_count,
+            source_highwater,
+            set_source_digest,
+        )
+        set_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_EQUITY_MARK_SET_COLUMNS[1:-1],
+                        set_without_hash,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EQUITY_MARK_SET_COLUMNS)
+            + " FROM phase1_equity_mark_sets WHERE session_date = ?",
+            (session_date.isoformat(),),
+        ).fetchone()
+        if existing is not None:
+            existing_semantics = tuple(
+                (str(row[0]), str(row[1]))
+                for row in _sql(
+                    self._connection,
+                    "SELECT purpose, semantic_manifest_digest "
+                    "FROM phase1_equity_mark_manifests "
+                    "WHERE mark_set_id = ? COLLATE BINARY "
+                    "ORDER BY CASE purpose WHEN 'QUOTE' THEN 1 ELSE 2 END",
+                    (str(existing[1]),),
+                ).fetchall()
+            )
+            requested_semantics = tuple(
+                (
+                    str(material["purpose"]),
+                    str(material["semantic_manifest_digest"]),
+                )
+                for material in role_material
+            )
+            if (
+                str(existing[1]) != mark_set_id
+                or existing_semantics != requested_semantics
+            ):
+                invalidation_id = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "namespace": (
+                                "stock-monitor/phase1-equity-mark-invalidation/v1"
+                            ),
+                            "mark_set_id": str(existing[1]),
+                            "session_date": session_date.isoformat(),
+                            "semantic_manifest_digests": list(requested_semantics),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                stored_invalidation = _sql(
+                    self._connection,
+                    "SELECT "
+                    + ", ".join(_PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS)
+                    + " FROM phase1_equity_mark_invalidations "
+                    "WHERE invalidation_id = ? COLLATE BINARY",
+                    (invalidation_id,),
+                ).fetchone()
+                if stored_invalidation is not None:
+                    return Phase1EquityMarkIngestResult(
+                        mark_set_id=str(existing[1]),
+                        query_cutoff=_parse_canonical_timestamp(str(existing[4])),
+                        duplicate=True,
+                        invalidated=True,
+                        invalidation_id=invalidation_id,
+                        invalidated_at=_parse_canonical_timestamp(
+                            str(stored_invalidation[6])
+                        ),
+                    )
+                invalidated_at = sealed_at
+                existing_sealed_at = _parse_canonical_timestamp(str(existing[5]))
+                if (
+                    invalidated_at <= existing_sealed_at
+                    or invalidated_at < query_cutoff
+                ):
+                    raise InvalidJournalValue(
+                        "Phase 1 equity invalidation must follow seal and evidence"
+                    )
+                semantic_by_purpose = dict(requested_semantics)
+                invalidation_page_rows: list[tuple[object, ...]] = []
+                for page_row in page_rows:
+                    page_values = (
+                        invalidation_id,
+                        str(page_row[1]),
+                        int(page_row[2]),
+                        int(page_row[3]),
+                        str(page_row[4]),
+                        str(page_row[5]),
+                        str(page_row[6]),
+                        page_row[7],
+                        page_row[8],
+                        str(page_row[9]),
+                        semantic_by_purpose[str(page_row[1])],
+                    )
+                    page_source_digest = hashlib.sha256(
+                        _canonical_audit_json(
+                            {
+                                "namespace": (
+                                    "stock-monitor/phase1-equity-"
+                                    "invalidation-page/v1"
+                                ),
+                                "values": page_values,
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    page_without_hash = (*page_values, page_source_digest)
+                    page_record_sha256 = hashlib.sha256(
+                        _canonical_audit_json(
+                            dict(
+                                zip(
+                                    _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS[
+                                        1:-1
+                                    ],
+                                    page_without_hash,
+                                    strict=True,
+                                )
+                            )
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    invalidation_page_rows.append(
+                        (*page_without_hash, page_record_sha256)
+                    )
+                existing_reference = _journal_row_reference(
+                    "phase1_equity_mark_sets",
+                    _PHASE1_EQUITY_MARK_SET_COLUMNS,
+                    existing,
+                )
+                invalidation_source_digest = _journal_bundle_digest(
+                    "stock-monitor/phase1-equity-mark-invalidation-source/v1",
+                    (existing_reference, *all_core_references),
+                    {
+                        "invalidation_id": invalidation_id,
+                        "mark_set_id": str(existing[1]),
+                        "semantic_manifest_digests": list(requested_semantics),
+                        "page_records": [
+                            str(row[-1]) for row in invalidation_page_rows
+                        ],
+                        "received_through": _canonical_timestamp(query_cutoff),
+                        "invalidated_at": _canonical_timestamp(invalidated_at),
+                    },
+                )
+                invalidation_without_hash = (
+                    invalidation_id,
+                    str(existing[1]),
+                    session_date.isoformat(),
+                    _canonical_audit_json(list(requested_semantics)),
+                    _canonical_timestamp(query_cutoff),
+                    _canonical_timestamp(invalidated_at),
+                    len(invalidation_page_rows),
+                    invalidation_source_digest,
+                )
+                invalidation_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS[1:-1],
+                                invalidation_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                _sql(
+                    self._connection,
+                    "INSERT INTO phase1_equity_mark_invalidations("
+                    + ", ".join(_PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS[1:])
+                    + ") VALUES ("
+                    + ", ".join(
+                        "?"
+                        for _ in range(
+                            len(_PHASE1_EQUITY_MARK_INVALIDATION_COLUMNS) - 1
+                        )
+                    )
+                    + ")",
+                    (*invalidation_without_hash, invalidation_record_sha256),
+                )
+                for row in invalidation_page_rows:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase1_equity_mark_invalidation_pages("
+                        + ", ".join(
+                            _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS[1:]
+                        )
+                        + ") VALUES ("
+                        + ", ".join(
+                            "?"
+                            for _ in range(
+                                len(
+                                    _PHASE1_EQUITY_MARK_INVALIDATION_PAGE_COLUMNS
+                                )
+                                - 1
+                            )
+                        )
+                        + ")",
+                        row,
+                    )
+                return Phase1EquityMarkIngestResult(
+                    mark_set_id=str(existing[1]),
+                    query_cutoff=_parse_canonical_timestamp(str(existing[4])),
+                    duplicate=False,
+                    invalidated=True,
+                    invalidation_id=invalidation_id,
+                    invalidated_at=invalidated_at,
+                )
+            return Phase1EquityMarkIngestResult(
+                mark_set_id=str(existing[1]),
+                query_cutoff=_parse_canonical_timestamp(str(existing[4])),
+                duplicate=True,
+            )
+
+        immutable = (*set_without_hash, set_record_sha256)
+        _sql(
+            self._connection,
+            "INSERT INTO phase1_equity_mark_sets("
+            + ", ".join(_PHASE1_EQUITY_MARK_SET_COLUMNS[1:])
+            + ") VALUES ("
+            + ", ".join("?" for _ in immutable)
+            + ")",
+            immutable,
+        )
+        for columns, table, rows in (
+            (
+                _PHASE1_EQUITY_MARK_MANIFEST_COLUMNS,
+                "phase1_equity_mark_manifests",
+                manifest_rows,
+            ),
+            (
+                _PHASE1_EQUITY_MARK_PAGE_COLUMNS,
+                "phase1_equity_mark_pages",
+                page_rows,
+            ),
+            (
+                _PHASE1_EQUITY_MARK_FACT_COLUMNS,
+                "phase1_equity_mark_facts",
+                fact_rows,
+            ),
+        ):
+            for row in rows:
+                _sql(
+                    self._connection,
+                    f"INSERT INTO {table}(" + ", ".join(columns[1:]) + ") "
+                    "VALUES (" + ", ".join("?" for _ in row) + ")",
+                    row,
+                )
+        return Phase1EquityMarkIngestResult(
+            mark_set_id=mark_set_id,
+            query_cutoff=query_cutoff,
+            duplicate=False,
+        )
+
+    def _prepare_phase1_session_cohort(
+        self,
+        *,
+        signal_id: str,
+        cohort: object,
+        core_source_row_ids: Sequence[int],
+        calendar_resolver: object,
+        recorded_at: datetime | None,
+    ) -> _Phase1CohortPlan:
+        from zoneinfo import ZoneInfo
+
+        from .providers.alpaca import (
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            read_provider_fetch_bundle,
+        )
+        from .risk import (
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+        )
+
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        try:
+            bundle = read_provider_fetch_bundle(cohort)
+        except ValueError as error:
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort authority is unverified"
+            ) from error
+        manifest = bundle.manifest
+        if (
+            tuple(cohort) != manifest.requested_symbols  # type: ignore[arg-type]
+            or manifest.collection not in {"trades", "quotes"}
+            or manifest.terminal is not True
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort is outside lifecycle scope"
+            )
+        signal_row = _sql(
+            self._connection,
+            "SELECT symbol, publication_session FROM phase1_signals "
+            "WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        symbol = str(signal_row[0])
+        if symbol not in manifest.requested_symbols:
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort omits the signal symbol"
+            )
+        try:
+            facts = tuple(cohort[symbol])  # type: ignore[index]
+        except (KeyError, TypeError) as error:
+            raise InvalidJournalValue(
+                "Phase 1 provider fetch cohort omits the signal symbol"
+            ) from error
+        fact_sources: list[tuple[object, object]] = []
+        for fact in facts:
+            if not is_issued_normalized_market_fact(fact):
+                raise InvalidJournalValue(
+                    "Phase 1 normalized market fact authority is unverified"
+                )
+            source = _normalized_market_fact_source(fact)
+            if (
+                source.fetch_manifest is not manifest
+                or source.symbol != symbol
+                or source.kind.lower() != manifest.collection[:-1]
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 normalized market fact conflicts with its cohort"
+                )
+            fact_sources.append((fact, source))
+
+        if isinstance(core_source_row_ids, (str, bytes)):
+            raise InvalidJournalValue(
+                "Phase 1 core source row IDs must be an exact sequence"
+            )
+        row_ids = tuple(
+            _require_integer(value, "Phase 1 core source row ID", minimum=1)
+            for value in core_source_row_ids
+        )
+        if len(row_ids) != len(set(row_ids)) or len(row_ids) != len(bundle.pages):
+            raise InvalidJournalValue(
+                "Phase 1 core source row set conflicts with provider pages"
+            )
+        core_by_external_id: dict[
+            str,
+            tuple[
+                tuple[object, ...],
+                tuple[object, ...],
+                JournalRowReference,
+                JournalRowReference,
+            ],
+        ] = {}
+        for row_id in row_ids:
+            source_row, payload_row = self._phase1_core_source_rows(
+                source_observation_id=row_id,
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 provider source observation",
+            )
+            external_id = details.get("source_observation_id")
+            if (
+                type(external_id) is not str
+                or details != {"source_observation_id": external_id}
+                or external_id in core_by_external_id
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 core source row identity is not exact"
+                )
+            core_by_external_id[external_id] = (
+                tuple(source_row),
+                tuple(payload_row),
+                _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                ),
+                _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                ),
+            )
+        if set(core_by_external_id) != {
+            page.page.source_observation_id for page in bundle.pages
+        }:
+            raise InvalidJournalValue(
+                "Phase 1 core source row set conflicts with provider pages"
+            )
+
+        semantic_pages: list[tuple[object, str]] = []
+        all_references: list[JournalRowReference] = []
+        session_instants: list[datetime] = []
+        for page_bundle in bundle.pages:
+            page = page_bundle.page
+            provider_observation = page_bundle.observation
+            source_row, payload_row, source_reference, payload_reference = (
+                core_by_external_id[page.source_observation_id]
+            )
+            try:
+                metadata = _phase1_recompute_alpaca_page_metadata(
+                    payload=page_bundle.payload,
+                    request_url=page.request_url,
+                    source_type=page.source_type,
+                    retrieved_at=provider_observation.retrieved_at,
+                )
+            except InvalidJournalValue as error:
+                raise InvalidJournalValue(
+                    "Phase 1 provider page metadata is invalid"
+                ) from error
+            if (
+                bytes(payload_row[3]) != page_bundle.payload
+                or str(source_row[2]) != page.payload_sha256
+                or str(source_row[3]) != page.request_url
+                or str(source_row[4]) != page.source_type
+                or str(source_row[5]).lower() != "alpaca"
+                or str(source_row[6]).lower()
+                != provider_observation.feed.lower()
+                or _parse_canonical_timestamp(str(source_row[7]))
+                != provider_observation.source_timestamp
+                or _parse_canonical_timestamp(str(source_row[8]))
+                != provider_observation.retrieved_at
+                or source_row[9] is not None
+                or int(source_row[10]) != provider_observation.delay_seconds
+                or str(source_row[11]) != "OK"
+                or str(getattr(metadata, "source_observation_id"))
+                != page.source_observation_id
+                or getattr(metadata, "source_time")
+                != provider_observation.source_timestamp
+                or int(getattr(metadata, "delay_seconds"))
+                != provider_observation.delay_seconds
+                or str(getattr(metadata, "payload_sha256"))
+                != page.payload_sha256
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 provider page conflicts with exact core evidence"
+                )
+            semantic_page_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "version": 1,
+                        "source_type": page.source_type,
+                        "request_url": page.request_url,
+                        "request_page_token": page.request_page_token,
+                        "next_page_token": page.next_page_token,
+                        "payload_sha256": page.payload_sha256,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            semantic_pages.append((page_bundle, semantic_page_digest))
+            all_references.extend((source_reference, payload_reference))
+            session_instants.append(provider_observation.source_timestamp)
+
+        new_york = ZoneInfo("America/New_York")
+        session_dates = {
+            value.astimezone(new_york).date() for value in session_instants
+        }
+        session_dates.update(
+            getattr(fact, "timestamp").astimezone(new_york).date()
+            for fact, _source in fact_sources
+        )
+        if len(session_dates) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle fetch must cover exactly one session"
+            )
+        session_date = next(iter(session_dates))
+        if (
+            session_date.isoformat() != str(signal_row[1])
+            or not calendar_resolver.is_open(session_date)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle fetch session conflicts with publication"
+            )
+        schedule = calendar_resolver.session(session_date)
+        session_open = datetime.combine(
+            session_date,
+            schedule.open_time,
+            schedule.timezone,
+        )
+        session_close = datetime.combine(
+            session_date,
+            schedule.close_time,
+            schedule.timezone,
+        )
+        request_start, request_end = _phase1_historical_request_window(
+            tuple(page.page.request_url for page in bundle.pages)
+        )
+        if (
+            request_start != session_open.astimezone(timezone.utc)
+            or request_end != session_close.astimezone(timezone.utc)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle fetch must cover the full release-calendar session"
+            )
+        if any(
+            not session_open <= getattr(fact, "timestamp") <= session_close
+            for fact, _source in fact_sources
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle fact lies outside the regular session"
+            )
+
+        semantic_manifest_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "collection": manifest.collection,
+                    "requested_symbols": list(manifest.requested_symbols),
+                    "request_digest": manifest.request_digest,
+                    "pages": [
+                        {
+                            "page_ordinal": page_bundle.page.page_ordinal,
+                            "semantic_page_digest": semantic_digest,
+                        }
+                        for page_bundle, semantic_digest in semantic_pages
+                    ],
+                    "terminal": True,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        cohort_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-signal-lifecycle-fetch/v1\x00"
+                + signal_id
+                + "\x00"
+                + session_date.isoformat()
+                + "\x00"
+                + semantic_manifest_digest
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS)
+            + " FROM phase1_observation_fetch_manifests "
+            "WHERE signal_id = ? COLLATE BINARY AND purpose = 'SIGNAL_LIFECYCLE' "
+            "AND semantic_manifest_digest = ? COLLATE BINARY",
+            (signal_id, semantic_manifest_digest),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing[1]) != cohort_id
+                or str(existing[3]) != session_date.isoformat()
+                or str(existing[5]) != manifest.collection
+                or str(existing[6])
+                != _canonical_audit_json(list(manifest.requested_symbols))
+                or str(existing[7]) != manifest.request_digest
+                or int(existing[10]) != 1
+                or _parse_canonical_timestamp(str(existing[11]))
+                != request_start
+                or _parse_canonical_timestamp(str(existing[12]))
+                != request_end
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 provider cohort semantic identity conflicts"
+                )
+            return _Phase1CohortPlan(
+                cohort_id=cohort_id,
+                collection=manifest.collection,
+                session_date=session_date,
+                bundle=bundle,
+                fact_sources=tuple(fact_sources),
+                source_rows_by_external_id={
+                    external_id: values[0]
+                    for external_id, values in core_by_external_id.items()
+                },
+                duplicate=True,
+            )
+
+        collection_conflict = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_observation_fetch_manifests "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND purpose = 'SIGNAL_LIFECYCLE' AND collection_name = ?",
+            (signal_id, session_date.isoformat(), manifest.collection),
+        ).fetchone()
+        completion = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SESSION_COMPLETION_COLUMNS)
+            + " FROM phase1_session_completions "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ?",
+            (signal_id, session_date.isoformat()),
+        ).fetchone()
+        if collection_conflict is not None:
+            if completion is not None:
+                late_evidence_id, duplicate = self._append_phase1_late_evidence(
+                    completion_row=completion,
+                    signal_id=signal_id,
+                    session_date=session_date,
+                    collection=manifest.collection,
+                    request_start=request_start,
+                    request_end=request_end,
+                    request_digest=manifest.request_digest,
+                    manifest_digest=manifest.manifest_digest,
+                    semantic_manifest_digest=semantic_manifest_digest,
+                    semantic_pages=tuple(semantic_pages),
+                    source_rows_by_external_id={
+                        external_id: values[0]
+                        for external_id, values in core_by_external_id.items()
+                    },
+                    source_references=tuple(all_references),
+                    recorded_at=recorded_at,
+                )
+                return _Phase1CohortPlan(
+                    cohort_id=late_evidence_id,
+                    collection=manifest.collection,
+                    session_date=session_date,
+                    bundle=bundle,
+                    fact_sources=(),
+                    source_rows_by_external_id={
+                        external_id: values[0]
+                        for external_id, values in core_by_external_id.items()
+                    },
+                    duplicate=duplicate,
+                    completion_invalidated=True,
+                )
+            raise InvalidJournalValue(
+                "Phase 1 lifecycle collection already has a different terminal cohort"
+            )
+
+        if completion is not None:
+            raise InvalidJournalValue(
+                "Phase 1 completed session rejects newly enrolled evidence"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        received_through = max(
+            page.observation.retrieved_at for page in bundle.pages
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-signal-lifecycle-fetch/v1",
+            tuple(all_references),
+            {
+                "signal_id": signal_id,
+                "session_date": session_date.isoformat(),
+                "collection": manifest.collection,
+                "request_digest": manifest.request_digest,
+                "manifest_digest": manifest.manifest_digest,
+                "semantic_manifest_digest": semantic_manifest_digest,
+                "request_start": _canonical_timestamp(request_start),
+                "request_end": _canonical_timestamp(request_end),
+                "calendar_digest": calendar_digest,
+                "received_through": _canonical_timestamp(received_through),
+            },
+        )
+        manifest_without_hash = (
+            cohort_id,
+            signal_id,
+            session_date.isoformat(),
+            "SIGNAL_LIFECYCLE",
+            manifest.collection,
+            _canonical_audit_json(list(manifest.requested_symbols)),
+            manifest.request_digest,
+            manifest.manifest_digest,
+            semantic_manifest_digest,
+            1,
+            _canonical_timestamp(request_start),
+            _canonical_timestamp(request_end),
+            calendar_digest,
+            _canonical_timestamp(received_through),
+            source_digest,
+        )
+        manifest_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS[1:-1],
+                        manifest_without_hash,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        _sql(
+            self._connection,
+            "INSERT INTO phase1_observation_fetch_manifests("
+            + ", ".join(_PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS[1:])
+            + ") VALUES ("
+            + ", ".join("?" for _ in (*manifest_without_hash, manifest_record_sha256))
+            + ")",
+            (*manifest_without_hash, manifest_record_sha256),
+        )
+        source_rows_by_external_id = {
+            external_id: values[0]
+            for external_id, values in core_by_external_id.items()
+        }
+        for page_bundle, semantic_page_digest in semantic_pages:
+            page = page_bundle.page
+            source_row = source_rows_by_external_id[page.source_observation_id]
+            page_without_hash = (
+                cohort_id,
+                page.page_ordinal,
+                int(source_row[0]),
+                page.source_observation_id,
+                page.source_type,
+                page.request_url,
+                page.request_page_token,
+                page.next_page_token,
+                page.payload_sha256,
+                semantic_page_digest,
+            )
+            page_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS[1:-1],
+                            page_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_observation_fetch_pages("
+                + ", ".join(_PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join("?" for _ in (*page_without_hash, page_record_sha256))
+                + ")",
+                (*page_without_hash, page_record_sha256),
+            )
+
+        return _Phase1CohortPlan(
+            cohort_id=cohort_id,
+            collection=manifest.collection,
+            session_date=session_date,
+            bundle=bundle,
+            fact_sources=tuple(fact_sources),
+            source_rows_by_external_id=source_rows_by_external_id,
+            duplicate=False,
+        )
+
+    def _append_phase1_late_evidence(
+        self,
+        *,
+        completion_row: Sequence[object],
+        signal_id: str,
+        session_date: date,
+        collection: str,
+        request_start: datetime,
+        request_end: datetime,
+        request_digest: str,
+        manifest_digest: str,
+        semantic_manifest_digest: str,
+        semantic_pages: Sequence[tuple[object, str]],
+        source_rows_by_external_id: Mapping[str, tuple[object, ...]],
+        source_references: Sequence[JournalRowReference],
+        recorded_at: datetime | None,
+    ) -> tuple[str, bool]:
+        completion_id = str(completion_row[1])
+        received_through = max(
+            page_bundle.observation.retrieved_at
+            for page_bundle, _digest in semantic_pages
+        )
+        completion_at = _parse_canonical_timestamp(str(completion_row[7]))
+        late_evidence_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-session-late-evidence/v1\x00"
+                + completion_id
+                + "\x00"
+                + semantic_manifest_digest
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SESSION_LATE_EVIDENCE_COLUMNS)
+            + " FROM phase1_session_late_evidence "
+            "WHERE late_evidence_id = ? COLLATE BINARY",
+            (late_evidence_id,),
+        ).fetchone()
+        if existing is not None:
+            invalidated_at = _parse_canonical_timestamp(str(existing[12]))
+            if recorded_at is not None and _parse_canonical_timestamp(
+                _canonical_timestamp(recorded_at)
+            ) != invalidated_at:
+                raise IdempotencyConflict(
+                    "Phase 1 late evidence invalidation time conflicts"
+                )
+        elif recorded_at is None:
+            invalidated_at = (
+                received_through
+                if received_through > completion_at
+                else max(_utc_now(), completion_at + timedelta(microseconds=1))
+            )
+        else:
+            invalidated_at = _parse_canonical_timestamp(
+                _canonical_timestamp(recorded_at)
+            )
+        if invalidated_at <= completion_at or received_through > invalidated_at:
+            raise InvalidJournalValue(
+                "Phase 1 late evidence invalidation must follow completion and retrieval"
+            )
+        completion_reference = _journal_row_reference(
+            "phase1_session_completions",
+            _PHASE1_SESSION_COMPLETION_COLUMNS,
+            completion_row,
+        )
+        references = (completion_reference, *source_references)
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-session-late-evidence/v1",
+            references,
+            {
+                "late_evidence_id": late_evidence_id,
+                "completion_id": completion_id,
+                "signal_id": signal_id,
+                "session_date": session_date.isoformat(),
+                "collection": collection,
+                "request_start": _canonical_timestamp(request_start),
+                "request_end": _canonical_timestamp(request_end),
+                "request_digest": request_digest,
+                "manifest_digest": manifest_digest,
+                "semantic_manifest_digest": semantic_manifest_digest,
+                "received_through": _canonical_timestamp(received_through),
+                "invalidated_at": _canonical_timestamp(invalidated_at),
+            },
+        )
+        without_hash = (
+            late_evidence_id,
+            completion_id,
+            signal_id,
+            session_date.isoformat(),
+            collection,
+            _canonical_timestamp(request_start),
+            _canonical_timestamp(request_end),
+            request_digest,
+            manifest_digest,
+            semantic_manifest_digest,
+            _canonical_timestamp(received_through),
+            _canonical_timestamp(invalidated_at),
+            source_digest,
+        )
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_SESSION_LATE_EVIDENCE_COLUMNS[1:-1],
+                        without_hash,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        immutable = (*without_hash, record_sha256)
+        if existing is not None:
+            if tuple(existing[1:]) != immutable:
+                raise IdempotencyConflict(
+                    "Phase 1 late evidence conflicts with stored content"
+                )
+            return late_evidence_id, True
+        _sql(
+            self._connection,
+            "INSERT INTO phase1_session_late_evidence("
+            + ", ".join(_PHASE1_SESSION_LATE_EVIDENCE_COLUMNS[1:])
+            + ") VALUES ("
+            + ", ".join("?" for _ in immutable)
+            + ")",
+            immutable,
+        )
+        for page_bundle, semantic_page_digest in semantic_pages:
+            page = page_bundle.page
+            source_row = source_rows_by_external_id[page.source_observation_id]
+            page_without_hash = (
+                late_evidence_id,
+                page.page_ordinal,
+                int(source_row[0]),
+                page.source_observation_id,
+                page.source_type,
+                page.request_url,
+                page.request_page_token,
+                page.next_page_token,
+                page.payload_sha256,
+                semantic_page_digest,
+            )
+            page_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS[1:-1],
+                            page_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_session_late_evidence_pages("
+                + ", ".join(_PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join("?" for _ in (*page_without_hash, page_record_sha256))
+                + ")",
+                (*page_without_hash, page_record_sha256),
+            )
+        return late_evidence_id, False
+
+    def _append_phase1_observation(
+        self,
+        plan: object,
+    ) -> tuple[int, bool]:
+        if (
+            not isinstance(plan, _Phase1ObservationAppendPlan)
+            or plan.authority_token is not self.__phase1_observation_ingest_token
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 append requires an internally authenticated observation plan"
+            )
+        signal_id = plan.signal_id
+        source_observation_id = plan.source_observation_id
+        observation_id = plan.observation_id
+        stream_id = plan.stream_id
+        source_ordinal = plan.source_ordinal
+        cohort_ordinal = plan.cohort_ordinal
+        payload = plan.payload
+        source_item_ordinal = plan.source_item_ordinal
+        source_item_path = plan.source_item_path
+        fetch_cohort_id = plan.fetch_cohort_id
+        fetch_page_ordinal = plan.fetch_page_ordinal
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        observation_id = _require_nonempty_text(
+            observation_id,
+            "Phase 1 observation ID",
+        )
+        stream_id = _require_nonempty_text(stream_id, "Phase 1 stream ID")
+        source_ordinal = _require_integer(
+            source_ordinal,
+            "Phase 1 source ordinal",
+            minimum=1,
+        )
+        cohort_ordinal = _require_integer(
+            cohort_ordinal,
+            "Phase 1 cohort ordinal",
+            minimum=1,
+        )
+        fetch_cohort_id = _require_sha256(
+            fetch_cohort_id,
+            "Phase 1 fetch cohort ID",
+        )
+        fetch_page_ordinal = _require_integer(
+            fetch_page_ordinal,
+            "Phase 1 fetch page ordinal",
+            minimum=1,
+        )
+        source_row, _payload_row, normalized, session_date, details_json = (
+            self._phase1_normalized_source_values(
+                signal_id=signal_id,
+                source_observation_id=source_observation_id,
+                source_item_ordinal=source_item_ordinal,
+                source_item_path=source_item_path,
+                payload=payload,
+            )
+        )
+        selected_path = str(normalized["source_item_path"])
+        immutable_without_digest = (
+            observation_id,
+            signal_id,
+            source_observation_id,
+            source_item_ordinal,
+            selected_path,
+            str(source_row[2]),
+            payload,
+            stream_id,
+            str(source_row[6]),
+            str(normalized["observation_kind"]),
+            session_date,
+            _canonical_timestamp(
+                _phase1_item_time(
+                    normalized["item_at"],
+                    _parse_canonical_timestamp(str(source_row[7])),
+                )
+            ),
+            str(source_row[8]),
+            (
+                normalized["item_sequence"]
+                if bool(normalized["alpaca_shape"])
+                else source_row[9]
+            ),
+            source_ordinal,
+            cohort_ordinal,
+            normalized["trade_price_micros"],
+            normalized["bid_micros"],
+            normalized["ask_micros"],
+            normalized["open_micros"],
+            normalized["high_micros"],
+            normalized["low_micros"],
+            normalized["close_micros"],
+            normalized["volume"],
+            1,
+            fetch_cohort_id,
+            fetch_page_ordinal,
+        )
+        source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "source_observation_sha256": str(source_row[1]),
+                    "values": dict(
+                        zip(
+                            _PHASE1_OBSERVATION_COLUMNS[1:28],
+                            tuple(
+                                (
+                                    {
+                                        "blob_length": len(value),
+                                        "blob_sha256": hashlib.sha256(value).hexdigest(),
+                                    }
+                                    if type(value) is bytes
+                                    else value
+                                )
+                                for value in immutable_without_digest
+                            ),
+                            strict=True,
+                        )
+                    ),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        immutable = (*immutable_without_digest, source_digest, details_json)
+        existing = _sql(
+            self._connection,
+            "SELECT id, "
+            + ", ".join(_PHASE1_OBSERVATION_COLUMNS[1:])
+            + " FROM phase1_observations WHERE observation_id = ? COLLATE BINARY",
+            (observation_id,),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:]) != immutable:
+                raise IdempotencyConflict(
+                    "Phase 1 observation conflicts with stored content"
+                )
+            return int(existing[0]), True
+        prior_stream = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(source_ordinal), 0) FROM phase1_observations "
+            "WHERE stream_id = ? COLLATE BINARY",
+            (stream_id,),
+        ).fetchone()
+        prior_cohort = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(cohort_ordinal), 0) FROM phase1_observations "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ?",
+            (signal_id, session_date),
+        ).fetchone()
+        if (
+            prior_stream is None
+            or int(prior_stream[0]) + 1 != source_ordinal
+            or prior_cohort is None
+            or int(prior_cohort[0]) + 1 != cohort_ordinal
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 observation ordinals must be contiguous"
+            )
+        try:
+            cursor = _sql(
+                self._connection,
+                "INSERT INTO phase1_observations("
+                + ", ".join(_PHASE1_OBSERVATION_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join("?" for _ in immutable)
+                + ")",
+                immutable,
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 observation conflicts with stored content"
+            ) from error
+        return int(cursor.lastrowid), False
+
+    def _read_phase1_observation_source(
+        self,
+        *,
+        observation_id: str,
+        query_cutoff: datetime,
+    ) -> Phase1ObservationSource:
+        self._ensure_open()
+        observation_id = _require_nonempty_text(
+            observation_id,
+            "Phase 1 observation ID",
+        )
+        stored_cutoff = _canonical_timestamp(query_cutoff)
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_OBSERVATION_COLUMNS)
+            + " FROM phase1_observations WHERE observation_id = ? COLLATE BINARY "
+            "AND received_at <= ?",
+            (observation_id, stored_cutoff),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue(
+                "Phase 1 observation is unavailable at the query cutoff"
+            )
+        try:
+            source_row, payload_row, normalized, session_date, details_json = (
+                self._phase1_normalized_source_values(
+                    signal_id=str(row[2]),
+                    source_observation_id=int(row[3]),
+                    source_item_ordinal=int(row[4]),
+                    source_item_path=str(row[5]),
+                    payload=bytes(row[7]),
+                )
+            )
+        except (IdempotencyConflict, InvalidJournalValue) as error:
+            raise MigrationCorruption(
+                "Phase 1 observation source integrity failed"
+            ) from error
+        expected_without_digest = (
+            str(row[1]),
+            str(row[2]),
+            int(row[3]),
+            int(row[4]),
+            str(normalized["source_item_path"]),
+            str(source_row[2]),
+            bytes(payload_row[3]),
+            str(row[8]),
+            str(source_row[6]),
+            str(normalized["observation_kind"]),
+            session_date,
+            _canonical_timestamp(
+                _phase1_item_time(
+                    normalized["item_at"],
+                    _parse_canonical_timestamp(str(source_row[7])),
+                )
+            ),
+            str(source_row[8]),
+            (
+                normalized["item_sequence"]
+                if bool(normalized["alpaca_shape"])
+                else source_row[9]
+            ),
+            int(row[15]),
+            int(row[16]),
+            normalized["trade_price_micros"],
+            normalized["bid_micros"],
+            normalized["ask_micros"],
+            normalized["open_micros"],
+            normalized["high_micros"],
+            normalized["low_micros"],
+            normalized["close_micros"],
+            normalized["volume"],
+            1,
+            str(row[26]),
+            int(row[27]),
+        )
+        if tuple(row[1:28]) != expected_without_digest or str(row[29]) != details_json:
+            raise MigrationCorruption(
+                "Phase 1 observation normalized values conflict with raw source"
+            )
+        expected_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "source_observation_sha256": str(source_row[1]),
+                    "values": dict(
+                        zip(
+                            _PHASE1_OBSERVATION_COLUMNS[1:28],
+                            tuple(
+                                (
+                                    {
+                                        "blob_length": len(value),
+                                        "blob_sha256": hashlib.sha256(value).hexdigest(),
+                                    }
+                                    if type(value) is bytes
+                                    else value
+                                )
+                                for value in expected_without_digest
+                            ),
+                            strict=True,
+                        )
+                    ),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(row[28]) != expected_digest:
+            raise MigrationCorruption(
+                "Phase 1 observation digest integrity failed"
+            )
+        stream_highwater = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(source_observation_id), 0) "
+            "FROM phase1_observations WHERE stream_id = ? COLLATE BINARY "
+            "AND received_at <= ?",
+            (str(row[8]), stored_cutoff),
+        ).fetchone()
+        if stream_highwater is None:
+            raise MigrationCorruption(
+                "Phase 1 observation stream highwater is missing"
+            )
+        references = (
+            _journal_row_reference(
+                "source_observations",
+                _SOURCE_OBSERVATION_COLUMNS,
+                source_row,
+            ),
+            _journal_row_reference(
+                "phase1_source_payloads",
+                _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                payload_row,
+            ),
+            _journal_row_reference(
+                "phase1_observations",
+                _PHASE1_OBSERVATION_COLUMNS,
+                row,
+            ),
+        )
+        return Phase1ObservationSource(
+            row_id=int(row[0]),
+            observation_id=str(row[1]),
+            signal_id=str(row[2]),
+            source_observation_id=int(row[3]),
+            source_item_ordinal=int(row[4]),
+            source_item_path=str(row[5]),
+            source_observation_sha256=str(source_row[1]),
+            source_payload=bytes(row[7]),
+            source_payload_sha256=str(row[6]),
+            stream_id=str(row[8]),
+            feed=str(row[9]),
+            observation_kind=str(row[10]),
+            session_date=date.fromisoformat(str(row[11])),
+            source_time=_parse_canonical_timestamp(str(row[12])),
+            received_at=_parse_canonical_timestamp(str(row[13])),
+            provider_sequence=(None if row[14] is None else int(row[14])),
+            source_cursor=int(row[3]),
+            source_ordinal=int(row[15]),
+            stream_through_cursor=int(stream_highwater[0]),
+            cohort_ordinal=int(row[16]),
+            trade_price_micros=(None if row[17] is None else int(row[17])),
+            bid_micros=(None if row[18] is None else int(row[18])),
+            ask_micros=(None if row[19] is None else int(row[19])),
+            open_micros=(None if row[20] is None else int(row[20])),
+            high_micros=(None if row[21] is None else int(row[21])),
+            low_micros=(None if row[22] is None else int(row[22])),
+            close_micros=(None if row[23] is None else int(row[23])),
+            volume=(None if row[24] is None else int(row[24])),
+            fresh=bool(row[25]),
+            fetch_cohort_id=str(row[26]),
+            fetch_page_ordinal=int(row[27]),
+            source_digest=str(row[28]),
+            row_references=references,
+        )
+
+    def _phase1_eligible_source_items(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        received_through: datetime,
+    ) -> tuple[frozenset[tuple[str, str]], dict[int, str]]:
+        signal_row = _sql(
+            self._connection,
+            "SELECT symbol FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        symbol = str(signal_row[0])
+        stored_through = _canonical_timestamp(received_through)
+        rows = _sql(
+            self._connection,
+            "SELECT id, source_time, details_json FROM source_observations "
+            "WHERE source_type IN (?, ?, ?, ?) AND health_result = 'OK' "
+            "AND feed IS NOT NULL AND retrieved_at <= ? ORDER BY id",
+            (*tuple(_PHASE1_ALPACA_SOURCE_CONTRACTS), stored_through),
+        ).fetchall()
+        from zoneinfo import ZoneInfo
+
+        new_york = ZoneInfo("America/New_York")
+        source_semantic_ids: dict[int, str] = {}
+        page_records: list[
+            tuple[
+                int,
+                str,
+                str,
+                str | None,
+                str | None,
+                str,
+                tuple[str, ...],
+            ]
+        ] = []
+        for row in rows:
+            source_id = int(row[0])
+            try:
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=source_id,
+                )
+                _validate_phase1_alpaca_page_contract(
+                    source_row,
+                    bytes(payload_row[3]),
+                )
+                items = _phase1_payload_items(bytes(payload_row[3]))
+            except InvalidJournalValue:
+                continue
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 core source observation",
+            )
+            fallback = _parse_canonical_timestamp(str(source_row[7]))
+            relevant_paths: list[str] = []
+            for item in items:
+                item_symbol = item.symbol or details.get("symbol")
+                item_at = _phase1_item_time(
+                    item.value.get("t") if item.alpaca_shape else item.value.get("at"),
+                    fallback,
+                )
+                if item_symbol == symbol and item_at.astimezone(new_york).date() == session_date:
+                    relevant_paths.append(item.path)
+            source_type = str(source_row[4])
+            _collection, _path, _feed, collection_is_list = (
+                _PHASE1_ALPACA_SOURCE_CONTRACTS[source_type]
+            )
+            parsed_uri = urlsplit(str(source_row[3]))
+            query_pairs = parse_qsl(parsed_uri.query, keep_blank_values=True)
+            page_tokens = [
+                value for name, value in query_pairs if name == "page_token"
+            ]
+            if len(page_tokens) > 1:
+                raise InvalidJournalValue(
+                    "Phase 1 provider page chain has duplicate page tokens"
+                )
+            request_pairs = [
+                (name, value)
+                for name, value in query_pairs
+                if name != "page_token"
+            ]
+            base_uri = urlunsplit(
+                (
+                    parsed_uri.scheme,
+                    parsed_uri.netloc,
+                    parsed_uri.path,
+                    urlencode(request_pairs),
+                    "",
+                )
+            )
+            semantic_page_id = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": "stock-monitor/phase1-provider-page/v1",
+                        "payload_sha256": str(source_row[2]),
+                        "request_page_token": (
+                            None if not page_tokens else page_tokens[0]
+                        ),
+                        "request_uri": base_uri,
+                        "source_type": source_type,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            source_semantic_ids[source_id] = semantic_page_id
+            document = json.loads(
+                bytes(payload_row[3]).decode("utf-8"),
+                parse_float=Decimal,
+            )
+            next_token = document.get("next_page_token")
+            page_records.append(
+                (
+                    source_id,
+                    source_type,
+                    base_uri,
+                    None if not page_tokens else page_tokens[0],
+                    None if next_token is None else str(next_token),
+                    semantic_page_id,
+                    tuple(relevant_paths),
+                )
+            )
+            if not collection_is_list and page_tokens:
+                raise InvalidJournalValue(
+                    "Phase 1 non-paginated provider source has a page token"
+                )
+        canonical_pages: dict[
+            tuple[str, str, str | None],
+            tuple[int, str | None, str, tuple[str, ...]],
+        ] = {}
+        for (
+            source_id,
+            source_type,
+            base_uri,
+            token,
+            next_token,
+            semantic_page_id,
+            relevant_paths,
+        ) in page_records:
+            position = (source_type, base_uri, token)
+            prior = canonical_pages.get(position)
+            if prior is None:
+                canonical_pages[position] = (
+                    source_id,
+                    next_token,
+                    semantic_page_id,
+                    relevant_paths,
+                )
+                continue
+            if (
+                prior[1] != next_token
+                or prior[2] != semantic_page_id
+                or prior[3] != relevant_paths
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 provider page chain contains conflicting duplicate pages"
+                )
+            # Exact retry aliases retain the first immutable page identity.
+            source_semantic_ids[source_id] = prior[2]
+
+        expected: set[tuple[str, str]] = {
+            (semantic_page_id, path)
+            for _source_id, _next, semantic_page_id, paths in canonical_pages.values()
+            for path in paths
+        }
+        selected_groups = {
+            (source_type, base_uri)
+            for (source_type, base_uri, _token), (
+                _source_id,
+                _next,
+                _semantic_page_id,
+                paths,
+            ) in canonical_pages.items()
+            if paths
+            and _PHASE1_ALPACA_SOURCE_CONTRACTS[source_type][3]
+        }
+        for selected_group in selected_groups:
+            group_rows = [
+                (token, next_token)
+                for (source_type, base_uri, token), (
+                    _source_id,
+                    next_token,
+                    _semantic_page_id,
+                    _paths,
+                ) in canonical_pages.items()
+                if (source_type, base_uri) == selected_group
+            ]
+            by_token: dict[str | None, str | None] = {}
+            for token, next_token in group_rows:
+                if token in by_token:
+                    raise InvalidJournalValue(
+                        "Phase 1 provider page chain contains duplicate pages"
+                    )
+                by_token[token] = next_token
+            if None not in by_token:
+                raise InvalidJournalValue(
+                    "Phase 1 provider page chain omits its first page"
+                )
+            visited: set[str | None] = set()
+            token: str | None = None
+            while True:
+                if token in visited:
+                    raise InvalidJournalValue(
+                        "Phase 1 provider page chain contains a cycle"
+                    )
+                visited.add(token)
+                next_token = by_token[token]
+                if next_token is None:
+                    break
+                if next_token not in by_token:
+                    raise InvalidJournalValue(
+                        "Phase 1 provider page chain is incomplete"
+                    )
+                token = next_token
+            if visited != set(by_token):
+                raise InvalidJournalValue(
+                    "Phase 1 provider page chain contains unlinked pages"
+                )
+        return frozenset(expected), source_semantic_ids
+
+    def _phase1_enrolled_session_evidence(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        calendar_digest: str,
+    ) -> tuple[
+        frozenset[tuple[str, int, str]],
+        tuple[JournalRowReference, ...],
+        datetime,
+    ]:
+        from zoneinfo import ZoneInfo
+
+        signal_row = _sql(
+            self._connection,
+            "SELECT symbol FROM phase1_signals "
+            "WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 signal does not exist")
+        symbol = str(signal_row[0])
+        stored_session = session_date.isoformat()
+        manifest_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS)
+            + " FROM phase1_observation_fetch_manifests "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND purpose = 'SIGNAL_LIFECYCLE' ORDER BY id",
+            (signal_id, stored_session),
+        ).fetchall()
+        if not manifest_rows:
+            raise InvalidJournalValue(
+                "PHASE1_OBSERVATION_COHORT_INCOMPLETE: no enrolled provider fetch"
+            )
+        collections = tuple(str(row[5]) for row in manifest_rows)
+        if (
+            len(manifest_rows) != 2
+            or set(collections) != {"trades", "quotes"}
+            or any(collections.count(value) != 1 for value in {"trades", "quotes"})
+        ):
+            raise MigrationCorruption(
+                "Phase 1 enrolled lifecycle fetch set is incomplete"
+            )
+        expected_items: set[tuple[str, int, str]] = set()
+        references: list[JournalRowReference] = []
+        received_through_values: list[datetime] = []
+        new_york = ZoneInfo("America/New_York")
+        for manifest_row in manifest_rows:
+            manifest_reference = _journal_row_reference(
+                "phase1_observation_fetch_manifests",
+                _PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS,
+                manifest_row,
+            )
+            manifest_without_hash = tuple(manifest_row[1:-1])
+            expected_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_OBSERVATION_FETCH_MANIFEST_COLUMNS[1:-1],
+                            manifest_without_hash,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            try:
+                requested_symbols_value = json.loads(str(manifest_row[6]))
+                requested_symbols = tuple(
+                    str(value) for value in requested_symbols_value
+                )
+            except (json.JSONDecodeError, TypeError) as error:
+                raise MigrationCorruption(
+                    "Phase 1 enrolled requested symbols are malformed"
+                ) from error
+            if (
+                str(manifest_row[16]) != expected_record_sha256
+                or str(manifest_row[2]) != signal_id
+                or str(manifest_row[3]) != stored_session
+                or str(manifest_row[4]) != "SIGNAL_LIFECYCLE"
+                or requested_symbols != (symbol,)
+                or int(manifest_row[10]) != 1
+                or str(manifest_row[13]) != calendar_digest
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 enrolled fetch manifest integrity failed"
+                )
+            cohort_id = str(manifest_row[1])
+            page_rows = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS)
+                + " FROM phase1_observation_fetch_pages "
+                "WHERE cohort_id = ? COLLATE BINARY ORDER BY page_ordinal",
+                (cohort_id,),
+            ).fetchall()
+            if (
+                not page_rows
+                or tuple(int(row[2]) for row in page_rows)
+                != tuple(range(1, len(page_rows) + 1))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 enrolled fetch page chain is incomplete"
+                )
+            page_sources: list[Phase1ProviderFetchPageSource] = []
+            page_semantic_digests: list[str] = []
+            source_references: list[JournalRowReference] = []
+            prior_next_token: str | None = None
+            for page_index, page_row in enumerate(page_rows):
+                page_reference = _journal_row_reference(
+                    "phase1_observation_fetch_pages",
+                    _PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS,
+                    page_row,
+                )
+                page_without_hash = tuple(page_row[1:-1])
+                expected_page_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_OBSERVATION_FETCH_PAGE_COLUMNS[1:-1],
+                                page_without_hash,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=int(page_row[3]),
+                )
+                payload = bytes(payload_row[3])
+                details = _canonical_stored_details(
+                    source_row[12],
+                    label="Phase 1 enrolled core source",
+                )
+                try:
+                    metadata = _phase1_recompute_alpaca_page_metadata(
+                        payload=payload,
+                        request_url=str(page_row[6]),
+                        source_type=str(page_row[5]),
+                        retrieved_at=_parse_canonical_timestamp(
+                            str(source_row[8])
+                        ),
+                    )
+                except InvalidJournalValue as error:
+                    raise MigrationCorruption(
+                        "Phase 1 enrolled provider page metadata is invalid"
+                    ) from error
+                expected_semantic_page_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "version": 1,
+                            "source_type": str(page_row[5]),
+                            "request_url": str(page_row[6]),
+                            "request_page_token": page_row[7],
+                            "next_page_token": page_row[8],
+                            "payload_sha256": str(page_row[9]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                if (
+                    str(page_row[11]) != expected_page_record_sha256
+                    or str(page_row[1]) != cohort_id
+                    or details
+                    != {
+                        "source_observation_id": str(page_row[4])
+                    }
+                    or str(getattr(metadata, "source_observation_id"))
+                    != str(page_row[4])
+                    or str(getattr(metadata, "payload_sha256"))
+                    != str(page_row[9])
+                    or _parse_canonical_timestamp(str(source_row[7]))
+                    != getattr(metadata, "source_time")
+                    or source_row[10] is None
+                    or int(source_row[10])
+                    != int(getattr(metadata, "delay_seconds"))
+                    or str(source_row[11]) != "OK"
+                    or str(page_row[10]) != expected_semantic_page_digest
+                    or (page_index == 0 and page_row[7] is not None)
+                    or (
+                        page_index > 0
+                        and page_row[7] != prior_next_token
+                    )
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 enrolled provider page integrity failed"
+                    )
+                prior_next_token = (
+                    None if page_row[8] is None else str(page_row[8])
+                )
+                page_sources.append(
+                    Phase1ProviderFetchPageSource(
+                        page_ordinal=int(page_row[2]),
+                        source_observation_id=str(page_row[4]),
+                        source_type=str(page_row[5]),
+                        request_url=str(page_row[6]),
+                        request_page_token=(
+                            None if page_row[7] is None else str(page_row[7])
+                        ),
+                        next_page_token=(
+                            None if page_row[8] is None else str(page_row[8])
+                        ),
+                        payload_sha256=str(page_row[9]),
+                        row_reference=page_reference,
+                    )
+                )
+                page_semantic_digests.append(expected_semantic_page_digest)
+                source_reference = _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                )
+                payload_reference = _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                )
+                source_references.extend((source_reference, payload_reference))
+                for item in _phase1_payload_items(payload):
+                    if item.symbol != symbol:
+                        continue
+                    item_at = _phase1_item_time(
+                        item.value.get("t"),
+                        getattr(metadata, "source_time"),
+                    )
+                    if item_at.astimezone(new_york).date() != session_date:
+                        raise MigrationCorruption(
+                            "Phase 1 enrolled item crosses its session"
+                        )
+                    expected_items.add(
+                        (cohort_id, int(page_row[2]), item.path)
+                    )
+                references.extend((page_reference, source_reference, payload_reference))
+                received_through_values.append(
+                    _parse_canonical_timestamp(str(source_row[8]))
+                )
+            if prior_next_token is not None:
+                raise MigrationCorruption(
+                    "Phase 1 enrolled provider page chain is not terminal"
+                )
+            expected_request_digest = _phase1_provider_request_digest(
+                collection=str(manifest_row[5]),
+                requested_symbols=requested_symbols,
+                request_url=page_sources[0].request_url,
+            )
+            expected_manifest_digest = _phase1_provider_manifest_digest(
+                collection=str(manifest_row[5]),
+                requested_symbols=requested_symbols,
+                request_digest=expected_request_digest,
+                pages=page_sources,
+            )
+            request_start, request_end = _phase1_historical_request_window(
+                tuple(page.request_url for page in page_sources)
+            )
+            expected_semantic_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "version": 1,
+                        "collection": str(manifest_row[5]),
+                        "requested_symbols": list(requested_symbols),
+                        "request_digest": expected_request_digest,
+                        "pages": [
+                            {
+                                "page_ordinal": page.page_ordinal,
+                                "semantic_page_digest": semantic_digest,
+                            }
+                            for page, semantic_digest in zip(
+                                page_sources,
+                                page_semantic_digests,
+                                strict=True,
+                            )
+                        ],
+                        "terminal": True,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-signal-lifecycle-fetch/v1",
+                tuple(source_references),
+                {
+                    "signal_id": signal_id,
+                    "session_date": stored_session,
+                    "collection": str(manifest_row[5]),
+                    "request_digest": expected_request_digest,
+                    "manifest_digest": expected_manifest_digest,
+                    "semantic_manifest_digest": expected_semantic_manifest_digest,
+                    "request_start": _canonical_timestamp(request_start),
+                    "request_end": _canonical_timestamp(request_end),
+                    "calendar_digest": calendar_digest,
+                    "received_through": str(manifest_row[14]),
+                },
+            )
+            if (
+                str(manifest_row[7]) != expected_request_digest
+                or str(manifest_row[8]) != expected_manifest_digest
+                or str(manifest_row[9]) != expected_semantic_manifest_digest
+                or _parse_canonical_timestamp(str(manifest_row[11]))
+                != request_start
+                or _parse_canonical_timestamp(str(manifest_row[12]))
+                != request_end
+                or str(manifest_row[15]) != expected_source_digest
+                or _parse_canonical_timestamp(str(manifest_row[14]))
+                != max(
+                    _parse_canonical_timestamp(
+                        str(
+                            self._phase1_core_source_rows(
+                                source_observation_id=int(page_row[3])
+                            )[0][8]
+                        )
+                    )
+                    for page_row in page_rows
+                )
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 enrolled fetch manifest digest is inconsistent"
+                )
+            references.append(manifest_reference)
+        return (
+            frozenset(expected_items),
+            tuple(references),
+            max(received_through_values),
+        )
+
+    def _complete_phase1_session(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        cohort_through_ordinal: int,
+        expected_observation_count: int,
+        received_through: datetime,
+        completed_at: datetime,
+        calendar_resolver: object,
+    ) -> tuple[int, bool]:
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        stored_session = _canonical_date(session_date)
+        cohort_through_ordinal = _require_integer(
+            cohort_through_ordinal,
+            "Phase 1 cohort terminal ordinal",
+            minimum=0,
+        )
+        expected_observation_count = _require_integer(
+            expected_observation_count,
+            "Phase 1 expected observation count",
+            minimum=0,
+        )
+        if expected_observation_count != cohort_through_ordinal:
+            raise InvalidJournalValue(
+                "Phase 1 completion ordinals must be session-local and contiguous"
+            )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        if not calendar_resolver.is_open(session_date):
+            raise InvalidJournalValue(
+                "Phase 1 completion requires an open release-calendar session"
+            )
+        schedule = calendar_resolver.session(session_date)
+        expected_close = datetime.combine(
+            session_date,
+            schedule.close_time,
+            schedule.timezone,
+        )
+        stored_received_through = _canonical_timestamp(received_through)
+        stored_completed_at = _canonical_timestamp(completed_at)
+        if (
+            stored_completed_at < _canonical_timestamp(expected_close)
+            or stored_received_through > stored_completed_at
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 completion lies outside its completed session"
+            )
+        rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_OBSERVATION_COLUMNS)
+            + " FROM phase1_observations WHERE signal_id = ? COLLATE BINARY "
+            "AND session_date = ? AND received_at <= ? "
+            "ORDER BY cohort_ordinal",
+            (signal_id, stored_session, stored_received_through),
+        ).fetchall()
+        if (
+            len(rows) != expected_observation_count
+            or tuple(int(row[16]) for row in rows)
+            != tuple(range(1, expected_observation_count + 1))
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 completion requires its exact contiguous observation cohort"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        (
+            expected_items,
+            enrolled_references,
+            enrolled_received_through,
+        ) = self._phase1_enrolled_session_evidence(
+            signal_id=signal_id,
+            session_date=session_date,
+            calendar_digest=calendar_digest,
+        )
+        stored_items = frozenset(
+            (str(row[26]), int(row[27]), str(row[5])) for row in rows
+        )
+        if (
+            stored_items != expected_items
+            or expected_observation_count != len(expected_items)
+            or _parse_canonical_timestamp(stored_received_through)
+            != enrolled_received_through
+        ):
+            raise InvalidJournalValue("PHASE1_OBSERVATION_COHORT_INCOMPLETE")
+        _validate_phase1_observation_chronology(rows)
+        observation_references = tuple(
+            _journal_row_reference(
+                "phase1_observations",
+                _PHASE1_OBSERVATION_COLUMNS,
+                row,
+            )
+            for row in rows
+        )
+        references = (*enrolled_references, *observation_references)
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-session-completion/v1",
+            references,
+            {
+                "signal_id": signal_id,
+                "session_date": stored_session,
+                "cohort_through_ordinal": cohort_through_ordinal,
+                "expected_observation_count": expected_observation_count,
+                "received_through": stored_received_through,
+                "completed_at": stored_completed_at,
+            },
+        )
+        completion_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-session-completion/v1\x00"
+                + signal_id
+                + "\x00"
+                + stored_session
+                + "\x00"
+                + source_digest
+            ).encode("utf-8")
+        ).hexdigest()
+        immutable = (
+            completion_id,
+            signal_id,
+            stored_session,
+            cohort_through_ordinal,
+            expected_observation_count,
+            stored_received_through,
+            stored_completed_at,
+            source_digest,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT id, completion_id, signal_id, session_date, "
+            "cohort_through_ordinal, expected_observation_count, "
+            "received_through, completed_at, source_digest "
+            "FROM phase1_session_completions WHERE signal_id = ? COLLATE BINARY "
+            "AND session_date = ?",
+            (signal_id, stored_session),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:]) != immutable:
+                raise IdempotencyConflict(
+                    "Phase 1 session completion conflicts with stored content"
+                )
+            return int(existing[0]), True
+        try:
+            cursor = _sql(
+                self._connection,
+                "INSERT INTO phase1_session_completions("
+                "completion_id, signal_id, session_date, "
+                "cohort_through_ordinal, expected_observation_count, "
+                "received_through, completed_at, source_digest"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                immutable,
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 session completion conflicts with stored content"
+            ) from error
+        return int(cursor.lastrowid), False
+
+    def _read_phase1_session_completion_source(
+        self,
+        *,
+        signal_id: str,
+        session_date: date,
+        query_cutoff: datetime,
+    ) -> Phase1SessionCompletionSource:
+        self._ensure_open()
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        stored_session = _canonical_date(session_date)
+        stored_cutoff = _canonical_timestamp(query_cutoff)
+        row = _sql(
+            self._connection,
+            "SELECT id, completion_id, signal_id, session_date, "
+            "cohort_through_ordinal, expected_observation_count, "
+            "received_through, completed_at, source_digest "
+            "FROM phase1_session_completions WHERE signal_id = ? COLLATE BINARY "
+            "AND session_date = ? AND completed_at <= ?",
+            (signal_id, stored_session, stored_cutoff),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue(
+                "Phase 1 session completion is unavailable at the query cutoff"
+            )
+        if self._phase1_late_evidence_references(
+            completion_row=row,
+            query_cutoff=_parse_canonical_timestamp(stored_cutoff),
+        ):
+            raise InvalidJournalValue(
+                "PHASE1_OBSERVATION_COHORT_LATE_FACT: completion is invalidated"
+            )
+        observation_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_OBSERVATION_COLUMNS)
+            + " FROM phase1_observations WHERE signal_id = ? COLLATE BINARY "
+            "AND session_date = ? AND received_at <= ? ORDER BY cohort_ordinal",
+            (signal_id, stored_session, str(row[6])),
+        ).fetchall()
+        expected_count = int(row[5])
+        if (
+            int(row[4]) != expected_count
+            or len(observation_rows) != expected_count
+            or tuple(int(item[16]) for item in observation_rows)
+            != tuple(range(1, expected_count + 1))
+        ):
+            raise MigrationCorruption(
+                "Phase 1 session completion manifest integrity failed"
+            )
+        calendar_row = _sql(
+            self._connection,
+            "SELECT calendar_digest FROM phase1_signals "
+            "WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if calendar_row is None:
+            raise MigrationCorruption(
+                "Phase 1 completion signal calendar is missing"
+            )
+        (
+            current_items,
+            enrolled_references,
+            enrolled_received_through,
+        ) = self._phase1_enrolled_session_evidence(
+            signal_id=signal_id,
+            session_date=session_date,
+            calendar_digest=str(calendar_row[0]),
+        )
+        stored_items = frozenset(
+            (str(item[26]), int(item[27]), str(item[5]))
+            for item in observation_rows
+        )
+        if (
+            stored_items != current_items
+            or expected_count != len(current_items)
+            or _parse_canonical_timestamp(str(row[6]))
+            != enrolled_received_through
+        ):
+            raise InvalidJournalValue("PHASE1_OBSERVATION_COHORT_INCOMPLETE")
+        _validate_phase1_observation_chronology(observation_rows)
+        observation_references = tuple(
+            _journal_row_reference(
+                "phase1_observations",
+                _PHASE1_OBSERVATION_COLUMNS,
+                item,
+            )
+            for item in observation_rows
+        )
+        references = (*enrolled_references, *observation_references)
+        expected_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-session-completion/v1",
+            references,
+            {
+                "signal_id": signal_id,
+                "session_date": stored_session,
+                "cohort_through_ordinal": int(row[4]),
+                "expected_observation_count": expected_count,
+                "received_through": str(row[6]),
+                "completed_at": str(row[7]),
+            },
+        )
+        expected_completion_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-session-completion/v1\x00"
+                + signal_id
+                + "\x00"
+                + stored_session
+                + "\x00"
+                + expected_digest
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(row[1]) != expected_completion_id or str(row[8]) != expected_digest:
+            raise MigrationCorruption(
+                "Phase 1 session completion digest integrity failed"
+            )
+        row_reference = _journal_row_reference(
+            "phase1_session_completions",
+            _PHASE1_SESSION_COMPLETION_COLUMNS,
+            row,
+        )
+        return Phase1SessionCompletionSource(
+            row_id=int(row[0]),
+            completion_id=str(row[1]),
+            signal_id=str(row[2]),
+            session_date=date.fromisoformat(str(row[3])),
+            cohort_through_ordinal=int(row[4]),
+            expected_observation_count=expected_count,
+            received_through=_parse_canonical_timestamp(str(row[6])),
+            completed_at=_parse_canonical_timestamp(str(row[7])),
+            source_digest=str(row[8]),
+            row_reference=row_reference,
+            row_references=(*references, row_reference),
+        )
+
+    @staticmethod
+    def _phase1_lifecycle_source_from_row(
+        row: Sequence[object],
+    ) -> Phase1LifecycleEventSource:
+        reference = _journal_row_reference(
+            "phase1_signal_events",
+            _PHASE1_SIGNAL_EVENT_COLUMNS,
+            row,
+        )
+        return Phase1LifecycleEventSource(
+            row_id=int(row[0]),
+            lifecycle_event_id=str(row[1]),
+            signal_id=str(row[2]),
+            event_ordinal=int(row[3]),
+            event_kind=str(row[4]),
+            from_status=None if row[5] is None else str(row[5]),
+            to_status=str(row[6]),
+            event_time=_parse_canonical_timestamp(str(row[7])),
+            message_time=_parse_canonical_timestamp(str(row[8])),
+            received_at=_parse_canonical_timestamp(str(row[9])),
+            confirmation_execution_event_id=(
+                None if row[10] is None else int(row[10])
+            ),
+            trigger_observation_id=(
+                None if row[11] is None else str(row[11])
+            ),
+            quote_observation_id=(
+                None if row[12] is None else str(row[12])
+            ),
+            session_completion_id=(
+                None if row[13] is None else str(row[13])
+            ),
+            exit_observation_id=(
+                None if row[14] is None else str(row[14])
+            ),
+            exit_authority_digest=(
+                None if row[15] is None else str(row[15])
+            ),
+            shares=None if row[16] is None else int(row[16]),
+            price_micros=None if row[17] is None else int(row[17]),
+            recommended_stop_micros=(
+                None if row[18] is None else int(row[18])
+            ),
+            source_digest=str(row[19]),
+            row_reference=reference,
+            signal_evidence_id=(
+                None if row[21] is None else str(row[21])
+            ),
+            expiry_source_id=(
+                None if row[22] is None else str(row[22])
+            ),
+        )
+
+    @staticmethod
+    def _phase1_entry_event_material(
+        values_without_digest: Sequence[object],
+        details_json: str,
+    ) -> dict[str, object]:
+        if len(values_without_digest) != 18:
+            raise JournalError("Phase 1 lifecycle event material is malformed")
+        return {
+            **dict(
+                zip(
+                    _PHASE1_SIGNAL_EVENT_COLUMNS[1:19],
+                    values_without_digest,
+                    strict=True,
+                )
+            ),
+            "details_json": details_json,
+        }
+
+    def _insert_phase1_entry_event(
+        self,
+        *,
+        lifecycle_event_id: str,
+        signal_id: str,
+        event_ordinal: int,
+        event_kind: str,
+        from_status: str,
+        to_status: str,
+        event_time: datetime,
+        message_time: datetime,
+        received_at: datetime,
+        confirmation_execution_event_id: int | None,
+        trigger_observation_id: str | None,
+        quote_observation_id: str | None,
+        session_completion_id: str,
+        shares: int | None,
+        price_micros: int | None,
+        references: Sequence[JournalRowReference],
+        details: Mapping[str, object],
+    ) -> Sequence[object]:
+        details_json = _canonical_details(details)
+        values_without_digest = (
+            lifecycle_event_id,
+            signal_id,
+            event_ordinal,
+            event_kind,
+            from_status,
+            to_status,
+            _canonical_timestamp(event_time),
+            _canonical_timestamp(message_time),
+            _canonical_timestamp(received_at),
+            confirmation_execution_event_id,
+            trigger_observation_id,
+            quote_observation_id,
+            session_completion_id,
+            None,
+            None,
+            shares,
+            price_micros,
+            None,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-entry-lifecycle-event/v1",
+            tuple(references),
+            self._phase1_entry_event_material(
+                values_without_digest,
+                details_json,
+            ),
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_signal_events("
+                "lifecycle_event_id, signal_id, event_ordinal, event_kind, "
+                "from_status, to_status, event_time, message_time, received_at, "
+                "confirmation_execution_event_id, trigger_observation_id, "
+                "quote_observation_id, session_completion_id, "
+                "exit_observation_id, exit_authority_digest, shares, "
+                "price_micros, recommended_stop_micros, source_digest, "
+                "details_json) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*values_without_digest, source_digest, details_json),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 entry lifecycle conflicts with stored content"
+            ) from error
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE lifecycle_event_id = ? COLLATE BINARY",
+            (lifecycle_event_id,),
+        ).fetchone()
+        if row is None:
+            raise JournalError("Phase 1 entry lifecycle insert was not readable")
+        return row
+
+    def _insert_phase1_entry_buy(
+        self,
+        *,
+        signal_row: Sequence[object],
+        event_row: Sequence[object],
+        signal_id: str,
+        shares: int,
+        price_micros: int,
+        occurred_at: datetime,
+        received_at: datetime,
+        session_date: date,
+    ) -> None:
+        posting_key = "phase1-canonical-buy:" + signal_id
+        event_reference = _journal_row_reference(
+            "phase1_signal_events",
+            _PHASE1_SIGNAL_EVENT_COLUMNS,
+            event_row,
+        )
+        signal_reference = _journal_row_reference(
+            "phase1_signals",
+            _PHASE1_SIGNAL_COLUMNS,
+            signal_row,
+        )
+        fee_schedule_version = "PHASE1_NO_ENTRY_FEE_V1"
+        fee_schedule_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-entry-fee-schedule/v1",
+                    "payload": {"fee_micros": 0, "version": fee_schedule_version},
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        details_json = _canonical_details(
+            {
+                "lifecycle_event_source_digest": str(event_row[19]),
+            }
+        )
+        posting_values_without_hashes = (
+            posting_key,
+            str(event_row[1]),
+            signal_id,
+            "BUY",
+            "CASH",
+            -(price_micros * shares),
+            shares,
+            price_micros,
+            _canonical_timestamp(occurred_at),
+            _canonical_timestamp(received_at),
+            session_date.isoformat(),
+            fee_schedule_version,
+            fee_schedule_digest,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-canonical-buy/v1",
+            (signal_reference, event_reference),
+            {
+                **dict(
+                    zip(
+                        _PHASE1_CANONICAL_POSTING_COLUMNS[1:14],
+                        posting_values_without_hashes,
+                        strict=True,
+                    )
+                ),
+                "details_json": details_json,
+            },
+        )
+        record_material = {
+            **dict(
+                zip(
+                    _PHASE1_CANONICAL_POSTING_COLUMNS[1:15],
+                    (*posting_values_without_hashes, source_digest),
+                    strict=True,
+                )
+            ),
+            "details_json": details_json,
+        }
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(record_material).encode("utf-8")
+        ).hexdigest()
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_canonical_postings("
+                "posting_key, lifecycle_event_id, signal_id, entry_kind, "
+                "account_name, amount_micros, shares_delta, unit_price_micros, "
+                "occurred_at, received_at, settlement_available_session, "
+                "fee_schedule_version, fee_schedule_digest, source_digest, "
+                "record_sha256, details_json) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    *posting_values_without_hashes,
+                    source_digest,
+                    record_sha256,
+                    details_json,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 canonical BUY conflicts with stored content"
+            ) from error
+
+    def _record_phase1_signal_evidence(
+        self,
+        *,
+        authority: object,
+        registry_source_row_id: int,
+        source_observation_row_ids: Sequence[int],
+        manifest_bytes: bytes,
+    ) -> StoredPhase1SignalEvidence:
+        from .risk import Phase1SignalEvidenceAuthority
+
+        if not self._transaction_active:
+            raise JournalError(
+                "Phase 1 signal evidence requires an active transaction"
+            )
+        if not isinstance(authority, Phase1SignalEvidenceAuthority):
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence authority is malformed"
+            )
+        if type(manifest_bytes) is not bytes or not manifest_bytes:
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence manifest is malformed"
+            )
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        if manifest_digest != authority.source_digest:
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence manifest digest conflicts"
+            )
+        signal_source = authority.signal_source
+        if not isinstance(signal_source, Phase1SignalSource):
+            raise InvalidJournalValue(
+                "Phase 1 signal evidence signal source is malformed"
+            )
+        bundle = authority.reviewed_bundle
+        decision = authority.evidence_decision
+        expected_registry_document = _phase1_reviewed_registry_document(bundle)
+        expected_registry_payload = _canonical_audit_json(
+            expected_registry_document
+        ).encode("utf-8")
+        registry_source_row_id = _require_integer(
+            registry_source_row_id,
+            "Phase 1 evidence registry source row ID",
+            minimum=1,
+        )
+        registry_row, registry_payload_row = self._phase1_core_source_rows(
+            source_observation_id=registry_source_row_id,
+        )
+        registry_payload = bytes(registry_payload_row[3])
+        registry_details = _canonical_stored_details(
+            registry_row[12],
+            label="Phase 1 evidence registry source",
+        )
+        expected_registry_details = {
+            "content_hash": authority.registry_content_hash,
+            "registry_id": authority.registry_id,
+        }
+        reviewed_at = getattr(bundle, "reviewed_at")
+        if (
+            registry_payload != expected_registry_payload
+            or hashlib.sha256(registry_payload).hexdigest()
+            != authority.registry_content_hash
+            or str(registry_row[3])
+            != (
+                "urn:stock-monitor:reviewed-evidence-registry:"
+                + authority.registry_id
+            )
+            or str(registry_row[4]) != "REVIEWED_EVIDENCE_REGISTRY"
+            or str(registry_row[5]) != "operator-reviewed"
+            or registry_row[6] is not None
+            or _parse_canonical_timestamp(str(registry_row[7])) != reviewed_at
+            or _parse_canonical_timestamp(str(registry_row[8])) != reviewed_at
+            or registry_row[9] is not None
+            or int(registry_row[10]) != 0
+            or str(registry_row[11]) != "REVIEWED"
+            or registry_details != expected_registry_details
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 evidence registry conflicts with issued authority"
+            )
+
+        if isinstance(source_observation_row_ids, (str, bytes)):
+            raise InvalidJournalValue(
+                "Phase 1 evidence source row IDs must be an exact sequence"
+            )
+        binding_row_ids = tuple(
+            _require_integer(
+                value,
+                "Phase 1 evidence source observation row ID",
+                minimum=1,
+            )
+            for value in source_observation_row_ids
+        )
+        bindings = tuple(getattr(bundle, "source_bindings"))
+        if (
+            not binding_row_ids
+            or len(binding_row_ids) != len(set(binding_row_ids))
+            or len(binding_row_ids) != len(bindings)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 evidence source row set is incomplete"
+            )
+        rows_by_external_id: dict[
+            str,
+            tuple[
+                Sequence[object],
+                Sequence[object],
+                JournalRowReference,
+                JournalRowReference,
+            ],
+        ] = {}
+        for row_id in binding_row_ids:
+            source_row, payload_row = self._phase1_core_source_rows(
+                source_observation_id=row_id,
+            )
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 evidence source binding",
+            )
+            external_id = details.get("source_observation_id")
+            if type(external_id) is not str or external_id in rows_by_external_id:
+                raise InvalidJournalValue(
+                    "Phase 1 evidence source row identity is not exact"
+                )
+            rows_by_external_id[external_id] = (
+                source_row,
+                payload_row,
+                _journal_row_reference(
+                    "source_observations",
+                    _SOURCE_OBSERVATION_COLUMNS,
+                    source_row,
+                ),
+                _journal_row_reference(
+                    "phase1_source_payloads",
+                    _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                    payload_row,
+                ),
+            )
+        expected_external_ids = tuple(
+            getattr(binding.document, "source_observation_id")
+            for binding in bindings
+        )
+        if set(rows_by_external_id) != set(expected_external_ids) or (
+            set(expected_external_ids) != set(authority.source_observation_ids)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 evidence source row set conflicts with authority"
+            )
+
+        binding_values: list[tuple[object, ...]] = []
+        binding_core_references: list[JournalRowReference] = []
+        canonical_binding_row_ids: list[int] = []
+        for ordinal, binding in enumerate(bindings, start=1):
+            document = binding.document
+            external_id = document.source_observation_id
+            source_row, payload_row, source_reference, payload_reference = (
+                rows_by_external_id[external_id]
+            )
+            source_time = document.published_at or document.retrieved_at
+            expected_details = {
+                "accession": document.accession,
+                "issuer_cik": binding.issuer_cik,
+                "source_observation_id": external_id,
+                "source_role": document.source_role,
+                "symbol": binding.symbol,
+                "timestamp_source": document.timestamp_source,
+            }
+            details = _canonical_stored_details(
+                source_row[12],
+                label="Phase 1 evidence source binding",
+            )
+            expected_delay = int(
+                (document.retrieved_at - source_time).total_seconds()
+            )
+            if (
+                bytes(payload_row[3]) != document.body
+                or str(source_row[3]) != document.url
+                or str(source_row[4]) != document.source_type
+                or str(source_row[5]) != document.publisher
+                or str(source_row[6]) != document.timestamp_source
+                or _parse_canonical_timestamp(str(source_row[7])) != source_time
+                or _parse_canonical_timestamp(str(source_row[8]))
+                != document.retrieved_at
+                or source_row[9] is not None
+                or int(source_row[10]) != expected_delay
+                or str(source_row[11])
+                != ("OK" if binding.healthy else "UNHEALTHY")
+                or details != expected_details
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 evidence binding conflicts with issued authority"
+                )
+            binding_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-signal-evidence-binding/v1",
+                (source_reference, payload_reference),
+                {
+                    "external_source_observation_id": external_id,
+                    "binding_ordinal": ordinal,
+                },
+            )
+            values_without_hash = (
+                "",  # evidence_id is filled after its deterministic derivation.
+                ordinal,
+                int(source_row[0]),
+                external_id,
+                binding_source_digest,
+            )
+            binding_values.append(values_without_hash)
+            binding_core_references.extend((source_reference, payload_reference))
+            canonical_binding_row_ids.append(int(source_row[0]))
+
+        release_sha256 = getattr(bundle, "_release_pin", None)
+        if (
+            type(release_sha256) is not str
+            or release_sha256 != authority.registry_content_hash
+            or authority.bundle_digest != getattr(bundle, "_bundle_digest", None)
+            or authority.decision_digest != getattr(decision, "_decision_digest", None)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 evidence release authority is inconsistent"
+            )
+        evidence_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-signal-evidence/v1\x00"
+                + authority.signal_id
+                + "\x00"
+                + _canonical_timestamp(authority.review_at)
+                + "\x00"
+                + manifest_digest
+            ).encode("utf-8")
+        ).hexdigest()
+        registry_reference = _journal_row_reference(
+            "source_observations",
+            _SOURCE_OBSERVATION_COLUMNS,
+            registry_row,
+        )
+        registry_payload_reference = _journal_row_reference(
+            "phase1_source_payloads",
+            _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+            registry_payload_row,
+        )
+        provenance_references = (
+            *signal_source.row_references,
+            registry_reference,
+            registry_payload_reference,
+            *binding_core_references,
+        )
+        source_observation_highwater = max(
+            registry_source_row_id,
+            *canonical_binding_row_ids,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-signal-evidence-source/v1",
+            provenance_references,
+            {
+                "evidence_id": evidence_id,
+                "signal_id": authority.signal_id,
+                "review_at": _canonical_timestamp(authority.review_at),
+                "manifest_digest": manifest_digest,
+                "registry_source_row_id": registry_source_row_id,
+                "source_observation_row_ids": canonical_binding_row_ids,
+                "registry_id": authority.registry_id,
+                "registry_content_hash": authority.registry_content_hash,
+                "registry_release_pin": release_sha256,
+                "bundle_digest": authority.bundle_digest,
+                "decision_digest": authority.decision_digest,
+                "calendar_digest": authority.calendar_digest,
+                "source_observation_highwater": source_observation_highwater,
+                "expected_source_observation_count": len(bindings),
+            },
+        )
+        review_without_hash = (
+            evidence_id,
+            authority.signal_id,
+            _canonical_timestamp(authority.review_at),
+            registry_source_row_id,
+            manifest_digest,
+            manifest_bytes,
+            authority.registry_id,
+            authority.registry_content_hash,
+            release_sha256,
+            authority.bundle_digest,
+            authority.decision_digest,
+            authority.calendar_digest,
+            source_observation_highwater,
+            len(bindings),
+            _canonical_timestamp(authority.review_at),
+            source_digest,
+        )
+        review_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    **dict(
+                        zip(
+                            _PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS[1:-1],
+                            (
+                                *review_without_hash[:5],
+                                manifest_bytes.hex(),
+                                *review_without_hash[6:],
+                            ),
+                            strict=True,
+                        )
+                    ),
+                    "manifest_bytes_encoding": "hex",
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS)
+            + " FROM phase1_signal_evidence_reviews "
+            "WHERE signal_id = ? COLLATE BINARY AND review_at = ?",
+            (authority.signal_id, _canonical_timestamp(authority.review_at)),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:-1]) != review_without_hash or str(
+                existing[-1]
+            ) != review_record_sha256:
+                raise IdempotencyConflict(
+                    "Phase 1 signal evidence conflicts with stored content"
+                )
+            return StoredPhase1SignalEvidence(
+                manifest_digest=manifest_digest,
+                source_digest=source_digest,
+                duplicate=True,
+            )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_signal_evidence_reviews("
+                + ", ".join(_PHASE1_SIGNAL_EVIDENCE_REVIEW_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join(
+                    "?" for _ in (*review_without_hash, review_record_sha256)
+                )
+                + ")",
+                (*review_without_hash, review_record_sha256),
+            )
+            for values in binding_values:
+                completed_values = (evidence_id, *values[1:])
+                binding_record_sha256 = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS[1:-1],
+                                completed_values,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                _sql(
+                    self._connection,
+                    "INSERT INTO phase1_signal_evidence_bindings("
+                    + ", ".join(_PHASE1_SIGNAL_EVIDENCE_BINDING_COLUMNS[1:])
+                    + ") VALUES ("
+                    + ", ".join(
+                        "?" for _ in (*completed_values, binding_record_sha256)
+                    )
+                    + ")",
+                    (*completed_values, binding_record_sha256),
+                )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 signal evidence conflicts with stored content"
+            ) from error
+        return StoredPhase1SignalEvidence(
+            manifest_digest=manifest_digest,
+            source_digest=source_digest,
+            duplicate=False,
+        )
+
+    def _record_phase1_entry(
+        self,
+        *,
+        signal_id: str,
+        confirmation_action_source: JournalActionSource | None,
+        trigger_observation_id: str | None,
+        quote_observation_id: str | None,
+        calendar_resolver: object,
+        recorded_at: datetime,
+    ) -> None:
+        from zoneinfo import ZoneInfo
+
+        from .ledger import _phase1_entry_result_from_observations
+        from .phase1 import SignalStatus
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        if not self._transaction_active:
+            raise JournalError("Phase 1 entry requires an active transaction")
+        if confirmation_action_source is not None and (
+            not is_verified_journal_action_source(confirmation_action_source)
+            or _journal_action_source_owner(confirmation_action_source) is not self
+        ):
+            raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
+        signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        signal_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_COLUMNS)
+            + " FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise InvalidJournalValue("Phase 1 entry signal does not exist")
+        signal = dict(zip(_PHASE1_SIGNAL_COLUMNS, tuple(signal_row), strict=True))
+        role = str(signal["role"])
+        publication_session = date.fromisoformat(
+            str(signal["publication_session"])
+        )
+        if (
+            str(signal["calendar_digest"]) != _calendar_digest(calendar_resolver)
+            or not calendar_resolver.is_open(publication_session)
+        ):
+            raise RiskBlock("PHASE1_CALENDAR_SOURCE_MISMATCH")
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "ORDER BY event_ordinal",
+            (signal_id,),
+        ).fetchall()
+        if not event_rows:
+            raise MigrationCorruption("Phase 1 signal has no publication event")
+        current_status = str(event_rows[-1][6])
+        metadata_only = (
+            current_status == "TRIGGERED_PAPER"
+            and confirmation_action_source is not None
+        )
+        terminal_retry = current_status in {
+            "LIVE_CONFIRMED",
+            "SKIPPED_LIVE_TRACKED_PAPER",
+            "SHADOW_FILLED_INFORMATIONAL",
+        }
+        if current_status not in {
+            "PUBLISHED",
+            "TRIGGERED_PAPER",
+            "LIVE_CONFIRMED",
+            "SKIPPED_LIVE_TRACKED_PAPER",
+            "SHADOW_FILLED_INFORMATIONAL",
+        }:
+            raise InvalidJournalValue(
+                "Phase 1 entry conflicts with the current lifecycle disposition"
+            )
+        completion = self._read_phase1_session_completion_source(
+            signal_id=signal_id,
+            session_date=publication_session,
+            query_cutoff=normalized_recorded_at,
+        )
+        if completion.completed_at > normalized_recorded_at:
+            raise InvalidJournalValue("Phase 1 entry predates session completion")
+        observation_rows = _sql(
+            self._connection,
+            "SELECT observation_id FROM phase1_observations "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND received_at <= ? ORDER BY cohort_ordinal",
+            (
+                signal_id,
+                publication_session.isoformat(),
+                _canonical_timestamp(completion.received_through),
+            ),
+        ).fetchall()
+        observations = tuple(
+            self._read_phase1_observation_source(
+                observation_id=str(row[0]),
+                query_cutoff=completion.received_through,
+            )
+            for row in observation_rows
+        )
+        if len(observations) != completion.expected_observation_count:
+            raise InvalidJournalValue("PHASE1_OBSERVATION_COHORT_INCOMPLETE")
+        simulated = _phase1_entry_result_from_observations(
+            observations,
+            trigger=money_from_micros(int(signal["trigger_price_micros"])),
+            limit=money_from_micros(int(signal["maximum_entry_micros"])),
+        )
+        if simulated.status is not SignalStatus.TRIGGERED_PAPER:
+            raise InvalidJournalValue(
+                "Phase 1 entry does not match the exact sealed cohort result"
+            )
+        by_id = {item.observation_id: item for item in observations}
+        metadata_context = metadata_only or (
+            terminal_retry
+            and str(event_rows[-1][5]) == "TRIGGERED_PAPER"
+        )
+        if metadata_context:
+            if trigger_observation_id is not None or quote_observation_id is not None:
+                raise InvalidJournalValue(
+                    "Phase 1 LIVE metadata cannot repeat entry observations"
+                )
+            economic_event = event_rows[2] if terminal_retry else event_rows[-1]
+            if (
+                str(economic_event[4]) != "PAPER_FILL"
+                or str(economic_event[13]) != completion.completion_id
+                or economic_event[11] is None
+                or economic_event[12] is None
+                or simulated.trigger_observation_id != str(economic_event[11])
+                or simulated.quote_observation_id != str(economic_event[12])
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 paper entry conflicts with its sealed cohort"
+                )
+            trigger = by_id.get(str(economic_event[11]))
+            quote = by_id.get(str(economic_event[12]))
+        else:
+            if (
+                trigger_observation_id is None
+                or quote_observation_id is None
+                or simulated.trigger_observation_id != trigger_observation_id
+                or simulated.quote_observation_id != quote_observation_id
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 entry does not match the exact sealed cohort result"
+                )
+            trigger = by_id.get(trigger_observation_id)
+            quote = by_id.get(quote_observation_id)
+        if trigger is None or quote is None:
+            raise MigrationCorruption(
+                "Phase 1 entry observations are missing from the sealed cohort"
+            )
+        schedule = calendar_resolver.session(publication_session)
+        expected_close = datetime.combine(
+            publication_session,
+            schedule.close_time,
+            schedule.timezone,
+        )
+        if (
+            trigger.source_time.astimezone(ZoneInfo("America/New_York")).date()
+            != publication_session
+            or quote.source_time.astimezone(ZoneInfo("America/New_York")).date()
+            != publication_session
+            or trigger.source_time > expected_close
+            or quote.source_time > expected_close
+            or quote.source_time <= trigger.source_time
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 entry observations lie outside the release session"
+            )
+        current_action: JournalActionSource | None = None
+        if confirmation_action_source is not None:
+            current_action = self._read_action_source(
+                execution_event_id=confirmation_action_source.execution_event_id,
+            )
+            if _action_source_fingerprint(current_action) != _action_source_fingerprint(
+                confirmation_action_source
+            ):
+                raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
+            event_kind_by_action = {
+                "BOUGHT": "LIVE_CONFIRM",
+                "SKIPPED": "LIVE_SKIP",
+            }
+            event_kind = event_kind_by_action.get(current_action.domain_kind)
+            if event_kind is None:
+                raise InvalidJournalValue(
+                    "Phase 1 confirmation action does not select an entry disposition"
+                )
+            action_session = current_action.event_time.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            if (
+                current_action.symbol != str(signal["symbol"])
+                or action_session != publication_session
+                or current_action.event_time < trigger.source_time
+                or current_action.received_at > normalized_recorded_at
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 confirmation action conflicts with the signal session"
+                )
+            if event_kind == "LIVE_SKIP" and any(
+                value is not None
+                for value in (
+                    current_action.shares,
+                    current_action.price_micros,
+                    current_action.bid_micros,
+                    current_action.ask_micros,
+                    current_action.user_confirmed_stop_micros,
+                )
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 SKIPPED action carries unexpected fill fields"
+                )
+        else:
+            event_kind = "PAPER_FILL"
+
+        signal_reference = _journal_row_reference(
+            "phase1_signals",
+            _PHASE1_SIGNAL_COLUMNS,
+            signal_row,
+        )
+
+        if role == "WATCHLIST_SHADOW":
+            if current_action is not None:
+                raise InvalidJournalValue(
+                    "Phase 1 watchlist shadows cannot record LIVE actions"
+                )
+            event_kind = "SHADOW_FILL"
+        elif role != "PRIMARY":
+            raise MigrationCorruption("Phase 1 signal role is unsupported")
+
+        if current_status != "PUBLISHED" and not metadata_only:
+            last_row = event_rows[-1]
+            retry_matches = False
+            if current_status == "TRIGGERED_PAPER":
+                retry_matches = (
+                    current_action is None
+                    and role == "PRIMARY"
+                    and str(last_row[4]) == "PAPER_FILL"
+                    and str(last_row[11]) == trigger.observation_id
+                    and str(last_row[12]) == quote.observation_id
+                )
+            elif current_status == "SHADOW_FILLED_INFORMATIONAL":
+                retry_matches = (
+                    current_action is None
+                    and role == "WATCHLIST_SHADOW"
+                    and str(last_row[4]) == "SHADOW_FILL"
+                    and str(last_row[11]) == trigger.observation_id
+                    and str(last_row[12]) == quote.observation_id
+                )
+            elif current_status in {
+                "LIVE_CONFIRMED",
+                "SKIPPED_LIVE_TRACKED_PAPER",
+            }:
+                expected_event_kind = (
+                    "LIVE_CONFIRM"
+                    if current_status == "LIVE_CONFIRMED"
+                    else "LIVE_SKIP"
+                )
+                retry_matches = (
+                    current_action is not None
+                    and str(last_row[4]) == expected_event_kind
+                    and last_row[10] == current_action.execution_event_id
+                    and (
+                        (
+                            str(last_row[5]) == "TRIGGERED_PAPER"
+                            and trigger_observation_id is None
+                            and quote_observation_id is None
+                        )
+                        or (
+                            str(last_row[5]) == "TRIGGERED_AWAITING_LIMIT"
+                            and str(last_row[11]) == trigger.observation_id
+                            and str(last_row[12]) == quote.observation_id
+                        )
+                    )
+                )
+            if not retry_matches:
+                raise IdempotencyConflict(
+                    "Phase 1 entry retry conflicts with stored content"
+                )
+            return
+
+        if current_status == "PUBLISHED":
+            prior_row = event_rows[-1]
+            trigger_event_id = "phase1-trigger:" + hashlib.sha256(
+                (
+                    signal_id
+                    + "\x00"
+                    + completion.completion_id
+                    + "\x00"
+                    + trigger.observation_id
+                ).encode("utf-8")
+            ).hexdigest()
+            trigger_references = (
+                signal_reference,
+                *completion.row_references,
+                _journal_row_reference(
+                    "phase1_signal_events",
+                    _PHASE1_SIGNAL_EVENT_COLUMNS,
+                    prior_row,
+                ),
+            )
+            trigger_row = self._insert_phase1_entry_event(
+                lifecycle_event_id=trigger_event_id,
+                signal_id=signal_id,
+                event_ordinal=int(prior_row[3]) + 1,
+                event_kind="TRIGGER_OBSERVED",
+                from_status="PUBLISHED",
+                to_status="TRIGGERED_AWAITING_LIMIT",
+                event_time=trigger.source_time,
+                message_time=completion.completed_at,
+                received_at=normalized_recorded_at,
+                confirmation_execution_event_id=None,
+                trigger_observation_id=trigger.observation_id,
+                quote_observation_id=None,
+                session_completion_id=completion.completion_id,
+                shares=None,
+                price_micros=None,
+                references=trigger_references,
+                details={
+                    "completion_id": completion.completion_id,
+                    "trigger_observation_id": trigger.observation_id,
+                },
+            )
+            if role == "WATCHLIST_SHADOW":
+                to_status = "SHADOW_FILLED_INFORMATIONAL"
+            else:
+                to_status = {
+                    "PAPER_FILL": "TRIGGERED_PAPER",
+                    "LIVE_CONFIRM": "LIVE_CONFIRMED",
+                    "LIVE_SKIP": "SKIPPED_LIVE_TRACKED_PAPER",
+                }[event_kind]
+            action_references = (
+                () if current_action is None else current_action.row_references
+            )
+            entry_event_id = "phase1-entry:" + hashlib.sha256(
+                (
+                    signal_id
+                    + "\x00"
+                    + event_kind
+                    + "\x00"
+                    + completion.completion_id
+                    + "\x00"
+                    + trigger.observation_id
+                    + "\x00"
+                    + quote.observation_id
+                    + "\x00"
+                    + (
+                        ""
+                        if current_action is None
+                        else str(current_action.execution_event_id)
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            event_time = (
+                quote.source_time
+                if current_action is None
+                else current_action.event_time
+            )
+            message_time = max(
+                completion.completed_at,
+                (
+                    completion.completed_at
+                    if current_action is None
+                    else current_action.message_time
+                ),
+            )
+            entry_row = self._insert_phase1_entry_event(
+                lifecycle_event_id=entry_event_id,
+                signal_id=signal_id,
+                event_ordinal=int(trigger_row[3]) + 1,
+                event_kind=event_kind,
+                from_status="TRIGGERED_AWAITING_LIMIT",
+                to_status=to_status,
+                event_time=event_time,
+                message_time=message_time,
+                received_at=normalized_recorded_at,
+                confirmation_execution_event_id=(
+                    None
+                    if current_action is None
+                    else current_action.execution_event_id
+                ),
+                trigger_observation_id=trigger.observation_id,
+                quote_observation_id=quote.observation_id,
+                session_completion_id=completion.completion_id,
+                shares=(
+                    None
+                    if role == "WATCHLIST_SHADOW"
+                    else int(signal["planned_shares"])
+                ),
+                price_micros=int(signal["maximum_entry_micros"]),
+                references=(
+                    signal_reference,
+                    *completion.row_references,
+                    _journal_row_reference(
+                        "phase1_signal_events",
+                        _PHASE1_SIGNAL_EVENT_COLUMNS,
+                        trigger_row,
+                    ),
+                    *action_references,
+                ),
+                details={
+                    "completion_id": completion.completion_id,
+                    "confirmation_source_digest": (
+                        None
+                        if current_action is None
+                        else current_action.source_digest
+                    ),
+                    "trigger_observation_id": trigger.observation_id,
+                    "quote_observation_id": quote.observation_id,
+                },
+            )
+            if role == "PRIMARY":
+                self._insert_phase1_entry_buy(
+                    signal_row=signal_row,
+                    event_row=entry_row,
+                    signal_id=signal_id,
+                    shares=int(signal["planned_shares"]),
+                    price_micros=int(signal["maximum_entry_micros"]),
+                    occurred_at=quote.source_time,
+                    received_at=normalized_recorded_at,
+                    session_date=publication_session,
+                )
+            return
+
+        if current_status == "TRIGGERED_PAPER" and current_action is not None:
+            if trigger_observation_id is not None or quote_observation_id is not None:
+                raise InvalidJournalValue(
+                    "Phase 1 LIVE metadata cannot repeat entry observations"
+                )
+            prior_row = event_rows[-1]
+            metadata_event_id = "phase1-live-metadata:" + hashlib.sha256(
+                (
+                    signal_id
+                    + "\x00"
+                    + event_kind
+                    + "\x00"
+                    + str(current_action.execution_event_id)
+                ).encode("utf-8")
+            ).hexdigest()
+            metadata_event_time = max(
+                current_action.event_time,
+                _parse_canonical_timestamp(str(prior_row[7])),
+            )
+            self._insert_phase1_entry_event(
+                lifecycle_event_id=metadata_event_id,
+                signal_id=signal_id,
+                event_ordinal=int(prior_row[3]) + 1,
+                event_kind=event_kind,
+                from_status="TRIGGERED_PAPER",
+                to_status=(
+                    "LIVE_CONFIRMED"
+                    if event_kind == "LIVE_CONFIRM"
+                    else "SKIPPED_LIVE_TRACKED_PAPER"
+                ),
+                event_time=metadata_event_time,
+                message_time=max(
+                    completion.completed_at,
+                    current_action.message_time,
+                    metadata_event_time,
+                ),
+                received_at=normalized_recorded_at,
+                confirmation_execution_event_id=current_action.execution_event_id,
+                trigger_observation_id=None,
+                quote_observation_id=None,
+                session_completion_id=completion.completion_id,
+                shares=None,
+                price_micros=None,
+                references=(
+                    signal_reference,
+                    *completion.row_references,
+                    _journal_row_reference(
+                        "phase1_signal_events",
+                        _PHASE1_SIGNAL_EVENT_COLUMNS,
+                        prior_row,
+                    ),
+                    *current_action.row_references,
+                ),
+                details={
+                    "completion_id": completion.completion_id,
+                    "confirmation_source_digest": current_action.source_digest,
+                    "economic_entry_lifecycle_event_id": str(prior_row[1]),
+                },
+            )
+            return
+
+        raise InvalidJournalValue(
+            "Phase 1 entry conflicts with the current lifecycle disposition"
+        )
+
+    @staticmethod
+    def _phase1_exit_identities(
+        *,
+        signal_id: str,
+        review_id: str,
+        authority_digest: str,
+        step_count: int,
+        closes: bool,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+        lifecycle_event_ids = tuple(
+            "phase1-exit:"
+            + hashlib.sha256(
+                (
+                    "stock-monitor/phase1-canonical-exit-event/v1\x00"
+                    + signal_id
+                    + "\x00"
+                    + review_id
+                    + "\x00"
+                    + authority_digest
+                    + "\x00"
+                    + str(ordinal)
+                ).encode("utf-8")
+            ).hexdigest()
+            for ordinal in range(1, step_count + 1)
+        )
+        posting_keys = tuple(
+            key
+            for lifecycle_event_id in lifecycle_event_ids
+            for key in (
+                f"phase1-canonical-sale:{lifecycle_event_id}",
+                f"phase1-canonical-fee:{lifecycle_event_id}",
+            )
+        )
+        closed_trade_id = (
+            "phase1-closed-trade:"
+            + hashlib.sha256(
+                (
+                    "stock-monitor/phase1-canonical-closed-trade/v1\x00"
+                    + signal_id
+                    + "\x00"
+                    + lifecycle_event_ids[-1]
+                ).encode("utf-8")
+            ).hexdigest()
+            if closes
+            else None
+        )
+        return lifecycle_event_ids, posting_keys, closed_trade_id
+
+    def _phase1_existing_canonical_exit_result(
+        self,
+        *,
+        exit_authority: object,
+        source: Phase1ExitReviewSource,
+    ) -> StoredPhase1CanonicalExit | None:
+        """Return an exact prior batch only for the original issued identity."""
+
+        steps = tuple(getattr(exit_authority, "steps", ()))
+        authority_digest = getattr(exit_authority, "authority_digest", None)
+        if (
+            not steps
+            or type(authority_digest) is not str
+            or len(authority_digest) != 64
+        ):
+            return None
+        closes = getattr(steps[-1], "event_kind", None) == "CLOSE"
+        event_ids, posting_keys, closed_trade_id = self._phase1_exit_identities(
+            signal_id=source.signal_id,
+            review_id=source.review_id,
+            authority_digest=authority_digest,
+            step_count=len(steps),
+            closes=closes,
+        )
+        placeholders = ", ".join("?" for _ in event_ids)
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE lifecycle_event_id IN ("
+            + placeholders
+            + ") ORDER BY event_ordinal",
+            event_ids,
+        ).fetchall()
+        if not event_rows:
+            return None
+        if len(event_rows) != len(steps):
+            raise IdempotencyConflict(
+                "Phase 1 canonical exit retry is incomplete"
+            )
+        for row, step, event_id in zip(
+            event_rows,
+            steps,
+            event_ids,
+            strict=True,
+        ):
+            result = getattr(step, "execution_result", None)
+            action = getattr(step, "action", None)
+            exited_at = getattr(result, "exited_at", None)
+            fill_price = getattr(result, "fill_price", None)
+            expected_stop = (
+                money_to_micros(getattr(action, "recommended_stop"))
+                if getattr(step, "event_kind", None) == "PARTIAL_EXIT"
+                else None
+            )
+            if (
+                str(row[1]) != event_id
+                or str(row[2]) != source.signal_id
+                or str(row[4]) != getattr(step, "event_kind", None)
+                or str(row[14]) != getattr(result, "observation_id", None)
+                or str(row[15]) != authority_digest
+                or int(row[16]) != getattr(action, "shares_to_exit", None)
+                or int(row[17]) != money_to_micros(fill_price)
+                or (None if row[18] is None else int(row[18])) != expected_stop
+                or _parse_canonical_timestamp(str(row[7])) != exited_at
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 canonical exit retry conflicts with stored content"
+                )
+        posting_placeholders = ", ".join("?" for _ in posting_keys)
+        posting_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_CANONICAL_POSTING_COLUMNS)
+            + " FROM phase1_canonical_postings WHERE posting_key IN ("
+            + posting_placeholders
+            + ") ORDER BY id",
+            posting_keys,
+        ).fetchall()
+        if len(posting_rows) != len(posting_keys):
+            raise IdempotencyConflict(
+                "Phase 1 canonical exit retry posting bundle is incomplete"
+            )
+        if tuple(str(row[1]) for row in posting_rows) != posting_keys:
+            raise IdempotencyConflict(
+                "Phase 1 canonical exit retry posting order conflicts"
+            )
+        stored_trade_id: str | None = None
+        if closed_trade_id is not None:
+            trade = _sql(
+                self._connection,
+                "SELECT trade_id, lifecycle_event_id FROM phase1_closed_trades "
+                "WHERE validation_window_id = ? COLLATE BINARY "
+                "AND ledger_name = 'CANONICAL' AND signal_id = ? COLLATE BINARY",
+                (source.validation_window_id, source.signal_id),
+            ).fetchone()
+            if trade is None or tuple(trade) != (
+                closed_trade_id,
+                event_ids[-1],
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 canonical exit retry closed trade conflicts"
+                )
+            stored_trade_id = str(trade[0])
+        elif _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_closed_trades WHERE validation_window_id = ? "
+            "COLLATE BINARY AND ledger_name = 'CANONICAL' "
+            "AND signal_id = ? COLLATE BINARY",
+            (source.validation_window_id, source.signal_id),
+        ).fetchone() is not None:
+            raise IdempotencyConflict(
+                "Phase 1 partial exit retry conflicts with a closed trade"
+            )
+        return StoredPhase1CanonicalExit(
+            lifecycle_event_ids=event_ids,
+            posting_keys=posting_keys,
+            closed_trade_id=stored_trade_id,
+            duplicate=True,
+        )
+
+    @staticmethod
+    def _phase1_exit_event_material(
+        values_without_digest: Sequence[object],
+        details_json: str,
+    ) -> dict[str, object]:
+        if len(values_without_digest) != 18:
+            raise JournalError("Phase 1 exit lifecycle material is malformed")
+        return {
+            **dict(
+                zip(
+                    _PHASE1_SIGNAL_EVENT_COLUMNS[1:19],
+                    values_without_digest,
+                    strict=True,
+                )
+            ),
+            "details_json": details_json,
+        }
+
+    def _insert_phase1_exit_event(
+        self,
+        *,
+        lifecycle_event_id: str,
+        signal_id: str,
+        event_ordinal: int,
+        event_kind: str,
+        from_status: str,
+        to_status: str,
+        event_time: datetime,
+        recorded_at: datetime,
+        exit_observation_id: str,
+        exit_authority_digest: str,
+        shares: int,
+        price_micros: int,
+        recommended_stop_micros: int | None,
+        references: Sequence[JournalRowReference],
+        details: Mapping[str, object],
+    ) -> Sequence[object]:
+        details_json = _canonical_details(details)
+        values_without_digest = (
+            lifecycle_event_id,
+            signal_id,
+            event_ordinal,
+            event_kind,
+            from_status,
+            to_status,
+            _canonical_timestamp(event_time),
+            _canonical_timestamp(recorded_at),
+            _canonical_timestamp(recorded_at),
+            None,
+            None,
+            None,
+            None,
+            exit_observation_id,
+            exit_authority_digest,
+            shares,
+            price_micros,
+            recommended_stop_micros,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-exit-lifecycle-event/v1",
+            tuple(references),
+            self._phase1_exit_event_material(
+                values_without_digest,
+                details_json,
+            ),
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_signal_events("
+                "lifecycle_event_id, signal_id, event_ordinal, event_kind, "
+                "from_status, to_status, event_time, message_time, received_at, "
+                "confirmation_execution_event_id, trigger_observation_id, "
+                "quote_observation_id, session_completion_id, "
+                "exit_observation_id, exit_authority_digest, shares, "
+                "price_micros, recommended_stop_micros, source_digest, "
+                "details_json) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*values_without_digest, source_digest, details_json),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 canonical exit lifecycle conflicts with stored content"
+            ) from error
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE lifecycle_event_id = ? COLLATE BINARY",
+            (lifecycle_event_id,),
+        ).fetchone()
+        if row is None:
+            raise JournalError("Phase 1 canonical exit event was not readable")
+        return row
+
+    def _insert_phase1_exit_posting(
+        self,
+        *,
+        posting_key: str,
+        event_row: Sequence[object],
+        signal_reference: JournalRowReference,
+        review_reference: JournalRowReference,
+        execution_reference: JournalRowReference,
+        quote_reference: JournalRowReference,
+        signal_id: str,
+        entry_kind: str,
+        amount_micros: int,
+        shares_delta: int | None,
+        unit_price_micros: int | None,
+        occurred_at: datetime,
+        received_at: datetime,
+        settlement_available_session: date,
+        details: Mapping[str, object],
+    ) -> Sequence[object]:
+        account_name = "CASH" if entry_kind == "SALE" else "FEE"
+        details_json = _canonical_details(details)
+        values_without_hashes = (
+            posting_key,
+            str(event_row[1]),
+            signal_id,
+            entry_kind,
+            account_name,
+            amount_micros,
+            shares_delta,
+            unit_price_micros,
+            _canonical_timestamp(occurred_at),
+            _canonical_timestamp(received_at),
+            settlement_available_session.isoformat(),
+            _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+            _PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+        )
+        references = (
+            signal_reference,
+            _journal_row_reference(
+                "phase1_signal_events",
+                _PHASE1_SIGNAL_EVENT_COLUMNS,
+                event_row,
+            ),
+            review_reference,
+            execution_reference,
+            quote_reference,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-canonical-exit-posting/v1",
+            references,
+            {
+                **dict(
+                    zip(
+                        _PHASE1_CANONICAL_POSTING_COLUMNS[1:14],
+                        values_without_hashes,
+                        strict=True,
+                    )
+                ),
+                "details_json": details_json,
+            },
+        )
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    **dict(
+                        zip(
+                            _PHASE1_CANONICAL_POSTING_COLUMNS[1:15],
+                            (*values_without_hashes, source_digest),
+                            strict=True,
+                        )
+                    ),
+                    "details_json": details_json,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_canonical_postings("
+                "posting_key, lifecycle_event_id, signal_id, entry_kind, "
+                "account_name, amount_micros, shares_delta, unit_price_micros, "
+                "occurred_at, received_at, settlement_available_session, "
+                "fee_schedule_version, fee_schedule_digest, source_digest, "
+                "record_sha256, details_json) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    *values_without_hashes,
+                    source_digest,
+                    record_sha256,
+                    details_json,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 canonical exit posting conflicts with stored content"
+            ) from error
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_CANONICAL_POSTING_COLUMNS)
+            + " FROM phase1_canonical_postings WHERE posting_key = ? COLLATE BINARY",
+            (posting_key,),
+        ).fetchone()
+        if row is None:
+            raise JournalError("Phase 1 canonical exit posting was not readable")
+        return row
+
+    def _insert_phase1_closed_trade(
+        self,
+        *,
+        trade_id: str,
+        source: Phase1ExitReviewSource,
+        signal_row: Sequence[object],
+        final_event_row: Sequence[object],
+        recorded_at: datetime,
+    ) -> None:
+        signal = dict(zip(_PHASE1_SIGNAL_COLUMNS, signal_row, strict=True))
+        posting_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_CANONICAL_POSTING_COLUMNS)
+            + " FROM phase1_canonical_postings WHERE signal_id = ? COLLATE BINARY "
+            "ORDER BY id",
+            (source.signal_id,),
+        ).fetchall()
+        buys = tuple(row for row in posting_rows if str(row[4]) == "BUY")
+        sales = tuple(row for row in posting_rows if str(row[4]) == "SALE")
+        fees = tuple(row for row in posting_rows if str(row[4]) == "FEE")
+        if (
+            len(buys) != 1
+            or not sales
+            or len(sales) != len(fees)
+            or sum(int(row[7] or 0) for row in (*buys, *sales)) != 0
+        ):
+            raise MigrationCorruption(
+                "Phase 1 canonical close posting bundle is incomplete"
+            )
+        buy = buys[0]
+        shares = int(buy[7])
+        entry_value_micros = -int(buy[6])
+        exit_value_micros = sum(int(row[6]) for row in sales)
+        fee_micros = -sum(int(row[6]) for row in fees)
+        pnl_micros = exit_value_micros - entry_value_micros - fee_micros
+        initial_risk_micros = (
+            int(signal["maximum_entry_micros"])
+            - int(signal["recommended_stop_micros"])
+        ) * shares
+        final_at = _parse_canonical_timestamp(str(final_event_row[7]))
+        from zoneinfo import ZoneInfo
+
+        session_date = final_at.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        values_without_digest = (
+            trade_id,
+            source.validation_window_id,
+            "CANONICAL",
+            source.signal_id,
+            str(final_event_row[1]),
+            session_date.isoformat(),
+            shares,
+            entry_value_micros,
+            exit_value_micros,
+            fee_micros,
+            pnl_micros,
+            initial_risk_micros,
+            pnl_micros,
+            _canonical_timestamp(final_at),
+            _canonical_timestamp(recorded_at),
+            _canonical_timestamp(recorded_at),
+        )
+        references = (
+            _journal_row_reference(
+                "phase1_signals",
+                _PHASE1_SIGNAL_COLUMNS,
+                signal_row,
+            ),
+            *(
+                _journal_row_reference(
+                    "phase1_canonical_postings",
+                    _PHASE1_CANONICAL_POSTING_COLUMNS,
+                    row,
+                )
+                for row in posting_rows
+            ),
+            _journal_row_reference(
+                "phase1_signal_events",
+                _PHASE1_SIGNAL_EVENT_COLUMNS,
+                final_event_row,
+            ),
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-closed-trade/v1",
+            references,
+            dict(
+                zip(
+                    _PHASE1_CLOSED_TRADE_COLUMNS[1:17],
+                    values_without_digest,
+                    strict=True,
+                )
+            ),
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_closed_trades("
+                "trade_id, validation_window_id, ledger_name, signal_id, "
+                "lifecycle_event_id, session_date, shares, entry_value_micros, "
+                "exit_value_micros, fee_micros, pnl_micros, initial_risk_micros, "
+                "net_r_numerator_micros, at, message_time, received_at, "
+                "source_digest) VALUES ("
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*values_without_digest, source_digest),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 aggregate closed trade conflicts with stored content"
+            ) from error
+
+    def _record_phase1_canonical_exit(
+        self,
+        *,
+        exit_authority: object,
+        source: Phase1ExitReviewSource,
+        recorded_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1CanonicalExit:
+        from zoneinfo import ZoneInfo
+
+        from .risk import (
+            SessionCalendarResolver,
+            _calendar_digest,
+            is_issued_phase1_position_exit_authority,
+        )
+
+        if not self._transaction_active:
+            raise JournalError(
+                "Phase 1 canonical exit requires an active transaction"
+            )
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit calendar is unverified"
+            )
+        steps = tuple(getattr(exit_authority, "steps", ()))
+        authority_digest = getattr(exit_authority, "authority_digest", None)
+        closes = bool(steps) and getattr(steps[-1], "event_kind", None) == "CLOSE"
+        identities = self._phase1_exit_identities(
+            signal_id=source.signal_id,
+            review_id=source.review_id,
+            authority_digest=(
+                authority_digest if type(authority_digest) is str else ""
+            ),
+            step_count=len(steps),
+            closes=closes,
+        )
+        if not is_issued_phase1_position_exit_authority(exit_authority):
+            duplicate = self._phase1_existing_canonical_exit_result(
+                exit_authority=exit_authority,
+                source=source,
+            )
+            if duplicate is not None:
+                return duplicate
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit authority is unverified"
+            )
+        if (
+            not is_verified_phase1_exit_review_source(source)
+            or _phase1_source_owner(source) is not self
+            or getattr(exit_authority, "source_digest", None)
+            != source.source_digest
+            or getattr(exit_authority, "validation_window_id", None)
+            != source.validation_window_id
+            or getattr(exit_authority, "query_cutoff", None)
+            != source.query_cutoff
+            or normalized_recorded_at < source.query_cutoff
+            or source.calendar_digest != _calendar_digest(calendar_resolver)
+            or getattr(exit_authority, "fee_schedule_version", None)
+            != _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+            or getattr(exit_authority, "fee_schedule_digest", None)
+            != _PHASE1_EXIT_FEE_SCHEDULE_DIGEST
+            or not 1 <= len(steps) <= 2
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit conflicts with its review source"
+            )
+        lifecycle_event_ids, posting_keys, closed_trade_id = identities
+        signal_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_COLUMNS)
+            + " FROM phase1_signals WHERE signal_id = ? COLLATE BINARY",
+            (source.signal_id,),
+        ).fetchone()
+        review_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_EXIT_REVIEW_COLUMNS)
+            + " FROM phase1_exit_reviews WHERE review_id = ? COLLATE BINARY",
+            (source.review_id,),
+        ).fetchone()
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "ORDER BY event_ordinal",
+            (source.signal_id,),
+        ).fetchall()
+        if signal_row is None or review_row is None or not event_rows:
+            raise MigrationCorruption(
+                "Phase 1 canonical exit lineage is incomplete"
+            )
+        signal = dict(zip(_PHASE1_SIGNAL_COLUMNS, signal_row, strict=True))
+        if (
+            str(signal["role"]) != "PRIMARY"
+            or str(signal["validation_window_id"])
+            != source.validation_window_id
+            or str(signal["symbol"]) != source.symbol
+            or str(review_row[2]) != source.signal_id
+            or str(review_row[3]) != source.review_session.isoformat()
+            or str(review_row[4]) != source.calendar_digest
+            or str(review_row[5]) != _canonical_timestamp(source.query_cutoff)
+        ):
+            raise MigrationCorruption(
+                "Phase 1 canonical exit signal/review lineage conflicts"
+            )
+        current_status = str(event_rows[-1][6])
+        if current_status not in {
+            "TRIGGERED_PAPER",
+            "LIVE_CONFIRMED",
+            "SKIPPED_LIVE_TRACKED_PAPER",
+        }:
+            duplicate = self._phase1_existing_canonical_exit_result(
+                exit_authority=exit_authority,
+                source=source,
+            )
+            if duplicate is not None:
+                return duplicate
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit conflicts with lifecycle status"
+            )
+        posting_balance = _sql(
+            self._connection,
+            "SELECT COALESCE(SUM(CASE WHEN entry_kind IN ('BUY', 'SALE') "
+            "THEN shares_delta ELSE 0 END), 0) "
+            "FROM phase1_canonical_postings WHERE signal_id = ? COLLATE BINARY",
+            (source.signal_id,),
+        ).fetchone()
+        position = getattr(exit_authority, "position", None)
+        if (
+            posting_balance is None
+            or int(posting_balance[0]) != getattr(position, "shares", None)
+            or getattr(position, "signal_id", None) != source.signal_id
+            or getattr(position, "symbol", None) != source.symbol
+            or getattr(position, "ledger_name", None) != "CANONICAL"
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit position conflicts with replay"
+            )
+        facts_by_id = {
+            fact.fact_id: fact
+            for fact in (*source.execution_bar_facts, *source.quote_facts)
+        }
+        signal_reference = _journal_row_reference(
+            "phase1_signals",
+            _PHASE1_SIGNAL_COLUMNS,
+            signal_row,
+        )
+        review_reference = _journal_row_reference(
+            "phase1_exit_reviews",
+            _PHASE1_EXIT_REVIEW_COLUMNS,
+            review_row,
+        )
+        prior_row = event_rows[-1]
+        next_ordinal = int(prior_row[3]) + 1
+        remaining_shares = int(posting_balance[0])
+        self._transaction_dirty = True
+        created_event_rows: list[Sequence[object]] = []
+        created_posting_rows: list[Sequence[object]] = []
+        for step_ordinal, (step, lifecycle_event_id) in enumerate(
+            zip(steps, lifecycle_event_ids, strict=True),
+            start=1,
+        ):
+            result = getattr(step, "execution_result")
+            action = getattr(step, "action")
+            event_kind = str(getattr(step, "event_kind"))
+            exited_at = getattr(result, "exited_at")
+            fill_price = getattr(result, "fill_price")
+            execution_fact = facts_by_id.get(getattr(result, "observation_id"))
+            quote_fact = facts_by_id.get(
+                getattr(step, "execution_quote_observation_id")
+            )
+            shares_to_exit = int(getattr(action, "shares_to_exit"))
+            price_micros = money_to_micros(fill_price)
+            fee_micros = money_to_micros(getattr(step, "fee"))
+            if (
+                execution_fact is None
+                or execution_fact.purpose != "EXECUTION_BAR"
+                or quote_fact is None
+                or quote_fact.purpose != "QUOTE"
+                or execution_fact.source_time != exited_at
+                or shares_to_exit <= 0
+                or shares_to_exit > remaining_shares
+                or int(getattr(action, "remaining_shares"))
+                != remaining_shares - shares_to_exit
+                or fee_micros != _PHASE1_EXIT_FEE_MICROS
+                or exited_at > normalized_recorded_at
+                or (
+                    created_event_rows
+                    and exited_at
+                    <= _parse_canonical_timestamp(
+                        str(created_event_rows[-1][7])
+                    )
+                )
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 canonical exit step conflicts with review facts"
+                )
+            to_status = "CLOSED" if event_kind == "CLOSE" else current_status
+            recommended_stop_micros = (
+                money_to_micros(getattr(action, "recommended_stop"))
+                if event_kind == "PARTIAL_EXIT"
+                else None
+            )
+            execution_reference = execution_fact.row_references[0]
+            quote_reference = quote_fact.row_references[0]
+            prior_reference = _journal_row_reference(
+                "phase1_signal_events",
+                _PHASE1_SIGNAL_EVENT_COLUMNS,
+                prior_row,
+            )
+            details = {
+                "authority_digest": authority_digest,
+                "execution_quote_observation_id": quote_fact.fact_id,
+                "execution_reason": getattr(result, "exit_reason").value,
+                "execution_reason_codes": list(
+                    getattr(result, "reason_codes")
+                ),
+                "exit_authority_source_digest": source.source_digest,
+                "exit_review_id": source.review_id,
+                "exit_review_source_digest": str(review_row[10]),
+                "fee_schedule_digest": _PHASE1_EXIT_FEE_SCHEDULE_DIGEST,
+                "fee_schedule_version": _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+                "mark_observation_id": getattr(
+                    exit_authority,
+                    "mark_observation_id",
+                ),
+                "position_evidence_digest": getattr(
+                    exit_authority,
+                    "position_evidence_digest",
+                ),
+                "profit_target_taken": bool(
+                    getattr(getattr(step, "position"), "profit_target_taken")
+                    or event_kind == "PARTIAL_EXIT"
+                ),
+                "remaining_shares": int(getattr(action, "remaining_shares")),
+                "step_count": len(steps),
+                "step_ordinal": step_ordinal,
+            }
+            event_row = self._insert_phase1_exit_event(
+                lifecycle_event_id=lifecycle_event_id,
+                signal_id=source.signal_id,
+                event_ordinal=next_ordinal,
+                event_kind=event_kind,
+                from_status=current_status,
+                to_status=to_status,
+                event_time=exited_at,
+                recorded_at=normalized_recorded_at,
+                exit_observation_id=execution_fact.fact_id,
+                exit_authority_digest=authority_digest,
+                shares=shares_to_exit,
+                price_micros=price_micros,
+                recommended_stop_micros=recommended_stop_micros,
+                references=(
+                    signal_reference,
+                    review_reference,
+                    execution_reference,
+                    quote_reference,
+                    prior_reference,
+                ),
+                details=details,
+            )
+            exit_session = exited_at.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            sale_key = posting_keys[(step_ordinal - 1) * 2]
+            fee_key = posting_keys[(step_ordinal - 1) * 2 + 1]
+            posting_details = {
+                "authority_digest": authority_digest,
+                "calendar_digest": source.calendar_digest,
+                "execution_quote_observation_id": quote_fact.fact_id,
+                "execution_reason": getattr(result, "exit_reason").value,
+                "exit_session": exit_session.isoformat(),
+                "exit_authority_source_digest": source.source_digest,
+                "exit_review_id": source.review_id,
+                "exit_review_source_digest": str(review_row[10]),
+                "lifecycle_event_source_digest": str(event_row[19]),
+                "step_count": len(steps),
+                "step_ordinal": step_ordinal,
+            }
+            sale_settlement_session = calendar_resolver.add_sessions(
+                exit_session,
+                1,
+            )
+            sale_row = self._insert_phase1_exit_posting(
+                posting_key=sale_key,
+                event_row=event_row,
+                signal_reference=signal_reference,
+                review_reference=review_reference,
+                execution_reference=execution_reference,
+                quote_reference=quote_reference,
+                signal_id=source.signal_id,
+                entry_kind="SALE",
+                amount_micros=shares_to_exit * price_micros,
+                shares_delta=-shares_to_exit,
+                unit_price_micros=price_micros,
+                occurred_at=exited_at,
+                received_at=normalized_recorded_at,
+                settlement_available_session=sale_settlement_session,
+                details={
+                    **posting_details,
+                    "settlement_available_session": (
+                        sale_settlement_session.isoformat()
+                    ),
+                },
+            )
+            fee_row = self._insert_phase1_exit_posting(
+                posting_key=fee_key,
+                event_row=event_row,
+                signal_reference=signal_reference,
+                review_reference=review_reference,
+                execution_reference=execution_reference,
+                quote_reference=quote_reference,
+                signal_id=source.signal_id,
+                entry_kind="FEE",
+                amount_micros=-fee_micros,
+                shares_delta=None,
+                unit_price_micros=None,
+                occurred_at=exited_at,
+                received_at=normalized_recorded_at,
+                settlement_available_session=exit_session,
+                details={
+                    **posting_details,
+                    "settlement_available_session": exit_session.isoformat(),
+                },
+            )
+            created_event_rows.append(event_row)
+            created_posting_rows.extend((sale_row, fee_row))
+            remaining_shares -= shares_to_exit
+            current_status = to_status
+            prior_row = event_row
+            next_ordinal += 1
+        if (closes and remaining_shares != 0) or (
+            not closes and remaining_shares <= 0
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 canonical exit batch leaves an invalid share balance"
+            )
+        if closed_trade_id is not None:
+            self._insert_phase1_closed_trade(
+                trade_id=closed_trade_id,
+                source=source,
+                signal_row=signal_row,
+                final_event_row=created_event_rows[-1],
+                recorded_at=normalized_recorded_at,
+            )
+        return StoredPhase1CanonicalExit(
+            lifecycle_event_ids=lifecycle_event_ids,
+            posting_keys=posting_keys,
+            closed_trade_id=closed_trade_id,
+            duplicate=False,
+        )
+
+    @staticmethod
+    def _phase1_canonical_posting_source_from_row(
+        row: Sequence[object],
+    ) -> Phase1CanonicalPostingSource:
+        reference = _journal_row_reference(
+            "phase1_canonical_postings",
+            _PHASE1_CANONICAL_POSTING_COLUMNS,
+            row,
+        )
+        return Phase1CanonicalPostingSource(
+            row_id=int(row[0]),
+            posting_key=str(row[1]),
+            lifecycle_event_id=str(row[2]),
+            signal_id=str(row[3]),
+            entry_kind=str(row[4]),
+            account_name=str(row[5]),
+            amount_micros=int(row[6]),
+            shares_delta=None if row[7] is None else int(row[7]),
+            unit_price_micros=None if row[8] is None else int(row[8]),
+            occurred_at=_parse_canonical_timestamp(str(row[9])),
+            received_at=_parse_canonical_timestamp(str(row[10])),
+            settlement_available_session=date.fromisoformat(str(row[11])),
+            fee_schedule_version=str(row[12]),
+            fee_schedule_digest=str(row[13]),
+            source_digest=str(row[14]),
+            record_sha256=str(row[15]),
+            row_reference=reference,
+        )
+
+    def _phase1_entry_observation_bundle(
+        self,
+        *,
+        signal_source: Phase1SignalSource,
+        query_cutoff: datetime,
+    ) -> tuple[
+        tuple[Phase1ObservationSource, ...],
+        Phase1SessionCompletionSource,
+        int,
+        tuple[tuple[str, int], ...],
+    ]:
+        late_completion = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_session_completions "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND completed_at > ? LIMIT 1",
+            (
+                signal_source.signal_id,
+                signal_source.publication_session.isoformat(),
+                _canonical_timestamp(query_cutoff),
+            ),
+        ).fetchone()
+        if late_completion is not None:
+            from .risk import RiskBlock
+
+            raise RiskBlock("PHASE1_SOURCE_LOOKAHEAD")
+        completion = self._read_phase1_session_completion_source(
+            signal_id=signal_source.signal_id,
+            session_date=signal_source.publication_session,
+            query_cutoff=query_cutoff,
+        )
+        rows = _sql(
+            self._connection,
+            "SELECT observation_id FROM phase1_observations "
+            "WHERE signal_id = ? COLLATE BINARY AND session_date = ? "
+            "AND received_at <= ? ORDER BY cohort_ordinal",
+            (
+                signal_source.signal_id,
+                signal_source.publication_session.isoformat(),
+                _canonical_timestamp(completion.received_through),
+            ),
+        ).fetchall()
+        observations = tuple(
+            self._read_phase1_observation_source(
+                observation_id=str(row[0]),
+                query_cutoff=completion.received_through,
+            )
+            for row in rows
+        )
+        if (
+            len(observations) != completion.expected_observation_count
+            or tuple(item.cohort_ordinal for item in observations)
+            != tuple(range(1, len(observations) + 1))
+            or any(
+                item.signal_id != signal_source.signal_id
+                or item.session_date != signal_source.publication_session
+                or item.received_at > completion.received_through
+                for item in observations
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 1 entry observation bundle is incomplete"
+            )
+        highwater = max((item.source_cursor for item in observations), default=0)
+        stream_highwaters = tuple(
+            sorted(
+                (
+                    stream_id,
+                    max(
+                        item.source_cursor
+                        for item in observations
+                        if item.stream_id == stream_id
+                    ),
+                )
+                for stream_id in {item.stream_id for item in observations}
+            )
+        )
+        return observations, completion, highwater, stream_highwaters
+
+    def _verify_phase1_entry_event_digest(
+        self,
+        *,
+        event_row: Sequence[object],
+        references: Sequence[JournalRowReference],
+    ) -> None:
+        details = _canonical_stored_details(
+            event_row[20],
+            label="Phase 1 entry lifecycle",
+        )
+        expected = _journal_bundle_digest(
+            "stock-monitor/phase1-entry-lifecycle-event/v1",
+            references,
+            self._phase1_entry_event_material(
+                tuple(event_row[1:19]),
+                _canonical_audit_json(details),
+            ),
+        )
+        if str(event_row[19]) != expected:
+            raise MigrationCorruption(
+                "Phase 1 entry lifecycle source digest is inconsistent"
+            )
+
+    def _verify_phase1_entry_posting(
+        self,
+        *,
+        posting_row: Sequence[object],
+        signal_source: Phase1SignalSource,
+        lifecycle_event: Phase1LifecycleEventSource,
+    ) -> Phase1CanonicalPostingSource:
+        details = _canonical_stored_details(
+            posting_row[16],
+            label="Phase 1 canonical BUY",
+        )
+        expected_fee_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": "stock-monitor/phase1-entry-fee-schedule/v1",
+                    "payload": {
+                        "fee_micros": 0,
+                        "version": "PHASE1_NO_ENTRY_FEE_V1",
+                    },
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        signal_reference = signal_source.row_references[0]
+        expected_source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-canonical-buy/v1",
+            (signal_reference, lifecycle_event.row_reference),
+            {
+                **dict(
+                    zip(
+                        _PHASE1_CANONICAL_POSTING_COLUMNS[1:14],
+                        tuple(posting_row[1:14]),
+                        strict=True,
+                    )
+                ),
+                "details_json": _canonical_audit_json(details),
+            },
+        )
+        expected_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    **dict(
+                        zip(
+                            _PHASE1_CANONICAL_POSTING_COLUMNS[1:15],
+                            tuple(posting_row[1:15]),
+                            strict=True,
+                        )
+                    ),
+                    "details_json": _canonical_audit_json(details),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(posting_row[2]) != lifecycle_event.lifecycle_event_id
+            or str(posting_row[3]) != signal_source.signal_id
+            or str(posting_row[4]) != "BUY"
+            or str(posting_row[5]) != "CASH"
+            or int(posting_row[6])
+            != -(signal_source.maximum_entry_micros * signal_source.planned_shares)
+            or int(posting_row[7]) != signal_source.planned_shares
+            or int(posting_row[8]) != signal_source.maximum_entry_micros
+            or str(posting_row[11])
+            != signal_source.publication_session.isoformat()
+            or str(posting_row[12]) != "PHASE1_NO_ENTRY_FEE_V1"
+            or str(posting_row[13]) != expected_fee_digest
+            or str(posting_row[14]) != expected_source_digest
+            or str(posting_row[15]) != expected_record_sha256
+            or details.get("lifecycle_event_source_digest")
+            != lifecycle_event.source_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 1 canonical BUY bundle is inconsistent"
+            )
+        return self._phase1_canonical_posting_source_from_row(posting_row)
+
+    def _read_phase1_entry_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> Phase1EntrySource:
+        """Authenticate the one economic PRIMARY fill and canonical BUY."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError("Phase 1 entry source requires a post-commit read")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        signal_source = self._read_phase1_signal_source(
+            signal_id,
+            query_cutoff=normalized_cutoff,
+        )
+        if signal_source.role != "PRIMARY" or signal_source.planned_shares <= 0:
+            raise InvalidJournalValue(
+                "Phase 1 entry source requires a PRIMARY signal"
+            )
+        observations, completion, highwater, stream_highwaters = (
+            self._phase1_entry_observation_bundle(
+                signal_source=signal_source,
+                query_cutoff=normalized_cutoff,
+            )
+        )
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "AND received_at <= ? ORDER BY event_ordinal",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchall()
+        if (
+            len(event_rows) < 3
+            or tuple(int(row[3]) for row in event_rows)
+            != tuple(range(len(event_rows)))
+            or str(event_rows[0][4]) != "PUBLISHED"
+            or str(event_rows[1][4]) != "TRIGGER_OBSERVED"
+        ):
+            raise MigrationCorruption(
+                "Phase 1 entry lifecycle history is incomplete"
+            )
+        economic_rows = tuple(
+            row
+            for row in event_rows
+            if str(row[4]) in {"PAPER_FILL", "LIVE_CONFIRM", "LIVE_SKIP"}
+            and row[16] is not None
+        )
+        if len(economic_rows) != 1 or economic_rows[0] is not event_rows[2]:
+            raise MigrationCorruption(
+                "Phase 1 entry lifecycle has no unique economic fill"
+            )
+        trigger_row = event_rows[1]
+        economic_row = economic_rows[0]
+        if (
+            str(trigger_row[13]) != completion.completion_id
+            or str(economic_row[13]) != completion.completion_id
+        ):
+            raise MigrationCorruption(
+                "Phase 1 entry lifecycle conflicts with session completion"
+            )
+        self._verify_phase1_entry_event_digest(
+            event_row=trigger_row,
+            references=(
+                signal_source.row_references[0],
+                *completion.row_references,
+                self._phase1_lifecycle_source_from_row(event_rows[0]).row_reference,
+            ),
+        )
+        confirmation_references: tuple[JournalRowReference, ...] = ()
+        if economic_row[10] is not None:
+            action_source = self._read_action_source(
+                execution_event_id=int(economic_row[10])
+            )
+            confirmation_references = action_source.row_references
+        self._verify_phase1_entry_event_digest(
+            event_row=economic_row,
+            references=(
+                signal_source.row_references[0],
+                *completion.row_references,
+                self._phase1_lifecycle_source_from_row(trigger_row).row_reference,
+                *confirmation_references,
+            ),
+        )
+        lifecycle_event = self._phase1_lifecycle_source_from_row(economic_row)
+        metadata_rows = tuple(
+            row
+            for row in event_rows[3:]
+            if str(row[4]) in {"LIVE_CONFIRM", "LIVE_SKIP"}
+        )
+        if (
+            len(metadata_rows) > 1
+            or any(
+                str(row[4]) in {"LIVE_CONFIRM", "LIVE_SKIP"}
+                and row not in metadata_rows
+                for row in event_rows[3:]
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 1 entry has conflicting LIVE metadata"
+            )
+        metadata_references: tuple[JournalRowReference, ...] = ()
+        if metadata_rows:
+            metadata_row = metadata_rows[0]
+            if (
+                str(economic_row[4]) != "PAPER_FILL"
+                or int(metadata_row[3]) != int(economic_row[3]) + 1
+                or str(metadata_row[5]) != "TRIGGERED_PAPER"
+                or (
+                    str(metadata_row[4]),
+                    str(metadata_row[6]),
+                )
+                not in {
+                    ("LIVE_CONFIRM", "LIVE_CONFIRMED"),
+                    ("LIVE_SKIP", "SKIPPED_LIVE_TRACKED_PAPER"),
+                }
+                or metadata_row[10] is None
+                or metadata_row[11] is not None
+                or metadata_row[12] is not None
+                or str(metadata_row[13]) != completion.completion_id
+                or metadata_row[16] is not None
+                or metadata_row[17] is not None
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 LIVE metadata shape is inconsistent"
+                )
+            action_source = self._read_action_source(
+                execution_event_id=int(metadata_row[10])
+            )
+            expected_kind = (
+                "BOUGHT" if str(metadata_row[4]) == "LIVE_CONFIRM" else "SKIPPED"
+            )
+            observation_by_id = {
+                item.observation_id: item for item in observations
+            }
+            trigger = observation_by_id.get(lifecycle_event.trigger_observation_id)
+            from zoneinfo import ZoneInfo
+
+            if (
+                action_source.domain_kind != expected_kind
+                or action_source.symbol != signal_source.symbol
+                or action_source.event_time.astimezone(
+                    ZoneInfo("America/New_York")
+                ).date()
+                != signal_source.publication_session
+                or trigger is None
+                or action_source.event_time < trigger.source_time
+                or _parse_canonical_timestamp(str(metadata_row[7]))
+                != max(action_source.event_time, lifecycle_event.event_time)
+                or _parse_canonical_timestamp(str(metadata_row[8]))
+                != max(
+                    completion.completed_at,
+                    action_source.message_time,
+                    _parse_canonical_timestamp(str(metadata_row[7])),
+                )
+                or action_source.received_at
+                > _parse_canonical_timestamp(str(metadata_row[9]))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 LIVE metadata conflicts with its action source"
+                )
+            details = _canonical_stored_details(
+                metadata_row[20],
+                label="Phase 1 LIVE metadata",
+            )
+            if (
+                details.get("completion_id") != completion.completion_id
+                or details.get("confirmation_source_digest")
+                != action_source.source_digest
+                or details.get("economic_entry_lifecycle_event_id")
+                != lifecycle_event.lifecycle_event_id
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 LIVE metadata details are inconsistent"
+                )
+            self._verify_phase1_entry_event_digest(
+                event_row=metadata_row,
+                references=(
+                    signal_source.row_references[0],
+                    *completion.row_references,
+                    lifecycle_event.row_reference,
+                    *action_source.row_references,
+                ),
+            )
+            metadata_references = action_source.row_references
+        posting_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_CANONICAL_POSTING_COLUMNS)
+            + " FROM phase1_canonical_postings WHERE signal_id = ? COLLATE BINARY "
+            "AND entry_kind = 'BUY' AND received_at <= ? ORDER BY id",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchall()
+        if len(posting_rows) != 1:
+            raise MigrationCorruption(
+                "Phase 1 entry requires exactly one canonical BUY"
+            )
+        buy_posting = self._verify_phase1_entry_posting(
+            posting_row=posting_rows[0],
+            signal_source=signal_source,
+            lifecycle_event=lifecycle_event,
+        )
+        references = (
+            *signal_source.row_references,
+            *(reference for item in observations for reference in item.row_references),
+            *completion.row_references,
+            *(self._phase1_lifecycle_source_from_row(row).row_reference for row in event_rows),
+            buy_posting.row_reference,
+            *confirmation_references,
+            *metadata_references,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-entry-source/v1",
+            references,
+            {
+                "signal_id": signal_source.signal_id,
+                "lifecycle_terminal_cursor": int(event_rows[-1][0]),
+                "lifecycle_source_through": str(event_rows[-1][9]),
+                "completion_id": completion.completion_id,
+                "economic_lifecycle_event_id": lifecycle_event.lifecycle_event_id,
+                "buy_posting_key": buy_posting.posting_key,
+                "observation_source_highwater": highwater,
+                "observation_stream_highwaters": [
+                    [stream_id, cursor]
+                    for stream_id, cursor in stream_highwaters
+                ],
+                "expected_observation_count": len(observations),
+                "calendar_digest": signal_source.calendar_digest,
+            },
+        )
+        source = Phase1EntrySource(
+            signal_source=signal_source,
+            observations=observations,
+            completion=completion,
+            lifecycle_event=lifecycle_event,
+            buy_posting=buy_posting,
+            query_cutoff=normalized_cutoff,
+            observation_source_highwater=highwater,
+            observation_stream_highwaters=stream_highwaters,
+            expected_observation_count=len(observations),
+            calendar_digest=signal_source.calendar_digest,
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_ENTRY_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def _read_phase1_shadow_fill_source(
+        self,
+        signal_id: str,
+        *,
+        query_cutoff: datetime,
+        exact_signal_source: Phase1SignalSource | None = None,
+    ) -> Phase1ShadowFillSource:
+        """Authenticate one terminal price/time-only watchlist fill."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 shadow fill source requires a post-commit read"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        _historical_signal_source, signal_source = (
+            self._phase1_nested_signal_sources(
+                signal_id,
+                query_cutoff=normalized_cutoff,
+                exact_signal_source=exact_signal_source,
+            )
+        )
+        if (
+            signal_source.role != "WATCHLIST_SHADOW"
+            or signal_source.planned_shares != 0
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 shadow fill source requires a watchlist shadow"
+            )
+        observations, completion, highwater, stream_highwaters = (
+            self._phase1_entry_observation_bundle(
+                signal_source=signal_source,
+                query_cutoff=normalized_cutoff,
+            )
+        )
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events WHERE signal_id = ? COLLATE BINARY "
+            "AND received_at <= ? ORDER BY event_ordinal",
+            (signal_id, _canonical_timestamp(normalized_cutoff)),
+        ).fetchall()
+        if (
+            len(event_rows) != 3
+            or tuple(int(row[3]) for row in event_rows) != (0, 1, 2)
+            or tuple(str(row[4]) for row in event_rows)
+            != ("PUBLISHED", "TRIGGER_OBSERVED", "SHADOW_FILL")
+            or any(str(row[13]) != completion.completion_id for row in event_rows[1:])
+        ):
+            raise MigrationCorruption(
+                "Phase 1 shadow fill lifecycle history is incomplete"
+            )
+        trigger_row, shadow_row = event_rows[1], event_rows[2]
+        self._verify_phase1_entry_event_digest(
+            event_row=trigger_row,
+            references=(
+                signal_source.row_references[0],
+                *completion.row_references,
+                self._phase1_lifecycle_source_from_row(event_rows[0]).row_reference,
+            ),
+        )
+        self._verify_phase1_entry_event_digest(
+            event_row=shadow_row,
+            references=(
+                signal_source.row_references[0],
+                *completion.row_references,
+                self._phase1_lifecycle_source_from_row(trigger_row).row_reference,
+            ),
+        )
+        posting_row = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_canonical_postings "
+            "WHERE signal_id = ? COLLATE BINARY LIMIT 1",
+            (signal_id,),
+        ).fetchone()
+        if posting_row is not None:
+            raise MigrationCorruption(
+                "Phase 1 shadow fill cannot have canonical postings"
+            )
+        trigger_event = self._phase1_lifecycle_source_from_row(trigger_row)
+        lifecycle_event = self._phase1_lifecycle_source_from_row(shadow_row)
+        references = (
+            *signal_source.row_references,
+            *(reference for item in observations for reference in item.row_references),
+            *completion.row_references,
+            *(self._phase1_lifecycle_source_from_row(row).row_reference for row in event_rows),
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase1-shadow-fill-source/v1",
+            references,
+            {
+                "signal_id": signal_source.signal_id,
+                "lifecycle_terminal_cursor": int(event_rows[-1][0]),
+                "lifecycle_source_through": str(event_rows[-1][9]),
+                "completion_id": completion.completion_id,
+                "trigger_lifecycle_event_id": trigger_event.lifecycle_event_id,
+                "lifecycle_event_id": lifecycle_event.lifecycle_event_id,
+                "observation_source_highwater": highwater,
+                "observation_stream_highwaters": [
+                    [stream_id, cursor]
+                    for stream_id, cursor in stream_highwaters
+                ],
+                "expected_observation_count": len(observations),
+                "calendar_digest": signal_source.calendar_digest,
+            },
+        )
+        source = Phase1ShadowFillSource(
+            signal_source=signal_source,
+            observations=observations,
+            completion=completion,
+            trigger_event=trigger_event,
+            lifecycle_event=lifecycle_event,
+            query_cutoff=normalized_cutoff,
+            observation_source_highwater=highwater,
+            observation_stream_highwaters=stream_highwaters,
+            expected_observation_count=len(observations),
+            calendar_digest=signal_source.calendar_digest,
+            row_references=tuple(references),
+            source_digest=source_digest,
+        )
+        _register_journal_source_authority(
+            _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
+            source,
+            self,
+        )
+        return source
+
+    def _phase1_late_evidence_references(
+        self,
+        *,
+        completion_row: Sequence[object],
+        query_cutoff: datetime,
+    ) -> tuple[JournalRowReference, ...]:
+        completion_id = str(completion_row[1])
+        rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SESSION_LATE_EVIDENCE_COLUMNS)
+            + " FROM phase1_session_late_evidence "
+            "WHERE completion_id = ? COLLATE BINARY AND invalidated_at <= ? "
+            "ORDER BY id",
+            (completion_id, _canonical_timestamp(query_cutoff)),
+        ).fetchall()
+        if not rows:
+            return ()
+        completion_reference = _journal_row_reference(
+            "phase1_session_completions",
+            _PHASE1_SESSION_COMPLETION_COLUMNS,
+            completion_row,
+        )
+        all_references: list[JournalRowReference] = []
+        for row in rows:
+            row_reference = _journal_row_reference(
+                "phase1_session_late_evidence",
+                _PHASE1_SESSION_LATE_EVIDENCE_COLUMNS,
+                row,
+            )
+            expected_record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_SESSION_LATE_EVIDENCE_COLUMNS[1:-1],
+                            tuple(row[1:-1]),
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                str(row[14]) != expected_record_sha256
+                or str(row[2]) != completion_id
+                or str(row[3]) != str(completion_row[2])
+                or str(row[4]) != str(completion_row[3])
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 late evidence row integrity failed"
+                )
+            late_evidence_id = str(row[1])
+            page_rows = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS)
+                + " FROM phase1_session_late_evidence_pages "
+                "WHERE late_evidence_id = ? COLLATE BINARY ORDER BY page_ordinal",
+                (late_evidence_id,),
+            ).fetchall()
+            if (
+                not page_rows
+                or tuple(int(page[2]) for page in page_rows)
+                != tuple(range(1, len(page_rows) + 1))
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 late evidence page chain is incomplete"
+                )
+            page_sources: list[Phase1ProviderFetchPageSource] = []
+            semantic_page_digests: list[str] = []
+            source_references: list[JournalRowReference] = []
+            received_values: list[datetime] = []
+            prior_next_token: str | None = None
+            for index, page_row in enumerate(page_rows):
+                page_reference = _journal_row_reference(
+                    "phase1_session_late_evidence_pages",
+                    _PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS,
+                    page_row,
+                )
+                expected_page_hash = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_SESSION_LATE_EVIDENCE_PAGE_COLUMNS[1:-1],
+                                tuple(page_row[1:-1]),
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                source_row, payload_row = self._phase1_core_source_rows(
+                    source_observation_id=int(page_row[3]),
+                )
+                payload = bytes(payload_row[3])
+                try:
+                    metadata = _phase1_recompute_alpaca_page_metadata(
+                        payload=payload,
+                        request_url=str(page_row[6]),
+                        source_type=str(page_row[5]),
+                        retrieved_at=_parse_canonical_timestamp(
+                            str(source_row[8])
+                        ),
+                    )
+                except InvalidJournalValue as error:
+                    raise MigrationCorruption(
+                        "Phase 1 late evidence provider page is invalid"
+                    ) from error
+                details = _canonical_stored_details(
+                    source_row[12],
+                    label="Phase 1 late evidence core source",
+                )
+                expected_semantic_page_digest = hashlib.sha256(
+                    _canonical_audit_json(
+                        {
+                            "version": 1,
+                            "source_type": str(page_row[5]),
+                            "request_url": str(page_row[6]),
+                            "request_page_token": page_row[7],
+                            "next_page_token": page_row[8],
+                            "payload_sha256": str(page_row[9]),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                if (
+                    str(page_row[11]) != expected_page_hash
+                    or str(page_row[1]) != late_evidence_id
+                    or details
+                    != {
+                        "source_observation_id": str(page_row[4])
+                    }
+                    or str(getattr(metadata, "source_observation_id"))
+                    != str(page_row[4])
+                    or str(getattr(metadata, "payload_sha256"))
+                    != str(page_row[9])
+                    or str(source_row[11]) != "OK"
+                    or str(page_row[10]) != expected_semantic_page_digest
+                    or (index == 0 and page_row[7] is not None)
+                    or (index > 0 and page_row[7] != prior_next_token)
+                ):
+                    raise MigrationCorruption(
+                        "Phase 1 late evidence page integrity failed"
+                    )
+                prior_next_token = (
+                    None if page_row[8] is None else str(page_row[8])
+                )
+                page_sources.append(
+                    Phase1ProviderFetchPageSource(
+                        page_ordinal=int(page_row[2]),
+                        source_observation_id=str(page_row[4]),
+                        source_type=str(page_row[5]),
+                        request_url=str(page_row[6]),
+                        request_page_token=(
+                            None if page_row[7] is None else str(page_row[7])
+                        ),
+                        next_page_token=(
+                            None if page_row[8] is None else str(page_row[8])
+                        ),
+                        payload_sha256=str(page_row[9]),
+                        row_reference=page_reference,
+                    )
+                )
+                semantic_page_digests.append(expected_semantic_page_digest)
+                source_references.extend(
+                    (
+                        _journal_row_reference(
+                            "source_observations",
+                            _SOURCE_OBSERVATION_COLUMNS,
+                            source_row,
+                        ),
+                        _journal_row_reference(
+                            "phase1_source_payloads",
+                            _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                            payload_row,
+                        ),
+                    )
+                )
+                received_values.append(
+                    _parse_canonical_timestamp(str(source_row[8]))
+                )
+                all_references.append(page_reference)
+            if prior_next_token is not None:
+                raise MigrationCorruption(
+                    "Phase 1 late evidence page chain is not terminal"
+                )
+            request_start, request_end = _phase1_historical_request_window(
+                tuple(page.request_url for page in page_sources)
+            )
+            request_digest = _phase1_provider_request_digest(
+                collection=str(row[5]),
+                requested_symbols=(
+                    str(
+                        _sql(
+                            self._connection,
+                            "SELECT symbol FROM phase1_signals "
+                            "WHERE signal_id = ? COLLATE BINARY",
+                            (str(row[3]),),
+                        ).fetchone()[0]
+                    ),
+                ),
+                request_url=page_sources[0].request_url,
+            )
+            manifest_digest = _phase1_provider_manifest_digest(
+                collection=str(row[5]),
+                requested_symbols=(
+                    str(
+                        _sql(
+                            self._connection,
+                            "SELECT symbol FROM phase1_signals "
+                            "WHERE signal_id = ? COLLATE BINARY",
+                            (str(row[3]),),
+                        ).fetchone()[0]
+                    ),
+                ),
+                request_digest=request_digest,
+                pages=page_sources,
+            )
+            semantic_manifest_digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "version": 1,
+                        "collection": str(row[5]),
+                        "requested_symbols": [
+                            str(
+                                _sql(
+                                    self._connection,
+                                    "SELECT symbol FROM phase1_signals "
+                                    "WHERE signal_id = ? COLLATE BINARY",
+                                    (str(row[3]),),
+                                ).fetchone()[0]
+                            )
+                        ],
+                        "request_digest": request_digest,
+                        "pages": [
+                            {
+                                "page_ordinal": page.page_ordinal,
+                                "semantic_page_digest": digest,
+                            }
+                            for page, digest in zip(
+                                page_sources,
+                                semantic_page_digests,
+                                strict=True,
+                            )
+                        ],
+                        "terminal": True,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_source_digest = _journal_bundle_digest(
+                "stock-monitor/phase1-session-late-evidence/v1",
+                (completion_reference, *source_references),
+                {
+                    "late_evidence_id": late_evidence_id,
+                    "completion_id": completion_id,
+                    "signal_id": str(row[3]),
+                    "session_date": str(row[4]),
+                    "collection": str(row[5]),
+                    "request_start": _canonical_timestamp(request_start),
+                    "request_end": _canonical_timestamp(request_end),
+                    "request_digest": request_digest,
+                    "manifest_digest": manifest_digest,
+                    "semantic_manifest_digest": semantic_manifest_digest,
+                    "received_through": _canonical_timestamp(
+                        max(received_values)
+                    ),
+                    "invalidated_at": str(row[12]),
+                },
+            )
+            if (
+                _parse_canonical_timestamp(str(row[6])) != request_start
+                or _parse_canonical_timestamp(str(row[7])) != request_end
+                or str(row[8]) != request_digest
+                or str(row[9]) != manifest_digest
+                or str(row[10]) != semantic_manifest_digest
+                or _parse_canonical_timestamp(str(row[11]))
+                != max(received_values)
+                or _parse_canonical_timestamp(str(row[12]))
+                <= _parse_canonical_timestamp(str(completion_row[7]))
+                or _parse_canonical_timestamp(str(row[11]))
+                > _parse_canonical_timestamp(str(row[12]))
+                or str(row[13]) != expected_source_digest
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 late evidence digest integrity failed"
+                )
+            all_references.extend((*source_references, row_reference))
+        return tuple(all_references)
+
+    def _ensure_phase1_source_payload(
+        self,
+        *,
+        source_observation_id: int,
+        payload: bytes,
+        payload_sha256: str,
+        recorded_at: str,
+    ) -> None:
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "source_observation_id": source_observation_id,
+                    "payload_sha256": payload_sha256,
+                    "recorded_at": recorded_at,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        immutable = (
+            payload_sha256,
+            payload,
+            recorded_at,
+            record_sha256,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT id, payload_sha256, source_payload, recorded_at, "
+            "record_sha256 FROM phase1_source_payloads "
+            "WHERE source_observation_id = ?",
+            (source_observation_id,),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:]) != immutable:
+                raise IdempotencyConflict(
+                    "Phase 1 source payload conflicts with stored content"
+                )
+            return
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_source_payloads("
+                "source_observation_id, payload_sha256, source_payload, "
+                "recorded_at, record_sha256) VALUES (?, ?, ?, ?, ?)",
+                (source_observation_id, *immutable),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 source payload conflicts with stored content"
+            ) from error
+
+    def _start_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
+
+        window_id = _require_sha256(window_id, "Phase 1 validation window ID")
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        stored_session = _canonical_date(started_session)
+        if not calendar_resolver.is_open(started_session):
+            raise InvalidJournalValue(
+                "Phase 1 validation window must start on an open session"
+            )
+        schedule = calendar_resolver.session(started_session)
+        expected_close = datetime.combine(
+            started_session,
+            schedule.close_time,
+            schedule.timezone,
+        )
+        stored_started_at = _canonical_timestamp(started_at)
+        stored_received_at = _canonical_timestamp(received_at)
+        if _canonical_timestamp(expected_close) != stored_started_at:
+            raise InvalidJournalValue(
+                "Phase 1 validation window must start at the session close"
+            )
+        if stored_received_at < stored_started_at:
+            raise InvalidJournalValue(
+                "Phase 1 validation window receipt precedes its start"
+            )
+        try:
+            capital_micros = money_to_micros(starting_capital)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as error:
+            raise InvalidJournalValue(
+                "Phase 1 starting capital must be exact money"
+            ) from error
+        if capital_micros != 5_000_000_000:
+            raise InvalidJournalValue(
+                "Phase 1 starting capital must be exactly $5,000"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        source_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "window_id": window_id,
+                    "started_session": stored_session,
+                    "starting_capital_micros": capital_micros,
+                    "started_at": stored_started_at,
+                    "received_at": stored_received_at,
+                    "calendar_digest": calendar_digest,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        immutable = (
+            window_id,
+            stored_session,
+            capital_micros,
+            stored_started_at,
+            stored_received_at,
+            calendar_digest,
+            source_digest,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT id, window_id, started_session, starting_capital_micros, "
+            "started_at, received_at, calendar_digest, source_digest, singleton_key "
+            "FROM phase1_validation_windows WHERE window_id = ? COLLATE BINARY",
+            (window_id,),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:-1]) != immutable or int(existing[-1]) != 1:
+                raise IdempotencyConflict(
+                    "Phase 1 validation window conflicts with stored content"
+                )
+            self._verify_phase1_window_baselines(
+                immutable=immutable,
+            )
+            return StoredPhase1ValidationWindow(
+                window_id,
+                started_session,
+                capital_micros,
+                calendar_digest,
+                source_digest,
+                True,
+            )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase1_validation_windows("
+                "window_id, started_session, starting_capital_micros, started_at, "
+                "received_at, calendar_digest, source_digest"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                immutable,
+            )
+            for ledger_name in ("CANONICAL", "ACTUAL"):
+                self._insert_phase1_window_baseline(
+                    window_id=window_id,
+                    ledger_name=ledger_name,
+                    session_date=stored_session,
+                    capital_micros=capital_micros,
+                    at=stored_started_at,
+                    received_at=stored_received_at,
+                    window_source_digest=source_digest,
+                )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 validation window conflicts with stored content"
+            ) from error
+        self._verify_phase1_window_baselines(immutable=immutable)
+        return StoredPhase1ValidationWindow(
+            window_id,
+            started_session,
+            capital_micros,
+            calendar_digest,
+            source_digest,
+            False,
+        )
+
+    def _persist_phase1_publication_manifest(
+        self,
+        *,
+        publication_source: Phase1PublicationSource,
+        observation_manifest: object,
+    ) -> tuple[JournalRowReference, ...]:
+        candidate_source_ids = tuple(
+            (str(symbol), tuple(str(value) for value in values))
+            for symbol, values in getattr(
+                observation_manifest,
+                "candidate_source_observation_ids",
+            )
+        )
+        candidate_context_digests = tuple(
+            (str(symbol), str(digest))
+            for symbol, digest in getattr(
+                observation_manifest,
+                "candidate_context_digests",
+            )
+        )
+        candidate_subjects = tuple(
+            (
+                str(symbol),
+                str(subject_kind),
+                None if issuer_cik is None else str(issuer_cik),
+            )
+            for symbol, subject_kind, issuer_cik in getattr(
+                observation_manifest,
+                "candidate_subjects",
+            )
+        )
+        source_ids = tuple(
+            str(value)
+            for value in getattr(observation_manifest, "source_observation_ids")
+        )
+        normalized_sources = tuple(
+            getattr(observation_manifest, "normalized_market_fact_sources")
+        )
+        fetch_manifests = tuple(
+            getattr(observation_manifest, "provider_fetch_manifests")
+        )
+        manifest_digest = _require_sha256(
+            getattr(observation_manifest, "manifest_digest"),
+            "Phase 1 publication manifest digest",
+        )
+        manifest_immutable_without_record = (
+            publication_source.report_row_id,
+            manifest_digest,
+            _canonical_audit_json(
+                [[symbol, list(values)] for symbol, values in candidate_source_ids]
+            ),
+            _canonical_audit_json(
+                [[symbol, digest] for symbol, digest in candidate_context_digests]
+            ),
+            _canonical_audit_json(
+                [
+                    [symbol, subject_kind, issuer_cik]
+                    for symbol, subject_kind, issuer_cik in candidate_subjects
+                ]
+            ),
+            _canonical_audit_json(list(source_ids)),
+        )
+        manifest_record = hashlib.sha256(
+            _canonical_audit_json(
+                dict(
+                    zip(
+                        _PHASE1_PUBLICATION_MANIFEST_COLUMNS[1:-1],
+                        manifest_immutable_without_record,
+                        strict=True,
+                    )
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest_immutable = (*manifest_immutable_without_record, manifest_record)
+
+        page_values: list[tuple[object, ...]] = []
+        for manifest_ordinal, manifest in enumerate(fetch_manifests, start=1):
+            requested_symbols_json = _canonical_audit_json(
+                list(manifest.requested_symbols)
+            )
+            for page in manifest.pages:
+                immutable_without_record = (
+                    publication_source.report_row_id,
+                    manifest_ordinal,
+                    manifest.manifest_digest,
+                    manifest.collection,
+                    requested_symbols_json,
+                    manifest.request_digest,
+                    page.page_ordinal,
+                    page.source_observation_id,
+                    page.source_type,
+                    page.request_url,
+                    page.request_page_token,
+                    page.next_page_token,
+                    page.payload_sha256,
+                    int(manifest.terminal),
+                )
+                record = hashlib.sha256(
+                    _canonical_audit_json(
+                        dict(
+                            zip(
+                                _PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS[1:-1],
+                                immutable_without_record,
+                                strict=True,
+                            )
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+                page_values.append((*immutable_without_record, record))
+
+        fact_values: list[tuple[object, ...]] = []
+        for fact_ordinal, (candidate_symbol, source) in enumerate(
+            normalized_sources,
+            start=1,
+        ):
+            immutable_without_record = (
+                publication_source.report_row_id,
+                fact_ordinal,
+                candidate_symbol,
+                source.kind,
+                source.symbol,
+                source.feed,
+                source.source_observation_id,
+                source.page_ordinal,
+                source.source_item_ordinal,
+                source.source_item_path,
+                source.page_payload_sha256,
+                source.normalized_fields_digest,
+                source.fetch_manifest.manifest_digest,
+            )
+            record = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_PUBLICATION_FACT_COLUMNS[1:-1],
+                            immutable_without_record,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            fact_values.append((*immutable_without_record, record))
+
+        existing_manifest = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_PUBLICATION_MANIFEST_COLUMNS)
+            + " FROM phase1_publication_manifests "
+            "WHERE publication_report_id = ?",
+            (publication_source.report_row_id,),
+        ).fetchone()
+        existing_pages = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS[1:])
+            + " FROM phase1_publication_fetch_pages "
+            "WHERE publication_report_id = ? "
+            "ORDER BY fetch_manifest_ordinal, page_ordinal",
+            (publication_source.report_row_id,),
+        ).fetchall()
+        existing_facts = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_PUBLICATION_FACT_COLUMNS[1:])
+            + " FROM phase1_publication_facts "
+            "WHERE publication_report_id = ? ORDER BY fact_ordinal",
+            (publication_source.report_row_id,),
+        ).fetchall()
+        if existing_manifest is not None or existing_pages or existing_facts:
+            if (
+                existing_manifest is None
+                or tuple(existing_manifest[1:]) != manifest_immutable
+                or tuple(tuple(row) for row in existing_pages)
+                != tuple(page_values)
+                or tuple(tuple(row) for row in existing_facts)
+                != tuple(fact_values)
+            ):
+                raise IdempotencyConflict(
+                    "Phase 1 publication provider manifest conflicts with stored content"
+                )
+        else:
+            try:
+                _sql(
+                    self._connection,
+                    "INSERT INTO phase1_publication_manifests("
+                    + ", ".join(_PHASE1_PUBLICATION_MANIFEST_COLUMNS[1:])
+                    + ") VALUES ("
+                    + ", ".join("?" for _ in manifest_immutable)
+                    + ")",
+                    manifest_immutable,
+                )
+                for values in page_values:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase1_publication_fetch_pages("
+                        + ", ".join(_PHASE1_PUBLICATION_FETCH_PAGE_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in values)
+                        + ")",
+                        values,
+                    )
+                for values in fact_values:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase1_publication_facts("
+                        + ", ".join(_PHASE1_PUBLICATION_FACT_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in values)
+                        + ")",
+                        values,
+                    )
+            except sqlite3.IntegrityError as error:
+                raise IdempotencyConflict(
+                    "Phase 1 publication provider manifest conflicts with stored content"
+                ) from error
+        try:
+            (
+                stored_candidate_sources,
+                stored_candidate_contexts,
+                stored_candidate_subjects,
+                stored_facts,
+                stored_fetch_manifests,
+                stored_manifest_digest,
+                _references,
+            ) = self._read_phase1_publication_manifest_source(
+                publication_report_id=publication_source.report_row_id,
+                publication_observations=publication_source.source_observations,
+            )
+        except MigrationCorruption as error:
+            raise InvalidJournalValue(
+                "Phase 1 publication provider manifest conflicts with raw evidence"
+            ) from error
+        expected_fact_coordinates = tuple(
+            (
+                candidate_symbol,
+                source.kind,
+                source.symbol,
+                source.feed,
+                source.source_observation_id,
+                source.page_ordinal,
+                source.source_item_ordinal,
+                source.source_item_path,
+                source.page_payload_sha256,
+                source.normalized_fields_digest,
+                source.fetch_manifest.manifest_digest,
+            )
+            for candidate_symbol, source in normalized_sources
+        )
+        stored_fact_coordinates = tuple(
+            (
+                source.candidate_symbol,
+                source.kind,
+                source.symbol,
+                source.feed,
+                source.source_observation_id,
+                source.page_ordinal,
+                source.source_item_ordinal,
+                source.source_item_path,
+                source.page_payload_sha256,
+                source.normalized_fields_digest,
+                source.fetch_manifest_digest,
+            )
+            for source in stored_facts
+        )
+        if (
+            stored_candidate_sources != candidate_source_ids
+            or stored_candidate_contexts != candidate_context_digests
+            or stored_candidate_subjects != candidate_subjects
+            or stored_manifest_digest != manifest_digest
+            or stored_fact_coordinates != expected_fact_coordinates
+            or tuple(manifest.manifest_digest for manifest in stored_fetch_manifests)
+            != tuple(manifest.manifest_digest for manifest in fetch_manifests)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication provider manifest conflicts with its decision"
+            )
+        return tuple(_references)
+
+    def _publish_phase1_report(
+        self,
+        *,
+        publication_source: Phase1PublicationSource,
+        decision: object,
+        primary_plan_decision: object,
+        validation_window_id: str,
+        calendar_resolver: object,
+        received_at: datetime,
+    ) -> StoredPhase1Publication:
+        from .risk import (
+            SessionCalendarResolver,
+            _calendar_digest,
+            _phase1_bound_sources as _risk_phase1_bound_sources,
+        )
+        from .screening import (
+            PublicationDecision,
+            _publication_decision_fingerprint,
+            _publication_observation_manifest,
+            is_issued_publication_decision_for_plan,
+        )
+
+        if (
+            not isinstance(publication_source, Phase1PublicationSource)
+            or not is_verified_phase1_publication_source(publication_source)
+            or _phase1_source_owner(publication_source) is not self
+        ):
+            raise InvalidJournalValue("Phase 1 publication source is unverified")
+        if not isinstance(decision, PublicationDecision) or not (
+            is_issued_publication_decision_for_plan(
+                decision,
+                primary_plan_decision,
+            )
+        ):
+            raise InvalidJournalValue("Phase 1 publication decision is unverified")
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            from .risk import RiskBlock
+
+            raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+        validation_window_id = _require_sha256(
+            validation_window_id,
+            "Phase 1 validation window ID",
+        )
+        stored_received_at = _canonical_timestamp(received_at)
+        if (
+            stored_received_at
+            != _canonical_timestamp(publication_source.received_at)
+            or publication_source.published_at != publication_source.received_at
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication receipt conflicts with the finalized report"
+            )
+        candidates = tuple(decision.candidates)
+        if (
+            decision.status != "READY"
+            or decision.primary is None
+            or not 1 <= len(candidates) <= 3
+            or tuple(item.rank for item in candidates)
+            != tuple(range(1, len(candidates) + 1))
+            or tuple(item.role for item in candidates)
+            != ("PRIMARY", *("WATCHLIST_SHADOW",) * (len(candidates) - 1))
+            or decision.primary is not candidates[0]
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication candidate manifest is incomplete"
+            )
+        if any(
+            item.candidate.publication_session != publication_source.session_date
+            for item in candidates
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication candidate manifest conflicts with its report"
+            )
+        observation_manifest = _publication_observation_manifest(decision)
+        pinned_external_source_ids = tuple(
+            item.external_source_observation_id
+            for item in publication_source.source_observations
+        )
+        if (
+            pinned_external_source_ids
+            != observation_manifest.source_observation_ids
+            or tuple(
+                symbol
+                for symbol, _source_ids in (
+                    observation_manifest.candidate_source_observation_ids
+                )
+            )
+            != tuple(item.candidate.symbol for item in candidates)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication observation manifest conflicts with its report"
+            )
+        expected_state_sha256 = phase1_publication_state_sha256(
+            decision,
+            primary_plan_decision,
+        )
+        if publication_source.state_sha256 != expected_state_sha256:
+            raise InvalidJournalValue(
+                "Phase 1 publication state manifest conflicts with its report"
+            )
+        plan_manifest = _phase1_primary_plan_manifest(primary_plan_decision)
+        if (
+            plan_manifest["as_of"]
+            != _canonical_timestamp(publication_source.published_at)
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication plan cutoff conflicts with its report"
+            )
+        plan_digest = hashlib.sha256(
+            _canonical_audit_json(plan_manifest).encode("utf-8")
+        ).hexdigest()
+        decision_digest = _publication_decision_fingerprint(decision)
+        calendar_digest = _calendar_digest(calendar_resolver)
+        if (
+            plan_manifest["calendar_digest"] != calendar_digest
+            or plan_manifest["policy_digest"] is None
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication calendar conflicts with its plan"
+            )
+        plan_authority = getattr(primary_plan_decision, "portfolio_authority", None)
+        bound_sources = _risk_phase1_bound_sources(plan_authority)
+        if (
+            {kind for _source, kind in bound_sources}
+            != {"CANONICAL_REPLAY", "BREAKER_HISTORY"}
+            or any(
+                _phase1_source_owner(source) is not self
+                or getattr(source, "validation_window_id", None)
+                != validation_window_id
+                for source, _kind in bound_sources
+            )
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication plan source lineage is incomplete"
+            )
+        window_row = _sql(
+            self._connection,
+            "SELECT id, window_id, started_session, starting_capital_micros, "
+            "started_at, received_at, calendar_digest, source_digest, singleton_key "
+            "FROM phase1_validation_windows WHERE window_id = ? COLLATE BINARY",
+            (validation_window_id,),
+        ).fetchone()
+        if window_row is None:
+            raise InvalidJournalValue("Phase 1 validation window does not exist")
+        if (
+            str(window_row[6]) != calendar_digest
+            or str(window_row[2]) >= publication_source.session_date.isoformat()
+            or str(window_row[5]) > stored_received_at
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication conflicts with its validation window"
+            )
+        manifest_row_references = self._persist_phase1_publication_manifest(
+            publication_source=publication_source,
+            observation_manifest=observation_manifest,
+        )
+        if (
+            not publication_source.row_references
+            or publication_source.row_references[-1].table != "outbox"
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 publication source row closure is incomplete"
+            )
+        publication_source_digest = _phase1_publication_source_bundle_digest(
+            source=publication_source,
+            references=(
+                *publication_source.row_references[:-1],
+                *manifest_row_references,
+                publication_source.row_references[-1],
+            ),
+            candidate_subjects=tuple(observation_manifest.candidate_subjects),
+            manifest_digest=observation_manifest.manifest_digest,
+        )
+        primary_quantity = int(plan_manifest["quantity"])
+        policy_digest = str(plan_manifest["policy_digest"])
+        published_at = _canonical_timestamp(publication_source.published_at)
+        subjects_by_symbol = {
+            symbol: (subject_kind, issuer_cik)
+            for symbol, subject_kind, issuer_cik in observation_manifest.candidate_subjects
+        }
+        signal_values: list[tuple[object, ...]] = []
+        event_values: list[tuple[object, ...]] = []
+        signal_ids: list[str] = []
+        for publication in candidates:
+            candidate = publication.candidate
+            price_values = (
+                candidate.maximum_permitted_entry,
+                candidate.recommended_stop,
+                candidate.target_price,
+                candidate.tick_size,
+                candidate.trigger_price,
+            )
+            if candidate.publication_session is None or any(
+                value is None for value in price_values
+            ):
+                raise InvalidJournalValue(
+                    "Phase 1 publication candidate manifest is incomplete"
+                )
+            signal_id = (
+                f"{candidate.publication_session.isoformat()}:{candidate.symbol}"
+            )
+            subject = subjects_by_symbol.get(candidate.symbol)
+            if subject is None:
+                raise InvalidJournalValue(
+                    "Phase 1 publication candidate subject is missing"
+                )
+            subject_kind, issuer_cik = subject
+            planned_shares = (
+                primary_quantity if publication.role == "PRIMARY" else 0
+            )
+            immutable = (
+                signal_id,
+                validation_window_id,
+                candidate.symbol,
+                subject_kind,
+                issuer_cik,
+                publication.role,
+                candidate.publication_session.isoformat(),
+                money_to_micros(candidate.maximum_permitted_entry),
+                money_to_micros(candidate.recommended_stop),
+                money_to_micros(candidate.target_price),
+                planned_shares,
+                money_to_micros(candidate.tick_size),
+                money_to_micros(candidate.trigger_price),
+                publication_source.report_row_id,
+                publication.rank,
+                publication_source_digest,
+                publication_source.state_sha256,
+                publication_source.body_sha256,
+                publication_source.observation_set_sha256,
+                decision_digest,
+                plan_digest,
+                policy_digest,
+                calendar_digest,
+                published_at,
+                stored_received_at,
+            )
+            record_sha256 = hashlib.sha256(
+                _canonical_audit_json(
+                    dict(
+                        zip(
+                            _PHASE1_SIGNAL_COLUMNS[1:-1],
+                            immutable,
+                            strict=True,
+                        )
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            signal_values.append((*immutable, record_sha256))
+            signal_ids.append(signal_id)
+            lifecycle_event_id = "phase1-published:" + signal_id
+            event_material = {
+                "version": 1,
+                "lifecycle_event_id": lifecycle_event_id,
+                "signal_id": signal_id,
+                "event_ordinal": 0,
+                "event_kind": "PUBLISHED",
+                "from_status": None,
+                "to_status": "PUBLISHED",
+                "event_time": published_at,
+                "message_time": published_at,
+                "received_at": stored_received_at,
+                "publication_source_digest": publication_source_digest,
+                "publication_rank": publication.rank,
+                "publication_observation_manifest_digest": (
+                    observation_manifest.manifest_digest
+                ),
+            }
+            event_source_digest = hashlib.sha256(
+                _canonical_audit_json(event_material).encode("utf-8")
+            ).hexdigest()
+            event_values.append(
+                (
+                    lifecycle_event_id,
+                    signal_id,
+                    0,
+                    "PUBLISHED",
+                    None,
+                    "PUBLISHED",
+                    published_at,
+                    published_at,
+                    stored_received_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    event_source_digest,
+                    _canonical_details(
+                        {
+                            "publication_rank": publication.rank,
+                            "publication_source_digest": (
+                                publication_source_digest
+                            ),
+                            "publication_observation_manifest_digest": (
+                                observation_manifest.manifest_digest
+                            ),
+                        }
+                    ),
+                )
+            )
+        batch_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "version": 1,
+                    "validation_window_id": validation_window_id,
+                    "publication_source_digest": publication_source_digest,
+                    "publication_state_sha256": expected_state_sha256,
+                    "publication_decision_digest": decision_digest,
+                    "publication_observation_manifest_digest": (
+                        observation_manifest.manifest_digest
+                    ),
+                    "primary_plan_digest": plan_digest,
+                    "received_at": stored_received_at,
+                    "signal_record_sha256s": [row[-1] for row in signal_values],
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        existing_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE1_SIGNAL_COLUMNS[1:])
+            + " FROM phase1_signals "
+            "WHERE publication_report_id = ? ORDER BY publication_rank, id",
+            (publication_source.report_row_id,),
+        ).fetchall()
+        if existing_rows:
+            stored_events = _sql(
+                self._connection,
+                "SELECT lifecycle_event_id, signal_id, event_ordinal, event_kind, "
+                "from_status, to_status, event_time, message_time, received_at, "
+                "confirmation_execution_event_id, trigger_observation_id, "
+                "quote_observation_id, session_completion_id, "
+                "exit_observation_id, exit_authority_digest, shares, price_micros, "
+                "recommended_stop_micros, source_digest, details_json "
+                "FROM phase1_signal_events "
+                "WHERE signal_id IN (SELECT signal_id FROM phase1_signals "
+                "WHERE publication_report_id = ?) ORDER BY signal_id, event_ordinal",
+                (publication_source.report_row_id,),
+            ).fetchall()
+            expected_events = tuple(sorted(event_values, key=lambda row: str(row[1])))
+            if tuple(tuple(row) for row in existing_rows) != tuple(signal_values) or tuple(
+                tuple(row) for row in stored_events
+            ) != expected_events:
+                raise IdempotencyConflict(
+                    "Phase 1 report publication conflicts with stored content"
+                )
+            return StoredPhase1Publication(
+                tuple(signal_ids),
+                "PUBLISHED",
+                batch_digest,
+                True,
+            )
+        conflicting_session = _sql(
+            self._connection,
+            "SELECT 1 FROM phase1_signals WHERE publication_session = ? LIMIT 1",
+            (publication_source.session_date.isoformat(),),
+        ).fetchone()
+        if conflicting_session is not None:
+            raise IdempotencyConflict(
+                "Phase 1 report publication conflicts with stored session"
+            )
+        try:
+            for signal_row, event_row in zip(
+                signal_values,
+                event_values,
+                strict=True,
+            ):
+                _sql(
+                    self._connection,
+                    "INSERT INTO phase1_signals("
+                    + ", ".join(_PHASE1_SIGNAL_COLUMNS[1:])
+                    + ") VALUES ("
+                    + ", ".join("?" for _ in signal_row)
+                    + ")",
+                    signal_row,
+                )
+                _sql(
+                    self._connection,
+                    "INSERT INTO phase1_signal_events("
+                    "lifecycle_event_id, signal_id, event_ordinal, event_kind, "
+                    "from_status, to_status, event_time, message_time, received_at, "
+                    "confirmation_execution_event_id, trigger_observation_id, "
+                    "quote_observation_id, "
+                    "session_completion_id, exit_observation_id, "
+                    "exit_authority_digest, shares, price_micros, "
+                    "recommended_stop_micros, source_digest, "
+                    "details_json) VALUES ("
+                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    event_row,
+                )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 1 report publication conflicts with stored content"
+            ) from error
+        return StoredPhase1Publication(
+            tuple(signal_ids),
+            "PUBLISHED",
+            batch_digest,
+            False,
+        )
+
+    def _insert_phase1_window_baseline(
+        self,
+        *,
+        window_id: str,
+        ledger_name: str,
+        session_date: str,
+        capital_micros: int,
+        at: str,
+        received_at: str,
+        window_source_digest: str,
+    ) -> None:
+        material = {
+            "version": 1,
+            "window_id": window_id,
+            "ledger_name": ledger_name,
+            "session_date": session_date,
+            "equity_micros": capital_micros,
+            "cash_micros": capital_micros,
+            "positions_value_micros": 0,
+            "external_cash_flow_micros": 0,
+            "source_cursor": 1,
+            "mark_source_digest": window_source_digest,
+            "at": at,
+            "message_time": at,
+            "received_at": received_at,
+        }
+        source_digest = hashlib.sha256(
+            _canonical_audit_json(material).encode("utf-8")
+        ).hexdigest()
+        point_id = hashlib.sha256(
+            (
+                "stock-monitor/phase1-window-baseline/v1\x00"
+                + window_id
+                + "\x00"
+                + ledger_name
+            ).encode("utf-8")
+        ).hexdigest()
+        _sql(
+            self._connection,
+            "INSERT INTO phase1_equity_points("
+            "point_id, validation_window_id, ledger_name, session_date, "
+            "equity_micros, cash_micros, positions_value_micros, "
+            "external_cash_flow_micros, source_cursor, mark_source_digest, at, "
+            "message_time, received_at, source_digest"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                point_id,
+                window_id,
+                ledger_name,
+                session_date,
+                capital_micros,
+                capital_micros,
+                0,
+                0,
+                1,
+                window_source_digest,
+                at,
+                at,
+                received_at,
+                source_digest,
+            ),
+        )
+
+    def _verify_phase1_window_baselines(
+        self,
+        *,
+        immutable: tuple[object, ...],
+    ) -> None:
+        (
+            window_id,
+            session_date,
+            capital_micros,
+            at,
+            received_at,
+            _calendar_digest_value,
+            window_source_digest,
+        ) = immutable
+        rows = _sql(
+            self._connection,
+            "SELECT point_id, ledger_name, session_date, equity_micros, "
+            "cash_micros, positions_value_micros, external_cash_flow_micros, "
+            "source_cursor, mark_source_digest, at, message_time, received_at, "
+            "source_digest FROM phase1_equity_points "
+            "WHERE validation_window_id = ? COLLATE BINARY ORDER BY ledger_name",
+            (window_id,),
+        ).fetchall()
+        if len(rows) != 2 or tuple(str(row[1]) for row in rows) != (
+            "ACTUAL",
+            "CANONICAL",
+        ):
+            raise MigrationCorruption(
+                "Phase 1 validation window baselines are incomplete"
+            )
+        for row in rows:
+            ledger_name = str(row[1])
+            expected_point_id = hashlib.sha256(
+                (
+                    "stock-monitor/phase1-window-baseline/v1\x00"
+                    + str(window_id)
+                    + "\x00"
+                    + ledger_name
+                ).encode("utf-8")
+            ).hexdigest()
+            material = {
+                "version": 1,
+                "window_id": window_id,
+                "ledger_name": ledger_name,
+                "session_date": session_date,
+                "equity_micros": capital_micros,
+                "cash_micros": capital_micros,
+                "positions_value_micros": 0,
+                "external_cash_flow_micros": 0,
+                "source_cursor": 1,
+                "mark_source_digest": window_source_digest,
+                "at": at,
+                "message_time": at,
+                "received_at": received_at,
+            }
+            expected_digest = hashlib.sha256(
+                _canonical_audit_json(material).encode("utf-8")
+            ).hexdigest()
+            expected = (
+                expected_point_id,
+                ledger_name,
+                session_date,
+                capital_micros,
+                capital_micros,
+                0,
+                0,
+                1,
+                window_source_digest,
+                at,
+                at,
+                received_at,
+                expected_digest,
+            )
+            if tuple(row) != expected:
+                raise MigrationCorruption(
+                    "Phase 1 validation window baseline integrity failed"
+                )
 
     def _finalize_report(
         self,
@@ -5156,12 +25232,23 @@ def _journal_row_reference(
         row_id = int(row[0])
     except (TypeError, ValueError) as error:
         raise MigrationCorruption("journal row identity is invalid") from error
+    values = [
+        (
+            {
+                "blob_length": len(bytes(value)),
+                "blob_sha256": hashlib.sha256(bytes(value)).hexdigest(),
+            }
+            if isinstance(value, (bytes, bytearray, memoryview))
+            else value
+        )
+        for value in row
+    ]
     payload = {
         "version": 1,
         "table": table,
         "row_id": row_id,
         "columns": list(columns),
-        "values": list(row),
+        "values": values,
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     return JournalRowReference(table, row_id, digest)
@@ -5191,7 +25278,45 @@ def _journal_bundle_digest(
             for reference in ordered
         ],
     }
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        _canonical_audit_json(payload).encode("utf-8")
+    ).hexdigest()
+
+
+def _phase1_publication_source_bundle_digest(
+    *,
+    source: Phase1PublicationSource,
+    references: Sequence[JournalRowReference],
+    candidate_subjects: Sequence[tuple[str, str, str | None]],
+    manifest_digest: str | None,
+) -> str:
+    """Compute the post-manifest publication digest without issuing a source."""
+    return _journal_bundle_digest(
+        "stock-monitor/phase1-publication-source/v1",
+        references,
+        {
+            "report_id": source.report_id,
+            "session_date": source.session_date.isoformat(),
+            "report_kind": source.report_kind,
+            "state_sha256": source.state_sha256,
+            "content_sha256": source.body_sha256,
+            "observation_set_sha256": source.observation_set_sha256,
+            "external_source_observation_ids": [
+                item.external_source_observation_id
+                for item in source.source_observations
+            ],
+            "candidate_subjects": [
+                [symbol, subject_kind, issuer_cik]
+                for symbol, subject_kind, issuer_cik in candidate_subjects
+            ],
+            "publication_manifest_digest": manifest_digest,
+            "published_at": _canonical_timestamp(source.published_at),
+            "received_at": _canonical_timestamp(source.received_at),
+            "outbox_row_id": source.outbox_row_id,
+            "outbox_destination": source.outbox_destination,
+            "outbox_payload_sha256": source.outbox_payload_sha256,
+        },
+    )
 
 
 def _confirmation_outbox_key(event_id: str, destination: str) -> str:
@@ -5403,6 +25528,20 @@ def _canonical_json(value: object) -> str:
         )
     except (TypeError, ValueError) as error:
         raise InvalidJournalValue("details are not canonical JSON data") from error
+
+
+def _canonical_audit_json(value: object) -> str:
+    """Encode trusted typed audit material, including microdollar field names."""
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as error:
+        raise InvalidJournalValue("audit material is not canonical JSON data") from error
 
 
 def _canonical_details(value: object) -> str:

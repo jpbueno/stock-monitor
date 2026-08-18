@@ -135,7 +135,7 @@ Names and signatures are fixed so later tasks and tests do not invent incompatib
 | Task 1 | `load_settings(project_root: Path, environ: Mapping[str, str]) -> Settings`; `money_to_micros(value: Decimal) -> int`; `money_from_micros(value: int) -> Decimal`; `Policy.from_toml(path: Path) -> Policy`; `Policy.validate() -> None` |
 | Task 2 | `MarketCalendar.load(path: Path) -> MarketCalendar`; `session(day: date) -> MarketSession`; `is_open(day: date) -> bool`; `add_sessions(start: date, count: int) -> date`; `UniverseSnapshot.load(path: Path, as_of: date) -> UniverseSnapshot`; `eligible_records() -> tuple[UniverseRecord, ...]` |
 | Task 3 | `Journal.open(path: Path) -> Journal`; `transaction() -> ContextManager[JournalTransaction]`; `migrate() -> None`; `append_raw_message(message_id: str, message_time: datetime, text: str) -> tuple[int, bool]`; `claim_report(session_date: date, kind: str) -> ReportClaim`; `count(table: str) -> int` |
-| Task 4 | `EgressPolicy.validate_get(url: str) -> None`; `HttpGetClient.get(url: str, headers: Mapping[str, str]) -> HttpResponse`; `ContentCache.put(observation: SourceObservation, payload: bytes) -> str`; `AlpacaMarketData.daily_bars(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Bar, ...]]`; `historical_quotes(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Quote, ...]]`; `latest_iex_quotes(symbols: Sequence[str]) -> Mapping[str, Quote]`; `option_chain(underlying: str) -> tuple[OptionSnapshot, ...]`; `smoke() -> EntitlementSmoke`; `SecClient.get_submission(cik: str) -> SourceDocument`; `get_archive(path: str) -> SourceDocument`; `ReferenceClient.fetch(url: str) -> SourceDocument`; `classify_evidence(records: Sequence[EvidenceRecord], hold: DateRange) -> EvidenceDecision` |
+| Task 4 | `EgressPolicy.validate_get(url: str) -> None`; `HttpGetClient.get(url: str, headers: Mapping[str, str]) -> HttpResponse`; `ContentCache.put(observation: SourceObservation, payload: bytes) -> str`; `AlpacaMarketData.daily_bars(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Bar, ...]]`; `historical_minute_bars(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Bar, ...]]`; `historical_trades(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Trade, ...]]`; `historical_quotes(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Quote, ...]]`; `latest_iex_quotes(symbols: Sequence[str]) -> Mapping[str, Quote]`; `option_chain(underlying: str) -> tuple[OptionSnapshot, ...]`; `smoke() -> EntitlementSmoke`; `SecClient.get_submission(cik: str) -> SourceDocument`; `get_archive(path: str) -> SourceDocument`; `ReferenceClient.fetch(url: str) -> SourceDocument`; `classify_evidence(records: Sequence[EvidenceRecord], hold: DateRange) -> EvidenceDecision` |
 | Task 5 | `sma(values: Sequence[Decimal], period: int) -> Decimal`; `ema(values: Sequence[Decimal], period: int) -> Decimal`; `wilder_atr(bars: Sequence[Bar], period: int) -> Decimal`; `evaluate_eligibility(context: CandidateContext) -> EligibilityDecision`; `detect_setup(context: CandidateContext) -> SetupDecision`; `midrank_percentile(value: Decimal, cohort: Sequence[Decimal]) -> Decimal`; `score_candidate(context: CandidateContext) -> ScoreCard`; `rank_candidates(candidates: Sequence[ScoredCandidate]) -> tuple[ScoredCandidate, ...]` |
 | Task 6 | `size_long(entry: Decimal, stop: Decimal, settled_cash: Decimal, deployed: Decimal, open_risk: Decimal) -> PositionPlan`; `evaluate_position(position: Position, mark: MarketMark, policy: Policy) -> PositionAction`; `account_check_eligible(check: AccountCheck, buy: ExecutionEvent, intervening_events: Sequence[ExecutionEvent]) -> bool`; `evaluate_breakers(equity: Sequence[EquityPoint], closes: Sequence[ClosedTrade], calendar: MarketCalendar) -> BreakerState`; `LedgerPair.record_actual_buy(signal_id: str, price: Decimal, shares: int, at: datetime) -> ComplianceDecision`; `LedgerPair.record_canonical_fill(signal_id: str, price: Decimal, shares: int, at: datetime) -> None` |
 | Task 7 | `parse_confirmation(text: str, session_date: date) -> ParsedConfirmation`; `parse_confirmation_or_pending(text: str, session_date: date) -> ParsedConfirmation | PendingConfirmation`; `ConfirmationEnvelope(message_id: str, message_time: datetime, received_at: datetime, text: str, session_date: date)`; `ingest_confirmation(journal: Journal, envelope: ConfirmationEnvelope, *, plans: SignalPlanResolver, calendar: SessionCalendarResolver, policy: Policy, entry_authorities: ActualEntryAuthorityResolver, destination: str = "CODEX_TASK") -> IngestionResult` |
@@ -738,7 +738,17 @@ git commit -m "feat: record and reconcile manual confirmations"
 - Create: `src/stock_monitor/sql/002_phase1.sql`
 - Create: `src/stock_monitor/phase1.py`
 - Create: `src/stock_monitor/validation.py`
-- Modify: `tests/support.py`
+- Modify: `src/stock_monitor/evidence.py`
+- Modify: `src/stock_monitor/journal.py`
+- Modify: `src/stock_monitor/ledger.py`
+- Modify: `src/stock_monitor/providers/alpaca.py`
+- Modify: `src/stock_monitor/risk.py`
+- Modify: `src/stock_monitor/screening.py`
+- Modify: `tests/contract/test_alpaca.py`
+- Modify: `tests/integration/test_journal.py`
+- Modify: `tests/integration/test_journal_migrations.py`
+- Modify: `tests/unit/test_evidence.py`
+- Test: `tests/integration/test_phase1_authorities.py`
 - Test: `tests/unit/test_paper_fills.py`
 - Test: `tests/integration/test_signal_lifecycle.py`
 - Test: `tests/unit/test_equity_curve.py`
@@ -833,14 +843,22 @@ Run `test_signal_lifecycle`, `test_paper_fills`, `test_equity_curve`, and `test_
 
 - [ ] **Step 4: Run Task 8 tests and verify GREEN**
 
-Run: `PYTHONPATH=src python3 -m unittest tests.unit.test_paper_fills tests.integration.test_signal_lifecycle tests.unit.test_equity_curve tests.unit.test_phase1_promotion -v`
+Run the expanded Task 8 authority, persistence, provider, and domain suites:
+
+`PYTHONPATH=src .venv/bin/python -W error -m unittest tests.unit.test_paper_fills tests.unit.test_equity_curve tests.unit.test_phase1_promotion tests.integration.test_signal_lifecycle tests.integration.test_phase1_authorities tests.integration.test_journal_migrations tests.contract.test_alpaca tests.unit.test_evidence -v`
+
+Run the affected Task 3-7 authority and risk regressions, then the complete repository suite:
+
+`PYTHONPATH=src .venv/bin/python -W error -m unittest tests.architecture.test_brokerage_boundary tests.security.test_network_boundary tests.contract.test_sec tests.contract.test_reference tests.integration.test_journal tests.integration.test_actual_transitions tests.integration.test_confirmation_idempotency tests.integration.test_journal_confirmation_sources tests.integration.test_reconciliation tests.integration.test_risk_journal_adapter tests.integration.test_separate_ledgers tests.integration.test_task7_final_review tests.integration.test_task7_source_authorities tests.unit.test_circuit_breakers tests.unit.test_confirmations tests.unit.test_eligibility tests.unit.test_indicators tests.unit.test_position_management tests.unit.test_position_sizing tests.unit.test_ranking tests.unit.test_scoring tests.unit.test_settlement tests.unit.test_setups -v`
+
+`PYTHONPATH=src .venv/bin/python -W error -m unittest discover -s tests -v`
 
 Expected: all Task 8 tests pass.
 
 - [ ] **Step 5: Commit Task 8**
 
 ```bash
-git add src/stock_monitor/sql/002_phase1.sql src/stock_monitor/phase1.py src/stock_monitor/validation.py tests/support.py tests/unit/test_paper_fills.py tests/integration/test_signal_lifecycle.py tests/unit/test_equity_curve.py tests/unit/test_phase1_promotion.py tests/fixtures/intraday
+git add docs/superpowers/plans/2026-08-14-stock-monitor-implementation.md src/stock_monitor/evidence.py src/stock_monitor/journal.py src/stock_monitor/ledger.py src/stock_monitor/phase1.py src/stock_monitor/providers/alpaca.py src/stock_monitor/risk.py src/stock_monitor/screening.py src/stock_monitor/sql/002_phase1.sql src/stock_monitor/validation.py tests/contract/test_alpaca.py tests/integration/test_journal.py tests/integration/test_journal_migrations.py tests/integration/test_phase1_authorities.py tests/integration/test_signal_lifecycle.py tests/unit/test_evidence.py tests/unit/test_equity_curve.py tests/unit/test_paper_fills.py tests/unit/test_phase1_promotion.py
 git commit -m "feat: track prospective phase one validation"
 ```
 

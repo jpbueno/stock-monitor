@@ -35,6 +35,13 @@ from .market_calendar import (
     is_release_verified_market_calendar,
 )
 from .providers.reference import is_reviewed_instrument_status_decision
+from .providers.alpaca import (
+    NormalizedMarketFactSource,
+    ProviderFetchManifest,
+    _normalized_market_fact_source,
+    is_issued_normalized_market_fact,
+    normalized_market_facts_share_owner,
+)
 from .universe import UniverseSnapshot, is_verified_universe_snapshot
 
 
@@ -649,10 +656,123 @@ class ScoredCandidate:
                 raise ScreeningError("scored-candidate setup decision is inconsistent")
 
 
-_ISSUED_SCORED_CANDIDATES: dict[
-    int,
-    tuple[ReferenceType[ScoredCandidate], str],
-] = {}
+@dataclass(frozen=True, slots=True)
+class PublicationObservationManifest:
+    """Exact Task 5 source material retained by one issued publication."""
+
+    candidate_source_observation_ids: tuple[tuple[str, tuple[str, ...]], ...]
+    candidate_context_digests: tuple[tuple[str, str], ...]
+    candidate_subjects: tuple[tuple[str, str, str | None], ...]
+    normalized_market_fact_sources: tuple[
+        tuple[str, NormalizedMarketFactSource], ...
+    ]
+    provider_fetch_manifests: tuple[ProviderFetchManifest, ...]
+    source_observation_ids: tuple[str, ...]
+    manifest_digest: str
+
+    def __post_init__(self) -> None:
+        candidate_sources = tuple(self.candidate_source_observation_ids)
+        candidate_digests = tuple(self.candidate_context_digests)
+        candidate_subjects = tuple(self.candidate_subjects)
+        normalized_sources = tuple(self.normalized_market_fact_sources)
+        fetch_manifests = tuple(self.provider_fetch_manifests)
+        source_ids = tuple(self.source_observation_ids)
+        object.__setattr__(
+            self,
+            "candidate_source_observation_ids",
+            candidate_sources,
+        )
+        object.__setattr__(self, "candidate_context_digests", candidate_digests)
+        object.__setattr__(self, "candidate_subjects", candidate_subjects)
+        object.__setattr__(
+            self,
+            "normalized_market_fact_sources",
+            normalized_sources,
+        )
+        object.__setattr__(
+            self,
+            "provider_fetch_manifests",
+            fetch_manifests,
+        )
+        object.__setattr__(self, "source_observation_ids", source_ids)
+        symbols = tuple(symbol for symbol, _values in candidate_sources)
+        if (
+            not candidate_sources
+            or symbols != tuple(symbol for symbol, _digest in candidate_digests)
+            or symbols
+            != tuple(symbol for symbol, _kind, _issuer in candidate_subjects)
+            or len(symbols) != len(set(symbols))
+            or any(_SYMBOL.fullmatch(symbol) is None for symbol in symbols)
+            or any(
+                type(values) is not tuple
+                or not values
+                or values != tuple(sorted(set(values)))
+                or any(type(value) is not str or not value for value in values)
+                for _symbol, values in candidate_sources
+            )
+            or any(_SHA256_HEX.fullmatch(digest) is None for _symbol, digest in candidate_digests)
+            or any(
+                subject_kind not in {"STOCK", "ETF"}
+                or (
+                    subject_kind == "STOCK"
+                    and (
+                        type(issuer_cik) is not str
+                        or not issuer_cik.isdigit()
+                        or len(issuer_cik) != 10
+                    )
+                )
+                or (subject_kind == "ETF" and issuer_cik is not None)
+                for _symbol, subject_kind, issuer_cik in candidate_subjects
+            )
+            or not normalized_sources
+            or any(
+                candidate_symbol not in symbols
+                or not isinstance(source, NormalizedMarketFactSource)
+                for candidate_symbol, source in normalized_sources
+            )
+            or not fetch_manifests
+            or any(
+                not isinstance(manifest, ProviderFetchManifest)
+                for manifest in fetch_manifests
+            )
+            or len(
+                {manifest.manifest_digest for manifest in fetch_manifests}
+            )
+            != len(fetch_manifests)
+            or {
+                source.fetch_manifest.manifest_digest
+                for _candidate_symbol, source in normalized_sources
+            }
+            != {manifest.manifest_digest for manifest in fetch_manifests}
+            or not source_ids
+            or source_ids != tuple(sorted(set(source_ids)))
+            or _SHA256_HEX.fullmatch(self.manifest_digest) is None
+        ):
+            raise ScreeningError("publication observation manifest is malformed")
+        expected_ids = tuple(
+            sorted(
+                {
+                    source_id
+                    for _symbol, values in candidate_sources
+                    for source_id in values
+                }
+            )
+        )
+        if expected_ids != source_ids:
+            raise ScreeningError("publication observation manifest is incomplete")
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedScoredCandidateAuthority:
+    reference: ReferenceType[ScoredCandidate]
+    candidate_digest: str
+    context: CandidateContext
+    context_digest: str
+    source_observation_ids: tuple[str, ...]
+    normalized_market_fact_sources: tuple[NormalizedMarketFactSource, ...]
+
+
+_ISSUED_SCORED_CANDIDATES: dict[int, _IssuedScoredCandidateAuthority] = {}
 _ISSUED_SCORED_CANDIDATES_LOCK = RLock()
 
 
@@ -668,16 +788,310 @@ def _scored_candidate_fingerprint(candidate: ScoredCandidate) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def is_issued_scored_candidate(candidate: object) -> bool:
+def _candidate_source_observation_ids(
+    context: CandidateContext,
+) -> tuple[str, ...]:
+    """Return every exact raw-page identity used to score one context."""
+    if type(context) is not CandidateContext:
+        raise ScreeningError("candidate context must be the exact DTO")
+    source_ids: set[str] = set()
+
+    def remember(source_id: object) -> None:
+        if type(source_id) is not str or not source_id:
+            raise ScreeningError("candidate source observation ID is malformed")
+        source_ids.add(source_id)
+
+    for symbol in sorted(context.bars_by_symbol):
+        for bar in context.bars_by_symbol[symbol]:
+            remember(getattr(bar, "source_observation_id", None))
+    for quote in (
+        context.previous_session_quote,
+        context.latest_iex_quote,
+    ):
+        if quote is None:
+            continue
+        remember(getattr(quote, "source_observation_id", None))
+    if context.instrument_status is not None:
+        for source_id in context.instrument_status.source_observation_ids:
+            remember(source_id)
+    if context.evidence is not None:
+        for record in context.evidence.qualifying_records:
+            for source_id in record.source_observation_ids:
+                remember(source_id)
+        for source_id in context.evidence.source_observation_ids:
+            remember(source_id)
+    if not source_ids:
+        raise ScreeningError("candidate source observation manifest is empty")
+    return tuple(sorted(source_ids))
+
+
+def _candidate_market_facts(context: CandidateContext) -> tuple[object, ...]:
+    facts: list[object] = []
+    for symbol in sorted(context.bars_by_symbol):
+        for bar in context.bars_by_symbol[symbol]:
+            if getattr(bar, "symbol", None) != symbol:
+                raise ScreeningError(
+                    "candidate market fact symbol conflicts with its cohort"
+                )
+            facts.append(bar)
+    for quote in (
+        context.previous_session_quote,
+        context.latest_iex_quote,
+    ):
+        if quote is not None:
+            if getattr(quote, "symbol", None) != str(context.record.symbol).upper():
+                raise ScreeningError(
+                    "candidate quote symbol conflicts with its instrument"
+                )
+            facts.append(quote)
+    if not facts or len({id(fact) for fact in facts}) != len(facts):
+        raise ScreeningError("candidate normalized market facts are incomplete")
+    return tuple(facts)
+
+
+def _candidate_normalized_market_fact_sources(
+    context: CandidateContext,
+) -> tuple[NormalizedMarketFactSource, ...]:
+    facts = _candidate_market_facts(context)
+    first = facts[0]
+    if not is_issued_normalized_market_fact(first):
+        raise ScreeningError(
+            "candidate market facts require provider normalization authority"
+        )
+    sources: list[NormalizedMarketFactSource] = []
+    for fact in facts:
+        if (
+            not is_issued_normalized_market_fact(fact)
+            or not normalized_market_facts_share_owner(first, fact)
+        ):
+            raise ScreeningError(
+                "candidate market facts require one provider authority owner"
+            )
+        source = _normalized_market_fact_source(fact)
+        if (
+            source.symbol != getattr(fact, "symbol", None)
+            or source.feed != getattr(fact, "feed", None)
+            or source.source_observation_id
+            != getattr(fact, "source_observation_id", None)
+            or not source.fetch_manifest.terminal
+        ):
+            raise ScreeningError(
+                "candidate normalized market fact source is inconsistent"
+            )
+        sources.append(source)
+    return tuple(sources)
+
+
+def _issued_scored_candidate_authority(
+    candidate: object,
+) -> _IssuedScoredCandidateAuthority | None:
     if not isinstance(candidate, ScoredCandidate):
-        return False
+        return None
+    try:
+        candidate_digest = _scored_candidate_fingerprint(candidate)
+    except Exception:
+        return None
     with _ISSUED_SCORED_CANDIDATES_LOCK:
         issued = _ISSUED_SCORED_CANDIDATES.get(id(candidate))
-        return (
-            issued is not None
-            and issued[0]() is candidate
-            and issued[1] == _scored_candidate_fingerprint(candidate)
+        if (
+            issued is None
+            or issued.reference() is not candidate
+            or issued.candidate_digest != candidate_digest
+        ):
+            return None
+    context = issued.context
+    try:
+        if (
+            issued.context_digest != _relative_input_fingerprint(context)
+            or issued.source_observation_ids
+            != _candidate_source_observation_ids(context)
+            or (
+                bool(issued.normalized_market_fact_sources)
+                and issued.normalized_market_fact_sources
+                != _candidate_normalized_market_fact_sources(context)
+            )
+            or context.evidence is None
+            or not is_reviewed_evidence_decision(context.evidence)
+            or context.instrument_status is None
+            or not is_reviewed_instrument_status_decision(
+                context.instrument_status
+            )
+            or not is_release_verified_market_calendar(context.market_calendar)
+            or context.relative_strength_cohort is None
+            or not _trusted_relative_strength_cohort(
+                context,
+                context.relative_strength_cohort,
+            )
+        ):
+            return None
+    except Exception:
+        return None
+    return issued
+
+
+def is_issued_scored_candidate(candidate: object) -> bool:
+    return _issued_scored_candidate_authority(candidate) is not None
+
+
+def _provider_fetch_manifest_document(
+    manifest: ProviderFetchManifest,
+) -> dict[str, object]:
+    return {
+        "collection": manifest.collection,
+        "requested_symbols": list(manifest.requested_symbols),
+        "request_digest": manifest.request_digest,
+        "terminal": manifest.terminal,
+        "manifest_digest": manifest.manifest_digest,
+        "pages": [
+            {
+                "page_ordinal": page.page_ordinal,
+                "source_observation_id": page.source_observation_id,
+                "source_type": page.source_type,
+                "request_url": page.request_url,
+                "request_page_token": page.request_page_token,
+                "next_page_token": page.next_page_token,
+                "payload_sha256": page.payload_sha256,
+            }
+            for page in manifest.pages
+        ],
+    }
+
+
+def _normalized_market_fact_source_document(
+    candidate_symbol: str,
+    source: NormalizedMarketFactSource,
+) -> dict[str, object]:
+    return {
+        "candidate_symbol": candidate_symbol,
+        "kind": source.kind,
+        "symbol": source.symbol,
+        "feed": source.feed,
+        "source_observation_id": source.source_observation_id,
+        "page_ordinal": source.page_ordinal,
+        "source_item_ordinal": source.source_item_ordinal,
+        "source_item_path": source.source_item_path,
+        "page_payload_sha256": source.page_payload_sha256,
+        "normalized_fields_digest": source.normalized_fields_digest,
+        "fetch_manifest_digest": source.fetch_manifest.manifest_digest,
+    }
+
+
+def _build_publication_observation_manifest(
+    candidates: Sequence[ScoredCandidate],
+) -> PublicationObservationManifest:
+    values = tuple(candidates)
+    if not values:
+        raise ScreeningError("publication source candidate cohort is empty")
+    candidate_sources: list[tuple[str, tuple[str, ...]]] = []
+    candidate_digests: list[tuple[str, str]] = []
+    candidate_subjects: list[tuple[str, str, str | None]] = []
+    normalized_sources: list[tuple[str, NormalizedMarketFactSource]] = []
+    fetch_manifests_by_digest: dict[str, ProviderFetchManifest] = {}
+    source_ids: set[str] = set()
+    owner_anchor: object | None = None
+    for candidate in values:
+        issued = _issued_scored_candidate_authority(candidate)
+        if issued is None:
+            raise ScreeningError(
+                "publication source requires identity-issued candidates"
+            )
+        current_normalized_sources = (
+            _candidate_normalized_market_fact_sources(issued.context)
         )
+        if (
+            not issued.normalized_market_fact_sources
+            or issued.normalized_market_fact_sources
+            != current_normalized_sources
+        ):
+            raise ScreeningError(
+                "publication source requires provider-issued normalized facts"
+            )
+        candidate_facts = _candidate_market_facts(issued.context)
+        if owner_anchor is None:
+            owner_anchor = candidate_facts[0]
+        if any(
+            not normalized_market_facts_share_owner(owner_anchor, fact)
+            for fact in candidate_facts
+        ):
+            raise ScreeningError(
+                "publication source candidate facts cross provider owners"
+            )
+        candidate_sources.append(
+            (candidate.symbol, issued.source_observation_ids)
+        )
+        candidate_digests.append((candidate.symbol, issued.context_digest))
+        evidence = issued.context.evidence
+        if (
+            evidence is None
+            or evidence.symbol != candidate.symbol
+            or evidence.subject_kind not in {"STOCK", "ETF"}
+            or evidence.issuer_cik != issued.context.issuer_cik
+            or (
+                evidence.subject_kind == "STOCK"
+                and evidence.issuer_cik is None
+            )
+            or (
+                evidence.subject_kind == "ETF"
+                and evidence.issuer_cik is not None
+            )
+        ):
+            raise ScreeningError(
+                "publication source candidate subject is unverified"
+            )
+        candidate_subjects.append(
+            (
+                candidate.symbol,
+                evidence.subject_kind,
+                evidence.issuer_cik,
+            )
+        )
+        for normalized_source in current_normalized_sources:
+            normalized_sources.append((candidate.symbol, normalized_source))
+            fetch_manifest = normalized_source.fetch_manifest
+            prior = fetch_manifests_by_digest.setdefault(
+                fetch_manifest.manifest_digest,
+                fetch_manifest,
+            )
+            if prior != fetch_manifest:
+                raise ScreeningError(
+                    "publication source fetch manifest digest conflicts"
+                )
+        source_ids.update(issued.source_observation_ids)
+    ordered_source_ids = tuple(sorted(source_ids))
+    fetch_manifests = tuple(fetch_manifests_by_digest.values())
+    manifest_document = {
+        "candidate_context_digests": candidate_digests,
+        "candidate_source_observation_ids": candidate_sources,
+        "candidate_subjects": candidate_subjects,
+        "normalized_market_fact_sources": [
+            _normalized_market_fact_source_document(symbol, source)
+            for symbol, source in normalized_sources
+        ],
+        "provider_fetch_manifests": [
+            _provider_fetch_manifest_document(manifest)
+            for manifest in fetch_manifests
+        ],
+        "source_observation_ids": ordered_source_ids,
+        "version": 3,
+    }
+    manifest_digest = hashlib.sha256(
+        json.dumps(
+            manifest_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return PublicationObservationManifest(
+        candidate_source_observation_ids=tuple(candidate_sources),
+        candidate_context_digests=tuple(candidate_digests),
+        candidate_subjects=tuple(candidate_subjects),
+        normalized_market_fact_sources=tuple(normalized_sources),
+        provider_fetch_manifests=fetch_manifests,
+        source_observation_ids=ordered_source_ids,
+        manifest_digest=manifest_digest,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,7 +1128,12 @@ class PublicationDecision:
 
 _ISSUED_PUBLICATION_DECISIONS: dict[
     int,
-    tuple[ReferenceType[PublicationDecision], str],
+    tuple[
+        ReferenceType[PublicationDecision],
+        str,
+        ReferenceType[object],
+        PublicationObservationManifest,
+    ],
 ] = {}
 _ISSUED_PUBLICATION_DECISIONS_LOCK = RLock()
 
@@ -734,17 +1153,159 @@ def _publication_decision_fingerprint(decision: PublicationDecision) -> str:
 def is_issued_publication_decision(decision: object) -> bool:
     if not isinstance(decision, PublicationDecision):
         return False
+    try:
+        fingerprint = _publication_decision_fingerprint(decision)
+    except Exception:
+        return False
     with _ISSUED_PUBLICATION_DECISIONS_LOCK:
         issued = _ISSUED_PUBLICATION_DECISIONS.get(id(decision))
-        return (
+        if (
             issued is not None
             and issued[0]() is decision
-            and issued[1] == _publication_decision_fingerprint(decision)
-            and all(
-                is_issued_scored_candidate(item.candidate)
-                for item in decision.candidates
-            )
+            and issued[1] == fingerprint
+        ):
+            primary_plan_decision = issued[2]()
+            source_manifest = issued[3]
+        else:
+            return False
+    if primary_plan_decision is None:
+        return False
+    from .risk import is_issued_long_plan_decision
+
+    try:
+        current_manifest = _build_publication_observation_manifest(
+            tuple(item.candidate for item in decision.candidates)
         )
+    except Exception:
+        return False
+    return (
+        is_issued_long_plan_decision(primary_plan_decision)
+        and source_manifest == current_manifest
+    )
+
+
+def is_issued_publication_decision_for_plan(
+    decision: object,
+    primary_plan_decision: object,
+) -> bool:
+    """Require the exact portfolio-bound plan used to issue *decision*."""
+    if not is_issued_publication_decision(decision):
+        return False
+    with _ISSUED_PUBLICATION_DECISIONS_LOCK:
+        issued = _ISSUED_PUBLICATION_DECISIONS.get(id(decision))
+        return issued is not None and issued[2]() is primary_plan_decision
+
+
+def _publication_observation_manifest(
+    decision: PublicationDecision,
+) -> PublicationObservationManifest:
+    """Reveal source pins only for the exact current issued decision identity."""
+    if not is_issued_publication_decision(decision):
+        raise ScreeningError("publication decision authority is unverified")
+    with _ISSUED_PUBLICATION_DECISIONS_LOCK:
+        issued = _ISSUED_PUBLICATION_DECISIONS.get(id(decision))
+        if issued is None or issued[0]() is not decision:
+            raise ScreeningError("publication decision authority is unverified")
+        return issued[3]
+
+
+def _issue_portfolio_bound_publication_decision(
+    candidates: Sequence[ScoredCandidate],
+    *,
+    primary_plan_decision: object,
+) -> PublicationDecision:
+    """Issue one complete up-to-three cohort from ranking and capacity authority.
+
+    This is deliberately not a generic registrar: it recomputes ranking and
+    roles, requires every Task 5 candidate identity, and binds rank one to the
+    exact Task 6 production plan and its canonical portfolio authority.
+    """
+    if isinstance(candidates, (str, bytes)):
+        raise TypeError("publication candidates must be a sequence")
+    values = tuple(candidates)
+    if not 1 <= len(values) <= 3:
+        raise ScreeningError(
+            "portfolio-bound publication requires from one through three candidates"
+        )
+    if any(not is_issued_scored_candidate(candidate) for candidate in values):
+        raise ScreeningError(
+            "portfolio-bound publication requires identity-issued candidates"
+        )
+    ranked = rank_candidates(values)
+    if len(ranked) != len(values) or {id(candidate) for candidate in ranked} != {
+        id(candidate) for candidate in values
+    }:
+        raise ScreeningError("publication candidate cohort is incomplete")
+
+    from .risk import (
+        LongPlanDecision,
+        is_issued_long_plan_decision,
+        is_issued_portfolio_risk_authority,
+    )
+
+    if not isinstance(primary_plan_decision, LongPlanDecision) or not (
+        is_issued_long_plan_decision(primary_plan_decision)
+    ):
+        raise ScreeningError("primary plan authority is unverified")
+    authority = primary_plan_decision.portfolio_authority
+    if (
+        not primary_plan_decision.eligible
+        or primary_plan_decision.plan is None
+        or primary_plan_decision.request is None
+        or primary_plan_decision.authority_scope != "CANONICAL_PUBLICATION"
+        or not is_issued_portfolio_risk_authority(authority)
+        or authority is not primary_plan_decision.portfolio_authority
+        or authority.request is not primary_plan_decision.request
+        or authority.portfolio_state
+        is not primary_plan_decision.portfolio_authority.portfolio_state
+    ):
+        raise ScreeningError("primary plan authority is unverified")
+    primary = ranked[0]
+    request = primary_plan_decision.request
+    if (
+        primary.publication_session is None
+        or primary.maximum_permitted_entry is None
+        or primary.recommended_stop is None
+        or primary.target_price is None
+        or primary.tick_size is None
+        or request.symbol != primary.symbol
+        or request.session_date != primary.publication_session
+        or request.entry != primary.maximum_permitted_entry
+        or request.stop != primary.recommended_stop
+        or request.tick_size != primary.tick_size
+        or request.published_target != primary.target_price
+        or primary_plan_decision.target != primary.target_price
+    ):
+        raise ScreeningError("rank-one candidate and primary plan do not match")
+
+    decision = select_publication_roles(ranked, capacity_available=True)
+    if (
+        decision.status != "READY"
+        or decision.primary is None
+        or decision.primary.candidate is not primary
+        or tuple(item.rank for item in decision.candidates)
+        != tuple(range(1, len(ranked) + 1))
+        or tuple(item.role for item in decision.candidates)
+        != ("PRIMARY", *("WATCHLIST_SHADOW",) * (len(ranked) - 1))
+    ):
+        raise ScreeningError("publication role derivation is inconsistent")
+    source_manifest = _build_publication_observation_manifest(ranked)
+    identity = id(decision)
+
+    def discard(dead: ReferenceType[PublicationDecision]) -> None:
+        with _ISSUED_PUBLICATION_DECISIONS_LOCK:
+            current = _ISSUED_PUBLICATION_DECISIONS.get(identity)
+            if current is not None and current[0] is dead:
+                _ISSUED_PUBLICATION_DECISIONS.pop(identity, None)
+
+    with _ISSUED_PUBLICATION_DECISIONS_LOCK:
+        _ISSUED_PUBLICATION_DECISIONS[identity] = (
+            ref(decision, discard),
+            _publication_decision_fingerprint(decision),
+            ref(primary_plan_decision),
+            source_manifest,
+        )
+    return decision
 
 
 def _append(values: list[str], value: str) -> None:
@@ -2230,16 +2791,31 @@ def to_scored_candidate(context: CandidateContext) -> ScoredCandidate:
         )
     identity = id(candidate)
     digest = _scored_candidate_fingerprint(candidate)
+    context_digest = _relative_input_fingerprint(context)
+    source_observation_ids = _candidate_source_observation_ids(context)
+    try:
+        normalized_market_fact_sources = (
+            _candidate_normalized_market_fact_sources(context)
+        )
+    except ScreeningError:
+        normalized_market_fact_sources = ()
 
     def discard(dead: ReferenceType[ScoredCandidate]) -> None:
         with _ISSUED_SCORED_CANDIDATES_LOCK:
             current = _ISSUED_SCORED_CANDIDATES.get(identity)
-            if current is not None and current[0] is dead:
+            if current is not None and current.reference is dead:
                 _ISSUED_SCORED_CANDIDATES.pop(identity, None)
 
     reference = ref(candidate, discard)
     with _ISSUED_SCORED_CANDIDATES_LOCK:
-        _ISSUED_SCORED_CANDIDATES[identity] = (reference, digest)
+        _ISSUED_SCORED_CANDIDATES[identity] = _IssuedScoredCandidateAuthority(
+            reference=reference,
+            candidate_digest=digest,
+            context=context,
+            context_digest=context_digest,
+            source_observation_ids=source_observation_ids,
+            normalized_market_fact_sources=normalized_market_fact_sources,
+        )
     return candidate
 
 
@@ -2347,6 +2923,7 @@ __all__ = [
     "MarketSessionAttestationLike",
     "PublicationCandidate",
     "PublicationDecision",
+    "PublicationObservationManifest",
     "QuoteLike",
     "RelativeStrengthCohort",
     "ScoredCandidate",
@@ -2358,6 +2935,7 @@ __all__ = [
     "detect_setup",
     "evaluate_eligibility",
     "is_issued_publication_decision",
+    "is_issued_publication_decision_for_plan",
     "is_issued_scored_candidate",
     "midrank_percentile",
     "rank_candidates",

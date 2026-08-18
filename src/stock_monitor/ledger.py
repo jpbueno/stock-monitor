@@ -23,6 +23,13 @@ from .domain import (
     money_to_micros,
     require_aware_timestamp,
 )
+from .phase1 import (
+    IntradayObservation,
+    ObservationKind,
+    PaperEntryResult,
+    SignalStatus,
+    simulate_entry,
+)
 from .risk import (
     AccountCheck,
     ActualBreakerRefreshAuthority,
@@ -89,6 +96,14 @@ _ACTUAL_BUY_CONTEXT_AUTHORITIES: dict[
 _PAPER_ENTRY_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_SHADOW_FILL_DISPOSITION_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_PHASE1_SOURCE_BINDINGS: dict[
+    int,
+    tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
 ] = {}
 
 
@@ -392,13 +407,18 @@ def _ledger_signal_fingerprint(signal: LedgerSignal) -> tuple[object, ...]:
 def is_issued_ledger_signal(signal: object) -> bool:
     if not isinstance(signal, LedgerSignal):
         return False
+    try:
+        fingerprint = _ledger_signal_fingerprint(signal)
+    except Exception:
+        return False
     with _EVENT_AUTHORITY_LOCK:
         issued = _ISSUED_LEDGER_SIGNALS.get(id(signal))
-        return (
+        registered = (
             issued is not None
             and issued[0]() is signal
-            and issued[1] == _ledger_signal_fingerprint(signal)
+            and issued[1] == fingerprint
         )
+    return registered and _phase1_sources_are_current(signal)
 
 
 def _ledger_signal_digest(signal: LedgerSignal) -> str:
@@ -641,11 +661,125 @@ def _paper_entry_fingerprint(
 
 def is_issued_paper_entry_authority(authority: object) -> bool:
     """Return false until Task 8 verifies and registers source lineage."""
-    return isinstance(authority, PaperEntryAuthority) and _has_ledger_authority(
+    if not isinstance(authority, PaperEntryAuthority):
+        return False
+    try:
+        fingerprint = _paper_entry_fingerprint(authority)
+    except Exception:
+        return False
+    return _has_ledger_authority(
         _PAPER_ENTRY_AUTHORITIES,
         authority,
-        _paper_entry_fingerprint(authority),
+        fingerprint,
+    ) and _phase1_sources_are_current(authority)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ShadowFillDispositionAuthority:
+    """Price/time-only informational fill for one watchlist shadow."""
+
+    signal_id: str
+    lifecycle_event_id: str
+    trigger_observation_id: str
+    quote_observation_id: str
+    trigger_at: datetime
+    filled_at: datetime
+    fill_price: Decimal
+    source_digest: str
+    session_complete_digest: str
+    calendar_digest: str
+    lifecycle_cursor: int
+    action_ordinal: int
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.signal_id,
+            self.lifecycle_event_id,
+            self.trigger_observation_id,
+            self.quote_observation_id,
+        ):
+            if type(value) is not str or not value:
+                raise RiskBlock("INVALID_SHADOW_FILL_DISPOSITION")
+        trigger_at = _aware(
+            self.trigger_at,
+            "INVALID_SHADOW_FILL_DISPOSITION",
+        )
+        filled_at = _aware(
+            self.filled_at,
+            "INVALID_SHADOW_FILL_DISPOSITION",
+        )
+        if (
+            trigger_at.astimezone(_ET).time().replace(tzinfo=None)
+            <= time(9, 35)
+            or filled_at < trigger_at
+            or filled_at.astimezone(_ET).date()
+            != trigger_at.astimezone(_ET).date()
+        ):
+            raise RiskBlock("INVALID_SHADOW_FILL_DISPOSITION")
+        object.__setattr__(
+            self,
+            "fill_price",
+            _money(
+                self.fill_price,
+                "INVALID_SHADOW_FILL_DISPOSITION",
+                positive=True,
+            ),
+        )
+        for digest in (
+            self.source_digest,
+            self.session_complete_digest,
+            self.calendar_digest,
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+            ):
+                raise RiskBlock("INVALID_SHADOW_FILL_DISPOSITION")
+        _positive_int(
+            self.lifecycle_cursor,
+            "INVALID_SHADOW_FILL_DISPOSITION",
+        )
+        _nonnegative_int(
+            self.action_ordinal,
+            "INVALID_SHADOW_FILL_DISPOSITION",
+        )
+
+
+def _shadow_fill_disposition_fingerprint(
+    authority: ShadowFillDispositionAuthority,
+) -> tuple[object, ...]:
+    return (
+        authority.signal_id,
+        authority.lifecycle_event_id,
+        authority.trigger_observation_id,
+        authority.quote_observation_id,
+        authority.trigger_at,
+        authority.filled_at,
+        authority.fill_price,
+        authority.source_digest,
+        authority.session_complete_digest,
+        authority.calendar_digest,
+        authority.lifecycle_cursor,
+        authority.action_ordinal,
     )
+
+
+def is_issued_shadow_fill_disposition_authority(authority: object) -> bool:
+    if not isinstance(authority, ShadowFillDispositionAuthority):
+        return False
+    try:
+        fingerprint = _shadow_fill_disposition_fingerprint(authority)
+    except Exception:
+        return False
+    return _has_ledger_authority(
+        _SHADOW_FILL_DISPOSITION_AUTHORITIES,
+        authority,
+        fingerprint,
+    ) and _phase1_sources_are_current(authority)
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,6 +817,7 @@ class LedgerPosition:
     lots: tuple[LedgerLot, ...]
     reconciled: bool
     reason_codes: tuple[str, ...] = ()
+    profit_target_taken: bool = False
 
     def __post_init__(self) -> None:
         if type(self.signal_id) is not str or not self.signal_id:
@@ -731,6 +866,8 @@ class LedgerPosition:
         object.__setattr__(self, "lots", lots)
         if type(self.reconciled) is not bool:
             raise RiskBlock("INVALID_RECONCILIATION_STATE")
+        if type(self.profit_target_taken) is not bool:
+            raise RiskBlock("INVALID_PROFIT_TARGET_STATE")
         object.__setattr__(
             self,
             "reason_codes",
@@ -840,6 +977,8 @@ class LedgerEvent:
     signal_digest: str | None = None
     message_time: datetime | None = None
     received_at: datetime | None = None
+    recommended_stop: Decimal | None = None
+    profit_target_taken: bool = False
 
     def __post_init__(self) -> None:
         if self.ledger_name not in {"ACTUAL", "CANONICAL"}:
@@ -858,6 +997,18 @@ class LedgerEvent:
                     positive=True,
                 ),
             )
+        if self.recommended_stop is not None:
+            object.__setattr__(
+                self,
+                "recommended_stop",
+                _money(
+                    self.recommended_stop,
+                    "INVALID_RECOMMENDED_STOP",
+                    positive=True,
+                ),
+            )
+        if type(self.profit_target_taken) is not bool:
+            raise RiskBlock("INVALID_PROFIT_TARGET_STATE")
         if not isinstance(self.decision, ComplianceDecision):
             raise RiskBlock("INVALID_COMPLIANCE_DECISION")
         if type(self.event_id) is not str or not self.event_id:
@@ -1256,6 +1407,79 @@ def _has_ledger_authority(
             and issued[0]() is value
             and issued[1] == fingerprint
         )
+
+
+def _register_phase1_derived_authority(
+    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
+    value: object,
+    fingerprint: tuple[object, ...],
+) -> None:
+    identity = id(value)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _EVENT_AUTHORITY_LOCK:
+            current = registry.get(identity)
+            if current is not None and current[0] is dead:
+                registry.pop(identity, None)
+
+    reference = ref(value, discard)
+    with _EVENT_AUTHORITY_LOCK:
+        registry[identity] = (reference, fingerprint)
+
+
+def _bind_phase1_sources(
+    value: object,
+    sources: Sequence[tuple[object, str]],
+) -> None:
+    """Bind an issued value to exact live Journal-owned source identities."""
+    frozen_sources = tuple(sources)
+    if not frozen_sources:
+        return
+    identity = id(value)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _EVENT_AUTHORITY_LOCK:
+            current = _PHASE1_SOURCE_BINDINGS.get(identity)
+            if current is not None and current[0] is dead:
+                _PHASE1_SOURCE_BINDINGS.pop(identity, None)
+
+    value_reference = ref(value, discard)
+    with _EVENT_AUTHORITY_LOCK:
+        _PHASE1_SOURCE_BINDINGS[identity] = (
+            value_reference,
+            frozen_sources,
+        )
+
+
+def _phase1_bound_sources(value: object) -> tuple[tuple[object, str], ...]:
+    with _EVENT_AUTHORITY_LOCK:
+        binding = _PHASE1_SOURCE_BINDINGS.get(id(value))
+        if binding is None or binding[0]() is not value:
+            return ()
+        return binding[1]
+
+
+def _phase1_sources_are_current(value: object) -> bool:
+    with _EVENT_AUTHORITY_LOCK:
+        binding = _PHASE1_SOURCE_BINDINGS.get(id(value))
+        if binding is None:
+            return True
+        if binding[0]() is not value:
+            return False
+        resolved = binding[1]
+    from . import journal as journal_module
+
+    verifier_names = {
+        "SIGNAL": "is_verified_phase1_signal_source",
+        "ENTRY": "is_verified_phase1_entry_source",
+        "SHADOW_FILL": "is_verified_phase1_shadow_fill_source",
+        "CANONICAL_REPLAY": "is_verified_phase1_canonical_replay_source",
+    }
+    for source, kind in resolved:
+        verifier = getattr(journal_module, verifier_names.get(kind, ""), None)
+        if verifier is None or not verifier(source):
+            return False
+    return True
 
 
 def _issue_execution_quote_evidence(
@@ -1723,6 +1947,12 @@ def _ledger_event_content_digest(event: LedgerEvent) -> str:
                 if event.user_confirmed_stop is None
                 else money_to_micros(event.user_confirmed_stop)
             ),
+            "recommended_stop_micros": (
+                None
+                if event.recommended_stop is None
+                else money_to_micros(event.recommended_stop)
+            ),
+            "profit_target_taken": event.profit_target_taken,
             "decision": {
                 "status": event.decision.status,
                 "compliant": event.decision.compliant,
@@ -2055,13 +2285,17 @@ def _issue_actual_projection_from_journal(
 
 def is_issued_verified_replay_cohort(cohort: object) -> bool:
     """Return false until Task 7/8 registers a source-row-verified cohort."""
-    return isinstance(cohort, VerifiedLedgerReplayCohort) and (
-        _has_ledger_authority(
-            _VERIFIED_REPLAY_COHORT_AUTHORITIES,
-            cohort,
-            _replay_cohort_fingerprint(cohort),
-        )
-    )
+    if not isinstance(cohort, VerifiedLedgerReplayCohort):
+        return False
+    try:
+        fingerprint = _replay_cohort_fingerprint(cohort)
+    except Exception:
+        return False
+    return _has_ledger_authority(
+        _VERIFIED_REPLAY_COHORT_AUTHORITIES,
+        cohort,
+        fingerprint,
+    ) and _phase1_sources_are_current(cohort)
 
 
 def _replay_cohort_authorizes_stream(
@@ -2394,20 +2628,35 @@ def _apply_position_event(
     )
     lot = _copy_lot(event.lot)
     if existing_index is None:
+        recommended_stop = (
+            signal.recommended_stop
+            if event.recommended_stop is None
+            else event.recommended_stop
+        )
+        if recommended_stop < signal.recommended_stop:
+            raise RiskBlock("RECOMMENDED_STOP_WIDENED")
         position = LedgerPosition(
             signal_id=signal.signal_id,
             symbol=signal.symbol,
             ledger_name=event.ledger_name,
-            recommended_stop=signal.recommended_stop,
+            recommended_stop=recommended_stop,
             user_confirmed_stop=event.user_confirmed_stop,
             target=signal.target,
             tick_size=signal.tick_size,
             lots=(lot,),
             reconciled=event.decision.compliant,
             reason_codes=event.decision.reason_codes,
+            profit_target_taken=event.profit_target_taken,
         )
         return (*positions, position)
     existing = positions[existing_index]
+    recommended_stop = (
+        existing.recommended_stop
+        if event.recommended_stop is None
+        else event.recommended_stop
+    )
+    if recommended_stop < existing.recommended_stop:
+        raise RiskBlock("RECOMMENDED_STOP_WIDENED")
     projected_lots = tuple(
         sorted(
             (*existing.lots, lot),
@@ -2417,6 +2666,7 @@ def _apply_position_event(
     updated = replace(
         existing,
         lots=projected_lots,
+        recommended_stop=recommended_stop,
         user_confirmed_stop=(
             event.user_confirmed_stop
             if event.user_confirmed_stop is not None
@@ -2425,6 +2675,9 @@ def _apply_position_event(
         reconciled=existing.reconciled and event.decision.compliant,
         reason_codes=tuple(
             dict.fromkeys((*existing.reason_codes, *event.decision.reason_codes))
+        ),
+        profit_target_taken=(
+            existing.profit_target_taken or event.profit_target_taken
         ),
     )
     return positions[:existing_index] + (updated,) + positions[existing_index + 1 :]
@@ -2681,7 +2934,18 @@ def apply_ledger_event(
             raise RiskBlock("ENTRY_SESSION_MISMATCH")
         if event.lot.price != signal.maximum_entry:
             raise RiskBlock("CANONICAL_FILL_AUTHORITY_UNVERIFIED")
-        if event.lot.shares != signal.planned_shares:
+        phase1_remainder_projection = (
+            0 < event.lot.shares < signal.planned_shares
+            and any(
+                kind == "CANONICAL_REPLAY"
+                for _source, kind in _phase1_bound_sources(event)
+            )
+            and _phase1_sources_are_current(event)
+        )
+        if (
+            event.lot.shares != signal.planned_shares
+            and not phase1_remainder_projection
+        ):
             raise RiskBlock("SHARE_QUANTITY_MISMATCH")
         if any(
             position.signal_id == signal.signal_id
@@ -2870,13 +3134,6 @@ class LedgerPair:
         if isinstance(signals, (str, bytes)):
             raise RiskBlock("INVALID_LEDGER_SIGNALS")
         copied_signals = tuple(signals)
-        if not copied_signals or any(
-            not isinstance(signal, LedgerSignal) for signal in copied_signals
-        ):
-            raise RiskBlock("INVALID_LEDGER_SIGNALS")
-        identities = tuple(signal.signal_id for signal in copied_signals)
-        if len(identities) != len(set(identities)):
-            raise RiskBlock("DUPLICATE_SIGNAL_ID")
         copied_events = _normalize_ledger_events(tuple(events))
         cohorts = tuple(verified_replay_cohorts)
         if any(
@@ -2888,6 +3145,22 @@ class LedgerPair:
             {cohort.ledger_name for cohort in cohorts}
         ):
             raise RiskBlock("INVALID_REPLAY_COHORT")
+        issued_empty_canonical_replay = (
+            not copied_signals
+            and not copied_events
+            and len(cohorts) == 1
+            and cohorts[0].ledger_name == "CANONICAL"
+            and cohorts[0].expected_count == 0
+            and is_issued_verified_replay_cohort(cohorts[0])
+        )
+        if (
+            any(not isinstance(signal, LedgerSignal) for signal in copied_signals)
+            or (not copied_signals and not issued_empty_canonical_replay)
+        ):
+            raise RiskBlock("INVALID_LEDGER_SIGNALS")
+        identities = tuple(signal.signal_id for signal in copied_signals)
+        if len(identities) != len(set(identities)):
+            raise RiskBlock("DUPLICATE_SIGNAL_ID")
         if canonical is not None and not isinstance(canonical, CanonicalLedger):
             raise RiskBlock("INVALID_CANONICAL_LEDGER")
         if actual is not None and not isinstance(actual, ActualLedger):
@@ -3037,11 +3310,28 @@ class LedgerPair:
 
     @property
     def replay_verified(self) -> bool:
-        return self._replay_verified
+        return self.canonical_replay_verified and self.actual_replay_verified
 
     @property
     def canonical_replay_verified(self) -> bool:
-        return self._canonical_replay_verified
+        cohort = self._canonical_replay_cohort
+        if cohort is None:
+            return False
+        if not _phase1_bound_sources(cohort):
+            return self._canonical_replay_verified
+        return (
+            self._canonical_replay_verified
+            and _replay_cohort_authorizes_stream(
+                (cohort,),
+                "CANONICAL",
+                tuple(
+                    event
+                    for event in self.events
+                    if event.ledger_name == "CANONICAL"
+                ),
+                self.signals,
+            )
+        )
 
     @property
     def canonical_replay_cohort(self) -> VerifiedLedgerReplayCohort | None:
@@ -3049,7 +3339,24 @@ class LedgerPair:
 
     @property
     def actual_replay_verified(self) -> bool:
-        return self._actual_replay_verified
+        cohort = self._actual_replay_cohort
+        if cohort is None:
+            return False
+        if not _phase1_bound_sources(cohort):
+            return self._actual_replay_verified
+        return (
+            self._actual_replay_verified
+            and _replay_cohort_authorizes_stream(
+                (cohort,),
+                "ACTUAL",
+                tuple(
+                    event
+                    for event in self.events
+                    if event.ledger_name == "ACTUAL"
+                ),
+                self.signals,
+            )
+        )
 
     @property
     def actual_replay_cohort(self) -> VerifiedLedgerReplayCohort | None:
@@ -3424,6 +3731,7 @@ class LedgerPair:
         self._append(event)
         return decision
 
+
     def record_actual_buy_with_context(
         self,
         *,
@@ -3709,6 +4017,880 @@ class LedgerPair:
         return decision
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1CanonicalLedgerReplay:
+    """Task 8 cash/exit truth plus the Task 6 open-lot compatibility bridge."""
+
+    ledger_pair: LedgerPair
+    cohort: VerifiedLedgerReplayCohort
+    canonical_cash: Decimal
+    settled_buying_power: Decimal
+    realized_pnl: Decimal
+    postings: tuple[object, ...]
+    closed_trades: tuple[object, ...]
+    projection_terminal_cursor: int | None
+    lifecycle_source_terminal_cursor: int | None
+    posting_source_terminal_cursor: int | None
+    query_cutoff: datetime
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ledger_pair, LedgerPair) or not isinstance(
+            self.cohort,
+            VerifiedLedgerReplayCohort,
+        ):
+            raise RiskBlock("INVALID_PHASE1_CANONICAL_REPLAY")
+        for name in ("canonical_cash", "settled_buying_power"):
+            object.__setattr__(
+                self,
+                name,
+                _money(
+                    getattr(self, name),
+                    "INVALID_PHASE1_CANONICAL_REPLAY",
+                    nonnegative=True,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "realized_pnl",
+            _money(self.realized_pnl, "INVALID_PHASE1_CANONICAL_REPLAY"),
+        )
+        object.__setattr__(self, "postings", tuple(self.postings))
+        object.__setattr__(self, "closed_trades", tuple(self.closed_trades))
+        for cursor in (
+            self.projection_terminal_cursor,
+            self.lifecycle_source_terminal_cursor,
+            self.posting_source_terminal_cursor,
+        ):
+            if cursor is not None:
+                _positive_int(cursor, "INVALID_PHASE1_CANONICAL_REPLAY")
+        _aware(self.query_cutoff, "INVALID_PHASE1_CANONICAL_REPLAY")
+        if (
+            type(self.source_digest) is not str
+            or len(self.source_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.source_digest)
+        ):
+            raise RiskBlock("INVALID_PHASE1_CANONICAL_REPLAY")
+
+    @property
+    def source_verified(self) -> bool:
+        return bool(_phase1_bound_sources(self)) and _phase1_sources_are_current(
+            self
+        )
+
+
+def _phase1_signal_source_coordinates(source: object) -> tuple[object, ...]:
+    return (
+        getattr(source, "row_id"),
+        getattr(source, "row_sha256"),
+        getattr(source, "signal_id"),
+        getattr(source, "validation_window_id"),
+        getattr(source, "source_digest"),
+    )
+
+
+def _construct_phase1_signal(
+    source: object,
+    *,
+    binding_source: object,
+    binding_kind: str,
+) -> LedgerSignal:
+    signal = LedgerSignal(
+        signal_id=getattr(source, "signal_id"),
+        symbol=getattr(source, "symbol"),
+        role=getattr(source, "role"),
+        publication_session=getattr(source, "publication_session"),
+        maximum_entry=money_from_micros(getattr(source, "maximum_entry_micros")),
+        recommended_stop=money_from_micros(
+            getattr(source, "recommended_stop_micros")
+        ),
+        target=money_from_micros(getattr(source, "target_micros")),
+        planned_shares=getattr(source, "planned_shares"),
+        tick_size=money_from_micros(getattr(source, "tick_size_micros")),
+        trigger_price=money_from_micros(getattr(source, "trigger_price_micros")),
+    )
+    _register_phase1_derived_authority(
+        _ISSUED_LEDGER_SIGNALS,
+        signal,
+        _ledger_signal_fingerprint(signal),
+    )
+    _bind_phase1_sources(signal, ((binding_source, binding_kind),))
+    return signal
+
+
+def _issue_ledger_signal_from_phase1_source(source: object) -> LedgerSignal:
+    """Reissue one signal only from an exact owner-current Task 8 row source."""
+    from .journal import Phase1SignalSource, is_verified_phase1_signal_source
+
+    if not isinstance(source, Phase1SignalSource) or not (
+        is_verified_phase1_signal_source(source)
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_SOURCE_UNVERIFIED")
+    publication = source.publication_source
+    if (
+        source.received_at > source.query_cutoff
+        or source.published_at > source.received_at
+        or publication.received_at > source.query_cutoff
+    ):
+        raise RiskBlock("PHASE1_SOURCE_LOOKAHEAD")
+    if (
+        source.publication_report_row_id != publication.report_row_id
+        or source.publication_report_id != publication.report_id
+        or source.publication_source_digest != publication.source_digest
+        or source.publication_state_digest != publication.state_sha256
+        or source.publication_content_digest != publication.body_sha256
+        or source.publication_observation_set_digest
+        != publication.observation_set_sha256
+        or source.publication_session != publication.session_date
+        or source.published_at != publication.published_at
+        or source.publication_rank not in {1, 2, 3}
+        or (source.publication_rank == 1) != (source.role == "PRIMARY")
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_SOURCE_MISMATCH")
+    if source.role != "PRIMARY" or source.planned_shares <= 0:
+        raise RiskBlock("PHASE1_SIGNAL_NOT_TRADABLE")
+    return _construct_phase1_signal(
+        source,
+        binding_source=source,
+        binding_kind="SIGNAL",
+    )
+
+
+def _signal_matches_phase1_source(signal: LedgerSignal, source: object) -> bool:
+    from .journal import phase1_sources_share_owner
+
+    for bound_source, kind in _phase1_bound_sources(signal):
+        if kind != "SIGNAL":
+            continue
+        try:
+            same_row = _phase1_signal_source_coordinates(
+                bound_source
+            ) == _phase1_signal_source_coordinates(source)
+        except Exception:
+            return False
+        return same_row and phase1_sources_share_owner(bound_source, source)
+    return False
+
+
+def _phase1_entry_result_from_observations(
+    observations: Sequence[object],
+    *,
+    trigger: Decimal,
+    limit: Decimal,
+) -> PaperEntryResult:
+    """Recompute the first canonical trigger/fill from exact cohort order."""
+
+    def optional_money(value: object) -> Decimal | None:
+        if value is None:
+            return None
+        if type(value) is not int:
+            raise RiskBlock("PHASE1_ENTRY_OBSERVATION_MISMATCH")
+        try:
+            return money_from_micros(value)
+        except DomainValidationError:
+            raise RiskBlock("PHASE1_ENTRY_OBSERVATION_MISMATCH") from None
+
+    normalized: list[IntradayObservation] = []
+    for source in tuple(observations):
+        kind_value = getattr(source, "observation_kind", None)
+        try:
+            kind = ObservationKind(kind_value)
+        except (TypeError, ValueError):
+            raise RiskBlock("PHASE1_ENTRY_OBSERVATION_KIND_MISMATCH") from None
+        observed_at = getattr(source, "source_time", None)
+        received_at = getattr(source, "received_at", None)
+        sequence = getattr(source, "cohort_ordinal", None)
+        fresh = getattr(source, "fresh", None)
+        if (
+            not isinstance(observed_at, datetime)
+            or not isinstance(received_at, datetime)
+            or type(sequence) is not int
+            or type(fresh) is not bool
+        ):
+            raise RiskBlock("PHASE1_ENTRY_OBSERVATION_MISMATCH")
+        normalized.append(
+            IntradayObservation(
+                observation_id=getattr(source, "observation_id", None),
+                stream_id=getattr(source, "stream_id", None),
+                feed=getattr(source, "feed", None),
+                kind=kind,
+                at=observed_at,
+                received_at=received_at,
+                sequence=sequence,
+                fresh=fresh,
+                trade_price=optional_money(
+                    getattr(source, "trade_price_micros", None)
+                ),
+                bid=optional_money(getattr(source, "bid_micros", None)),
+                ask=optional_money(getattr(source, "ask_micros", None)),
+                open_price=optional_money(
+                    getattr(source, "open_micros", None)
+                ),
+                high=optional_money(getattr(source, "high_micros", None)),
+                low=optional_money(getattr(source, "low_micros", None)),
+                close_price=optional_money(
+                    getattr(source, "close_micros", None)
+                ),
+                session_open=(
+                    kind is ObservationKind.BAR
+                    and observed_at.astimezone(_ET).time().replace(tzinfo=None)
+                    == time(9, 30)
+                ),
+            )
+        )
+    return simulate_entry(trigger, limit, tuple(normalized))
+
+
+def _paper_entry_from_source_material(
+    source: object,
+    *,
+    signal: LedgerSignal,
+    calendar_digest: str,
+    binding_source: object,
+    binding_kind: str,
+) -> PaperEntryAuthority:
+    observations = tuple(getattr(source, "observations"))
+    completion = getattr(source, "completion")
+    lifecycle = getattr(source, "lifecycle_event")
+    posting = getattr(source, "buy_posting")
+    expected_count = getattr(source, "expected_observation_count")
+    query_cutoff = getattr(source, "query_cutoff")
+    if (
+        expected_count != len(observations)
+        or completion.expected_observation_count != expected_count
+        or completion.cohort_through_ordinal
+        != (observations[-1].cohort_ordinal if observations else 0)
+        or completion.completed_at > query_cutoff
+        or any(observation.received_at > completion.received_through for observation in observations)
+        or tuple(observation.cohort_ordinal for observation in observations)
+        != tuple(sorted(observation.cohort_ordinal for observation in observations))
+        or len({observation.observation_id for observation in observations})
+        != len(observations)
+        or any(observation.signal_id != signal.signal_id for observation in observations)
+        or completion.signal_id != signal.signal_id
+        or completion.session_date != signal.publication_session
+        or lifecycle.signal_id != signal.signal_id
+        or posting.signal_id != signal.signal_id
+        or tuple(
+            sorted(
+                (
+                    stream_id,
+                    max(
+                        observation.source_cursor
+                        for observation in observations
+                        if observation.stream_id == stream_id
+                    ),
+                )
+                for stream_id in {observation.stream_id for observation in observations}
+            )
+        )
+        != tuple(sorted(getattr(source, "observation_stream_highwaters")))
+    ):
+        raise RiskBlock("PHASE1_OBSERVATION_COHORT_INCOMPLETE")
+    by_id = {observation.observation_id: observation for observation in observations}
+    trigger = by_id.get(lifecycle.trigger_observation_id)
+    quote = by_id.get(lifecycle.quote_observation_id)
+    simulated = _phase1_entry_result_from_observations(
+        observations,
+        trigger=signal.trigger_price,
+        limit=signal.maximum_entry,
+    )
+    entry_status_by_event = {
+        "PAPER_FILL": "TRIGGERED_PAPER",
+        "LIVE_CONFIRM": "LIVE_CONFIRMED",
+        "LIVE_SKIP": "SKIPPED_LIVE_TRACKED_PAPER",
+    }
+    if (
+        trigger is None
+        or quote is None
+        or trigger.observation_kind != "TRADE"
+        or quote.observation_kind != "QUOTE"
+        or not trigger.fresh
+        or not quote.fresh
+        or trigger.trade_price_micros is None
+        or quote.bid_micros is None
+        or quote.ask_micros is None
+        or quote.ask_micros < quote.bid_micros
+        or quote.cohort_ordinal <= trigger.cohort_ordinal
+        or quote.source_time < trigger.source_time
+        or simulated.status is not SignalStatus.TRIGGERED_PAPER
+        or simulated.fill_price != signal.maximum_entry
+        or simulated.trigger_observation_id != trigger.observation_id
+        or simulated.quote_observation_id != quote.observation_id
+        or simulated.trigger_at != trigger.source_time
+        or simulated.filled_at != quote.source_time
+        or lifecycle.event_kind not in entry_status_by_event
+        or lifecycle.from_status != "TRIGGERED_AWAITING_LIMIT"
+        or lifecycle.to_status
+        != entry_status_by_event.get(lifecycle.event_kind)
+        or lifecycle.signal_id != signal.signal_id
+        or lifecycle.shares != signal.planned_shares
+        or lifecycle.price_micros != money_to_micros(signal.maximum_entry)
+        or lifecycle.received_at > query_cutoff
+        or posting.entry_kind != "BUY"
+        or posting.signal_id != signal.signal_id
+        or posting.lifecycle_event_id != lifecycle.lifecycle_event_id
+        or posting.shares_delta != signal.planned_shares
+        or posting.unit_price_micros != money_to_micros(signal.maximum_entry)
+        or posting.amount_micros
+        != -(money_to_micros(signal.maximum_entry) * signal.planned_shares)
+        or posting.received_at > query_cutoff
+        or money_from_micros(trigger.trade_price_micros) < signal.trigger_price
+        or money_from_micros(quote.ask_micros) > signal.maximum_entry
+    ):
+        raise RiskBlock("PHASE1_ENTRY_SOURCE_MISMATCH")
+    authority = PaperEntryAuthority(
+        signal_id=signal.signal_id,
+        signal_digest=_ledger_signal_digest(signal),
+        lifecycle_event_id=lifecycle.lifecycle_event_id,
+        trigger_observation_id=trigger.observation_id,
+        trigger_stream_id=trigger.stream_id,
+        trigger_feed=trigger.feed,
+        trigger_at=trigger.source_time,
+        trigger_received_at=trigger.received_at,
+        trigger_sequence=trigger.provider_sequence,
+        trigger_source_cursor=trigger.source_cursor,
+        trigger_source_ordinal=trigger.source_ordinal,
+        trigger_stream_through_cursor=trigger.stream_through_cursor,
+        trigger_cohort_ordinal=trigger.cohort_ordinal,
+        trigger_price=money_from_micros(trigger.trade_price_micros),
+        quote_observation_id=quote.observation_id,
+        quote_stream_id=quote.stream_id,
+        quote_feed=quote.feed,
+        quote_at=quote.source_time,
+        quote_received_at=quote.received_at,
+        quote_sequence=quote.provider_sequence,
+        quote_source_cursor=quote.source_cursor,
+        quote_source_ordinal=quote.source_ordinal,
+        quote_stream_through_cursor=quote.stream_through_cursor,
+        quote_cohort_ordinal=quote.cohort_ordinal,
+        bid=money_from_micros(quote.bid_micros),
+        ask=money_from_micros(quote.ask_micros),
+        source_digest=getattr(source, "source_digest"),
+        session_complete_digest=completion.source_digest,
+        cohort_through_ordinal=completion.cohort_through_ordinal,
+        cohort_received_through=completion.received_through,
+        canonical_event_id=lifecycle.lifecycle_event_id,
+        lifecycle_cursor=lifecycle.row_id,
+        action_ordinal=lifecycle.event_ordinal,
+        calendar_digest=calendar_digest,
+    )
+    _register_phase1_derived_authority(
+        _PAPER_ENTRY_AUTHORITIES,
+        authority,
+        _paper_entry_fingerprint(authority),
+    )
+    _bind_phase1_sources(authority, ((binding_source, binding_kind),))
+    return authority
+
+
+def _issue_paper_entry_authority_from_phase1_source(
+    source: object,
+    *,
+    signal: LedgerSignal,
+    calendar_resolver: SessionCalendarResolver,
+) -> PaperEntryAuthority:
+    from .journal import Phase1EntrySource, is_verified_phase1_entry_source
+    from .risk import _calendar_digest
+
+    if not isinstance(source, Phase1EntrySource) or not (
+        is_verified_phase1_entry_source(source)
+    ):
+        raise RiskBlock("PHASE1_ENTRY_SOURCE_UNVERIFIED")
+    if not is_issued_ledger_signal(signal) or not _signal_matches_phase1_source(
+        signal,
+        source.signal_source,
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_SOURCE_MISMATCH")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    calendar_digest = _calendar_digest(calendar_resolver)
+    if source.calendar_digest != calendar_digest:
+        raise RiskBlock("PHASE1_CALENDAR_SOURCE_MISMATCH")
+    return _paper_entry_from_source_material(
+        source,
+        signal=signal,
+        calendar_digest=calendar_digest,
+        binding_source=source,
+        binding_kind="ENTRY",
+    )
+
+
+def _issue_shadow_fill_disposition_from_phase1_source(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> ShadowFillDispositionAuthority:
+    """Recompute one price/time-only shadow disposition from a sealed cohort."""
+    from .journal import (
+        Phase1ShadowFillSource,
+        is_verified_phase1_shadow_fill_source,
+    )
+    from .risk import _calendar_digest
+
+    if not isinstance(source, Phase1ShadowFillSource) or not (
+        is_verified_phase1_shadow_fill_source(source)
+    ):
+        raise RiskBlock("PHASE1_SHADOW_FILL_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    calendar_digest = _calendar_digest(calendar_resolver)
+    signal = source.signal_source
+    observations = tuple(source.observations)
+    completion = source.completion
+    trigger_event = source.trigger_event
+    lifecycle = source.lifecycle_event
+    if (
+        signal.role != "WATCHLIST_SHADOW"
+        or signal.planned_shares != 0
+        or source.calendar_digest != calendar_digest
+        or source.query_cutoff < completion.completed_at
+        or source.expected_observation_count != len(observations)
+        or completion.expected_observation_count != len(observations)
+        or completion.signal_id != signal.signal_id
+        or completion.session_date != signal.publication_session
+        or completion.cohort_through_ordinal
+        != (observations[-1].cohort_ordinal if observations else 0)
+        or source.observation_source_highwater
+        != max((item.source_cursor for item in observations), default=0)
+        or tuple(item.cohort_ordinal for item in observations)
+        != tuple(sorted(item.cohort_ordinal for item in observations))
+        or len({item.observation_id for item in observations})
+        != len(observations)
+        or any(item.signal_id != signal.signal_id for item in observations)
+        or any(item.received_at > completion.received_through for item in observations)
+        or completion.received_through > completion.completed_at
+        or completion.completed_at > source.query_cutoff
+        or tuple(
+            sorted(
+                (
+                    stream_id,
+                    max(
+                        item.source_cursor
+                        for item in observations
+                        if item.stream_id == stream_id
+                    ),
+                )
+                for stream_id in {item.stream_id for item in observations}
+            )
+        )
+        != tuple(sorted(source.observation_stream_highwaters))
+    ):
+        raise RiskBlock("PHASE1_SHADOW_FILL_COHORT_INCOMPLETE")
+    by_id = {item.observation_id: item for item in observations}
+    trigger = by_id.get(lifecycle.trigger_observation_id)
+    quote = by_id.get(lifecycle.quote_observation_id)
+    simulated = _phase1_entry_result_from_observations(
+        observations,
+        trigger=money_from_micros(signal.trigger_price_micros),
+        limit=money_from_micros(signal.maximum_entry_micros),
+    )
+    if (
+        trigger is None
+        or quote is None
+        or trigger.observation_kind != "TRADE"
+        or quote.observation_kind != "QUOTE"
+        or not trigger.fresh
+        or not quote.fresh
+        or trigger.trade_price_micros is None
+        or quote.bid_micros is None
+        or quote.ask_micros is None
+        or quote.ask_micros < quote.bid_micros
+        or quote.cohort_ordinal <= trigger.cohort_ordinal
+        or quote.source_time <= trigger.source_time
+        or simulated.status is not SignalStatus.TRIGGERED_PAPER
+        or simulated.fill_price
+        != money_from_micros(signal.maximum_entry_micros)
+        or simulated.trigger_observation_id != trigger.observation_id
+        or simulated.quote_observation_id != quote.observation_id
+        or simulated.trigger_at != trigger.source_time
+        or simulated.filled_at != quote.source_time
+        or trigger_event.signal_id != signal.signal_id
+        or trigger_event.event_kind != "TRIGGER_OBSERVED"
+        or trigger_event.from_status != "PUBLISHED"
+        or trigger_event.to_status != "TRIGGERED_AWAITING_LIMIT"
+        or trigger_event.trigger_observation_id != trigger.observation_id
+        or trigger_event.quote_observation_id is not None
+        or trigger_event.event_time != trigger.source_time
+        or lifecycle.signal_id != signal.signal_id
+        or lifecycle.event_kind != "SHADOW_FILL"
+        or lifecycle.from_status != "TRIGGERED_AWAITING_LIMIT"
+        or lifecycle.to_status != "SHADOW_FILLED_INFORMATIONAL"
+        or lifecycle.trigger_observation_id != trigger.observation_id
+        or lifecycle.quote_observation_id != quote.observation_id
+        or lifecycle.event_time != quote.source_time
+        or lifecycle.price_micros != signal.maximum_entry_micros
+        or lifecycle.shares is not None
+        or lifecycle.recommended_stop_micros is not None
+        or lifecycle.event_ordinal != trigger_event.event_ordinal + 1
+        or trigger_event.received_at > source.query_cutoff
+        or lifecycle.received_at > source.query_cutoff
+    ):
+        raise RiskBlock("PHASE1_SHADOW_FILL_SOURCE_MISMATCH")
+    authority = ShadowFillDispositionAuthority(
+        signal_id=signal.signal_id,
+        lifecycle_event_id=lifecycle.lifecycle_event_id,
+        trigger_observation_id=trigger.observation_id,
+        quote_observation_id=quote.observation_id,
+        trigger_at=trigger.source_time,
+        filled_at=quote.source_time,
+        fill_price=money_from_micros(signal.maximum_entry_micros),
+        source_digest=source.source_digest,
+        session_complete_digest=completion.source_digest,
+        calendar_digest=calendar_digest,
+        lifecycle_cursor=lifecycle.row_id,
+        action_ordinal=lifecycle.event_ordinal,
+    )
+    _register_phase1_derived_authority(
+        _SHADOW_FILL_DISPOSITION_AUTHORITIES,
+        authority,
+        _shadow_fill_disposition_fingerprint(authority),
+    )
+    _bind_phase1_sources(authority, ((source, "SHADOW_FILL"),))
+    return authority
+
+
+def _canonical_event_from_paper_authority(
+    signal: LedgerSignal,
+    authority: PaperEntryAuthority,
+    *,
+    remaining_shares: int | None = None,
+) -> LedgerEvent:
+    shares = signal.planned_shares if remaining_shares is None else remaining_shares
+    _positive_int(shares, "INVALID_POSITION_SHARES")
+    if shares > signal.planned_shares:
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+    return LedgerEvent(
+        ledger_name="CANONICAL",
+        signal_id=signal.signal_id,
+        lot=LedgerLot(
+            price=signal.maximum_entry,
+            shares=shares,
+            at=authority.quote_at,
+        ),
+        user_confirmed_stop=None,
+        decision=ComplianceDecision("COMPLIANT", True, False, ()),
+        event_id=(
+            authority.canonical_event_id
+            if shares == signal.planned_shares
+            else f"{authority.canonical_event_id}:remaining:{shares}"
+        ),
+        cursor=authority.lifecycle_cursor,
+        ordinal=authority.action_ordinal,
+        authority_basis=authority.source_digest,
+        signal_digest=_ledger_signal_digest(signal),
+        message_time=authority.quote_received_at,
+        received_at=authority.quote_received_at,
+    )
+
+
+def _phase1_open_position_state(
+    signal: LedgerSignal,
+    lifecycle_events: Sequence[object],
+    *,
+    remaining_shares: int,
+) -> tuple[Decimal, bool]:
+    """Fold the one allowed partial exit into the compatibility open lot."""
+    if not isinstance(signal, LedgerSignal):
+        raise TypeError("signal must be a LedgerSignal")
+    if (
+        type(remaining_shares) is not int
+        or remaining_shares <= 0
+        or remaining_shares > signal.planned_shares
+        or isinstance(lifecycle_events, (str, bytes))
+    ):
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+    partials = tuple(
+        event
+        for event in tuple(lifecycle_events)
+        if getattr(event, "signal_id", None) == signal.signal_id
+        and getattr(event, "event_kind", None) == "PARTIAL_EXIT"
+    )
+    exited_shares = signal.planned_shares - remaining_shares
+    if exited_shares == 0:
+        if partials:
+            raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+        return signal.recommended_stop, False
+    if len(partials) != 1:
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+    partial = partials[0]
+    shares = getattr(partial, "shares", None)
+    price_micros = getattr(partial, "price_micros", None)
+    stop_micros = getattr(partial, "recommended_stop_micros", None)
+    if (
+        type(getattr(partial, "row_id", None)) is not int
+        or partial.row_id <= 0
+        or type(shares) is not int
+        or shares != exited_shares
+        or type(price_micros) is not int
+        or price_micros <= 0
+        or type(stop_micros) is not int
+        or stop_micros <= 0
+    ):
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+    try:
+        exit_price = money_from_micros(price_micros)
+        recommended_stop = money_from_micros(stop_micros)
+    except DomainValidationError:
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH") from None
+    if (
+        recommended_stop <= signal.recommended_stop
+        or recommended_stop >= exit_price
+        or not _tick_aligned(recommended_stop, signal.tick_size)
+    ):
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+    return recommended_stop, True
+
+
+def _issue_canonical_ledger_replay_from_phase1_source(
+    source: object,
+) -> Phase1CanonicalLedgerReplay:
+    """Issue Task 6 compatibility state while retaining complete Task 8 truth."""
+    from .journal import (
+        Phase1CanonicalReplaySource,
+        is_verified_phase1_canonical_replay_source,
+    )
+    from .risk import ClosedTrade
+
+    if not isinstance(source, Phase1CanonicalReplaySource) or not (
+        is_verified_phase1_canonical_replay_source(source)
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_UNVERIFIED")
+    lifecycle_terminal = (
+        source.lifecycle_events[-1].row_id if source.lifecycle_events else None
+    )
+    posting_terminal = source.postings[-1].row_id if source.postings else None
+    source_signal_ids = tuple(item.signal_id for item in source.signal_sources)
+    primary_signal_sources = tuple(
+        item for item in source.signal_sources if item.role == "PRIMARY"
+    )
+    shadow_signal_ids = {
+        item.signal_id
+        for item in source.signal_sources
+        if item.role == "WATCHLIST_SHADOW"
+    }
+    entry_signal_ids = tuple(
+        item.signal_source.signal_id for item in source.entry_sources
+    )
+    if (
+        source.expected_lifecycle_count != len(source.lifecycle_events)
+        or source.expected_posting_count != len(source.postings)
+        or source.expected_closed_trade_count != len(source.closed_trades)
+        or source.lifecycle_terminal_cursor != lifecycle_terminal
+        or source.posting_terminal_cursor != posting_terminal
+        or (
+            lifecycle_terminal is not None
+            and (
+                source.lifecycle_source_highwater is None
+                or source.lifecycle_source_highwater < lifecycle_terminal
+            )
+        )
+        or (
+            posting_terminal is not None
+            and (
+                source.posting_source_highwater is None
+                or source.posting_source_highwater < posting_terminal
+            )
+        )
+        or len(source_signal_ids) != len(set(source_signal_ids))
+        or any(
+            (item.role == "PRIMARY" and item.planned_shares <= 0)
+            or (item.role == "WATCHLIST_SHADOW" and item.planned_shares != 0)
+            or item.role not in {"PRIMARY", "WATCHLIST_SHADOW"}
+            for item in source.signal_sources
+        )
+        or len(entry_signal_ids) != len(set(entry_signal_ids))
+        or any(signal_id in shadow_signal_ids for signal_id in entry_signal_ids)
+        or any(
+            item.validation_window_id != source.validation_window_id
+            or item.query_cutoff > source.query_cutoff
+            for item in source.signal_sources
+        )
+        or any(item.query_cutoff > source.query_cutoff for item in source.entry_sources)
+        or any(
+            item.signal_id not in source_signal_ids
+            for item in (
+                *source.lifecycle_events,
+                *source.postings,
+                *source.closed_trades,
+            )
+        )
+        or any(posting.signal_id in shadow_signal_ids for posting in source.postings)
+        or any(trade.signal_id in shadow_signal_ids for trade in source.closed_trades)
+        or any(
+            event.signal_id in shadow_signal_ids
+            and event.event_kind
+            in {"PAPER_FILL", "LIVE_CONFIRM", "LIVE_SKIP", "CLOSE"}
+            for event in source.lifecycle_events
+        )
+        or any(
+            item.validation_window_id != source.validation_window_id
+            for item in source.closed_trades
+        )
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+    if any(
+        getattr(item, "received_at", source.query_cutoff) > source.query_cutoff
+        for item in (*source.lifecycle_events, *source.postings, *source.closed_trades)
+    ):
+        raise RiskBlock("PHASE1_SOURCE_LOOKAHEAD")
+    recomputed_cash_micros = source.starting_capital_micros + sum(
+        posting.amount_micros for posting in source.postings
+    )
+    cutoff_session = source.query_cutoff.astimezone(_ET).date()
+    recomputed_settled_micros = source.starting_capital_micros + sum(
+        posting.amount_micros
+        for posting in source.postings
+        if posting.settlement_available_session <= cutoff_session
+    )
+    if (
+        recomputed_cash_micros != source.canonical_cash_micros
+        or recomputed_settled_micros != source.settled_buying_power_micros
+        or sum(trade.pnl_micros for trade in source.closed_trades)
+        != source.realized_pnl_micros
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_ARITHMETIC_MISMATCH")
+    signals = tuple(
+        _construct_phase1_signal(
+            signal_source,
+            binding_source=source,
+            binding_kind="CANONICAL_REPLAY",
+        )
+        for signal_source in primary_signal_sources
+    )
+    by_signal = {signal.signal_id: signal for signal in signals}
+    if len(by_signal) != len(signals):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+    remaining_shares: dict[str, int] = {signal.signal_id: 0 for signal in signals}
+    for posting in source.postings:
+        if posting.entry_kind in {"BUY", "SALE"}:
+            if posting.signal_id not in remaining_shares or posting.shares_delta is None:
+                raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+            remaining_shares[posting.signal_id] += posting.shares_delta
+    if any(
+        remaining < 0 or remaining > by_signal[signal_id].planned_shares
+        for signal_id, remaining in remaining_shares.items()
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+    buy_signal_ids = tuple(
+        posting.signal_id
+        for posting in source.postings
+        if posting.entry_kind == "BUY"
+    )
+    if (
+        len(buy_signal_ids) != len(set(buy_signal_ids))
+        or set(buy_signal_ids) != set(entry_signal_ids)
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+    events: list[LedgerEvent] = []
+    for entry_source in source.entry_sources:
+        signal = by_signal.get(entry_source.signal_source.signal_id)
+        if signal is None:
+            raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
+        remaining = remaining_shares.get(signal.signal_id, 0)
+        if remaining == 0:
+            continue
+        recommended_stop, profit_target_taken = _phase1_open_position_state(
+            signal,
+            source.lifecycle_events,
+            remaining_shares=remaining,
+        )
+        authority = _paper_entry_from_source_material(
+            entry_source,
+            signal=signal,
+            calendar_digest=entry_source.calendar_digest,
+            binding_source=source,
+            binding_kind="CANONICAL_REPLAY",
+        )
+        event = _canonical_event_from_paper_authority(
+            signal,
+            authority,
+            remaining_shares=remaining,
+        )
+        if profit_target_taken:
+            event = replace(
+                event,
+                recommended_stop=recommended_stop,
+                profit_target_taken=True,
+            )
+        _bind_phase1_sources(event, ((source, "CANONICAL_REPLAY"),))
+        events.append(event)
+    ordered_events = tuple(sorted(events, key=_ledger_projection_order_key))
+    batch = VerifiedLedgerEventBatch(
+        tuple(
+            (event.event_id, _ledger_event_content_digest(event))
+            for event in ordered_events
+        )
+    )
+    _register_verified_batch(batch)
+    references = tuple(
+        (
+            event.event_id,
+            _ledger_event_content_digest(event),
+            event.signal_digest,
+        )
+        for event in ordered_events
+        if event.signal_digest is not None
+    )
+    cursors = tuple(event.cursor for event in ordered_events if event.cursor is not None)
+    cohort = VerifiedLedgerReplayCohort(
+        ledger_name="CANONICAL",
+        references=references,
+        expected_count=len(ordered_events),
+        start_cursor=(cursors[0] if cursors else None),
+        terminal_cursor=(cursors[-1] if cursors else None),
+        query_cutoff=source.query_cutoff,
+        source_digest=source.source_digest,
+    )
+    _register_phase1_derived_authority(
+        _VERIFIED_REPLAY_COHORT_AUTHORITIES,
+        cohort,
+        _replay_cohort_fingerprint(cohort),
+    )
+    _bind_phase1_sources(cohort, ((source, "CANONICAL_REPLAY"),))
+    pair = LedgerPair(
+        signals=signals,
+        events=ordered_events,
+        verified_event_batch=batch,
+        verified_replay_cohorts=(cohort,),
+    )
+    closed_trades = tuple(
+        ClosedTrade(
+            session_date=trade.session_date,
+            pnl=money_from_micros(trade.pnl_micros),
+            signal_id=trade.signal_id,
+            at=trade.at,
+            cursor=trade.row_id,
+            source_id=trade.trade_id,
+            message_time=trade.message_time,
+            received_at=trade.received_at,
+        )
+        for trade in source.closed_trades
+    )
+    replay = Phase1CanonicalLedgerReplay(
+        ledger_pair=pair,
+        cohort=cohort,
+        canonical_cash=money_from_micros(source.canonical_cash_micros),
+        settled_buying_power=money_from_micros(
+            source.settled_buying_power_micros
+        ),
+        realized_pnl=money_from_micros(source.realized_pnl_micros),
+        postings=source.postings,
+        closed_trades=closed_trades,
+        projection_terminal_cursor=(cursors[-1] if cursors else None),
+        lifecycle_source_terminal_cursor=source.lifecycle_terminal_cursor,
+        posting_source_terminal_cursor=source.posting_terminal_cursor,
+        query_cutoff=source.query_cutoff,
+        source_digest=source.source_digest,
+    )
+    _bind_phase1_sources(replay, ((source, "CANONICAL_REPLAY"),))
+    return replay
+
+
 __all__ = [
     "ActualBuyContext",
     "ActualLedger",
@@ -3720,9 +4902,12 @@ __all__ = [
     "LedgerPosition",
     "LedgerSignal",
     "PaperEntryAuthority",
+    "Phase1CanonicalLedgerReplay",
+    "ShadowFillDispositionAuthority",
     "VerifiedLedgerEventBatch",
     "VerifiedLedgerReplayCohort",
     "apply_ledger_event",
     "is_issued_paper_entry_authority",
+    "is_issued_shadow_fill_disposition_authority",
     "is_issued_verified_replay_cohort",
 ]

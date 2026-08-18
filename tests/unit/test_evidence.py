@@ -1389,6 +1389,21 @@ class EvidenceClassificationTests(unittest.TestCase):
                 expected_sha256="0" * 64,
             )
 
+    def test_phase1_reviewed_bundle_reissuer_is_capability_bound(self) -> None:
+        self.assertTrue(
+            hasattr(
+                evidence_module,
+                "_issue_reviewed_bundle_from_phase1_source",
+            )
+        )
+        with self.assertRaises(evidence_module.EvidenceUnavailableError):
+            evidence_module._issue_reviewed_bundle_from_phase1_source(
+                object()
+            )
+        self.assertFalse(
+            hasattr(evidence_module, "load_released_evidence_bundle")
+        )
+
     def test_only_untampered_classifier_output_is_a_reviewed_decision(self) -> None:
         self.assertFalse(evidence_module.is_reviewed_evidence_decision(object()))
         reviewed = decision([])

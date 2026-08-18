@@ -20,6 +20,14 @@ from .domain import (
     require_aware_timestamp,
     stable_execution_event_identity,
 )
+from .evidence import (
+    DateRange,
+    EvidenceDecision,
+    ReviewedEvidenceBundle,
+    _is_reviewed_bundle,
+    classify_evidence,
+    is_reviewed_evidence_decision,
+)
 from .journal import (
     JournalAccountCheckWindowSource,
     JournalActionSource,
@@ -33,6 +41,15 @@ from .market_calendar import (
     MarketCalendar,
     is_release_verified_market_calendar,
     is_validated_market_calendar,
+)
+from .phase1 import (
+    EquityPoint as Phase1MarkedEquityPoint,
+    ExitReason,
+    IntradayObservation,
+    ObservationKind,
+    PaperExitResult,
+    simulate_exit,
+    simulate_forced_exit,
 )
 from .policy import Policy
 
@@ -60,7 +77,23 @@ _POSITION_EVENT_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
+_PHASE1_SIGNAL_EVIDENCE_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_PHASE1_POSITION_EVIDENCE_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
 _MARK_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_PHASE1_POSITION_EXIT_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], tuple[object, ...]],
+] = {}
+_PHASE1_EQUITY_POINT_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
@@ -91,6 +124,10 @@ _SETTLEMENT_LEDGER_AUTHORITIES: dict[
 _JOURNAL_DERIVED_SOURCE_BINDINGS: dict[
     int,
     tuple[ReferenceType[object], ReferenceType[object], str],
+] = {}
+_PHASE1_DERIVED_SOURCE_BINDINGS: dict[
+    int,
+    tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
 ] = {}
 _LONG_PLAN_AUTHORITIES: dict[
     int,
@@ -470,6 +507,7 @@ class PortfolioRiskAuthority:
                 )
         if self.settlement_source not in {
             "CANONICAL_LEDGER",
+            "PHASE1_CANONICAL_REPLAY",
             "ACTUAL_SETTLEMENT_LEDGER",
         }:
             raise RiskBlock("INVALID_SETTLEMENT_AUTHORITY")
@@ -578,23 +616,7 @@ def _calendar_digest(resolver: SessionCalendarResolver) -> str:
 def _portfolio_risk_fingerprint(
     authority: PortfolioRiskAuthority,
 ) -> tuple[object, ...]:
-    return (
-        authority.request,
-        authority.portfolio_state,
-        authority.scope,
-        authority.as_of,
-        authority.ledger_name,
-        authority.projection_through_cursor,
-        authority.settlement_through_cursor,
-        authority.projection_digest,
-        authority.settlement_source,
-        authority.settlement_digest,
-        authority.policy_digest,
-        authority.calendar_digest,
-        authority.breaker_refresh_digest,
-        authority.breaker_refresh_through_execution_cursor,
-        authority.breaker_refresh_through_close_cursor,
-    )
+    return (_portfolio_authority_digest(authority),)
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -660,11 +682,17 @@ def is_issued_actual_breaker_refresh_authority(authority: object) -> bool:
 
 
 def is_issued_portfolio_risk_authority(authority: object) -> bool:
-    return isinstance(authority, PortfolioRiskAuthority) and _has_identity_authority(
+    if not isinstance(authority, PortfolioRiskAuthority):
+        return False
+    try:
+        fingerprint = _portfolio_risk_fingerprint(authority)
+    except Exception:
+        return False
+    return _has_identity_authority(
         _PORTFOLIO_RISK_AUTHORITIES,
         authority,
-        _portfolio_risk_fingerprint(authority),
-    )
+        fingerprint,
+    ) and _phase1_derived_sources_are_current(authority)
 
 
 def _issue_portfolio_risk_authority(
@@ -680,12 +708,69 @@ def _issue_portfolio_risk_authority(
     settlement_ledger: object | None = None,
     settled_at: datetime | None = None,
     actual_breaker_refresh: ActualBreakerRefreshAuthority | None = None,
+    phase1_canonical_replay: object | None = None,
 ) -> PortfolioRiskAuthority:
     """Trusted coordinator seam; all capacity fields are recomputed here."""
-    from .ledger import LedgerPair
+    from .ledger import (
+        LedgerPair,
+        Phase1CanonicalLedgerReplay,
+        _phase1_bound_sources as _ledger_phase1_bound_sources,
+    )
 
     if not isinstance(ledger_pair, LedgerPair):
         raise RiskBlock("INVALID_PORTFOLIO_PROJECTION")
+    phase1_source_bindings: tuple[tuple[object, str], ...] = ()
+    if phase1_canonical_replay is not None:
+        if not (
+            scope == "CANONICAL_PUBLICATION"
+            and ledger_name == "CANONICAL"
+            and isinstance(
+                phase1_canonical_replay,
+                Phase1CanonicalLedgerReplay,
+            )
+            and phase1_canonical_replay.ledger_pair is ledger_pair
+            and phase1_canonical_replay.cohort
+            is ledger_pair.canonical_replay_cohort
+            and phase1_canonical_replay.source_verified
+        ):
+            raise RiskBlock("PHASE1_CANONICAL_REPLAY_UNVERIFIED")
+        replay_sources = tuple(
+            source
+            for source, kind in _ledger_phase1_bound_sources(
+                phase1_canonical_replay
+            )
+            if kind == "CANONICAL_REPLAY"
+        )
+        history_sources = tuple(
+            source
+            for source, kind in _phase1_bound_sources(breaker_state)
+            if kind == "BREAKER_HISTORY"
+        )
+        if len(replay_sources) != 1 or len(history_sources) != 1:
+            raise RiskBlock("PHASE1_SOURCE_LINEAGE_INCOMPLETE")
+        replay_source = replay_sources[0]
+        history_source = history_sources[0]
+        from .journal import phase1_sources_share_owner
+
+        if not (
+            phase1_sources_share_owner(replay_source, history_source)
+            and replay_source.validation_window_id
+            == history_source.validation_window_id
+            and replay_source.query_cutoff == phase1_canonical_replay.query_cutoff
+            and replay_source.source_digest
+            == phase1_canonical_replay.source_digest
+            and money_from_micros(replay_source.canonical_cash_micros)
+            == phase1_canonical_replay.canonical_cash
+            and money_from_micros(replay_source.settled_buying_power_micros)
+            == phase1_canonical_replay.settled_buying_power
+            and money_from_micros(replay_source.realized_pnl_micros)
+            == phase1_canonical_replay.realized_pnl
+        ):
+            raise RiskBlock("PHASE1_SOURCE_LINEAGE_MISMATCH")
+        phase1_source_bindings = (
+            (replay_source, "CANONICAL_REPLAY"),
+            (history_source, "BREAKER_HISTORY"),
+        )
     expected_ledger = {
         "CANONICAL_PUBLICATION": "CANONICAL",
         "ACTUAL_ENTRY": "ACTUAL",
@@ -700,6 +785,11 @@ def _issue_portfolio_risk_authority(
         and as_of.astimezone(_ET).time().replace(tzinfo=None) != time(8, 45)
     ):
         raise RiskBlock("PUBLICATION_CUTOFF_MISMATCH")
+    if (
+        phase1_canonical_replay is not None
+        and phase1_canonical_replay.query_cutoff != as_of
+    ):
+        raise RiskBlock("PORTFOLIO_REPLAY_CUTOFF_MISMATCH")
     scoped_events = tuple(
         event
         for event in ledger_pair.events
@@ -784,17 +874,40 @@ def _issue_portfolio_risk_authority(
     if ledger_name == "CANONICAL":
         if settlement_ledger is not None or settled_at is not None:
             raise RiskBlock("INVALID_SETTLEMENT_AUTHORITY")
-        settled_cash = snapshot.cash
-        settlement_source = "CANONICAL_LEDGER"
-        settlement_payload = {
-            "version": 2,
-            "source": settlement_source,
-            "settled_cash_micros": money_to_micros(settled_cash),
-            "as_of": as_of.astimezone(UTC).isoformat(
-                timespec="microseconds"
-            ).replace("+00:00", "Z"),
-        }
-        settlement_through_cursor = None
+        if phase1_canonical_replay is None:
+            settled_cash = snapshot.cash
+            settlement_source = "CANONICAL_LEDGER"
+            settlement_payload = {
+                "version": 2,
+                "source": settlement_source,
+                "settled_cash_micros": money_to_micros(settled_cash),
+                "as_of": as_of.astimezone(UTC).isoformat(
+                    timespec="microseconds"
+                ).replace("+00:00", "Z"),
+            }
+            settlement_through_cursor = None
+        else:
+            settled_cash = phase1_canonical_replay.settled_buying_power
+            settlement_source = "PHASE1_CANONICAL_REPLAY"
+            settlement_through_cursor = (
+                phase1_canonical_replay.posting_source_terminal_cursor
+            )
+            settlement_payload = {
+                "version": 3,
+                "source": settlement_source,
+                "settled_buying_power_micros": money_to_micros(settled_cash),
+                "canonical_cash_micros": money_to_micros(
+                    phase1_canonical_replay.canonical_cash
+                ),
+                "realized_pnl_micros": money_to_micros(
+                    phase1_canonical_replay.realized_pnl
+                ),
+                "posting_source_terminal_cursor": settlement_through_cursor,
+                "replay_source_digest": phase1_canonical_replay.source_digest,
+                "as_of": as_of.astimezone(UTC).isoformat(
+                    timespec="microseconds"
+                ).replace("+00:00", "Z"),
+            }
     else:
         if not isinstance(settlement_ledger, SettlementLedger) or settled_at is None:
             raise RiskBlock("SETTLEMENT_AUTHORITY_UNVERIFIED")
@@ -950,6 +1063,8 @@ def _issue_portfolio_risk_authority(
         authority,
         _portfolio_risk_fingerprint(authority),
     )
+    if phase1_source_bindings:
+        _bind_phase1_derived_sources(authority, phase1_source_bindings)
     return authority
 
 
@@ -1033,7 +1148,11 @@ def _long_plan_fingerprint(
         decision.authority_scope,
         decision.authority_digest,
         decision.as_of,
-        decision.portfolio_authority,
+        (
+            None
+            if decision.portfolio_authority is None
+            else _portfolio_authority_digest(decision.portfolio_authority)
+        ),
     )
 
 
@@ -1225,10 +1344,20 @@ def _issue_long_plan_decision(
 
 
 def is_issued_long_plan_decision(decision: object) -> bool:
-    return isinstance(decision, LongPlanDecision) and _has_identity_authority(
-        _LONG_PLAN_AUTHORITIES,
-        decision,
-        _long_plan_fingerprint(decision),
+    if not isinstance(decision, LongPlanDecision):
+        return False
+    try:
+        fingerprint = _long_plan_fingerprint(decision)
+    except Exception:
+        return False
+    return (
+        _has_identity_authority(
+            _LONG_PLAN_AUTHORITIES,
+            decision,
+            fingerprint,
+        )
+        and decision.portfolio_authority is not None
+        and is_issued_portfolio_risk_authority(decision.portfolio_authority)
     )
 
 
@@ -1981,6 +2110,889 @@ def _has_identity_authority(
             and registered[0]() is value
             and registered[1] == fingerprint
         )
+
+
+def _bind_phase1_derived_sources(
+    value: object,
+    sources: Sequence[tuple[object, str]],
+) -> None:
+    """Bind a risk authority to exact owner-current Phase 1 sources."""
+    frozen_sources = tuple(sources)
+    if not frozen_sources:
+        return
+    identity = id(value)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _AUTHORITY_LOCK:
+            current = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
+            if current is not None and current[0] is dead:
+                _PHASE1_DERIVED_SOURCE_BINDINGS.pop(identity, None)
+
+    value_reference = ref(value, discard)
+    with _AUTHORITY_LOCK:
+        _PHASE1_DERIVED_SOURCE_BINDINGS[identity] = (
+            value_reference,
+            frozen_sources,
+        )
+
+
+def _phase1_bound_sources(value: object) -> tuple[tuple[object, str], ...]:
+    with _AUTHORITY_LOCK:
+        binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(id(value))
+        if binding is None or binding[0]() is not value:
+            return ()
+        return binding[1]
+
+
+def _phase1_derived_sources_are_current(value: object) -> bool:
+    with _AUTHORITY_LOCK:
+        binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(id(value))
+        if binding is None:
+            return True
+        if binding[0]() is not value:
+            return False
+        resolved = binding[1]
+    from . import journal as journal_module
+
+    verifier_names = {
+        "BREAKER_HISTORY": "is_verified_phase1_breaker_history_source",
+        "CANONICAL_REPLAY": "is_verified_phase1_canonical_replay_source",
+        "EQUITY_MARK": "is_verified_phase1_equity_mark_source",
+        "EXIT_REVIEW": "is_verified_phase1_exit_review_source",
+        "EXIT_REVIEW_MARKET": "is_verified_phase1_exit_review_market_source",
+        "SIGNAL_EVIDENCE": "is_verified_phase1_signal_evidence_source",
+        "SIGNAL_SOURCE": "is_verified_phase1_signal_source",
+    }
+    for source, kind in resolved:
+        verifier = getattr(journal_module, verifier_names.get(kind, ""), None)
+        if verifier is None or not verifier(source):
+            return False
+    return True
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1EquityPointAuthority:
+    """One source-bound canonical or actual Phase 1 equity observation."""
+
+    point: Phase1MarkedEquityPoint
+    validation_window_id: str
+    ledger_name: str
+    session_date: date
+    point_at: datetime
+    query_cutoff: datetime
+    replay_source_digest: str
+    mark_source_digest: str
+    source_digest: str
+    authority_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.point, Phase1MarkedEquityPoint)
+            or self.ledger_name not in {"CANONICAL", "ACTUAL"}
+            or self.point.ledger_name != self.ledger_name
+            or type(self.validation_window_id) is not str
+            or not _is_sha256_digest(self.validation_window_id)
+            or type(self.session_date) is not date
+        ):
+            raise RiskBlock("INVALID_PHASE1_EQUITY_POINT_AUTHORITY")
+        point_at = _require_aware(
+            self.point_at,
+            "INVALID_PHASE1_EQUITY_POINT_AUTHORITY",
+        )
+        query_cutoff = _require_aware(
+            self.query_cutoff,
+            "INVALID_PHASE1_EQUITY_POINT_AUTHORITY",
+        )
+        if (
+            self.point.at != point_at
+            or point_at.astimezone(_ET).date() != self.session_date
+            or point_at > query_cutoff
+        ):
+            raise RiskBlock("INVALID_PHASE1_EQUITY_POINT_AUTHORITY")
+        for digest in (
+            self.replay_source_digest,
+            self.mark_source_digest,
+            self.source_digest,
+            self.authority_digest,
+        ):
+            if not _is_sha256_digest(digest):
+                raise RiskBlock("INVALID_PHASE1_EQUITY_POINT_AUTHORITY")
+
+
+def _phase1_marked_equity_point_fingerprint(
+    point: Phase1MarkedEquityPoint,
+) -> tuple[object, ...]:
+    return (
+        point.ledger_name,
+        point.at,
+        point.cash,
+        point.positions_value,
+        point.equity,
+        point.external_cash_flow,
+        tuple(tuple(item) for item in point.mark_sources),
+    )
+
+
+def _phase1_equity_point_authority_document(
+    authority: Phase1EquityPointAuthority,
+) -> dict[str, object]:
+    point = authority.point
+
+    def instant(value: datetime) -> str:
+        return value.astimezone(UTC).isoformat(
+            timespec="microseconds",
+        ).replace("+00:00", "Z")
+
+    return {
+        "authority_kind": "PHASE1_EQUITY_POINT",
+        "cash_micros": money_to_micros(point.cash),
+        "equity_micros": money_to_micros(point.equity),
+        "external_cash_flow_micros": money_to_micros(
+            point.external_cash_flow
+        ),
+        "ledger_name": authority.ledger_name,
+        "mark_source_digest": authority.mark_source_digest,
+        "mark_sources": [list(item) for item in point.mark_sources],
+        "point_at": instant(authority.point_at),
+        "positions_value_micros": money_to_micros(point.positions_value),
+        "query_cutoff": instant(authority.query_cutoff),
+        "replay_source_digest": authority.replay_source_digest,
+        "session_date": authority.session_date.isoformat(),
+        "source_digest": authority.source_digest,
+        "validation_window_id": authority.validation_window_id,
+        "version": 1,
+    }
+
+
+def _phase1_equity_point_authority_fingerprint(
+    authority: Phase1EquityPointAuthority,
+) -> tuple[object, ...]:
+    return (
+        _phase1_marked_equity_point_fingerprint(authority.point),
+        authority.validation_window_id,
+        authority.ledger_name,
+        authority.session_date,
+        authority.point_at,
+        authority.query_cutoff,
+        authority.replay_source_digest,
+        authority.mark_source_digest,
+        authority.source_digest,
+        authority.authority_digest,
+    )
+
+
+def is_issued_phase1_equity_point_authority(value: object) -> bool:
+    """Return whether Journal material issued this exact current identity."""
+    if not isinstance(value, Phase1EquityPointAuthority):
+        return False
+    try:
+        fingerprint = _phase1_equity_point_authority_fingerprint(value)
+        document_digest = sha256(
+            json.dumps(
+                _phase1_equity_point_authority_document(value),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        return False
+    return (
+        _has_identity_authority(
+            _PHASE1_EQUITY_POINT_AUTHORITIES,
+            value,
+            fingerprint,
+        )
+        and document_digest == value.authority_digest
+        and _phase1_derived_sources_are_current(value)
+    )
+
+
+def _phase1_verified_actual_equity_replay(
+    source: JournalActualReplaySource,
+    state: object,
+) -> object:
+    """Require one exact identity-paired actual replay for an equity mark."""
+    from .reconciliation import (
+        ActualLedgerState,
+        is_verified_actual_ledger_state_for_source,
+    )
+
+    if (
+        not isinstance(source, JournalActualReplaySource)
+        or not isinstance(state, ActualLedgerState)
+        or not is_verified_actual_ledger_state_for_source(state, source)
+        or state.query_cutoff != source.query_cutoff
+        or state.through_cursor != source.terminal_cursor
+        or state.journal_source_digest != source.source_digest
+        or state.settlement_ledger != source.postings
+        or source.expected_action_count != len(source.actions)
+        or source.expected_posting_count != len(source.postings)
+    ):
+        raise RiskBlock("PHASE1_ACTUAL_ECONOMIC_CASH_SOURCE_MISMATCH")
+    return state
+
+
+def _phase1_actual_economic_cash_from_verified_replay(
+    source: JournalActualReplaySource,
+    state: object,
+) -> Decimal:
+    """Recover Phase 1 ACTUAL economic cash, including sale receivables.
+
+    Settlement availability answers whether cash can fund a new entry.  An
+    equity mark instead includes every already-executed strategy cash leg, so
+    a same-day sale remains an asset before its T+1 availability date.  Only
+    exact replay-issued strategy BUY/SALE/FEE postings contribute; account
+    observations and caller-reconciled/external cash never do.
+    """
+    _phase1_verified_actual_equity_replay(source, state)
+
+    strategy_sources = _strategy_settlement_sources(source)
+    selected_posting_keys = {
+        posting.posting_key for posting, _action in strategy_sources
+    }
+    if len(selected_posting_keys) != len(strategy_sources):
+        raise RiskBlock("PHASE1_ACTUAL_ECONOMIC_CASH_SOURCE_MISMATCH")
+    for posting in source.postings:
+        if posting.account_name == "ACCOUNT_EVIDENCE":
+            continue
+        if posting.posting_key not in selected_posting_keys:
+            raise RiskBlock("PHASE1_ACTUAL_ECONOMIC_CASH_SOURCE_MISMATCH")
+
+    cash_micros = money_to_micros(_VALIDATION_CAPITAL) + sum(
+        posting.amount_micros for posting, _action in strategy_sources
+    )
+    try:
+        return money_from_micros(cash_micros)
+    except DomainValidationError:
+        raise RiskBlock("PHASE1_ACTUAL_ECONOMIC_CASH_OVERFLOW") from None
+
+
+def _phase1_actual_strategy_positions_from_verified_replay(
+    source: JournalActualReplaySource,
+    state: object,
+) -> tuple[object, ...]:
+    """Project strategy lineages while excluding unrelated account inventory."""
+    from .phase1 import PaperPosition
+    from .reconciliation import ActualLedgerState
+
+    verified = _phase1_verified_actual_equity_replay(source, state)
+    assert isinstance(verified, ActualLedgerState)
+    allowed_lineages = {"ACTUAL_EVENT", "ACTUAL_GROUP"}
+    if any(
+        position.lineage_kind
+        not in {*allowed_lineages, "UNRELATED_POSITION"}
+        for position in verified.positions
+    ):
+        raise RiskBlock("PHASE1_ACTUAL_POSITION_LINEAGE_UNRESOLVED")
+    return tuple(
+        PaperPosition(
+            signal_id=position.signal_id,
+            symbol=position.symbol,
+            ledger_name="ACTUAL",
+            shares=position.shares,
+        )
+        for position in verified.positions
+        if position.lineage_kind in allowed_lineages
+    )
+
+
+def _issue_phase1_equity_point_from_source(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> Phase1EquityPointAuthority:
+    """Issue only from a complete owner-current replay/mark Journal source.
+
+    Journal's persisted source is intentionally moneyless: the adapter must
+    recover cash and open holdings from verified canonical/actual replay, then
+    derive every mark from raw-bound SIP quote or completed split-adjusted
+    daily-bar evidence.  Until Journal exposes that complete DTO, this seam
+    fails closed rather than accepting caller-provided monetary values.
+    """
+    from . import journal as journal_module
+
+    source_type = getattr(journal_module, "Phase1EquityMarkSource", None)
+    source_verifier = getattr(
+        journal_module,
+        "is_verified_phase1_equity_mark_source",
+        None,
+    )
+    if (
+        source_type is None
+        or not isinstance(source_type, type)
+        or not isinstance(source, source_type)
+        or not callable(source_verifier)
+        or not source_verifier(source)
+    ):
+        raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+        calendar_resolver.release_verified
+    ):
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if getattr(source, "calendar_digest", None) != _calendar_digest(
+        calendar_resolver
+    ):
+        raise RiskBlock("PHASE1_EQUITY_CALENDAR_MISMATCH")
+    required_material = (
+        "validation_window_id",
+        "ledger_name",
+        "session_date",
+        "point_at",
+        "query_cutoff",
+        "canonical_replay_source",
+        "canonical_replay",
+        "actual_replay_source",
+        "actual_replay",
+        "position_marks",
+        "expected_position_count",
+        "expected_mark_count",
+        "mark_terminal_cursor",
+        "mark_source_highwater",
+        "row_references",
+        "source_digest",
+    )
+    if any(not hasattr(source, name) for name in required_material):
+        raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_INCOMPLETE")
+    from urllib.parse import parse_qs, urlsplit
+
+    from .ledger import Phase1CanonicalLedgerReplay
+    from .phase1 import EquityMark, PaperPosition, mark_equity
+    from .providers.alpaca import (
+        Bar,
+        ProviderFetchCohort,
+        Quote,
+        _normalized_market_fact_source,
+        _provider_fetch_cohort_manifest,
+        is_issued_normalized_market_fact,
+        is_issued_provider_fetch_cohort,
+        provider_fetch_cohorts_share_owner,
+        read_provider_fetch_bundle,
+    )
+    from .reconciliation import (
+        ActualLedgerState,
+        is_verified_actual_ledger_state_for_source,
+    )
+
+    ledger_name = source.ledger_name
+    session_date = source.session_date
+    point_at = source.point_at
+    query_cutoff = source.query_cutoff
+    if (
+        ledger_name not in {"CANONICAL", "ACTUAL"}
+        or type(session_date) is not date
+        or not isinstance(point_at, datetime)
+        or not isinstance(query_cutoff, datetime)
+        or point_at.tzinfo is None
+        or point_at.utcoffset() is None
+        or query_cutoff.tzinfo is None
+        or query_cutoff.utcoffset() is None
+        or point_at > query_cutoff
+        or point_at.astimezone(_ET).date() != session_date
+    ):
+        raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_MISMATCH")
+    try:
+        session = calendar_resolver.session(session_date)
+    except RiskBlock:
+        raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_MISMATCH") from None
+    session_open = datetime.combine(
+        session_date,
+        session.open_time,
+        tzinfo=_ET,
+    ).astimezone(UTC)
+    session_close = datetime.combine(
+        session_date,
+        session.close_time,
+        tzinfo=_ET,
+    ).astimezone(UTC)
+    if point_at != session_close:
+        raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_MISMATCH")
+
+    canonical_source = source.canonical_replay_source
+    canonical_replay = source.canonical_replay
+    actual_source = source.actual_replay_source
+    actual_replay = source.actual_replay
+    phase1_sources_share_owner = getattr(
+        journal_module,
+        "phase1_sources_share_owner",
+        None,
+    )
+    if (
+        not isinstance(canonical_replay, Phase1CanonicalLedgerReplay)
+        or not canonical_replay.source_verified
+        or canonical_replay.source_digest
+        != getattr(canonical_source, "source_digest", None)
+        or canonical_replay.query_cutoff != query_cutoff
+        or not isinstance(actual_source, JournalActualReplaySource)
+        or not isinstance(actual_replay, ActualLedgerState)
+        or not is_verified_actual_ledger_state_for_source(
+            actual_replay,
+            actual_source,
+        )
+        or actual_replay.query_cutoff != query_cutoff
+        or actual_source.query_cutoff != query_cutoff
+        or not callable(phase1_sources_share_owner)
+        or not phase1_sources_share_owner(source, canonical_source)
+        or source.validation_window_id
+        != getattr(canonical_source, "validation_window_id", None)
+    ):
+        raise RiskBlock("PHASE1_EQUITY_REPLAY_SOURCE_MISMATCH")
+
+    if ledger_name == "CANONICAL":
+        cash = canonical_replay.canonical_cash
+        replay_source_digest = canonical_source.source_digest
+        raw_positions = canonical_replay.ledger_pair.canonical.open_positions
+        positions = tuple(
+            PaperPosition(
+                signal_id=position.signal_id,
+                symbol=position.symbol,
+                ledger_name="CANONICAL",
+                shares=position.shares,
+            )
+            for position in raw_positions
+        )
+    else:
+        cash = _phase1_actual_economic_cash_from_verified_replay(
+            actual_source,
+            actual_replay,
+        )
+        replay_source_digest = actual_source.source_digest
+        positions = _phase1_actual_strategy_positions_from_verified_replay(
+            actual_source,
+            actual_replay,
+        )
+    position_symbols = tuple(sorted({position.symbol for position in positions}))
+    mark_sources = tuple(source.position_marks)
+    if (
+        source.expected_position_count != len(positions)
+        or source.expected_mark_count != len(position_symbols)
+        or len(mark_sources) != len(position_symbols)
+        or tuple(getattr(mark, "symbol", None) for mark in mark_sources)
+        != position_symbols
+        or tuple(getattr(mark, "mark_ordinal", None) for mark in mark_sources)
+        != tuple(range(1, len(mark_sources) + 1))
+        or len(
+            {
+                getattr(mark, "source_cursor", None)
+                for mark in mark_sources
+            }
+        )
+        != len(mark_sources)
+        or any(
+            type(getattr(mark, "source_cursor", None)) is not int
+            or mark.source_cursor <= 0
+            for mark in mark_sources
+        )
+        or source.mark_terminal_cursor
+        != (mark_sources[-1].source_cursor if mark_sources else None)
+        or source.mark_source_highwater
+        < (mark_sources[-1].source_cursor if mark_sources else 0)
+    ):
+        raise RiskBlock("PHASE1_EQUITY_POSITION_MARK_SET_MISMATCH")
+
+    required_mark_material = (
+        "quote_cohort",
+        "daily_bar_cohort",
+        "quote_facts",
+        "daily_bar_facts",
+        "selected_observation",
+        "selected_provider_fact_source",
+        "derived_price_micros",
+        "mark_at",
+        "mark_ordinal",
+        "source_cursor",
+        "quote_terminal_cursor",
+        "quote_source_highwater",
+        "daily_bar_terminal_cursor",
+        "daily_bar_source_highwater",
+        "expected_quote_fact_count",
+        "expected_daily_bar_fact_count",
+        "source_digest",
+    )
+    if any(
+        not hasattr(mark, name)
+        for mark in mark_sources
+        for name in required_mark_material
+    ):
+        raise RiskBlock("PHASE1_EQUITY_POSITION_MARK_SOURCE_INCOMPLETE")
+    cohorts = tuple(
+        cohort
+        for mark in mark_sources
+        for cohort in (mark.quote_cohort, mark.daily_bar_cohort)
+    )
+    if cohorts and (
+        any(not isinstance(cohort, ProviderFetchCohort) for cohort in cohorts)
+        or any(not is_issued_provider_fetch_cohort(cohort) for cohort in cohorts)
+        or not provider_fetch_cohorts_share_owner(*cohorts)
+    ):
+        raise RiskBlock("PHASE1_EQUITY_PROVIDER_COHORT_UNVERIFIED")
+    marks: dict[str, EquityMark] = {}
+    mark_source_documents: list[dict[str, object]] = []
+    for mark_source in mark_sources:
+        quote_cohort = mark_source.quote_cohort
+        daily_bar_cohort = mark_source.daily_bar_cohort
+        quote_facts = tuple(mark_source.quote_facts)
+        daily_bar_facts = tuple(mark_source.daily_bar_facts)
+        selected_observation = mark_source.selected_observation
+        method = mark_source.method
+        if (
+            not isinstance(quote_cohort, ProviderFetchCohort)
+            or not isinstance(daily_bar_cohort, ProviderFetchCohort)
+            or not is_issued_provider_fetch_cohort(quote_cohort)
+            or not is_issued_provider_fetch_cohort(daily_bar_cohort)
+            or not provider_fetch_cohorts_share_owner(
+                quote_cohort,
+                daily_bar_cohort,
+            )
+            or type(mark_source.quote_facts) is not tuple
+            or type(mark_source.daily_bar_facts) is not tuple
+            or mark_source.expected_quote_fact_count != len(quote_facts)
+            or mark_source.expected_daily_bar_fact_count
+            != len(daily_bar_facts)
+            or not daily_bar_facts
+            or type(mark_source.quote_source_highwater) is not int
+            or mark_source.quote_source_highwater < 0
+            or type(mark_source.daily_bar_source_highwater) is not int
+            or mark_source.daily_bar_source_highwater <= 0
+            or type(mark_source.daily_bar_terminal_cursor) is not int
+            or mark_source.daily_bar_terminal_cursor <= 0
+            or mark_source.daily_bar_source_highwater
+            < mark_source.daily_bar_terminal_cursor
+            or (
+                (mark_source.quote_terminal_cursor is None)
+                != (len(quote_facts) == 0)
+            )
+            or (
+                mark_source.quote_terminal_cursor is not None
+                and (
+                    type(mark_source.quote_terminal_cursor) is not int
+                    or mark_source.quote_terminal_cursor <= 0
+                    or mark_source.quote_source_highwater
+                    < mark_source.quote_terminal_cursor
+                )
+            )
+        ):
+            raise RiskBlock("PHASE1_EQUITY_PROVIDER_COHORT_UNVERIFIED")
+        try:
+            exact_quote_facts = tuple(quote_cohort[mark_source.symbol])
+            exact_daily_bar_facts = tuple(
+                daily_bar_cohort[mark_source.symbol]
+            )
+            quote_manifest = _provider_fetch_cohort_manifest(quote_cohort)
+            daily_bar_manifest = _provider_fetch_cohort_manifest(
+                daily_bar_cohort
+            )
+            quote_bundle = read_provider_fetch_bundle(quote_cohort)
+            daily_bar_bundle = read_provider_fetch_bundle(daily_bar_cohort)
+            quote_fact_sources = tuple(
+                _normalized_market_fact_source(fact)
+                for fact in quote_facts
+            )
+            daily_bar_fact_sources = tuple(
+                _normalized_market_fact_source(fact)
+                for fact in daily_bar_facts
+            )
+            selected_fact_source = _normalized_market_fact_source(
+                selected_observation
+            )
+        except (KeyError, TypeError, ValueError):
+            raise RiskBlock("PHASE1_EQUITY_PROVIDER_FACT_UNVERIFIED") from None
+        if (
+            len(exact_quote_facts) != len(quote_facts)
+            or any(
+                exact is not retained
+                for exact, retained in zip(
+                    exact_quote_facts,
+                    quote_facts,
+                    strict=True,
+                )
+            )
+            or len(exact_daily_bar_facts) != len(daily_bar_facts)
+            or any(
+                exact is not retained
+                for exact, retained in zip(
+                    exact_daily_bar_facts,
+                    daily_bar_facts,
+                    strict=True,
+                )
+            )
+            or quote_bundle.manifest is not quote_manifest
+            or daily_bar_bundle.manifest is not daily_bar_manifest
+            or quote_manifest.collection != "quotes"
+            or daily_bar_manifest.collection != "bars"
+            or mark_source.symbol not in quote_manifest.requested_symbols
+            or mark_source.symbol not in daily_bar_manifest.requested_symbols
+            or any(
+                not isinstance(fact, Quote)
+                or not is_issued_normalized_market_fact(fact)
+                or fact.symbol != mark_source.symbol
+                or fact.feed.lower() != "sip"
+                or fact_source.kind != "QUOTE"
+                or fact_source.symbol != mark_source.symbol
+                or fact_source.feed.lower() != "sip"
+                or fact_source.fetch_manifest is not quote_manifest
+                for fact, fact_source in zip(
+                    quote_facts,
+                    quote_fact_sources,
+                    strict=True,
+                )
+            )
+            or any(
+                not isinstance(fact, Bar)
+                or not is_issued_normalized_market_fact(fact)
+                or fact.symbol != mark_source.symbol
+                or fact.feed.lower() != "sip"
+                or fact.adjustment.lower() != "split"
+                or fact_source.kind != "BAR"
+                or fact_source.symbol != mark_source.symbol
+                or fact_source.feed.lower() != "sip"
+                or fact_source.fetch_manifest is not daily_bar_manifest
+                for fact, fact_source in zip(
+                    daily_bar_facts,
+                    daily_bar_fact_sources,
+                    strict=True,
+                )
+            )
+            or not is_issued_normalized_market_fact(selected_observation)
+            or mark_source.selected_provider_fact_source
+            is not selected_fact_source
+            or mark_source.mark_at > point_at
+            or mark_source.mark_at.astimezone(_ET).date() != session_date
+            or any(
+                page.observation.retrieved_at < session_close
+                or page.observation.retrieved_at > query_cutoff
+                for bundle in (quote_bundle, daily_bar_bundle)
+                for page in bundle.pages
+            )
+        ):
+            raise RiskBlock("PHASE1_EQUITY_PROVIDER_FACT_MISMATCH")
+        try:
+            quote_queries = tuple(
+                parse_qs(
+                    urlsplit(page.request_url).query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+                for page in quote_manifest.pages
+            )
+            daily_bar_queries = tuple(
+                parse_qs(
+                    urlsplit(page.request_url).query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+                for page in daily_bar_manifest.pages
+            )
+            quote_starts = {
+                query["start"][0] for query in quote_queries
+            }
+            quote_ends = {query["end"][0] for query in quote_queries}
+            quote_feeds = {
+                query["feed"][0].lower() for query in quote_queries
+            }
+            daily_bar_starts = {
+                query["start"][0] for query in daily_bar_queries
+            }
+            daily_bar_ends = {
+                query["end"][0] for query in daily_bar_queries
+            }
+            daily_bar_feeds = {
+                query["feed"][0].lower() for query in daily_bar_queries
+            }
+            daily_bar_timeframes = {
+                query["timeframe"][0] for query in daily_bar_queries
+            }
+            daily_bar_adjustments = {
+                query["adjustment"][0].lower()
+                for query in daily_bar_queries
+            }
+            quote_request_start = datetime.fromisoformat(
+                next(iter(quote_starts)).replace("Z", "+00:00")
+            )
+            quote_request_end = datetime.fromisoformat(
+                next(iter(quote_ends)).replace("Z", "+00:00")
+            )
+            daily_bar_request_start = datetime.fromisoformat(
+                next(iter(daily_bar_starts)).replace("Z", "+00:00")
+            )
+            daily_bar_request_end = datetime.fromisoformat(
+                next(iter(daily_bar_ends)).replace("Z", "+00:00")
+            )
+            if (
+                len(quote_starts) != 1
+                or len(quote_ends) != 1
+                or quote_feeds != {"sip"}
+                or len(daily_bar_starts) != 1
+                or len(daily_bar_ends) != 1
+                or daily_bar_feeds != {"sip"}
+                or daily_bar_timeframes != {"1Day"}
+                or daily_bar_adjustments != {"split"}
+                or {
+                    urlsplit(page.request_url).path
+                    for page in quote_manifest.pages
+                }
+                != {"/v2/stocks/quotes"}
+                or {
+                    page.source_type for page in quote_manifest.pages
+                }
+                != {"ALPACA_HISTORICAL_QUOTES"}
+                or {
+                    urlsplit(page.request_url).path
+                    for page in daily_bar_manifest.pages
+                }
+                != {"/v2/stocks/bars"}
+                or {
+                    page.source_type for page in daily_bar_manifest.pages
+                }
+                != {"ALPACA_DAILY_BARS"}
+            ):
+                raise ValueError
+        except (KeyError, ValueError, IndexError, StopIteration):
+            raise RiskBlock("PHASE1_EQUITY_PROVIDER_FACT_MISMATCH") from None
+
+        current_daily_bars = tuple(
+            fact
+            for fact in daily_bar_facts
+            if fact.timestamp.astimezone(_ET).date() == session_date
+        )
+        usable_quotes = tuple(
+            fact
+            for fact in quote_facts
+            if session_open <= fact.timestamp <= point_at
+            and 0 <= (point_at - fact.timestamp).total_seconds() <= 60
+            and fact.bid > _ZERO
+            and fact.ask >= fact.bid
+        )
+        selected_quote = (
+            max(
+                usable_quotes,
+                key=lambda item: (
+                    item.timestamp,
+                    -1 if item.sequence is None else item.sequence,
+                ),
+            )
+            if usable_quotes
+            else None
+        )
+        if (
+            quote_request_start != session_open
+            or quote_request_end != session_close
+            or daily_bar_request_start > session_open
+            or daily_bar_request_end != session_close
+            or len(current_daily_bars) != 1
+        ):
+            raise RiskBlock("PHASE1_EQUITY_PROVIDER_FACT_MISMATCH")
+
+        if selected_quote is not None:
+            if (
+                method != "CONSOLIDATED_BID"
+                or selected_observation is not selected_quote
+                or selected_fact_source.fetch_manifest is not quote_manifest
+                or selected_observation.timestamp != mark_source.mark_at
+                or mark_source.derived_price_micros
+                != money_to_micros(selected_observation.bid)
+            ):
+                raise RiskBlock("PHASE1_EQUITY_MARK_PRIORITY_MISMATCH")
+            marks[mark_source.symbol] = EquityMark(
+                at=selected_observation.timestamp,
+                bid=selected_observation.bid,
+                ask=selected_observation.ask,
+                completed_close=None,
+            )
+        else:
+            selected_daily_bar = current_daily_bars[0]
+            if (
+                method != "CLOSE_MINUS_0.10_PERCENT"
+                or selected_observation is not selected_daily_bar
+                or selected_fact_source.fetch_manifest
+                is not daily_bar_manifest
+                or mark_source.mark_at != point_at
+                or mark_source.derived_price_micros
+                != (
+                    money_to_micros(selected_daily_bar.close) * 999
+                )
+                // 1000
+            ):
+                raise RiskBlock("PHASE1_EQUITY_MARK_PRIORITY_MISMATCH")
+            marks[mark_source.symbol] = EquityMark(
+                at=point_at,
+                bid=None,
+                ask=None,
+                completed_close=selected_daily_bar.close,
+            )
+        mark_source_documents.append(
+            {
+                "symbol": mark_source.symbol,
+                "method": method,
+                "derived_price_micros": mark_source.derived_price_micros,
+                "quote_manifest_digest": quote_manifest.manifest_digest,
+                "daily_bar_manifest_digest": (
+                    daily_bar_manifest.manifest_digest
+                ),
+                "selected_normalized_fields_digest": (
+                    selected_fact_source.normalized_fields_digest
+                ),
+                "source_digest": mark_source.source_digest,
+            }
+        )
+
+    try:
+        point = mark_equity(
+            cash,
+            positions,
+            marks,
+            ledger_name=ledger_name,
+            at=point_at,
+        )
+    except Exception as error:
+        raise RiskBlock("PHASE1_EQUITY_MARK_DERIVATION_FAILED") from error
+    mark_source_digest = sha256(
+        json.dumps(
+            {
+                "namespace": "stock-monitor/phase1-equity-mark-sources/v1",
+                "marks": mark_source_documents,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    authority = Phase1EquityPointAuthority(
+        point=point,
+        validation_window_id=source.validation_window_id,
+        ledger_name=ledger_name,
+        session_date=session_date,
+        point_at=point_at,
+        query_cutoff=query_cutoff,
+        replay_source_digest=replay_source_digest,
+        mark_source_digest=mark_source_digest,
+        source_digest=source.source_digest,
+        authority_digest="0" * 64,
+    )
+    authority = replace(
+        authority,
+        authority_digest=sha256(
+            json.dumps(
+                _phase1_equity_point_authority_document(authority),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+    _register_identity_authority(
+        _PHASE1_EQUITY_POINT_AUTHORITIES,
+        authority,
+        _phase1_equity_point_authority_fingerprint(authority),
+    )
+    _bind_phase1_derived_sources(authority, ((source, "EQUITY_MARK"),))
+    return authority
+
+
+def _inherit_phase1_derived_sources(value: object, parent: object) -> None:
+    sources = _phase1_bound_sources(parent)
+    if sources:
+        _bind_phase1_derived_sources(value, sources)
 
 
 def _bind_journal_derived_source(
@@ -3629,6 +4641,7 @@ class Position:
     tick_size: Decimal
     entered_session: date
     ledger_name: str = "ACTUAL"
+    profit_target_taken: bool = False
 
     def __post_init__(self) -> None:
         if type(self.signal_id) is not str or not self.signal_id:
@@ -3688,6 +4701,8 @@ class Position:
             raise RiskBlock("INVALID_ENTRY_SESSION")
         if self.ledger_name not in {"ACTUAL", "CANONICAL"}:
             raise RiskBlock("INVALID_POSITION_LEDGER")
+        if type(self.profit_target_taken) is not bool:
+            raise RiskBlock("INVALID_PROFIT_TARGET_STATE")
 
 
 def _position_revision_digest(position: Position) -> str:
@@ -3708,6 +4723,7 @@ def _position_revision_digest(position: Position) -> str:
         "target_micros": money_to_micros(position.target),
         "tick_size_micros": money_to_micros(position.tick_size),
         "entered_session": position.entered_session.isoformat(),
+        "profit_target_taken": position.profit_target_taken,
     }
     return sha256(
         json.dumps(
@@ -3719,12 +4735,721 @@ def _position_revision_digest(position: Position) -> str:
     ).hexdigest()
 
 
+def _phase1_evidence_sessions(
+    *,
+    start: date,
+    terminal: date,
+    calendar_resolver: SessionCalendarResolver,
+) -> tuple[date, ...]:
+    if (
+        type(start) is not date
+        or type(terminal) is not date
+        or start > terminal
+        or not calendar_resolver.is_open(start)
+        or not calendar_resolver.is_open(terminal)
+    ):
+        raise RiskBlock("PHASE1_EVIDENCE_WINDOW_INVALID")
+    result: list[date] = []
+    current = start
+    while current <= terminal:
+        if calendar_resolver.is_open(current):
+            result.append(current)
+        current += timedelta(days=1)
+    if not result or result[0] != start or result[-1] != terminal:
+        raise RiskBlock("PHASE1_EVIDENCE_WINDOW_INVALID")
+    return tuple(result)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1SignalEvidenceAuthority:
+    """Exact reviewed event/thesis truth for one persisted Phase 1 signal."""
+
+    signal_source: object = field(repr=False, compare=False)
+    reviewed_bundle: ReviewedEvidenceBundle = field(repr=False, compare=False)
+    evidence_decision: EvidenceDecision = field(repr=False, compare=False)
+    signal_id: str
+    validation_window_id: str
+    symbol: str
+    role: str
+    publication_session: date
+    subject_kind: str
+    issuer_cik: str | None
+    review_at: datetime
+    terminal_hold_session: date
+    remaining_sessions: tuple[date, ...]
+    event_exit_required: bool | None
+    thesis_invalidated: bool | None
+    status: str
+    reason_codes: tuple[str, ...]
+    relevant_events: tuple[tuple[date, str | None], ...]
+    adverse_tags: tuple[str, ...]
+    source_observation_ids: tuple[str, ...]
+    registry_id: str
+    registry_content_hash: str
+    bundle_digest: str
+    decision_digest: str
+    signal_source_digest: str
+    calendar_digest: str
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.signal_id) is not str
+            or not self.signal_id
+            or type(self.validation_window_id) is not str
+            or not _is_sha256_digest(self.validation_window_id)
+            or type(self.symbol) is not str
+            or not self.symbol
+            or self.symbol != self.symbol.upper()
+            or self.role not in {"PRIMARY", "WATCHLIST_SHADOW"}
+            or type(self.publication_session) is not date
+            or self.subject_kind not in {"STOCK", "ETF"}
+            or (
+                self.subject_kind == "STOCK"
+                and (
+                    type(self.issuer_cik) is not str
+                    or len(self.issuer_cik) != 10
+                    or not self.issuer_cik.isdigit()
+                )
+            )
+            or (self.subject_kind == "ETF" and self.issuer_cik is not None)
+        ):
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        _require_aware(
+            self.review_at,
+            "INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY",
+        )
+        sessions = tuple(self.remaining_sessions)
+        object.__setattr__(self, "remaining_sessions", sessions)
+        if (
+            not sessions
+            or any(type(day) is not date for day in sessions)
+            or sessions != tuple(sorted(set(sessions)))
+            or sessions[-1] != self.terminal_hold_session
+            or sessions[0] != self.review_at.astimezone(_ET).date()
+        ):
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        flags = (self.event_exit_required, self.thesis_invalidated)
+        if any(
+            value is not None and type(value) is not bool
+            for value in flags
+        ):
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        if (
+            (self.status == "CLEAR" and flags != (False, False))
+            or (
+                self.status == "EXIT_REQUIRED"
+                and True not in flags
+            )
+            or (
+                self.status == "UNRESOLVED"
+                and (True in flags or None not in flags)
+            )
+            or self.status not in {"CLEAR", "EXIT_REQUIRED", "UNRESOLVED"}
+        ):
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        for attribute in (
+            "reason_codes",
+            "adverse_tags",
+            "source_observation_ids",
+        ):
+            values = tuple(getattr(self, attribute))
+            object.__setattr__(self, attribute, values)
+            if (
+                len(values) != len(set(values))
+                or any(type(value) is not str or not value for value in values)
+            ):
+                raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        events = tuple(self.relevant_events)
+        object.__setattr__(self, "relevant_events", events)
+        if any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not date
+            or item[0] < sessions[0]
+            or item[0] > sessions[-1]
+            or (item[1] is not None and type(item[1]) is not str)
+            for item in events
+        ):
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        for digest in (
+            self.registry_content_hash,
+            self.bundle_digest,
+            self.decision_digest,
+            self.signal_source_digest,
+            self.calendar_digest,
+            self.source_digest,
+        ):
+            if not _is_sha256_digest(digest):
+                raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+        if type(self.registry_id) is not str or not self.registry_id:
+            raise RiskBlock("INVALID_PHASE1_SIGNAL_EVIDENCE_AUTHORITY")
+
+
+def _phase1_signal_evidence_document(
+    authority: Phase1SignalEvidenceAuthority,
+) -> dict[str, object]:
+    def instant(value: datetime) -> str:
+        return value.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
+    return {
+        "adverse_tags": list(authority.adverse_tags),
+        "bundle_digest": authority.bundle_digest,
+        "calendar_digest": authority.calendar_digest,
+        "decision_digest": authority.decision_digest,
+        "event_exit_required": authority.event_exit_required,
+        "issuer_cik": authority.issuer_cik,
+        "publication_session": authority.publication_session.isoformat(),
+        "reason_codes": list(authority.reason_codes),
+        "registry_content_hash": authority.registry_content_hash,
+        "registry_id": authority.registry_id,
+        "relevant_events": [
+            [day.isoformat(), event_type]
+            for day, event_type in authority.relevant_events
+        ],
+        "remaining_sessions": [
+            day.isoformat() for day in authority.remaining_sessions
+        ],
+        "review_at": instant(authority.review_at),
+        "role": authority.role,
+        "signal_id": authority.signal_id,
+        "signal_source_digest": authority.signal_source_digest,
+        "source_observation_ids": list(authority.source_observation_ids),
+        "status": authority.status,
+        "subject_kind": authority.subject_kind,
+        "symbol": authority.symbol,
+        "terminal_hold_session": authority.terminal_hold_session.isoformat(),
+        "thesis_invalidated": authority.thesis_invalidated,
+        "validation_window_id": authority.validation_window_id,
+        "version": 1,
+    }
+
+
+def _phase1_signal_evidence_bytes(
+    authority: Phase1SignalEvidenceAuthority,
+) -> bytes:
+    return json.dumps(
+        _phase1_signal_evidence_document(authority),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _phase1_signal_evidence_fingerprint(
+    authority: Phase1SignalEvidenceAuthority,
+) -> tuple[object, ...]:
+    return (
+        authority.signal_id,
+        authority.validation_window_id,
+        authority.symbol,
+        authority.role,
+        authority.publication_session,
+        authority.subject_kind,
+        authority.issuer_cik,
+        authority.review_at,
+        authority.terminal_hold_session,
+        authority.remaining_sessions,
+        authority.event_exit_required,
+        authority.thesis_invalidated,
+        authority.status,
+        authority.reason_codes,
+        authority.relevant_events,
+        authority.adverse_tags,
+        authority.source_observation_ids,
+        authority.registry_id,
+        authority.registry_content_hash,
+        authority.bundle_digest,
+        authority.decision_digest,
+        authority.signal_source_digest,
+        authority.calendar_digest,
+        authority.source_digest,
+    )
+
+
+def _issue_phase1_signal_evidence_authority(
+    signal_source: object,
+    reviewed_bundle: object,
+    decision: object,
+    *,
+    review_at: datetime,
+    calendar_resolver: SessionCalendarResolver,
+) -> Phase1SignalEvidenceAuthority:
+    """Reclassify one exact reviewed bundle for a persisted signal horizon."""
+    from .journal import (
+        Phase1SignalSource,
+        is_verified_phase1_signal_source,
+    )
+
+    if not isinstance(signal_source, Phase1SignalSource) or not (
+        is_verified_phase1_signal_source(signal_source)
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+        calendar_resolver.release_verified
+    ):
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if not _is_reviewed_bundle(reviewed_bundle) or not (
+        is_reviewed_evidence_decision(decision)
+    ):
+        raise RiskBlock("PHASE1_REVIEWED_EVIDENCE_UNVERIFIED")
+    assert isinstance(reviewed_bundle, ReviewedEvidenceBundle)
+    assert isinstance(decision, EvidenceDecision)
+    if decision._reviewed_bundle is not reviewed_bundle:
+        raise RiskBlock("PHASE1_EVIDENCE_BUNDLE_DECISION_SPLICE")
+    review_at = _require_aware(
+        review_at,
+        "INVALID_PHASE1_EVIDENCE_REVIEW_TIME",
+    )
+    subject_kind = getattr(signal_source, "subject_kind", None)
+    issuer_cik = getattr(signal_source, "issuer_cik", None)
+    calendar_digest = _calendar_digest(calendar_resolver)
+    review_session = review_at.astimezone(_ET).date()
+    terminal = calendar_resolver.add_sessions(
+        signal_source.publication_session,
+        MAX_HOLD_SESSIONS - 1,
+    )
+    remaining_sessions = _phase1_evidence_sessions(
+        start=review_session,
+        terminal=terminal,
+        calendar_resolver=calendar_resolver,
+    )
+    if (
+        subject_kind not in {"STOCK", "ETF"}
+        or reviewed_bundle.subject_kind != subject_kind
+        or reviewed_bundle.symbol != signal_source.symbol
+        or reviewed_bundle.issuer_cik != issuer_cik
+        or decision.subject_kind != subject_kind
+        or decision.symbol != signal_source.symbol
+        or decision.issuer_cik != issuer_cik
+        or decision.as_of != review_at
+        or signal_source.calendar_digest != calendar_digest
+        or signal_source.received_at > review_at
+        or review_at > signal_source.query_cutoff
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_LINEAGE_MISMATCH")
+    exact_decision = classify_evidence(
+        reviewed_bundle.records,
+        DateRange(review_session, terminal),
+        symbol=signal_source.symbol,
+        issuer_cik=issuer_cik,
+        source_bindings=reviewed_bundle.source_bindings,
+        as_of=review_at,
+        subject_kind=subject_kind,
+        coverage_attestations=reviewed_bundle.coverage_attestations,
+        reviewed_bundle=reviewed_bundle,
+    )
+    if (
+        not is_reviewed_evidence_decision(exact_decision)
+        or decision != exact_decision
+        or decision._decision_digest != exact_decision._decision_digest
+    ):
+        raise RiskBlock("PHASE1_EVIDENCE_DECISION_WINDOW_MISMATCH")
+
+    event_values = (
+        decision.binary_events
+        if subject_kind == "STOCK"
+        else decision.etf_actions
+    )
+    relevant_events = tuple(
+        item
+        for item in event_values
+        if review_session <= item[0] <= terminal
+    )
+    relevant_coverage = (
+        decision.binary_event_coverage
+        if subject_kind == "STOCK"
+        else decision.etf_action_coverage
+    )
+    evidence_integrity_clear = (
+        decision.health == "HEALTHY"
+        and not decision.ambiguities
+        and not decision.conflicts
+        and decision.block_reason
+        not in {
+            "EVIDENCE_COVERAGE_ATTESTATION_MISSING",
+            "EVIDENCE_PRODUCT_COVERAGE_INVALID",
+            "EVIDENCE_EVENT_COVERAGE_CONFLICT",
+        }
+    )
+    if not evidence_integrity_clear:
+        event_exit_required: bool | None = None
+        thesis_invalidated: bool | None = None
+    else:
+        if relevant_events:
+            event_exit_required = True
+        elif relevant_coverage == "CONFIRMED_CLEAR":
+            event_exit_required = False
+        else:
+            event_exit_required = None
+        thesis_invalidated = bool(decision.adverse_tags)
+
+    if True in (event_exit_required, thesis_invalidated):
+        status = "EXIT_REQUIRED"
+    elif (event_exit_required, thesis_invalidated) == (False, False):
+        status = "CLEAR"
+    else:
+        status = "UNRESOLVED"
+    reasons: list[str] = []
+    if event_exit_required is True:
+        reasons.append("EVENT_EXIT_REQUIRED")
+    if thesis_invalidated is True:
+        reasons.append("THESIS_INVALIDATED")
+    if status == "UNRESOLVED":
+        reasons.append(decision.block_reason or "EVIDENCE_STATUS_UNRESOLVED")
+    reason_codes = tuple(dict.fromkeys(reasons))
+    bundle_digest = reviewed_bundle._bundle_digest
+    decision_digest = decision._decision_digest
+    if not _is_sha256_digest(bundle_digest) or not _is_sha256_digest(
+        decision_digest
+    ):
+        raise RiskBlock("PHASE1_REVIEWED_EVIDENCE_UNVERIFIED")
+    authority = Phase1SignalEvidenceAuthority(
+        signal_source=signal_source,
+        reviewed_bundle=reviewed_bundle,
+        evidence_decision=decision,
+        signal_id=signal_source.signal_id,
+        validation_window_id=signal_source.validation_window_id,
+        symbol=signal_source.symbol,
+        role=signal_source.role,
+        publication_session=signal_source.publication_session,
+        subject_kind=subject_kind,
+        issuer_cik=issuer_cik,
+        review_at=review_at,
+        terminal_hold_session=terminal,
+        remaining_sessions=remaining_sessions,
+        event_exit_required=event_exit_required,
+        thesis_invalidated=thesis_invalidated,
+        status=status,
+        reason_codes=reason_codes,
+        relevant_events=relevant_events,
+        adverse_tags=decision.adverse_tags,
+        source_observation_ids=decision.source_observation_ids,
+        registry_id=reviewed_bundle.registry_id,
+        registry_content_hash=reviewed_bundle.content_hash,
+        bundle_digest=bundle_digest,
+        decision_digest=decision_digest,
+        signal_source_digest=signal_source.source_digest,
+        calendar_digest=calendar_digest,
+        source_digest="0" * 64,
+    )
+    source_digest = sha256(_phase1_signal_evidence_bytes(authority)).hexdigest()
+    authority = replace(authority, source_digest=source_digest)
+    _register_identity_authority(
+        _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+        authority,
+        _phase1_signal_evidence_fingerprint(authority),
+    )
+    _bind_phase1_derived_sources(
+        authority,
+        ((signal_source, "SIGNAL_SOURCE"),),
+    )
+    return authority
+
+
+def _issue_phase1_signal_evidence_authority_from_source(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> Phase1SignalEvidenceAuthority:
+    """Reissue reviewed signal truth from one exact persisted Journal source."""
+    from .evidence import (
+        EvidenceRegistryError,
+        EvidenceUnavailableError,
+        _issue_reviewed_bundle_from_phase1_source,
+    )
+    from .journal import (
+        Phase1SignalEvidenceSource,
+        is_verified_phase1_signal_evidence_source,
+        phase1_sources_share_owner,
+    )
+
+    if not isinstance(source, Phase1SignalEvidenceSource) or not (
+        is_verified_phase1_signal_evidence_source(source)
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+        calendar_resolver.release_verified
+    ):
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    signal_source = source.signal_source
+    if (
+        source.calendar_digest != _calendar_digest(calendar_resolver)
+        or source.calendar_digest != signal_source.calendar_digest
+        or source.review_at > source.query_cutoff
+        or signal_source.query_cutoff < source.query_cutoff
+        or not phase1_sources_share_owner(source, signal_source)
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_SOURCE_LINEAGE_MISMATCH")
+    try:
+        reviewed_bundle = _issue_reviewed_bundle_from_phase1_source(source)
+    except (EvidenceRegistryError, EvidenceUnavailableError) as error:
+        raise RiskBlock("PHASE1_REVIEWED_EVIDENCE_UNVERIFIED") from error
+    decision = source.evidence_decision
+    if not is_reviewed_evidence_decision(decision):
+        raise RiskBlock("PHASE1_REVIEWED_EVIDENCE_UNVERIFIED")
+    authority = _issue_phase1_signal_evidence_authority(
+        signal_source,
+        reviewed_bundle,
+        decision,
+        review_at=source.review_at,
+        calendar_resolver=calendar_resolver,
+    )
+    try:
+        historical_manifest = json.loads(source.manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_MANIFEST_MISMATCH") from error
+    if not isinstance(historical_manifest, dict):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_MANIFEST_MISMATCH")
+    historical_signal_digest = historical_manifest.get(
+        "signal_source_digest"
+    )
+    if not _is_sha256_digest(historical_signal_digest):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_MANIFEST_MISMATCH")
+    expected_historical_manifest = _phase1_signal_evidence_document(authority)
+    expected_historical_manifest["signal_source_digest"] = (
+        historical_signal_digest
+    )
+    expected_historical_bytes = json.dumps(
+        expected_historical_manifest,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if (
+        source.registry_id != authority.registry_id
+        or source.registry_content_hash != authority.registry_content_hash
+        or source.release_sha256 != authority.registry_content_hash
+        or source.bundle_digest != authority.bundle_digest
+        or source.decision_digest != authority.decision_digest
+        or source.manifest_bytes != expected_historical_bytes
+        or sha256(source.manifest_bytes).hexdigest()
+        != source.manifest_digest
+    ):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_MANIFEST_MISMATCH")
+    _bind_phase1_derived_sources(
+        authority,
+        ((source, "SIGNAL_EVIDENCE"),),
+    )
+    return authority
+
+
+def is_issued_phase1_signal_evidence_authority(value: object) -> bool:
+    if not isinstance(value, Phase1SignalEvidenceAuthority):
+        return False
+    try:
+        fingerprint = _phase1_signal_evidence_fingerprint(value)
+        return (
+            _has_identity_authority(
+                _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+                value,
+                fingerprint,
+            )
+            and _phase1_derived_sources_are_current(value)
+            and _is_reviewed_bundle(value.reviewed_bundle)
+            and is_reviewed_evidence_decision(value.evidence_decision)
+            and value.evidence_decision._reviewed_bundle
+            is value.reviewed_bundle
+            and value.bundle_digest == value.reviewed_bundle._bundle_digest
+            and value.decision_digest
+            == value.evidence_decision._decision_digest
+            and value.signal_source_digest
+            == getattr(value.signal_source, "source_digest", None)
+            and sha256(_phase1_signal_evidence_bytes(value)).hexdigest()
+            == value.source_digest
+        )
+    except Exception:
+        return False
+
+
+def phase1_signal_evidence_manifest(
+    authority: object,
+) -> bytes:
+    """Return immutable canonical persistence bytes for one current authority."""
+    if not is_issued_phase1_signal_evidence_authority(authority):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_AUTHORITY_UNVERIFIED")
+    assert isinstance(authority, Phase1SignalEvidenceAuthority)
+    return _phase1_signal_evidence_bytes(authority)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1PositionEvidenceAuthority:
+    """Position-revision wrapper over one exact signal evidence authority."""
+
+    signal_evidence: Phase1SignalEvidenceAuthority = field(
+        repr=False,
+        compare=True,
+    )
+    position: Position
+    position_digest: str
+    source_digest: str
+
+    @property
+    def subject_kind(self) -> str:
+        return self.signal_evidence.subject_kind
+
+    @property
+    def symbol(self) -> str:
+        return self.signal_evidence.symbol
+
+    @property
+    def issuer_cik(self) -> str | None:
+        return self.signal_evidence.issuer_cik
+
+    @property
+    def review_at(self) -> datetime:
+        return self.signal_evidence.review_at
+
+    @property
+    def entered_session(self) -> date:
+        return self.position.entered_session
+
+    @property
+    def terminal_hold_session(self) -> date:
+        return self.signal_evidence.terminal_hold_session
+
+    @property
+    def remaining_sessions(self) -> tuple[date, ...]:
+        return self.signal_evidence.remaining_sessions
+
+    @property
+    def event_exit_required(self) -> bool | None:
+        return self.signal_evidence.event_exit_required
+
+    @property
+    def thesis_invalidated(self) -> bool | None:
+        return self.signal_evidence.thesis_invalidated
+
+    @property
+    def status(self) -> str:
+        return self.signal_evidence.status
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        return self.signal_evidence.reason_codes
+
+    @property
+    def relevant_events(self) -> tuple[tuple[date, str | None], ...]:
+        return self.signal_evidence.relevant_events
+
+    @property
+    def adverse_tags(self) -> tuple[str, ...]:
+        return self.signal_evidence.adverse_tags
+
+    @property
+    def source_observation_ids(self) -> tuple[str, ...]:
+        return self.signal_evidence.source_observation_ids
+
+    @property
+    def registry_id(self) -> str:
+        return self.signal_evidence.registry_id
+
+    @property
+    def registry_content_hash(self) -> str:
+        return self.signal_evidence.registry_content_hash
+
+    @property
+    def bundle_digest(self) -> str:
+        return self.signal_evidence.bundle_digest
+
+    @property
+    def decision_digest(self) -> str:
+        return self.signal_evidence.decision_digest
+
+    @property
+    def calendar_digest(self) -> str:
+        return self.signal_evidence.calendar_digest
+
+
+def _phase1_position_evidence_fingerprint(
+    authority: Phase1PositionEvidenceAuthority,
+) -> tuple[object, ...]:
+    return (
+        _phase1_signal_evidence_fingerprint(authority.signal_evidence),
+        authority.position,
+        authority.position_digest,
+        authority.source_digest,
+    )
+
+
+def _issue_phase1_position_evidence_authority(
+    signal_evidence: object,
+    *,
+    position: Position,
+) -> Phase1PositionEvidenceAuthority:
+    if not is_issued_phase1_signal_evidence_authority(signal_evidence):
+        raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_AUTHORITY_UNVERIFIED")
+    assert isinstance(signal_evidence, Phase1SignalEvidenceAuthority)
+    if not isinstance(position, Position):
+        raise TypeError("position evidence authority requires a Position")
+    if (
+        signal_evidence.role != "PRIMARY"
+        or position.ledger_name != "CANONICAL"
+        or position.signal_id != signal_evidence.signal_id
+        or position.symbol != signal_evidence.symbol
+        or position.entered_session != signal_evidence.publication_session
+    ):
+        raise RiskBlock("PHASE1_POSITION_EVIDENCE_LINEAGE_MISMATCH")
+    position_digest = _position_revision_digest(position)
+    payload = {
+        "entered_session": position.entered_session.isoformat(),
+        "position_digest": position_digest,
+        "signal_evidence_digest": signal_evidence.source_digest,
+        "version": 1,
+    }
+    source_digest = sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    authority = Phase1PositionEvidenceAuthority(
+        signal_evidence=signal_evidence,
+        position=position,
+        position_digest=position_digest,
+        source_digest=source_digest,
+    )
+    _register_identity_authority(
+        _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
+        authority,
+        _phase1_position_evidence_fingerprint(authority),
+    )
+    _inherit_phase1_derived_sources(authority, signal_evidence)
+    return authority
+
+
+def is_issued_phase1_position_evidence_authority(value: object) -> bool:
+    if not isinstance(value, Phase1PositionEvidenceAuthority):
+        return False
+    try:
+        return (
+            _has_identity_authority(
+                _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
+                value,
+                _phase1_position_evidence_fingerprint(value),
+            )
+            and is_issued_phase1_signal_evidence_authority(
+                value.signal_evidence
+            )
+            and value.position_digest
+            == _position_revision_digest(value.position)
+            and _phase1_derived_sources_are_current(value)
+        )
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class PositionEventContext:
     """Ordered event/thesis review facts issued by a later Journal adapter."""
 
-    event_exit_required: bool
-    thesis_invalidated: bool
+    event_exit_required: bool | None
+    thesis_invalidated: bool | None
+    evidence_status: str
     at: datetime
     cursor: int
     start_cursor: int
@@ -3741,9 +5466,34 @@ class PositionEventContext:
     atr14: Decimal | None = None
 
     def __post_init__(self) -> None:
-        if type(self.event_exit_required) is not bool or type(
-            self.thesis_invalidated
-        ) is not bool:
+        if any(
+            value is not None and type(value) is not bool
+            for value in (
+                self.event_exit_required,
+                self.thesis_invalidated,
+            )
+        ):
+            raise RiskBlock("INVALID_POSITION_EVENT_CONTEXT")
+        if self.evidence_status not in {
+            "CLEAR",
+            "EXIT_REQUIRED",
+            "UNRESOLVED",
+            "UNAVAILABLE",
+        }:
+            raise RiskBlock("INVALID_POSITION_EVENT_CONTEXT")
+        if (
+            self.evidence_status == "CLEAR"
+            and (self.event_exit_required, self.thesis_invalidated)
+            != (False, False)
+        ) or (
+            self.evidence_status == "EXIT_REQUIRED"
+            and True
+            not in (self.event_exit_required, self.thesis_invalidated)
+        ) or (
+            self.evidence_status in {"UNRESOLVED", "UNAVAILABLE"}
+            and (self.event_exit_required, self.thesis_invalidated)
+            == (False, False)
+        ):
             raise RiskBlock("INVALID_POSITION_EVENT_CONTEXT")
         _require_aware(self.at, "INVALID_POSITION_EVENT_CONTEXT")
         _require_positive_int(self.cursor, "INVALID_POSITION_EVENT_CURSOR")
@@ -3819,6 +5569,7 @@ def _position_event_context_fingerprint(
     return (
         context.event_exit_required,
         context.thesis_invalidated,
+        context.evidence_status,
         context.at,
         context.cursor,
         context.start_cursor,
@@ -3839,8 +5590,9 @@ def _position_event_context_fingerprint(
 def _issue_position_event_context(
     *,
     position: Position,
-    event_exit_required: bool,
-    thesis_invalidated: bool,
+    event_exit_required: bool | None,
+    thesis_invalidated: bool | None,
+    evidence_status: str | None = None,
     at: datetime,
     cursor: int,
     start_cursor: int,
@@ -3875,6 +5627,13 @@ def _issue_position_event_context(
         raise RiskBlock("POSITION_REVIEW_OUTSIDE_WINDOW")
     calendar_digest = _calendar_digest(calendar_resolver)
     position_digest = _position_revision_digest(position)
+    if evidence_status is None:
+        if True in (event_exit_required, thesis_invalidated):
+            evidence_status = "EXIT_REQUIRED"
+        elif (event_exit_required, thesis_invalidated) == (False, False):
+            evidence_status = "CLEAR"
+        else:
+            evidence_status = "UNRESOLVED"
     source_payload = {
         "version": 1,
         "ledger_name": position.ledger_name,
@@ -3883,6 +5642,7 @@ def _issue_position_event_context(
         "position_digest": position_digest,
         "event_exit_required": event_exit_required,
         "thesis_invalidated": thesis_invalidated,
+        "evidence_status": evidence_status,
         "complete_through": at.astimezone(UTC).isoformat(
             timespec="microseconds"
         ).replace("+00:00", "Z"),
@@ -3914,6 +5674,7 @@ def _issue_position_event_context(
     context = PositionEventContext(
         event_exit_required=event_exit_required,
         thesis_invalidated=thesis_invalidated,
+        evidence_status=evidence_status,
         at=at,
         cursor=cursor,
         start_cursor=start_cursor,
@@ -3933,11 +5694,17 @@ def _issue_position_event_context(
 
 
 def is_issued_position_event_context(context: object) -> bool:
-    return isinstance(context, PositionEventContext) and _has_identity_authority(
+    if not isinstance(context, PositionEventContext):
+        return False
+    try:
+        fingerprint = _position_event_context_fingerprint(context)
+    except Exception:
+        return False
+    return _has_identity_authority(
         _POSITION_EVENT_AUTHORITIES,
         context,
-        _position_event_context_fingerprint(context),
-    )
+        fingerprint,
+    ) and _phase1_derived_sources_are_current(context)
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -3954,8 +5721,9 @@ class MarketMark:
     previous_session_low: Decimal | None = None
     current_session_low: Decimal | None = None
     atr14: Decimal | None = None
-    event_exit_required: bool = False
-    thesis_invalidated: bool = False
+    event_exit_required: bool | None = False
+    thesis_invalidated: bool | None = False
+    event_evidence_status: str = "CLEAR"
     context_verified: bool = True
     holding_sessions_verified: bool = False
     ledger_name: str | None = None
@@ -4009,14 +5777,27 @@ class MarketMark:
                         positive=True,
                     ),
                 )
-        for value in (
-            self.event_exit_required,
-            self.thesis_invalidated,
-            self.context_verified,
-            self.holding_sessions_verified,
+        if any(
+            value is not None and type(value) is not bool
+            for value in (
+                self.event_exit_required,
+                self.thesis_invalidated,
+            )
+        ) or any(
+            type(value) is not bool
+            for value in (
+                self.context_verified,
+                self.holding_sessions_verified,
+            )
         ):
-            if type(value) is not bool:
-                raise RiskBlock("INVALID_POSITION_CONTEXT")
+            raise RiskBlock("INVALID_POSITION_CONTEXT")
+        if self.event_evidence_status not in {
+            "CLEAR",
+            "EXIT_REQUIRED",
+            "UNRESOLVED",
+            "UNAVAILABLE",
+        }:
+            raise RiskBlock("INVALID_POSITION_CONTEXT")
         lineage = (
             self.ledger_name,
             self.signal_id,
@@ -4063,6 +5844,7 @@ def _market_mark_fingerprint(mark: MarketMark) -> tuple[object, ...]:
         mark.atr14,
         mark.event_exit_required,
         mark.thesis_invalidated,
+        mark.event_evidence_status,
         mark.context_verified,
         mark.holding_sessions_verified,
         mark.ledger_name,
@@ -4076,11 +5858,17 @@ def _market_mark_fingerprint(mark: MarketMark) -> tuple[object, ...]:
 
 
 def is_issued_market_mark(mark: object) -> bool:
-    return isinstance(mark, MarketMark) and _has_identity_authority(
+    if not isinstance(mark, MarketMark):
+        return False
+    try:
+        fingerprint = _market_mark_fingerprint(mark)
+    except Exception:
+        return False
+    return _has_identity_authority(
         _MARK_AUTHORITIES,
         mark,
-        _market_mark_fingerprint(mark),
-    )
+        fingerprint,
+    ) and _phase1_derived_sources_are_current(mark)
 
 
 def build_market_mark(
@@ -4089,9 +5877,10 @@ def build_market_mark(
     price: Decimal,
     at: datetime,
     calendar_resolver: SessionCalendarResolver,
-    event_exit_required: bool,
-    thesis_invalidated: bool,
+    event_exit_required: bool | None,
+    thesis_invalidated: bool | None,
     event_context_verified: bool,
+    event_evidence_status: str | None = None,
     previous_session_low: Decimal | None = None,
     current_session_low: Decimal | None = None,
     atr14: Decimal | None = None,
@@ -4123,6 +5912,13 @@ def build_market_mark(
     issued_event_context = is_issued_position_event_context(
         position_event_context
     )
+    if event_evidence_status is None:
+        if True in (event_exit_required, thesis_invalidated):
+            event_evidence_status = "EXIT_REQUIRED"
+        elif (event_exit_required, thesis_invalidated) == (False, False):
+            event_evidence_status = "CLEAR"
+        else:
+            event_evidence_status = "UNRESOLVED"
     if issued_event_context:
         assert position_event_context is not None
         if (
@@ -4139,6 +5935,8 @@ def build_market_mark(
             is not event_exit_required
             or position_event_context.thesis_invalidated
             is not thesis_invalidated
+            or position_event_context.evidence_status
+            != event_evidence_status
             or position_event_context.price != price
             or position_event_context.previous_session_low
             != previous_session_low
@@ -4161,6 +5959,7 @@ def build_market_mark(
         atr14=atr14,
         event_exit_required=event_exit_required,
         thesis_invalidated=thesis_invalidated,
+        event_evidence_status=event_evidence_status,
         context_verified=operational,
         holding_sessions_verified=release_verified,
         ledger_name=position.ledger_name if operational else None,
@@ -4258,6 +6057,324 @@ class PositionAction:
                     rounding=ROUND_FLOOR,
                 )
         object.__setattr__(self, "r_multiple", display_r_multiple)
+
+
+_PHASE1_EXIT_FEE_SCHEDULE_VERSION = "PHASE1_US_EQUITY_EXIT_V1"
+_PHASE1_EXIT_FEE_MICROS = 1_000_000
+
+
+def _phase1_exit_fee_schedule_digest() -> str:
+    payload = {
+        "namespace": "stock-monitor/phase1-exit-fee-schedule/v1",
+        "payload": {
+            "fee_micros": _PHASE1_EXIT_FEE_MICROS,
+            "version": _PHASE1_EXIT_FEE_SCHEDULE_VERSION,
+        },
+    }
+    return sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _position_action_fingerprint(action: PositionAction) -> tuple[object, ...]:
+    return (
+        action.status,
+        action.reason_codes,
+        action.recommended_stop,
+        action.user_confirmed_stop,
+        action.published_target,
+        action.shares_to_exit,
+        action.remaining_shares,
+        action.r_multiple,
+    )
+
+
+def _paper_exit_result_fingerprint(
+    result: PaperExitResult,
+) -> tuple[object, ...]:
+    return (
+        result.exit_reason.value,
+        result.fill_price,
+        result.exited_at,
+        result.observation_id,
+        result.reason_codes,
+    )
+
+
+def _phase1_position_exit_authority_payload(
+    *,
+    position: Position,
+    event_context: PositionEventContext,
+    mark: MarketMark,
+    steps: Sequence[Phase1PositionExitStep],
+    mark_observation_id: str,
+    position_evidence_digest: str | None,
+    fee_schedule_version: str,
+    fee_schedule_digest: str,
+    validation_window_id: str,
+    query_cutoff: datetime,
+    source_digest: str,
+) -> dict[str, object]:
+    def timestamp(value: datetime) -> str:
+        return value.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
+    def optional_money(value: Decimal | None) -> int | None:
+        return None if value is None else money_to_micros(value)
+
+    return {
+        "version": 2,
+        "mark_observation_id": mark_observation_id,
+        "position_evidence_digest": position_evidence_digest,
+        "validation_window_id": validation_window_id,
+        "query_cutoff": timestamp(query_cutoff),
+        "source_digest": source_digest,
+        "position_revision_digest": _position_revision_digest(position),
+        "event_context_digest": event_context.source_digest,
+        "mark": {
+            "price_micros": money_to_micros(mark.price),
+            "at": timestamp(mark.at),
+            "holding_sessions": mark.holding_sessions,
+            "previous_session_low_micros": optional_money(
+                mark.previous_session_low
+            ),
+            "current_session_low_micros": optional_money(
+                mark.current_session_low
+            ),
+            "atr14_micros": optional_money(mark.atr14),
+            "event_exit_required": mark.event_exit_required,
+            "thesis_invalidated": mark.thesis_invalidated,
+            "event_evidence_status": mark.event_evidence_status,
+            "review_cursor": mark.review_cursor,
+        },
+        "steps": [
+            {
+                "ordinal": ordinal,
+                "position_revision_digest": _position_revision_digest(
+                    step.position
+                ),
+                "event_kind": step.event_kind,
+                "action": {
+                    "status": step.action.status,
+                    "reason_codes": list(step.action.reason_codes),
+                    "recommended_stop_micros": money_to_micros(
+                        step.action.recommended_stop
+                    ),
+                    "user_confirmed_stop_micros": optional_money(
+                        step.action.user_confirmed_stop
+                    ),
+                    "published_target_micros": money_to_micros(
+                        step.action.published_target
+                    ),
+                    "shares_to_exit": step.action.shares_to_exit,
+                    "remaining_shares": step.action.remaining_shares,
+                    "r_multiple": str(step.action.r_multiple),
+                },
+                "execution_result": {
+                    "exit_reason": step.execution_result.exit_reason.value,
+                    "fill_price_micros": optional_money(
+                        step.execution_result.fill_price
+                    ),
+                    "exited_at": (
+                        None
+                        if step.execution_result.exited_at is None
+                        else timestamp(step.execution_result.exited_at)
+                    ),
+                    "observation_id": step.execution_result.observation_id,
+                    "reason_codes": list(step.execution_result.reason_codes),
+                    "quote_observation_id": (
+                        step.execution_quote_observation_id
+                    ),
+                },
+                "fee_micros": money_to_micros(step.fee),
+            }
+            for ordinal, step in enumerate(steps, start=1)
+        ],
+        "fee_schedule_version": fee_schedule_version,
+        "fee_schedule_digest": fee_schedule_digest,
+    }
+
+
+def _phase1_position_exit_authority_digest(
+    authority: Phase1PositionExitAuthority,
+) -> str:
+    payload = _phase1_position_exit_authority_payload(
+        position=authority.position,
+        event_context=authority.event_context,
+        mark=authority.mark,
+        steps=authority.steps,
+        mark_observation_id=authority.mark_observation_id,
+        position_evidence_digest=authority.position_evidence_digest,
+        fee_schedule_version=authority.fee_schedule_version,
+        fee_schedule_digest=authority.fee_schedule_digest,
+        validation_window_id=authority.validation_window_id,
+        query_cutoff=authority.query_cutoff,
+        source_digest=authority.source_digest,
+    )
+    return sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase1PositionExitAuthority:
+    """Owner-current complete ordered exit batch from one Journal review."""
+
+    position: Position
+    event_context: PositionEventContext
+    mark: MarketMark
+    steps: tuple[Phase1PositionExitStep, ...]
+    mark_observation_id: str
+    position_evidence_digest: str | None
+    fee_schedule_version: str
+    fee_schedule_digest: str
+    validation_window_id: str
+    query_cutoff: datetime
+    source_digest: str
+    authority_digest: str
+
+    def __post_init__(self) -> None:
+        steps = tuple(self.steps)
+        object.__setattr__(self, "steps", steps)
+        if (
+            not isinstance(self.position, Position)
+            or not isinstance(self.event_context, PositionEventContext)
+            or not isinstance(self.mark, MarketMark)
+            or not 1 <= len(steps) <= 2
+            or any(not isinstance(step, Phase1PositionExitStep) for step in steps)
+            or steps[0].position != self.position
+            or self.position.ledger_name != "CANONICAL"
+            or type(self.mark_observation_id) is not str
+            or not self.mark_observation_id
+        ):
+            raise RiskBlock("INVALID_PHASE1_EXIT_AUTHORITY")
+        if (
+            self.fee_schedule_version != _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+            or self.fee_schedule_digest != _phase1_exit_fee_schedule_digest()
+            or (
+                self.position_evidence_digest is not None
+                and not _is_sha256_digest(self.position_evidence_digest)
+            )
+            or not _is_sha256_digest(self.validation_window_id)
+        ):
+            raise RiskBlock("PHASE1_EXIT_FEE_SCHEDULE_MISMATCH")
+        _require_aware(self.query_cutoff, "INVALID_PHASE1_EXIT_AUTHORITY")
+        if not _is_sha256_digest(self.source_digest) or not _is_sha256_digest(
+            self.authority_digest
+        ):
+            raise RiskBlock("INVALID_PHASE1_EXIT_AUTHORITY")
+        if (
+            self.event_context.signal_id != self.position.signal_id
+            or self.mark.signal_id != self.position.signal_id
+            or self.mark.position_digest
+            != _position_revision_digest(self.position)
+        ):
+            raise RiskBlock("PHASE1_EXIT_ACTION_MISMATCH")
+        if len(steps) == 2:
+            first, second = steps
+            if (
+                first.event_kind != "PARTIAL_EXIT"
+                or second.event_kind != "CLOSE"
+                or second.position.signal_id != first.position.signal_id
+                or second.position.symbol != first.position.symbol
+                or second.position.entry != first.position.entry
+                or second.position.initial_stop != first.position.initial_stop
+                or second.position.target != first.position.target
+                or second.position.tick_size != first.position.tick_size
+                or second.position.entered_session != first.position.entered_session
+                or second.position.ledger_name != first.position.ledger_name
+                or second.position.shares != first.action.remaining_shares
+                or second.position.recommended_stop
+                != first.action.recommended_stop
+                or second.position.profit_target_taken is not True
+                or second.execution_result.exited_at
+                <= first.execution_result.exited_at
+            ):
+                raise RiskBlock("PHASE1_EXIT_BATCH_MISMATCH")
+
+    @property
+    def action(self) -> PositionAction:
+        """Compatibility view of the first ordered exit step."""
+        return self.steps[0].action
+
+    @property
+    def execution_result(self) -> PaperExitResult:
+        return self.steps[0].execution_result
+
+    @property
+    def execution_quote_observation_id(self) -> str:
+        return self.steps[0].execution_quote_observation_id
+
+    @property
+    def event_kind(self) -> str:
+        return self.steps[0].event_kind
+
+    @property
+    def fee(self) -> Decimal:
+        return self.steps[0].fee
+
+    @property
+    def total_fee(self) -> Decimal:
+        return sum((step.fee for step in self.steps), _ZERO)
+
+
+def _phase1_position_exit_authority_fingerprint(
+    authority: Phase1PositionExitAuthority,
+) -> tuple[object, ...]:
+    return (
+        _position_revision_digest(authority.position),
+        _position_event_context_fingerprint(authority.event_context),
+        _market_mark_fingerprint(authority.mark),
+        tuple(
+            (
+                _position_revision_digest(step.position),
+                _position_action_fingerprint(step.action),
+                _paper_exit_result_fingerprint(step.execution_result),
+                step.execution_quote_observation_id,
+                step.event_kind,
+                step.fee,
+            )
+            for step in authority.steps
+        ),
+        authority.mark_observation_id,
+        authority.position_evidence_digest,
+        authority.fee_schedule_version,
+        authority.fee_schedule_digest,
+        authority.validation_window_id,
+        authority.query_cutoff,
+        authority.source_digest,
+        authority.authority_digest,
+    )
+
+
+def is_issued_phase1_position_exit_authority(authority: object) -> bool:
+    if not isinstance(authority, Phase1PositionExitAuthority):
+        return False
+    try:
+        fingerprint = _phase1_position_exit_authority_fingerprint(authority)
+        digest = _phase1_position_exit_authority_digest(authority)
+    except Exception:
+        return False
+    return (
+        digest == authority.authority_digest
+        and _has_identity_authority(
+            _PHASE1_POSITION_EXIT_AUTHORITIES,
+            authority,
+            fingerprint,
+        )
+        and _phase1_derived_sources_are_current(authority)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4457,7 +6574,7 @@ def _evaluate_position_formula(
             r_multiple=r_multiple,
         )
 
-    if r_multiple >= _TWO:
+    if r_multiple >= _TWO and not position.profit_target_taken:
         recommended_stop = position.recommended_stop
         shares_to_exit = position.shares
         if (
@@ -4540,6 +6657,1583 @@ def _evaluate_position_formula(
         shares_to_exit=0,
         r_multiple=r_multiple,
     )
+
+
+def _phase1_exit_execution_result_from_observations(
+    observations: Sequence[object],
+    *,
+    stop: Decimal,
+    target: Decimal,
+    forced_exit_reason: ExitReason | None = None,
+    forced_expected_exit: Decimal | None = None,
+    forced_triggered_at: datetime | None = None,
+    target_enabled: bool = True,
+) -> tuple[PaperExitResult, str | None]:
+    """Translate exact Journal BAR/QUOTE facts into one conservative result."""
+
+    def optional_money(value: object, code: str) -> Decimal | None:
+        if value is None:
+            return None
+        if type(value) is not int:
+            raise RiskBlock(code)
+        try:
+            return money_from_micros(value)
+        except DomainValidationError:
+            raise RiskBlock(code) from None
+
+    items = tuple(observations)
+    quotes = tuple(
+        item for item in items if getattr(item, "observation_kind", None) == "QUOTE"
+    )
+    bars = tuple(
+        item for item in items if getattr(item, "observation_kind", None) == "BAR"
+    )
+    normalized_bars: list[IntradayObservation] = []
+    spread_sources: dict[str, str] = {}
+    for sequence, bar in enumerate(bars, start=1):
+        bar_at = getattr(bar, "source_time", None)
+        bar_received_at = getattr(bar, "received_at", None)
+        bar_observation_id = getattr(bar, "observation_id", None)
+        bar_stream_id = getattr(bar, "stream_id", None)
+        bar_feed = getattr(bar, "feed", None)
+        bar_fresh = getattr(bar, "fresh", None)
+        if (
+            type(bar_observation_id) is not str
+            or not bar_observation_id
+            or type(bar_stream_id) is not str
+            or not bar_stream_id
+            or type(bar_feed) is not str
+            or not bar_feed
+            or type(bar_fresh) is not bool
+            or not isinstance(bar_at, datetime)
+            or not isinstance(bar_received_at, datetime)
+        ):
+            raise RiskBlock("PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH")
+
+        bid = optional_money(
+            getattr(bar, "bid_micros", None),
+            "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+        )
+        ask = optional_money(
+            getattr(bar, "ask_micros", None),
+            "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+        )
+        spread_observation_id: str | None = None
+        if bid is not None or ask is not None:
+            if bid is None or ask is None or ask < bid:
+                bid = None
+                ask = None
+            else:
+                spread_observation_id = bar_observation_id
+        else:
+            eligible_quotes = tuple(
+                quote
+                for quote in quotes
+                if (
+                    getattr(quote, "feed", None) == bar_feed
+                    and isinstance(getattr(quote, "source_time", None), datetime)
+                    and getattr(quote, "source_time") <= bar_at
+                    and getattr(quote, "source_time").astimezone(_ET).date()
+                    == bar_at.astimezone(_ET).date()
+                    and (
+                        bar_at - getattr(quote, "source_time")
+                    ).total_seconds()
+                    <= 60
+                )
+            )
+            if eligible_quotes:
+                selected_quote = max(
+                    eligible_quotes,
+                    key=lambda item: (
+                        getattr(item, "source_time"),
+                        getattr(item, "cohort_ordinal", 0),
+                    ),
+                )
+                quote_bid = optional_money(
+                    getattr(selected_quote, "bid_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                )
+                quote_ask = optional_money(
+                    getattr(selected_quote, "ask_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                )
+                if (
+                    getattr(selected_quote, "fresh", None) is True
+                    and quote_bid is not None
+                    and quote_ask is not None
+                    and quote_ask >= quote_bid
+                ):
+                    quote_observation_id = getattr(
+                        selected_quote,
+                        "observation_id",
+                        None,
+                    )
+                    if (
+                        type(quote_observation_id) is not str
+                        or not quote_observation_id
+                    ):
+                        raise RiskBlock(
+                            "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH"
+                        )
+                    bid = quote_bid
+                    ask = quote_ask
+                    spread_observation_id = quote_observation_id
+
+        normalized_bars.append(
+            IntradayObservation(
+                observation_id=bar_observation_id,
+                stream_id=bar_stream_id,
+                feed=bar_feed,
+                kind=ObservationKind.BAR,
+                at=bar_at,
+                received_at=bar_received_at,
+                sequence=sequence,
+                fresh=bar_fresh,
+                bid=bid,
+                ask=ask,
+                open_price=optional_money(
+                    getattr(bar, "open_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                ),
+                high=optional_money(
+                    getattr(bar, "high_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                ),
+                low=optional_money(
+                    getattr(bar, "low_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                ),
+                close_price=optional_money(
+                    getattr(bar, "close_micros", None),
+                    "PHASE1_EXIT_EXECUTION_OBSERVATION_MISMATCH",
+                ),
+                session_open=(
+                    bar_at.astimezone(_ET).time().replace(tzinfo=None)
+                    == time(9, 30)
+                ),
+            )
+        )
+        if spread_observation_id is not None:
+            spread_sources[bar_observation_id] = spread_observation_id
+
+    if forced_exit_reason is None and (
+        forced_expected_exit is not None or forced_triggered_at is not None
+    ):
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_MODE_MISMATCH")
+    if forced_exit_reason is not None and (
+        forced_expected_exit is None or forced_triggered_at is None
+    ):
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_MODE_MISMATCH")
+    if type(target_enabled) is not bool:
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_MODE_MISMATCH")
+    normalized = tuple(normalized_bars)
+    if forced_exit_reason is None:
+        result = simulate_exit(
+            stop,
+            target,
+            normalized,
+            target_enabled=target_enabled,
+        )
+    else:
+        assert forced_expected_exit is not None
+        assert forced_triggered_at is not None
+        forced_result = simulate_forced_exit(
+            forced_expected_exit,
+            normalized,
+            exit_reason=forced_exit_reason,
+            triggered_at=forced_triggered_at,
+        )
+        protective_through = (
+            forced_result.exited_at
+            if forced_result.exited_at is not None
+            else forced_triggered_at
+        )
+        protective_result = simulate_exit(
+            stop,
+            target,
+            tuple(
+                observation
+                for observation in normalized
+                if observation.at <= protective_through
+            ),
+            target_enabled=False,
+        )
+        result = (
+            protective_result
+            if protective_result.exit_reason is not ExitReason.NO_EXIT
+            else forced_result
+        )
+    return (
+        result,
+        (
+            None
+            if result.observation_id is None
+            else spread_sources.get(result.observation_id)
+        ),
+    )
+
+
+def _phase1_position_exit_decision_from_observations(
+    *,
+    position: Position,
+    mark: MarketMark,
+    observations: Sequence[object],
+    policy: Policy,
+) -> tuple[PositionAction, PaperExitResult, str | None]:
+    """Derive action and fill in market chronology, before close-mark gating."""
+    _validate_position_evaluation(position, mark, policy)
+    forced_reason = None
+    for required, candidate in (
+        (mark.thesis_invalidated, ExitReason.THESIS_INVALIDATED),
+        (mark.event_exit_required, ExitReason.EVENT_EXIT_REQUIRED),
+        (
+            mark.holding_sessions >= MAX_HOLD_SESSIONS,
+            ExitReason.MAX_HOLD_SESSIONS_REACHED,
+        ),
+    ):
+        if required:
+            forced_reason = candidate
+            break
+    execution_result, spread_observation_id = (
+        _phase1_exit_execution_result_from_observations(
+            observations,
+            stop=position.recommended_stop,
+            target=position.target,
+            forced_exit_reason=forced_reason,
+            forced_expected_exit=(mark.price if forced_reason is not None else None),
+            forced_triggered_at=(mark.at if forced_reason is not None else None),
+            target_enabled=(
+                not position.profit_target_taken and forced_reason is None
+            ),
+        )
+    )
+    base_action = _evaluate_position_formula(
+        position,
+        mark,
+        _position_r_multiple(position, mark),
+    )
+    if execution_result.exit_reason in {
+        ExitReason.STOP,
+        ExitReason.GAP_STOP,
+        ExitReason.STOP_FIRST_CONSERVATIVE,
+    }:
+        action = _position_action(
+            position,
+            mark,
+            status="PROVISIONAL_EXIT",
+            reasons=("RECOMMENDED_STOP_REACHED",),
+            recommended_stop=position.recommended_stop,
+            shares_to_exit=position.shares,
+            r_multiple=_position_r_multiple(position, mark),
+        )
+    elif execution_result.exit_reason is ExitReason.TARGET:
+        assert execution_result.exited_at is not None
+        target_time_lows = tuple(
+            money_from_micros(low_micros)
+            for observation in observations
+            if getattr(observation, "observation_kind", None) == "BAR"
+            and isinstance(getattr(observation, "source_time", None), datetime)
+            and getattr(observation, "source_time") <= execution_result.exited_at
+            and type(
+                low_micros := getattr(observation, "low_micros", None)
+            ) is int
+            and low_micros > 0
+        )
+        if not target_time_lows:
+            raise RiskBlock("PHASE1_EXIT_EXECUTION_UNRESOLVED")
+        target_mark = replace(
+            mark,
+            price=position.target,
+            current_session_low=min(target_time_lows),
+            event_exit_required=False,
+            thesis_invalidated=False,
+            holding_sessions=min(
+                mark.holding_sessions,
+                MAX_HOLD_SESSIONS - 1,
+            ),
+        )
+        action = _evaluate_position_formula(
+            position,
+            target_mark,
+            _position_r_multiple(position, target_mark),
+        )
+    else:
+        action = base_action
+    return action, execution_result, spread_observation_id
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1PositionExitStep:
+    """One ordered canonical exit mutation and its exact conservative fill."""
+
+    position: Position
+    action: PositionAction
+    execution_result: PaperExitResult
+    execution_quote_observation_id: str
+    event_kind: str
+    fee: Decimal
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.position, Position)
+            or not isinstance(self.action, PositionAction)
+            or not isinstance(self.execution_result, PaperExitResult)
+            or self.position.ledger_name != "CANONICAL"
+            or self.event_kind not in {"PARTIAL_EXIT", "CLOSE"}
+            or type(self.execution_quote_observation_id) is not str
+            or not self.execution_quote_observation_id
+        ):
+            raise RiskBlock("INVALID_PHASE1_EXIT_STEP")
+        object.__setattr__(
+            self,
+            "fee",
+            _require_money(
+                self.fee,
+                reason_code="INVALID_PHASE1_EXIT_FEE",
+                positive=True,
+            ),
+        )
+        if (
+            self.fee != money_from_micros(_PHASE1_EXIT_FEE_MICROS)
+            or self.action.status != "PROVISIONAL_EXIT"
+            or self.action.shares_to_exit <= 0
+            or self.action.shares_to_exit + self.action.remaining_shares
+            != self.position.shares
+            or self.action.published_target != self.position.target
+            or self.execution_result.exit_reason
+            in {ExitReason.NO_EXIT, ExitReason.UNRESOLVED}
+            or self.execution_result.fill_price is None
+            or self.execution_result.fill_price <= _ZERO
+            or self.execution_result.exited_at is None
+            or not self.execution_result.observation_id
+        ):
+            raise RiskBlock("PHASE1_EXIT_STEP_MISMATCH")
+        if self.event_kind == "PARTIAL_EXIT":
+            if (
+                self.execution_result.exit_reason is not ExitReason.TARGET
+                or self.action.remaining_shares <= 0
+                or self.action.recommended_stop
+                <= self.position.recommended_stop
+                or self.position.profit_target_taken
+            ):
+                raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+        elif self.action.remaining_shares != 0:
+            raise RiskBlock("PHASE1_CLOSE_STATE_MISMATCH")
+
+
+def _phase1_position_exit_steps_from_observations(
+    *,
+    position: Position,
+    mark: MarketMark,
+    observations: Sequence[object],
+    policy: Policy,
+) -> tuple[Phase1PositionExitStep, ...]:
+    """Derive the complete ordered exit batch from one full-session review.
+
+    A first +2R target may create a partial exit and a tighter stop.  Only
+    observations strictly later than that target may then prove a close of the
+    remainder; a same-bar target/stop ambiguity remains stop-first.
+    """
+    action, result, quote_observation_id = (
+        _phase1_position_exit_decision_from_observations(
+            position=position,
+            mark=mark,
+            observations=observations,
+            policy=policy,
+        )
+    )
+    if (
+        action.status != "PROVISIONAL_EXIT"
+        or action.shares_to_exit <= 0
+        or result.exit_reason in {ExitReason.NO_EXIT, ExitReason.UNRESOLVED}
+        or quote_observation_id is None
+    ):
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_UNRESOLVED")
+    fee = money_from_micros(_PHASE1_EXIT_FEE_MICROS)
+    event_kind = "CLOSE" if action.remaining_shares == 0 else "PARTIAL_EXIT"
+    first = Phase1PositionExitStep(
+        position=position,
+        action=action,
+        execution_result=result,
+        execution_quote_observation_id=quote_observation_id,
+        event_kind=event_kind,
+        fee=fee,
+    )
+    if event_kind == "CLOSE":
+        return (first,)
+    if result.exit_reason is not ExitReason.TARGET:
+        raise RiskBlock("PHASE1_PARTIAL_EXIT_STATE_MISMATCH")
+    assert result.exited_at is not None
+    remaining_position = replace(
+        position,
+        shares=action.remaining_shares,
+        recommended_stop=action.recommended_stop,
+        user_confirmed_stop=(
+            position.user_confirmed_stop
+            if position.user_confirmed_stop is not None
+            and position.user_confirmed_stop >= action.recommended_stop
+            else None
+        ),
+        profit_target_taken=True,
+    )
+    later_observations = tuple(
+        observation
+        for observation in observations
+        if isinstance(getattr(observation, "source_time", None), datetime)
+        and getattr(observation, "source_time") > result.exited_at
+    )
+    if not later_observations:
+        return (first,)
+    later_result, later_quote_observation_id = (
+        _phase1_exit_execution_result_from_observations(
+            later_observations,
+            stop=remaining_position.recommended_stop,
+            target=remaining_position.target,
+            target_enabled=False,
+        )
+    )
+    if later_result.exit_reason is ExitReason.NO_EXIT:
+        return (first,)
+    if (
+        later_result.exit_reason is ExitReason.UNRESOLVED
+        or later_quote_observation_id is None
+        or later_result.exit_reason
+        not in {
+            ExitReason.STOP,
+            ExitReason.GAP_STOP,
+            ExitReason.STOP_FIRST_CONSERVATIVE,
+        }
+    ):
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_UNRESOLVED")
+    later_action = _position_action(
+        remaining_position,
+        mark,
+        status="PROVISIONAL_EXIT",
+        reasons=("RECOMMENDED_STOP_REACHED",),
+        recommended_stop=remaining_position.recommended_stop,
+        shares_to_exit=remaining_position.shares,
+        r_multiple=_position_r_multiple(remaining_position, mark),
+    )
+    close = Phase1PositionExitStep(
+        position=remaining_position,
+        action=later_action,
+        execution_result=later_result,
+        execution_quote_observation_id=later_quote_observation_id,
+        event_kind="CLOSE",
+        fee=fee,
+    )
+    if close.execution_result.exited_at <= first.execution_result.exited_at:
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_ORDER_MISMATCH")
+    return first, close
+
+
+def _phase1_review_mark_from_observations(
+    observations: Sequence[object],
+    *,
+    observation_id: str,
+    method: str,
+    price_micros: int,
+    at: datetime,
+    session_date: date,
+    query_cutoff: datetime,
+    calendar_resolver: SessionCalendarResolver,
+    daily_bar_cohort: object | None = None,
+) -> tuple[object, Decimal]:
+    """Recompute a review mark from an exact provider-normalized fact."""
+    if isinstance(observations, (str, bytes)):
+        raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+    items = tuple(observations)
+    matches = tuple(
+        item
+        for item in items
+        if getattr(item, "observation_id", None) == observation_id
+    )
+    if (
+        len(matches) != 1
+        or type(observation_id) is not str
+        or not observation_id
+        or method not in {
+            "SIP_QUOTE_BID",
+            "DAILY_BAR_CLOSE_HAIRCUT",
+        }
+        or type(price_micros) is not int
+        or price_micros <= 0
+        or type(session_date) is not date
+        or not isinstance(calendar_resolver, SessionCalendarResolver)
+        or not calendar_resolver.release_verified
+    ):
+        raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+    try:
+        normalized_at = _require_aware(at, "PHASE1_EXIT_MARK_MISMATCH")
+        normalized_cutoff = _require_aware(
+            query_cutoff,
+            "PHASE1_EXIT_MARK_MISMATCH",
+        )
+    except RiskBlock:
+        raise
+    observation = matches[0]
+    try:
+        session = calendar_resolver.session(session_date)
+    except RiskBlock:
+        raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH") from None
+    source_time = getattr(observation, "source_time", None)
+    received_at = getattr(observation, "received_at", None)
+    if (
+        not isinstance(source_time, datetime)
+        or not isinstance(received_at, datetime)
+        or source_time.tzinfo is None
+        or source_time.utcoffset() is None
+        or received_at.tzinfo is None
+        or received_at.utcoffset() is None
+        or type(getattr(observation, "fresh", None)) is not bool
+        or not observation.fresh
+        or source_time.astimezone(_ET).date() != session_date
+        or normalized_at.astimezone(_ET).date() != session_date
+        or source_time > normalized_at
+        or normalized_at > received_at
+        or received_at > normalized_cutoff
+        or not session.open_time
+        <= normalized_at.astimezone(_ET).time().replace(tzinfo=None)
+        <= session.close_time
+    ):
+        raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+    if method == "SIP_QUOTE_BID":
+        bid_micros = getattr(observation, "bid_micros", None)
+        ask_micros = getattr(observation, "ask_micros", None)
+        if (
+            getattr(observation, "observation_kind", None) != "QUOTE"
+            or getattr(observation, "feed", None) != "sip"
+            or source_time != normalized_at
+            or type(bid_micros) is not int
+            or type(ask_micros) is not int
+            or bid_micros <= 0
+            or ask_micros < bid_micros
+            or price_micros != bid_micros
+            or daily_bar_cohort is not None
+        ):
+            raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+    else:
+        from urllib.parse import parse_qs, urlsplit
+
+        from .providers.alpaca import (
+            Bar,
+            ProviderFetchCohort,
+            _normalized_market_fact_source,
+            _provider_fetch_cohort_manifest,
+            is_issued_provider_fetch_cohort,
+        )
+
+        close_micros = getattr(observation, "close_micros", None)
+        if (
+            getattr(observation, "observation_kind", None) != "BAR"
+            or type(close_micros) is not int
+            or close_micros <= 0
+            or normalized_at.astimezone(_ET).time().replace(tzinfo=None)
+            != session.close_time
+            or price_micros != (close_micros * 999) // 1000
+            or not isinstance(daily_bar_cohort, ProviderFetchCohort)
+            or not is_issued_provider_fetch_cohort(daily_bar_cohort)
+        ):
+            raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+        assert isinstance(daily_bar_cohort, ProviderFetchCohort)
+        try:
+            manifest = _provider_fetch_cohort_manifest(daily_bar_cohort)
+            symbol = getattr(observation, "symbol")
+            facts = tuple(daily_bar_cohort[symbol])
+            session_facts = tuple(
+                fact
+                for fact in facts
+                if isinstance(fact, Bar)
+                and fact.timestamp.astimezone(_ET).date() == session_date
+            )
+            if len(session_facts) != 1:
+                raise ValueError
+            fact = session_facts[0]
+            fact_source = _normalized_market_fact_source(fact)
+            page_queries = tuple(
+                (
+                    page,
+                    parse_qs(
+                        urlsplit(page.request_url).query,
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                    ),
+                    urlsplit(page.request_url),
+                )
+                for page in manifest.pages
+            )
+            request_starts = {
+                query["start"][0] for _page, query, _parsed in page_queries
+            }
+            request_ends = {
+                query["end"][0] for _page, query, _parsed in page_queries
+            }
+            if len(request_starts) != 1 or len(request_ends) != 1:
+                raise ValueError
+            request_start = datetime.fromisoformat(
+                next(iter(request_starts)).replace("Z", "+00:00")
+            )
+            request_end = datetime.fromisoformat(
+                next(iter(request_ends)).replace("Z", "+00:00")
+            )
+            session_open = datetime.combine(
+                session_date,
+                session.open_time,
+                tzinfo=_ET,
+            ).astimezone(UTC)
+            session_close = datetime.combine(
+                session_date,
+                session.close_time,
+                tzinfo=_ET,
+            ).astimezone(UTC)
+        except (AttributeError, KeyError, TypeError, ValueError, IndexError):
+            raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH") from None
+        if (
+            manifest.collection != "bars"
+            or manifest.requested_symbols != tuple(
+                sorted(manifest.requested_symbols)
+            )
+            or symbol not in manifest.requested_symbols
+            or any(
+                parsed.path != "/v2/stocks/bars"
+                or page.source_type != "ALPACA_DAILY_BARS"
+                or query.get("timeframe") != ["1Day"]
+                or query.get("adjustment") != ["split"]
+                or query.get("feed") != ["sip"]
+                or query.get("symbols")
+                != [",".join(manifest.requested_symbols)]
+                for page, query, parsed in page_queries
+            )
+            or request_start > session_open
+            or request_end < session_close
+            or fact.feed != "sip"
+            or fact.adjustment != "split"
+            or fact.close != money_from_micros(close_micros)
+            or fact.timestamp != source_time
+            or getattr(
+                observation,
+                "provider_source_observation_id",
+                None,
+            )
+            != fact_source.source_observation_id
+            or getattr(observation, "source_item_ordinal", None)
+            != fact_source.source_item_ordinal
+            or getattr(observation, "source_item_path", None)
+            != fact_source.source_item_path
+            or getattr(observation, "page_payload_sha256", None)
+            != fact_source.page_payload_sha256
+            or getattr(observation, "normalized_fields_digest", None)
+            != fact_source.normalized_fields_digest
+        ):
+            raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH")
+    try:
+        return observation, money_from_micros(price_micros)
+    except DomainValidationError:
+        raise RiskBlock("PHASE1_EXIT_MARK_MISMATCH") from None
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1ExitMarketMaterial:
+    observations: tuple[object, ...]
+    mark_observation: object
+    mark_price: Decimal
+    mark_at: datetime
+    previous_session_low: Decimal
+    current_session_low: Decimal
+    atr14: Decimal
+
+
+def _phase1_exit_review_market_material(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> _Phase1ExitMarketMaterial:
+    """Revalidate exact persisted provider cohorts and recompute market facts."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from .indicators import wilder_atr
+    from .providers.alpaca import (
+        Bar,
+        ProviderFetchCohort,
+        Quote,
+        _normalized_market_fact_source,
+        _provider_fetch_cohort_manifest,
+        is_issued_provider_fetch_cohort,
+        provider_fetch_cohorts_share_owner,
+        read_provider_fetch_bundle,
+    )
+
+    roles = (
+        (
+            "DAILY_BAR",
+            getattr(source, "daily_bar_cohort", None),
+            tuple(getattr(source, "daily_bar_facts", ())),
+            "bars",
+            "ALPACA_DAILY_BARS",
+            "1Day",
+        ),
+        (
+            "EXECUTION_BAR",
+            getattr(source, "execution_bar_cohort", None),
+            tuple(getattr(source, "execution_bar_facts", ())),
+            "bars",
+            "ALPACA_INTRADAY_BARS",
+            "1Min",
+        ),
+        (
+            "QUOTE",
+            getattr(source, "quote_cohort", None),
+            tuple(getattr(source, "quote_facts", ())),
+            "quotes",
+            "ALPACA_HISTORICAL_QUOTES",
+            None,
+        ),
+    )
+    cohorts = tuple(item[1] for item in roles)
+    if (
+        any(not isinstance(item, ProviderFetchCohort) for item in cohorts)
+        or any(not is_issued_provider_fetch_cohort(item) for item in cohorts)
+        or not provider_fetch_cohorts_share_owner(*cohorts)
+    ):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_UNVERIFIED")
+    symbol = getattr(source, "symbol", None)
+    review_session = getattr(source, "review_session", None)
+    query_cutoff = getattr(source, "query_cutoff", None)
+    if (
+        type(symbol) is not str
+        or not symbol
+        or type(review_session) is not date
+        or not isinstance(query_cutoff, datetime)
+    ):
+        raise RiskBlock("PHASE1_EXIT_SOURCE_LINEAGE_MISMATCH")
+    query_cutoff = _require_aware(
+        query_cutoff,
+        "PHASE1_EXIT_SOURCE_LINEAGE_MISMATCH",
+    )
+    try:
+        review_schedule = calendar_resolver.session(review_session)
+    except RiskBlock:
+        raise RiskBlock("PHASE1_EXIT_SOURCE_LINEAGE_MISMATCH") from None
+    review_open = datetime.combine(
+        review_session,
+        review_schedule.open_time,
+        tzinfo=_ET,
+    ).astimezone(UTC)
+    review_close = datetime.combine(
+        review_session,
+        review_schedule.close_time,
+        tzinfo=_ET,
+    ).astimezone(UTC)
+    if query_cutoff < review_close:
+        raise RiskBlock("PHASE1_EXIT_REVIEW_BEFORE_SESSION_CLOSE")
+
+    semantic_manifest_digests: list[str] = []
+    provider_facts_by_role: dict[str, tuple[object, ...]] = {}
+    stored_facts_by_role: dict[str, tuple[object, ...]] = {}
+    for purpose, cohort, stored_facts, collection, source_type, timeframe in roles:
+        assert isinstance(cohort, ProviderFetchCohort)
+        try:
+            manifest = _provider_fetch_cohort_manifest(cohort)
+            bundle = read_provider_fetch_bundle(cohort)
+            provider_facts = tuple(cohort[symbol])
+        except (KeyError, TypeError, ValueError):
+            raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_UNVERIFIED") from None
+        if (
+            manifest.collection != collection
+            or manifest.requested_symbols != (symbol,)
+            or manifest.terminal is not True
+            or not manifest.pages
+            or len(bundle.pages) != len(manifest.pages)
+            or any(page.source_type != source_type for page in manifest.pages)
+        ):
+            raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_MISMATCH")
+        page_queries: list[dict[str, list[str]]] = []
+        for page_bundle in bundle.pages:
+            parsed = urlsplit(page_bundle.page.request_url)
+            try:
+                query = parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+            except ValueError:
+                raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_MISMATCH") from None
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != "data.alpaca.markets"
+                or parsed.path
+                != ("/v2/stocks/bars" if collection == "bars" else "/v2/stocks/quotes")
+                or query.get("symbols") != [symbol]
+                or query.get("feed") != ["sip"]
+                or (
+                    timeframe is not None
+                    and (
+                        query.get("timeframe") != [timeframe]
+                        or query.get("adjustment") != ["split"]
+                    )
+                )
+                or (
+                    timeframe is None
+                    and (
+                        "timeframe" in query or "adjustment" in query
+                    )
+                )
+            ):
+                raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_MISMATCH")
+            page_queries.append(query)
+        try:
+            starts = {query["start"][0] for query in page_queries}
+            ends = {query["end"][0] for query in page_queries}
+            if len(starts) != 1 or len(ends) != 1:
+                raise ValueError
+            request_start = datetime.fromisoformat(
+                next(iter(starts)).replace("Z", "+00:00")
+            )
+            request_end = datetime.fromisoformat(
+                next(iter(ends)).replace("Z", "+00:00")
+            )
+        except (KeyError, ValueError, IndexError):
+            raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_MISMATCH") from None
+        if purpose in {"EXECUTION_BAR", "QUOTE"}:
+            if request_start != review_open or request_end != review_close:
+                raise RiskBlock("PHASE1_EXIT_SESSION_COVERAGE_INCOMPLETE")
+            role_close = review_close
+        else:
+            if not provider_facts or any(
+                not isinstance(fact, Bar) for fact in provider_facts
+            ):
+                raise RiskBlock("PHASE1_EXIT_DAILY_HISTORY_INCOMPLETE")
+            daily_end_session = provider_facts[-1].timestamp.astimezone(_ET).date()
+            daily_end_schedule = calendar_resolver.session(daily_end_session)
+            role_close = datetime.combine(
+                daily_end_session,
+                daily_end_schedule.close_time,
+                tzinfo=_ET,
+            ).astimezone(UTC)
+            first_daily_session = provider_facts[0].timestamp.astimezone(_ET).date()
+            first_daily_schedule = calendar_resolver.session(first_daily_session)
+            expected_daily_start = datetime.combine(
+                first_daily_session,
+                first_daily_schedule.open_time,
+                tzinfo=_ET,
+            ).astimezone(UTC)
+            if request_start != expected_daily_start or request_end != role_close:
+                raise RiskBlock("PHASE1_EXIT_DAILY_HISTORY_INCOMPLETE")
+        if any(
+            page.observation.retrieved_at < role_close
+            or page.observation.retrieved_at > query_cutoff
+            for page in bundle.pages
+        ):
+            raise RiskBlock("PHASE1_EXIT_PROVIDER_RECEIPT_TIME_MISMATCH")
+        semantic_manifest_digests.append(
+            sha256(
+                json.dumps(
+                    {
+                        "namespace": (
+                            "stock-monitor/phase1-exit-semantic-manifest/v1"
+                        ),
+                        "purpose": purpose,
+                        "collection": manifest.collection,
+                        "requested_symbols": list(manifest.requested_symbols),
+                        "request_start": request_start.astimezone(UTC).isoformat(
+                            timespec="microseconds"
+                        ).replace("+00:00", "Z"),
+                        "request_end": request_end.astimezone(UTC).isoformat(
+                            timespec="microseconds"
+                        ).replace("+00:00", "Z"),
+                        "pages": [
+                            {
+                                "page_ordinal": page.page.page_ordinal,
+                                "source_type": page.page.source_type,
+                                "request_url": page.page.request_url,
+                                "request_page_token": (
+                                    page.page.request_page_token
+                                ),
+                                "next_page_token": page.page.next_page_token,
+                                "payload_sha256": page.page.payload_sha256,
+                            }
+                            for page in bundle.pages
+                        ],
+                    },
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+        if len(provider_facts) != len(stored_facts):
+            raise RiskBlock("PHASE1_EXIT_PROVIDER_FACT_SET_MISMATCH")
+        page_observations = {
+            page.page.source_observation_id: page.observation
+            for page in bundle.pages
+        }
+        for ordinal, (provider_fact, stored_fact) in enumerate(
+            zip(provider_facts, stored_facts, strict=True),
+            start=1,
+        ):
+            try:
+                fact_source = _normalized_market_fact_source(provider_fact)
+                page_observation = page_observations[
+                    fact_source.source_observation_id
+                ]
+            except (KeyError, ValueError):
+                raise RiskBlock("PHASE1_EXIT_PROVIDER_FACT_SET_MISMATCH") from None
+            is_bar = isinstance(provider_fact, Bar)
+            is_quote = isinstance(provider_fact, Quote)
+            expected_kind = "BAR" if purpose != "QUOTE" else "QUOTE"
+            expected_values = (
+                (
+                    money_to_micros(provider_fact.open),
+                    money_to_micros(provider_fact.high),
+                    money_to_micros(provider_fact.low),
+                    money_to_micros(provider_fact.close),
+                    provider_fact.volume,
+                    None,
+                    None,
+                    provider_fact.adjustment,
+                    None,
+                )
+                if is_bar
+                else (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    money_to_micros(provider_fact.bid),
+                    money_to_micros(provider_fact.ask),
+                    None,
+                    provider_fact.sequence,
+                )
+            )
+            if (
+                (purpose != "QUOTE" and not is_bar)
+                or (purpose == "QUOTE" and not is_quote)
+                or getattr(stored_fact, "purpose", None) != purpose
+                or getattr(stored_fact, "fact_ordinal", None) != ordinal
+                or getattr(stored_fact, "observation_kind", None) != expected_kind
+                or getattr(stored_fact, "symbol", None) != symbol
+                or str(getattr(stored_fact, "feed", "")).lower() != "sip"
+                or getattr(stored_fact, "source_time", None)
+                != provider_fact.timestamp
+                or getattr(stored_fact, "received_at", None)
+                != page_observation.retrieved_at
+                or getattr(stored_fact, "provider_sequence", None)
+                != expected_values[8]
+                or getattr(stored_fact, "provider_source_observation_id", None)
+                != fact_source.source_observation_id
+                or getattr(stored_fact, "page_ordinal", None)
+                != fact_source.page_ordinal
+                or getattr(stored_fact, "source_item_ordinal", None)
+                != fact_source.source_item_ordinal
+                or getattr(stored_fact, "source_item_path", None)
+                != fact_source.source_item_path
+                or getattr(stored_fact, "page_payload_sha256", None)
+                != fact_source.page_payload_sha256
+                or getattr(stored_fact, "normalized_fields_digest", None)
+                != fact_source.normalized_fields_digest
+                or (
+                    getattr(stored_fact, "open_micros", None),
+                    getattr(stored_fact, "high_micros", None),
+                    getattr(stored_fact, "low_micros", None),
+                    getattr(stored_fact, "close_micros", None),
+                    getattr(stored_fact, "volume", None),
+                    getattr(stored_fact, "bid_micros", None),
+                    getattr(stored_fact, "ask_micros", None),
+                    getattr(stored_fact, "adjustment", None),
+                )
+                != expected_values[:8]
+                or getattr(stored_fact, "fresh", None) is not True
+                or type(getattr(stored_fact, "source_observation_id", None))
+                is not int
+                or getattr(stored_fact, "source_observation_id") <= 0
+            ):
+                raise RiskBlock("PHASE1_EXIT_PROVIDER_FACT_SET_MISMATCH")
+        provider_facts_by_role[purpose] = provider_facts
+        stored_facts_by_role[purpose] = stored_facts
+
+    review_id_payload = {
+        "namespace": "stock-monitor/phase1-exit-review/v1",
+        "payload": {
+            "signal_id": getattr(source, "signal_id", None),
+            "review_session": review_session.isoformat(),
+            "semantic_manifest_digests": semantic_manifest_digests,
+        },
+    }
+    computed_review_id = sha256(
+        json.dumps(
+            review_id_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    all_stored_facts = tuple(
+        fact
+        for purpose in ("DAILY_BAR", "EXECUTION_BAR", "QUOTE")
+        for fact in stored_facts_by_role[purpose]
+    )
+    observations = tuple(getattr(source, "observations", ()))
+    expected_observations = tuple(
+        sorted(
+            (
+                *stored_facts_by_role["EXECUTION_BAR"],
+                *stored_facts_by_role["QUOTE"],
+            ),
+            key=lambda item: getattr(item, "cohort_ordinal", 0),
+        )
+    )
+    all_ids = tuple(getattr(item, "observation_id", None) for item in all_stored_facts)
+    if (
+        getattr(source, "review_id", None) != computed_review_id
+        or getattr(source, "expected_manifest_count", None) != 3
+        or getattr(source, "expected_fact_count", None) != len(all_stored_facts)
+        or len(set(all_ids)) != len(all_ids)
+        or observations != expected_observations
+        or tuple(getattr(item, "cohort_ordinal", None) for item in observations)
+        != tuple(range(1, len(observations) + 1))
+        or not observations
+        or getattr(source, "source_observation_highwater", 0)
+        < max(getattr(item, "source_observation_id") for item in all_stored_facts)
+    ):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_FACT_SET_MISMATCH")
+
+    daily_bars = provider_facts_by_role["DAILY_BAR"]
+    execution_bars = provider_facts_by_role["EXECUTION_BAR"]
+    if len(daily_bars) != 14 or not execution_bars:
+        raise RiskBlock("PHASE1_EXIT_DAILY_HISTORY_INCOMPLETE")
+    daily_sessions = tuple(
+        bar.timestamp.astimezone(_ET).date() for bar in daily_bars
+    )
+    expected_daily_end = (
+        review_session
+        if query_cutoff >= review_close
+        else calendar_resolver.previous_session(review_session)
+    )
+    expected_sessions = [expected_daily_end]
+    while len(expected_sessions) < 14:
+        expected_sessions.append(
+            calendar_resolver.previous_session(expected_sessions[-1])
+        )
+    expected_sessions.reverse()
+    if daily_sessions != tuple(expected_sessions):
+        raise RiskBlock("PHASE1_EXIT_DAILY_HISTORY_INCOMPLETE")
+    if expected_daily_end == review_session:
+        daily_current = daily_bars[-1]
+        if (
+            daily_current.open != execution_bars[0].open
+            or daily_current.high != max(bar.high for bar in execution_bars)
+            or daily_current.low != min(bar.low for bar in execution_bars)
+            or daily_current.close != execution_bars[-1].close
+            or daily_current.volume != sum(bar.volume for bar in execution_bars)
+        ):
+            raise RiskBlock("PHASE1_EXIT_DAILY_INTRADAY_AGGREGATE_MISMATCH")
+        previous_low = daily_bars[-2].low
+    else:
+        previous_low = daily_bars[-1].low
+    current_low = min(bar.low for bar in execution_bars)
+    raw_atr14 = wilder_atr(daily_bars, 14)
+    atr14 = raw_atr14.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
+
+    quote_pairs = tuple(
+        zip(
+            provider_facts_by_role["QUOTE"],
+            stored_facts_by_role["QUOTE"],
+            strict=True,
+        )
+    )
+    eligible_quotes = tuple(
+        (provider_quote, stored_quote)
+        for provider_quote, stored_quote in quote_pairs
+        if (
+            review_open <= provider_quote.timestamp <= review_close
+            and (review_close - provider_quote.timestamp).total_seconds() <= 60
+        )
+    )
+    if eligible_quotes:
+        provider_quote, mark_observation = max(
+            eligible_quotes,
+            key=lambda item: (
+                item[0].timestamp,
+                -1 if item[0].sequence is None else item[0].sequence,
+            ),
+        )
+        mark_price = provider_quote.bid
+        mark_at = provider_quote.timestamp
+    else:
+        if expected_daily_end != review_session:
+            raise RiskBlock("PHASE1_EXIT_REVIEW_MARK_UNAVAILABLE")
+        mark_observation = stored_facts_by_role["DAILY_BAR"][-1]
+        close_micros = money_to_micros(daily_bars[-1].close)
+        mark_price = money_from_micros((close_micros * 999) // 1000)
+        mark_at = review_close
+    return _Phase1ExitMarketMaterial(
+        observations=observations,
+        mark_observation=mark_observation,
+        mark_price=mark_price,
+        mark_at=mark_at,
+        previous_session_low=previous_low,
+        current_session_low=current_low,
+        atr14=atr14,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Phase1DerivedPositionExit:
+    """Replay-independent recomputation of one exact ordered exit batch."""
+
+    event_context: PositionEventContext
+    mark: MarketMark
+    steps: tuple[Phase1PositionExitStep, ...]
+    mark_observation_id: str
+    position_evidence_digest: str | None
+
+
+def _derive_phase1_position_exit_material_from_verified_source(
+    source: object,
+    *,
+    position: Position,
+    calendar_resolver: SessionCalendarResolver,
+    policy: Policy,
+) -> Phase1DerivedPositionExit:
+    """Recompute exit facts from raw-bound material and an explicit position.
+
+    This is the common replay boundary.  It deliberately has no canonical
+    replay input: callers first reconstruct the position revision they intend
+    to verify, then this adapter independently reissues signal-level evidence,
+    binds it to that revision, and reruns the complete paper-exit simulation.
+    """
+    from .journal import (
+        Phase1ExitReviewMarketSource,
+        is_verified_phase1_exit_review_market_source,
+        phase1_sources_share_owner,
+    )
+
+    if not isinstance(source, Phase1ExitReviewMarketSource) or not (
+        is_verified_phase1_exit_review_market_source(source)
+    ):
+        raise RiskBlock("PHASE1_EXIT_REVIEW_MARKET_SOURCE_UNVERIFIED")
+    if not isinstance(position, Position):
+        raise TypeError("Phase 1 exit replay requires a Position")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if not isinstance(policy, Policy):
+        raise RiskBlock("INVALID_POLICY")
+    policy.validate()
+
+    calendar_digest = _calendar_digest(calendar_resolver)
+    signal_source = source.signal_source
+    try:
+        planned_shares = signal_source.planned_shares
+        if position.profit_target_taken:
+            legal_position_revision = (
+                position.shares == planned_shares - (planned_shares // 2)
+                and position.recommended_stop > position.initial_stop
+                and position.recommended_stop % position.tick_size == _ZERO
+            )
+        else:
+            legal_position_revision = (
+                position.shares == planned_shares
+                and position.recommended_stop == position.initial_stop
+            )
+        position_matches_signal = (
+            position.ledger_name == "CANONICAL"
+            and position.signal_id == source.signal_id
+            and position.symbol == source.symbol
+            and position.entry
+            == money_from_micros(signal_source.maximum_entry_micros)
+            and position.initial_stop
+            == money_from_micros(signal_source.recommended_stop_micros)
+            and position.target == money_from_micros(signal_source.target_micros)
+            and position.tick_size
+            == money_from_micros(signal_source.tick_size_micros)
+            and position.entered_session == signal_source.publication_session
+            and position.user_confirmed_stop is None
+            and legal_position_revision
+        )
+    except (AttributeError, DomainValidationError):
+        position_matches_signal = False
+    if _policy_digest(policy) != signal_source.policy_digest:
+        raise RiskBlock("PHASE1_EXIT_POLICY_MISMATCH")
+    if (
+        source.calendar_digest != calendar_digest
+        or source.signal_id != signal_source.signal_id
+        or source.validation_window_id != signal_source.validation_window_id
+        or source.symbol != signal_source.symbol
+        or signal_source.role != "PRIMARY"
+        or not phase1_sources_share_owner(source, signal_source)
+        or not position_matches_signal
+    ):
+        raise RiskBlock("PHASE1_EXIT_POSITION_MISMATCH")
+
+    market = _phase1_exit_review_market_material(
+        source,
+        calendar_resolver=calendar_resolver,
+    )
+    signal_evidence_source = source.signal_evidence_source
+    position_evidence: Phase1PositionEvidenceAuthority | None
+    if signal_evidence_source is None:
+        event_exit_required: bool | None = None
+        thesis_invalidated: bool | None = None
+        evidence_status = "UNAVAILABLE"
+        position_evidence = None
+        position_evidence_digest = None
+    else:
+        signal_evidence = _issue_phase1_signal_evidence_authority_from_source(
+            signal_evidence_source,
+            calendar_resolver=calendar_resolver,
+        )
+        evidence_signal_source = signal_evidence.signal_source
+        if (
+            signal_evidence.signal_id != source.signal_id
+            or signal_evidence.validation_window_id
+            != source.validation_window_id
+            or signal_evidence.symbol != source.symbol
+            or getattr(evidence_signal_source, "row_id", None)
+            != getattr(signal_source, "row_id", None)
+            or getattr(evidence_signal_source, "row_sha256", None)
+            != getattr(signal_source, "row_sha256", None)
+            or getattr(
+                evidence_signal_source,
+                "publication_source_digest",
+                None,
+            )
+            != getattr(signal_source, "publication_source_digest", None)
+            or not phase1_sources_share_owner(source, evidence_signal_source)
+            or signal_evidence.calendar_digest != calendar_digest
+            or signal_evidence.review_at > source.query_cutoff
+            or signal_evidence.review_at.astimezone(_ET).date()
+            != source.review_session
+        ):
+            raise RiskBlock("PHASE1_EXIT_EVENT_EVIDENCE_MISMATCH")
+        position_evidence = _issue_phase1_position_evidence_authority(
+            signal_evidence,
+            position=position,
+        )
+        event_exit_required = position_evidence.event_exit_required
+        thesis_invalidated = position_evidence.thesis_invalidated
+        evidence_status = position_evidence.status
+        position_evidence_digest = position_evidence.source_digest
+
+    all_market_facts = (
+        *tuple(source.daily_bar_facts),
+        *tuple(source.execution_bar_facts),
+        *tuple(source.quote_facts),
+    )
+    fact_cursors = tuple(
+        getattr(item, "source_cursor", None) for item in all_market_facts
+    )
+    if not fact_cursors or any(
+        type(cursor) is not int or cursor <= 0 for cursor in fact_cursors
+    ):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_FACT_SET_MISMATCH")
+    event_context = _issue_position_event_context(
+        position=position,
+        event_exit_required=event_exit_required,
+        thesis_invalidated=thesis_invalidated,
+        evidence_status=evidence_status,
+        at=market.mark_at,
+        cursor=max(fact_cursors),
+        start_cursor=min(fact_cursors),
+        event_count=(
+            0
+            if position_evidence is None
+            else len(position_evidence.source_observation_ids)
+        ),
+        calendar_resolver=calendar_resolver,
+        price=market.mark_price,
+        previous_session_low=market.previous_session_low,
+        current_session_low=market.current_session_low,
+        atr14=market.atr14,
+    )
+    _register_identity_authority(
+        _POSITION_EVENT_AUTHORITIES,
+        event_context,
+        _position_event_context_fingerprint(event_context),
+    )
+    _bind_phase1_derived_sources(
+        event_context,
+        ((source, "EXIT_REVIEW_MARKET"),),
+    )
+    mark = build_market_mark(
+        position,
+        price=market.mark_price,
+        at=market.mark_at,
+        calendar_resolver=calendar_resolver,
+        previous_session_low=market.previous_session_low,
+        current_session_low=market.current_session_low,
+        atr14=market.atr14,
+        event_exit_required=event_exit_required,
+        thesis_invalidated=thesis_invalidated,
+        event_evidence_status=evidence_status,
+        event_context_verified=True,
+        position_event_context=event_context,
+    )
+    _bind_phase1_derived_sources(mark, ((source, "EXIT_REVIEW_MARKET"),))
+    steps = _phase1_position_exit_steps_from_observations(
+        position=position,
+        mark=mark,
+        observations=market.observations,
+        policy=policy,
+    )
+    observation_ids = {
+        getattr(item, "observation_id", None) for item in market.observations
+    }
+    if any(
+        step.execution_result.observation_id not in observation_ids
+        or step.execution_quote_observation_id not in observation_ids
+        or step.execution_result.exited_at is None
+        or step.execution_result.exited_at > source.query_cutoff
+        for step in steps
+    ):
+        raise RiskBlock("PHASE1_EXIT_EXECUTION_UNRESOLVED")
+
+    partial_steps = tuple(
+        step for step in steps if step.event_kind == "PARTIAL_EXIT"
+    )
+    first_step = steps[0]
+    mechanically_independent_full = (
+        len(steps) == 1
+        and first_step.event_kind == "CLOSE"
+        and (
+            first_step.execution_result.exit_reason
+            in {
+                ExitReason.STOP,
+                ExitReason.GAP_STOP,
+                ExitReason.STOP_FIRST_CONSERVATIVE,
+            }
+            or "MAX_HOLD_SESSIONS_REACHED" in first_step.action.reason_codes
+            or (
+                first_step.execution_result.exit_reason is ExitReason.TARGET
+                and position.shares == 1
+            )
+        )
+    )
+    if partial_steps and evidence_status != "CLEAR":
+        raise RiskBlock("PHASE1_EXIT_EVENT_EVIDENCE_UNRESOLVED")
+    if (
+        evidence_status in {"UNRESOLVED", "UNAVAILABLE"}
+        and not mechanically_independent_full
+    ):
+        raise RiskBlock("PHASE1_EXIT_EVENT_EVIDENCE_UNRESOLVED")
+    evidence_dependent = bool(partial_steps) or any(
+        step.execution_result.exit_reason
+        in {
+            ExitReason.EVENT_EXIT_REQUIRED,
+            ExitReason.THESIS_INVALIDATED,
+        }
+        for step in steps
+    )
+    if (
+        evidence_dependent
+        and (
+            position_evidence is None
+            or position_evidence.review_at
+            > first_step.execution_result.exited_at
+        )
+    ):
+        raise RiskBlock("PHASE1_EXIT_EVIDENCE_LOOKAHEAD")
+    if (
+        source.fee_schedule_version != _PHASE1_EXIT_FEE_SCHEDULE_VERSION
+        or source.fee_schedule_digest != _phase1_exit_fee_schedule_digest()
+        or source.fee_micros != _PHASE1_EXIT_FEE_MICROS
+    ):
+        raise RiskBlock("PHASE1_EXIT_FEE_SCHEDULE_MISMATCH")
+    mark_observation_id = getattr(
+        market.mark_observation,
+        "observation_id",
+        None,
+    )
+    if type(mark_observation_id) is not str or not mark_observation_id:
+        raise RiskBlock("PHASE1_EXIT_REVIEW_MARK_UNAVAILABLE")
+    return Phase1DerivedPositionExit(
+        event_context=event_context,
+        mark=mark,
+        steps=steps,
+        mark_observation_id=mark_observation_id,
+        position_evidence_digest=position_evidence_digest,
+    )
+
+
+def _derive_phase1_position_exit_steps_from_verified_source(
+    source: object,
+    *,
+    position: Position,
+    calendar_resolver: SessionCalendarResolver,
+    policy: Policy,
+) -> tuple[Phase1PositionExitStep, ...]:
+    """Return exact exit steps for restart replay from raw-bound material."""
+    return _derive_phase1_position_exit_material_from_verified_source(
+        source,
+        position=position,
+        calendar_resolver=calendar_resolver,
+        policy=policy,
+    ).steps
+
+
+def _issue_phase1_position_exit_authority_from_source(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+    policy: Policy,
+) -> Phase1PositionExitAuthority:
+    """Recompute the complete canonical exit batch from one exact review."""
+    from .journal import (
+        Phase1ExitReviewSource,
+        is_verified_phase1_exit_review_source,
+        phase1_sources_share_owner,
+    )
+    from .ledger import _issue_canonical_ledger_replay_from_phase1_source
+
+    if not isinstance(source, Phase1ExitReviewSource) or not (
+        is_verified_phase1_exit_review_source(source)
+    ):
+        raise RiskBlock("PHASE1_EXIT_REVIEW_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if not isinstance(policy, Policy):
+        raise RiskBlock("INVALID_POLICY")
+    policy.validate()
+    calendar_digest = _calendar_digest(calendar_resolver)
+    market_source = source.market_source
+    replay_source = source.canonical_replay_source
+    signal_source = source.signal_source
+    if (
+        source.calendar_digest != calendar_digest
+        or market_source.calendar_digest != calendar_digest
+        or replay_source.query_cutoff != source.query_cutoff
+        or market_source.query_cutoff != source.query_cutoff
+        or replay_source.publication_predecessor
+        or source.signal_source is not market_source.signal_source
+        or source.signal_id != signal_source.signal_id
+        or source.validation_window_id != signal_source.validation_window_id
+        or source.validation_window_id != replay_source.validation_window_id
+        or source.symbol != signal_source.symbol
+        or signal_source.role != "PRIMARY"
+        or not phase1_sources_share_owner(source, market_source)
+        or not phase1_sources_share_owner(source, replay_source)
+        or not phase1_sources_share_owner(source, signal_source)
+    ):
+        raise RiskBlock("PHASE1_EXIT_SOURCE_LINEAGE_MISMATCH")
+    replay = _issue_canonical_ledger_replay_from_phase1_source(replay_source)
+    projected = tuple(
+        item
+        for item in replay.ledger_pair.canonical.open_positions
+        if item.signal_id == source.signal_id
+    )
+    if len(projected) != 1:
+        raise RiskBlock("PHASE1_EXIT_POSITION_MISMATCH")
+    projected_position = projected[0]
+    try:
+        initial_stop = money_from_micros(
+            signal_source.recommended_stop_micros
+        )
+    except (AttributeError, DomainValidationError):
+        raise RiskBlock("PHASE1_EXIT_POSITION_MISMATCH") from None
+    entered_session = projected_position.lots[0].at.astimezone(_ET).date()
+    position = Position(
+        signal_id=source.signal_id,
+        symbol=source.symbol,
+        entry=projected_position.entry,
+        shares=projected_position.shares,
+        initial_stop=initial_stop,
+        recommended_stop=projected_position.recommended_stop,
+        user_confirmed_stop=None,
+        target=projected_position.target,
+        tick_size=projected_position.tick_size,
+        entered_session=entered_session,
+        ledger_name="CANONICAL",
+        profit_target_taken=projected_position.profit_target_taken,
+    )
+    if (
+        projected_position.symbol != source.symbol
+        or projected_position.ledger_name != "CANONICAL"
+        or signal_source.maximum_entry_micros
+        != money_to_micros(projected_position.entry)
+        or signal_source.target_micros
+        != money_to_micros(projected_position.target)
+        or signal_source.tick_size_micros
+        != money_to_micros(projected_position.tick_size)
+    ):
+        raise RiskBlock("PHASE1_EXIT_POSITION_MISMATCH")
+
+    derived = _derive_phase1_position_exit_material_from_verified_source(
+        market_source,
+        position=position,
+        calendar_resolver=calendar_resolver,
+        policy=policy,
+    )
+    position_evidence = source.position_evidence
+    if (
+        (position_evidence is None)
+        != (derived.position_evidence_digest is None)
+        or (
+            position_evidence is not None
+            and (
+                not is_issued_phase1_position_evidence_authority(
+                    position_evidence
+                )
+                or position_evidence.position != position
+                or position_evidence.source_digest
+                != derived.position_evidence_digest
+            )
+        )
+    ):
+        raise RiskBlock("PHASE1_EXIT_EVENT_EVIDENCE_MISMATCH")
+    event_context = derived.event_context
+    mark = derived.mark
+    steps = derived.steps
+    mark_observation_id = derived.mark_observation_id
+    position_evidence_digest = derived.position_evidence_digest
+    digest_payload = _phase1_position_exit_authority_payload(
+        position=position,
+        event_context=event_context,
+        mark=mark,
+        steps=steps,
+        mark_observation_id=mark_observation_id,
+        position_evidence_digest=position_evidence_digest,
+        fee_schedule_version=source.fee_schedule_version,
+        fee_schedule_digest=source.fee_schedule_digest,
+        validation_window_id=source.validation_window_id,
+        query_cutoff=source.query_cutoff,
+        source_digest=source.source_digest,
+    )
+    authority_digest = sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    authority = Phase1PositionExitAuthority(
+        position=position,
+        event_context=event_context,
+        mark=mark,
+        steps=steps,
+        mark_observation_id=mark_observation_id,
+        position_evidence_digest=position_evidence_digest,
+        fee_schedule_version=source.fee_schedule_version,
+        fee_schedule_digest=source.fee_schedule_digest,
+        validation_window_id=source.validation_window_id,
+        query_cutoff=source.query_cutoff,
+        source_digest=source.source_digest,
+        authority_digest=authority_digest,
+    )
+    _register_identity_authority(
+        _PHASE1_POSITION_EXIT_AUTHORITIES,
+        authority,
+        _phase1_position_exit_authority_fingerprint(authority),
+    )
+    _bind_phase1_derived_sources(authority, ((source, "EXIT_REVIEW"),))
+    return authority
 
 
 @dataclass(frozen=True, slots=True)
@@ -4755,14 +8449,41 @@ def _breaker_history_fingerprint(
 ) -> tuple[object, ...]:
     return (
         history.ledger_name,
-        history.equity,
-        history.closes,
+        tuple(
+            (
+                point.session_date,
+                point.equity,
+                point.at,
+                point.cursor,
+                point.ordinal,
+                point.source_id,
+                point.message_time,
+                point.received_at,
+            )
+            for point in history.equity
+        ),
+        tuple(
+            (
+                trade.session_date,
+                trade.pnl,
+                trade.signal_id,
+                trade.at,
+                trade.cursor,
+                trade.ordinal,
+                trade.equity_after,
+                trade.source_id,
+                trade.message_time,
+                trade.received_at,
+            )
+            for trade in history.closes
+        ),
         history.start_cursor,
         history.terminal_cursor,
         history.close_start_cursor,
         history.close_terminal_cursor,
         history.through_session,
-        history.calendar_resolver,
+        _calendar_digest(history.calendar_resolver),
+        history.calendar_resolver.release_verified,
         history.source_digest,
         history.query_cutoff,
         history.equity_expected_count,
@@ -4775,11 +8496,17 @@ def _breaker_history_fingerprint(
 
 
 def is_issued_breaker_history_authority(history: object) -> bool:
-    return isinstance(history, BreakerHistoryAuthority) and _has_identity_authority(
+    if not isinstance(history, BreakerHistoryAuthority):
+        return False
+    try:
+        fingerprint = _breaker_history_fingerprint(history)
+    except Exception:
+        return False
+    return _has_identity_authority(
         _BREAKER_HISTORY_AUTHORITIES,
         history,
-        _breaker_history_fingerprint(history),
-    )
+        fingerprint,
+    ) and _phase1_derived_sources_are_current(history)
 
 
 def _issue_breaker_history_authority(
@@ -5025,6 +8752,181 @@ def _issue_breaker_history_authority(
     return history
 
 
+def _issue_breaker_history_from_phase1_source(
+    source: object,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> BreakerHistoryAuthority:
+    """Issue breaker history only from one complete owner-current Phase 1 read."""
+    from .journal import (
+        Phase1BreakerHistorySource,
+        Phase1EquityMarkSource,
+        is_verified_phase1_breaker_history_source,
+        phase1_sources_share_owner,
+    )
+
+    if not isinstance(source, Phase1BreakerHistorySource) or not (
+        is_verified_phase1_breaker_history_source(source)
+    ):
+        raise RiskBlock("PHASE1_BREAKER_HISTORY_SOURCE_UNVERIFIED")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if _calendar_digest(calendar_resolver) != source.calendar_digest:
+        raise RiskBlock("PHASE1_CALENDAR_SOURCE_MISMATCH")
+    persisted_points = tuple(source.equity_points)
+    equity_mark_sources = tuple(source.equity_mark_sources)
+    equity_authorities = tuple(source.equity_authorities)
+    if (
+        source.expected_mark_source_count != len(equity_mark_sources)
+        or len(equity_authorities) != len(equity_mark_sources)
+        or len(equity_mark_sources) != max(0, len(persisted_points) - 1)
+        or any(
+            not phase1_sources_share_owner(source, mark_source)
+            for mark_source in equity_mark_sources
+        )
+    ):
+        raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_INCOMPLETE")
+    for point, mark_source, authority in zip(
+        persisted_points[1:],
+        equity_mark_sources,
+        equity_authorities,
+        strict=True,
+    ):
+        expected_point_id = sha256(
+            (
+                "stock-monitor/phase1-session-equity-point/v1\x00"
+                + source.validation_window_id
+                + "\x00"
+                + source.ledger_name
+                + "\x00"
+                + point.session_date.isoformat()
+                + "\x00"
+                + getattr(authority, "authority_digest", "")
+            ).encode("utf-8")
+        ).hexdigest()
+        bound_sources = tuple(
+            bound_source
+            for bound_source, kind in _phase1_bound_sources(authority)
+            if kind == "EQUITY_MARK"
+        )
+        if (
+            not isinstance(authority, Phase1EquityPointAuthority)
+            or not isinstance(mark_source, Phase1EquityMarkSource)
+            or not is_issued_phase1_equity_point_authority(authority)
+            or bound_sources != (mark_source,)
+            or authority.source_digest != mark_source.source_digest
+            or authority.validation_window_id != source.validation_window_id
+            or authority.ledger_name != source.ledger_name
+            or authority.session_date != point.session_date
+            or authority.point_at != point.at
+            or authority.query_cutoff != point.received_at
+            or mark_source.query_cutoff != point.received_at
+            or authority.query_cutoff > source.query_cutoff
+            or point.point_id != expected_point_id
+            or authority.mark_source_digest != point.mark_source_digest
+            or money_to_micros(authority.point.cash) != point.cash_micros
+            or money_to_micros(authority.point.positions_value)
+            != point.positions_value_micros
+            or money_to_micros(authority.point.equity) != point.equity_micros
+            or money_to_micros(authority.point.external_cash_flow)
+            != point.external_cash_flow_micros
+        ):
+            raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_MISMATCH")
+
+    points = tuple(
+        EquityPoint(
+            session_date=point.session_date,
+            equity=(
+                money_from_micros(point.equity_micros)
+                if index == 0
+                else equity_authorities[index - 1].point.equity
+            ),
+            at=point.at,
+            cursor=point.source_cursor,
+            source_id=point.point_id,
+            message_time=point.message_time,
+            received_at=point.received_at,
+        )
+        for index, point in enumerate(persisted_points)
+    )
+    terminal_equity_by_session = {
+        point.session_date: point
+        for point in points
+        if point.at is not None
+        and point.at.astimezone(_ET).time().replace(tzinfo=None)
+        == calendar_resolver.session(point.session_date).close_time
+    }
+    trades = tuple(
+        ClosedTrade(
+            session_date=trade.session_date,
+            pnl=money_from_micros(trade.pnl_micros),
+            signal_id=trade.signal_id,
+            at=trade.at,
+            cursor=trade.row_id,
+            equity_after=(
+                terminal_equity_by_session[trade.session_date].equity
+                if trade.session_date in terminal_equity_by_session
+                and terminal_equity_by_session[trade.session_date].at is not None
+                and terminal_equity_by_session[trade.session_date].at >= trade.at
+                else None
+            ),
+            source_id=trade.trade_id,
+            message_time=trade.message_time,
+            received_at=trade.received_at,
+        )
+        for trade in source.closed_trades
+    )
+    if (
+        source.expected_equity_count != len(points)
+        or source.expected_close_count != len(trades)
+        or not points
+        or source.equity_terminal_cursor != points[-1].cursor
+        or source.close_terminal_cursor
+        != (trades[-1].cursor if trades else None)
+        or source.window_start_session != points[0].session_date
+        or source.window_start_source_id != points[0].source_id
+        or any(
+            point.validation_window_id != source.validation_window_id
+            or point.ledger_name != source.ledger_name
+            for point in source.equity_points
+        )
+        or any(
+            trade.validation_window_id != source.validation_window_id
+            or trade.ledger_name != source.ledger_name
+            for trade in source.closed_trades
+        )
+    ):
+        raise RiskBlock("PHASE1_BREAKER_HISTORY_SOURCE_MISMATCH")
+    diagnostic = _issue_breaker_history_authority(
+        ledger_name=source.ledger_name,
+        equity=points,
+        closes=trades,
+        through_session=source.through_session,
+        terminal_cursor=source.equity_terminal_cursor,
+        calendar_resolver=calendar_resolver,
+        query_cutoff=source.query_cutoff,
+        equity_expected_count=source.expected_equity_count,
+        close_expected_count=source.expected_close_count,
+        close_stream_through_cursor=source.close_source_highwater,
+    )
+    history = replace(
+        diagnostic,
+        source_digest=source.source_digest,
+        validation_window_id=source.validation_window_id,
+        window_start_session=source.window_start_session,
+        window_start_source_id=source.window_start_source_id,
+    )
+    _register_identity_authority(
+        _BREAKER_HISTORY_AUTHORITIES,
+        history,
+        _breaker_history_fingerprint(history),
+    )
+    _bind_phase1_derived_sources(history, ((source, "BREAKER_HISTORY"),))
+    return history
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class BreakerState:
     """Per-ledger breaker result evaluated from immutable ordered series."""
@@ -5227,11 +9129,17 @@ def _breaker_fingerprint(state: BreakerState) -> tuple[object, ...]:
 
 
 def is_issued_breaker_state(state: object) -> bool:
-    return isinstance(state, BreakerState) and _has_identity_authority(
+    if not isinstance(state, BreakerState):
+        return False
+    try:
+        fingerprint = _breaker_fingerprint(state)
+    except Exception:
+        return False
+    return _has_identity_authority(
         _BREAKER_AUTHORITIES,
         state,
-        _breaker_fingerprint(state),
-    )
+        fingerprint,
+    ) and _phase1_derived_sources_are_current(state)
 
 
 def _paired_breaker_fingerprint(
@@ -5241,17 +9149,28 @@ def _paired_breaker_fingerprint(
         state.as_of,
         state.live_entries_paused,
         state.reason_codes,
-        state.canonical,
-        state.actual,
+        _breaker_fingerprint(state.canonical),
+        _breaker_fingerprint(state.actual),
         state.canonical_observations_continue,
     )
 
 
 def is_issued_paired_breaker_state(state: object) -> bool:
-    return isinstance(state, PairedBreakerState) and _has_identity_authority(
-        _PAIRED_BREAKER_AUTHORITIES,
-        state,
-        _paired_breaker_fingerprint(state),
+    if not isinstance(state, PairedBreakerState):
+        return False
+    try:
+        fingerprint = _paired_breaker_fingerprint(state)
+    except Exception:
+        return False
+    return (
+        _has_identity_authority(
+            _PAIRED_BREAKER_AUTHORITIES,
+            state,
+            fingerprint,
+        )
+        and is_issued_breaker_state(state.canonical)
+        and is_issued_breaker_state(state.actual)
+        and _phase1_derived_sources_are_current(state)
     )
 
 
@@ -5546,6 +9465,7 @@ def evaluate_authorized_breakers(
         state,
         _breaker_fingerprint(state),
     )
+    _inherit_phase1_derived_sources(state, history)
     return state
 
 
@@ -5600,6 +9520,12 @@ def combine_breaker_states(
             paired,
             _paired_breaker_fingerprint(paired),
         )
+        phase1_sources = (
+            *_phase1_bound_sources(canonical),
+            *_phase1_bound_sources(actual),
+        )
+        if phase1_sources:
+            _bind_phase1_derived_sources(paired, phase1_sources)
     return paired
 
 
@@ -5639,6 +9565,11 @@ __all__ = [
     "MAX_WEEKLY_DRAWDOWN",
     "MarketMark",
     "PairedBreakerState",
+    "Phase1EquityPointAuthority",
+    "Phase1PositionEvidenceAuthority",
+    "Phase1PositionExitAuthority",
+    "Phase1PositionExitStep",
+    "Phase1SignalEvidenceAuthority",
     "Position",
     "PositionEventContext",
     "PositionAction",
@@ -5664,7 +9595,12 @@ __all__ = [
     "is_issued_breaker_state",
     "is_issued_market_mark",
     "is_issued_paired_breaker_state",
+    "is_issued_phase1_equity_point_authority",
+    "is_issued_phase1_position_exit_authority",
+    "is_issued_phase1_position_evidence_authority",
+    "is_issued_phase1_signal_evidence_authority",
     "is_issued_position_event_context",
+    "phase1_signal_evidence_manifest",
     "plan_long",
     "plan_long_diagnostic",
     "size_long",

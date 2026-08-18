@@ -538,6 +538,12 @@ class EvidenceDecision:
         repr=False,
         compare=False,
     )
+    _reviewed_bundle: object | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 def _decision_fingerprint(value: EvidenceDecision) -> str:
@@ -679,6 +685,10 @@ def is_reviewed_evidence_decision(value: object) -> bool:
             and _decision_fingerprint(value) == expected_digest
             and value.registry_id == expected_registry_id
             and value.registry_content_hash == expected_release_pin
+            and _is_reviewed_bundle(value._reviewed_bundle)
+            and value._reviewed_bundle.registry_id == value.registry_id
+            and value._reviewed_bundle.content_hash
+            == value.registry_content_hash
         )
     except (TypeError, ValueError):
         return False
@@ -723,6 +733,12 @@ class ReviewedEvidenceBundle:
         compare=False,
     )
     _bundle_digest: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _phase1_source: object | None = field(
         default=None,
         init=False,
         repr=False,
@@ -1098,6 +1114,7 @@ def classify_evidence(
     decision_digest = _decision_fingerprint(decision)
     object.__setattr__(decision, "_authority", _REVIEWED_AUTHORITY)
     object.__setattr__(decision, "_decision_digest", decision_digest)
+    object.__setattr__(decision, "_reviewed_bundle", reviewed_bundle)
     _remember_reviewed_authority(
         decision,
         kind="EVIDENCE_DECISION",
@@ -1459,6 +1476,13 @@ def _is_reviewed_bundle(value: object) -> bool:
         )
         if issuance is None:
             return False
+        if value._phase1_source is not None:
+            from .journal import is_verified_phase1_signal_evidence_source
+
+            if not is_verified_phase1_signal_evidence_source(
+                value._phase1_source
+            ):
+                return False
         expected_digest, expected_registry_id, expected_release_pin = issuance
         return (
             value._bundle_digest == expected_digest
@@ -1602,24 +1626,18 @@ def _verify_coverage_source_roles(
                 )
 
 
-def load_evidence_registry(
-    path: Path,
+def _load_evidence_registry_payload(
+    payload: bytes,
     *,
     expected_sha256: str,
     as_of: datetime,
     source_documents: Mapping[str, SourceDocument] | None = None,
 ) -> EvidenceRegistry:
-    """Load one operator-reviewed immutable registry pinned by an external digest."""
+    """Parse exact registry bytes without granting reviewed authority."""
     if not isinstance(expected_sha256, str) or not _SHA256.fullmatch(expected_sha256):
         raise EvidenceRegistryError("registry expected checksum is malformed")
     current = _utc(as_of, "evidence registry as_of")
-    try:
-        payload = Path(path).read_bytes()
-    except OSError as error:
-        raise EvidenceRegistryError(
-            f"cannot read reviewed evidence registry: {type(error).__name__}"
-        ) from None
-    if not payload or len(payload) > _MAX_REGISTRY_BYTES:
+    if type(payload) is not bytes or not payload or len(payload) > _MAX_REGISTRY_BYTES:
         raise EvidenceRegistryError("reviewed evidence registry size is invalid")
     digest = hashlib.sha256(payload).hexdigest()
     if digest != expected_sha256:
@@ -1745,6 +1763,145 @@ def load_evidence_registry(
     )
 
 
+def load_evidence_registry(
+    path: Path,
+    *,
+    expected_sha256: str,
+    as_of: datetime,
+    source_documents: Mapping[str, SourceDocument] | None = None,
+) -> EvidenceRegistry:
+    """Load one operator-reviewed immutable registry pinned by an external digest."""
+    try:
+        payload = Path(path).read_bytes()
+    except OSError as error:
+        raise EvidenceRegistryError(
+            f"cannot read reviewed evidence registry: {type(error).__name__}"
+        ) from None
+    return _load_evidence_registry_payload(
+        payload,
+        expected_sha256=expected_sha256,
+        as_of=as_of,
+        source_documents=source_documents,
+    )
+
+
+def _issue_reviewed_evidence_bundle(
+    registry: EvidenceRegistry,
+    *,
+    release_pin: str,
+    phase1_source: object | None = None,
+) -> ReviewedEvidenceBundle:
+    if (
+        not isinstance(registry, EvidenceRegistry)
+        or type(release_pin) is not str
+        or _SHA256.fullmatch(release_pin) is None
+        or registry.content_hash != release_pin
+    ):
+        raise EvidenceRegistryError("reviewed evidence release pin is invalid")
+    bundle = ReviewedEvidenceBundle(
+        registry_id=registry.registry_id,
+        reviewed_at=registry.reviewed_at,
+        subject_kind=registry.subject_kind,
+        symbol=registry.symbol,
+        issuer_cik=registry.issuer_cik,
+        records=registry.records,
+        source_bindings=registry.source_bindings,
+        coverage_attestations=registry.coverage_attestations,
+        content_hash=registry.content_hash,
+    )
+    bundle_digest = _bundle_fingerprint(bundle)
+    object.__setattr__(bundle, "_authority", _REVIEWED_AUTHORITY)
+    object.__setattr__(bundle, "_release_pin", release_pin)
+    object.__setattr__(bundle, "_bundle_digest", bundle_digest)
+    object.__setattr__(bundle, "_phase1_source", phase1_source)
+    _remember_reviewed_authority(
+        bundle,
+        kind="EVIDENCE_BUNDLE",
+        digest=bundle_digest,
+        registry_id=bundle.registry_id,
+        release_pin=release_pin,
+    )
+    return bundle
+
+
+def _issue_reviewed_bundle_from_phase1_source(
+    source: object,
+) -> ReviewedEvidenceBundle:
+    """Reissue exact reviewed bytes only from an owner-current Journal source."""
+    from .journal import (
+        Phase1SignalEvidenceSource,
+        is_verified_phase1_signal_evidence_source,
+    )
+
+    if not isinstance(source, Phase1SignalEvidenceSource) or not (
+        is_verified_phase1_signal_evidence_source(source)
+    ):
+        raise EvidenceUnavailableError(
+            "verified Phase 1 signal evidence source is required"
+        )
+    if source.reviewed_bundle is not None or source.evidence_decision is not None:
+        bundle = source.reviewed_bundle
+        decision = source.evidence_decision
+        if (
+            not _is_reviewed_bundle(bundle)
+            or not is_reviewed_evidence_decision(decision)
+            or decision._reviewed_bundle is not bundle
+            or bundle.content_hash != source.release_sha256
+            or bundle.registry_id != source.registry_id
+            or bundle._bundle_digest != source.bundle_digest
+        ):
+            raise EvidenceUnavailableError(
+                "Phase 1 reviewed evidence source authority is inconsistent"
+            )
+        return bundle
+    if (source.reviewed_bundle is None) != (source.evidence_decision is None):
+        raise EvidenceUnavailableError(
+            "Phase 1 reviewed evidence source authority is incomplete"
+        )
+    documents = tuple(source.source_documents)
+    if (
+        type(source.registry_payload) is not bytes
+        or type(source.release_sha256) is not str
+        or source.release_sha256 != source.registry_content_hash
+        or hashlib.sha256(source.registry_payload).hexdigest()
+        != source.release_sha256
+        or not documents
+        or any(type(document) is not SourceDocument for document in documents)
+        or tuple(document.source_observation_id for document in documents)
+        != tuple(
+            sorted(document.source_observation_id for document in documents)
+        )
+        or len({document.source_observation_id for document in documents})
+        != len(documents)
+        or source.review_at > source.query_cutoff
+    ):
+        raise EvidenceRegistryError(
+            "Phase 1 reviewed evidence raw material is inconsistent"
+        )
+    registry = _load_evidence_registry_payload(
+        source.registry_payload,
+        expected_sha256=source.release_sha256,
+        as_of=source.review_at,
+        source_documents={
+            document.source_observation_id: document for document in documents
+        },
+    )
+    bundle = _issue_reviewed_evidence_bundle(
+        registry,
+        release_pin=source.release_sha256,
+        phase1_source=source,
+    )
+    if (
+        bundle.registry_id != source.registry_id
+        or bundle.content_hash != source.registry_content_hash
+        or bundle._bundle_digest != source.bundle_digest
+    ):
+        raise EvidenceRegistryError(
+            "Phase 1 reviewed evidence source manifest is inconsistent"
+        )
+    return bundle
+
+
 def load_current_evidence_bundle(
     project_root: Path,
     *,
@@ -1759,30 +1916,10 @@ def load_current_evidence_bundle(
         as_of=as_of,
         source_documents=source_documents,
     )
-    bundle = ReviewedEvidenceBundle(
-        registry_id=registry.registry_id,
-        reviewed_at=registry.reviewed_at,
-        subject_kind=registry.subject_kind,
-        symbol=registry.symbol,
-        issuer_cik=registry.issuer_cik,
-        records=registry.records,
-        source_bindings=registry.source_bindings,
-        coverage_attestations=registry.coverage_attestations,
-        content_hash=registry.content_hash,
+    return _issue_reviewed_evidence_bundle(
+        registry,
+        release_pin=CURRENT_EVIDENCE_REGISTRY_SHA256,
     )
-    bundle_digest = _bundle_fingerprint(bundle)
-    release_pin = CURRENT_EVIDENCE_REGISTRY_SHA256
-    object.__setattr__(bundle, "_authority", _REVIEWED_AUTHORITY)
-    object.__setattr__(bundle, "_release_pin", release_pin)
-    object.__setattr__(bundle, "_bundle_digest", bundle_digest)
-    _remember_reviewed_authority(
-        bundle,
-        kind="EVIDENCE_BUNDLE",
-        digest=bundle_digest,
-        registry_id=bundle.registry_id,
-        release_pin=release_pin,
-    )
-    return bundle
 
 
 __all__ = [

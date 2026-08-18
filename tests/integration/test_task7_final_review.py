@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
@@ -753,6 +754,37 @@ class Task7FinalReviewTests(unittest.TestCase):
         )
         self.assertLessEqual(len(sql_statements), 80)
         self.assertLess(elapsed, 3.0)
+
+    def test_large_replay_respects_sqlite_minimum_variable_limit(self) -> None:
+        base = datetime(2026, 8, 14, 13, 30, tzinfo=UTC)
+        for batch in range(16):
+            message_time = base + timedelta(minutes=batch)
+            self.ingest(
+                envelope(
+                    f"message:sqlite-variable-limit:{batch}",
+                    "\n".join("SKIPPED SPY" for _ in range(64)),
+                    message_time=message_time,
+                    received_at=message_time + timedelta(seconds=1),
+                )
+            )
+
+        previous_limit = self.journal._connection.setlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+            999,
+        )
+        try:
+            with self.journal.transaction() as transaction:
+                source = transaction.read_actual_replay(
+                    query_cutoff=base + timedelta(minutes=16),
+                )
+        finally:
+            self.journal._connection.setlimit(
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                previous_limit,
+            )
+
+        self.assertEqual(source.expected_action_count, 1024)
+        self.assertEqual(len(source.actions), 1024)
 
     def test_split_receipt_batch_is_rejected_as_one_atomic_cohort(self) -> None:
         message_id = "message:split-receipt"

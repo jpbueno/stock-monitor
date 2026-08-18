@@ -24,6 +24,7 @@ from .domain import money_to_micros, stable_execution_event_identity
 APPLICATION_ID = 0x53544B4D
 BUSY_TIMEOUT_MILLISECONDS = 5_000
 REPORT_ID_PATH_PREFIX_LENGTH = 12
+_SQLITE_BIND_BATCH_SIZE = 500
 _REPORT_CLAIM_LEASE_SECONDS = 300
 _ACTUAL_LEDGER_EVENT_ACTIONS = frozenset(
     {
@@ -2950,33 +2951,33 @@ class Journal:
         )
 
         postings: list[JournalPostingSource] = []
-        if action_ids or check_ids:
-            predicates: list[str] = []
-            parameters: list[int] = []
-            if action_ids:
-                predicates.append(
-                    "execution_event_id IN ("
-                    + ",".join("?" for _ in action_ids)
-                    + ")"
-                )
-                parameters.extend(action_ids)
-            if check_ids:
-                predicates.append(
-                    "account_check_id IN ("
-                    + ",".join("?" for _ in check_ids)
-                    + ")"
-                )
-                parameters.extend(check_ids)
-            posting_rows = _sql(
-                self._connection,
-                "SELECT " + ", ".join(_LEDGER_POSTING_COLUMNS)
-                + " FROM ledger_postings WHERE "
-                + " OR ".join(f"({predicate})" for predicate in predicates)
-                + " ORDER BY id",
-                tuple(parameters),
-            ).fetchall()
-        else:
-            posting_rows = ()
+        posting_rows_by_id: dict[int, Sequence[object]] = {}
+        for origin_column, origin_ids in (
+            ("execution_event_id", action_ids),
+            ("account_check_id", check_ids),
+        ):
+            for start in range(0, len(origin_ids), _SQLITE_BIND_BATCH_SIZE):
+                batch = origin_ids[start : start + _SQLITE_BIND_BATCH_SIZE]
+                batch_rows = _sql(
+                    self._connection,
+                    "SELECT " + ", ".join(_LEDGER_POSTING_COLUMNS)
+                    + f" FROM ledger_postings WHERE {origin_column} IN ("
+                    + ",".join("?" for _ in batch)
+                    + ") ORDER BY id",
+                    batch,
+                ).fetchall()
+                for row in batch_rows:
+                    row_id = int(row[0])
+                    prior = posting_rows_by_id.get(row_id)
+                    if prior is not None and tuple(prior) != tuple(row):
+                        raise MigrationCorruption(
+                            "ledger posting replay rows conflict"
+                        )
+                    posting_rows_by_id[row_id] = row
+        posting_rows = tuple(
+            posting_rows_by_id[row_id]
+            for row_id in sorted(posting_rows_by_id)
+        )
         for row in posting_rows:
             posting_reference = _journal_row_reference(
                 "ledger_postings",

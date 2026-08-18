@@ -66,6 +66,14 @@ _VERIFIED_REPLAY_COHORT_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
+_ACTUAL_PROJECTION_COHORT_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+    ],
+] = {}
 _ISSUED_LEDGER_SIGNALS: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
@@ -990,6 +998,82 @@ class VerifiedLedgerReplayCohort:
         object.__setattr__(self, "references", references)
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualProjectionCohort:
+    """Open actual positions bound to an exact Task 7 Journal replay."""
+
+    positions: tuple[object, ...]
+    projection_start_cursor: int | None
+    projection_terminal_cursor: int | None
+    source_through_cursor: int | None
+    physical_source_highwater_cursor: int | None
+    query_cutoff: datetime
+    journal_source_digest: str
+    actual_state_digest: str
+    calendar_digest: str
+    policy_digest: str
+    expected_action_count: int
+    expected_posting_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "positions", tuple(self.positions))
+        if (self.projection_start_cursor is None) != (
+            self.projection_terminal_cursor is None
+        ):
+            raise RiskBlock("INVALID_ACTUAL_PROJECTION_COHORT")
+        for cursor in (
+            self.projection_start_cursor,
+            self.projection_terminal_cursor,
+            self.source_through_cursor,
+            self.physical_source_highwater_cursor,
+        ):
+            if cursor is not None:
+                _positive_int(cursor, "INVALID_ACTUAL_PROJECTION_COHORT")
+        if (
+            self.projection_start_cursor is not None
+            and self.projection_terminal_cursor is not None
+            and self.projection_start_cursor > self.projection_terminal_cursor
+        ):
+            raise RiskBlock("INVALID_ACTUAL_PROJECTION_COHORT")
+        if (
+            self.projection_terminal_cursor is not None
+            and self.source_through_cursor is not None
+            and self.projection_terminal_cursor > self.source_through_cursor
+        ):
+            raise RiskBlock("INVALID_ACTUAL_PROJECTION_COHORT")
+        if (
+            self.source_through_cursor is not None
+            and self.physical_source_highwater_cursor is not None
+            and self.source_through_cursor
+            > self.physical_source_highwater_cursor
+        ):
+            raise RiskBlock("INVALID_ACTUAL_PROJECTION_COHORT")
+        _aware(self.query_cutoff, "INVALID_ACTUAL_PROJECTION_COHORT")
+        for digest in (
+            self.journal_source_digest,
+            self.actual_state_digest,
+            self.calendar_digest,
+            self.policy_digest,
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+            ):
+                raise RiskBlock("INVALID_ACTUAL_PROJECTION_COHORT")
+        _nonnegative_int(
+            self.expected_action_count,
+            "INVALID_ACTUAL_PROJECTION_COHORT",
+        )
+        _nonnegative_int(
+            self.expected_posting_count,
+            "INVALID_ACTUAL_PROJECTION_COHORT",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalLedger:
     open_positions: tuple[LedgerPosition, ...] = ()
@@ -1784,6 +1868,189 @@ def _replay_cohort_fingerprint(
         cohort.query_cutoff,
         cohort.source_digest,
     )
+
+
+def _actual_projection_position_fingerprint(position: object) -> tuple[object, ...]:
+    return (
+        getattr(position, "signal_id"),
+        getattr(position, "symbol"),
+        getattr(position, "lineage_kind"),
+        getattr(position, "signal_digest"),
+        tuple(
+            (
+                lot.source_event_id,
+                lot.source_cursor,
+                lot.remaining_shares,
+                lot.unit_cost_micros,
+                lot.acquired_at.astimezone(UTC).isoformat(
+                    timespec="microseconds"
+                ),
+                lot.received_at.astimezone(UTC).isoformat(
+                    timespec="microseconds"
+                ),
+                lot.parent_order_id,
+            )
+            for lot in getattr(position, "lots")
+        ),
+        getattr(position, "recommended_stop_micros"),
+        getattr(position, "user_stop_micros"),
+        getattr(position, "target_micros"),
+        getattr(position, "tick_micros"),
+        getattr(position, "cumulative_buy_cost_micros"),
+        getattr(position, "cumulative_sale_proceeds_micros"),
+        getattr(position, "linked_fees_micros"),
+        tuple(getattr(position, "reason_codes")),
+        tuple(getattr(position, "lifecycle_event_ids")),
+    )
+
+
+def _actual_projection_cohort_fingerprint(
+    cohort: ActualProjectionCohort,
+) -> tuple[object, ...]:
+    return (
+        tuple(
+            _actual_projection_position_fingerprint(position)
+            for position in cohort.positions
+        ),
+        cohort.projection_start_cursor,
+        cohort.projection_terminal_cursor,
+        cohort.source_through_cursor,
+        cohort.physical_source_highwater_cursor,
+        cohort.query_cutoff.astimezone(UTC).isoformat(timespec="microseconds"),
+        cohort.journal_source_digest,
+        cohort.actual_state_digest,
+        cohort.calendar_digest,
+        cohort.policy_digest,
+        cohort.expected_action_count,
+        cohort.expected_posting_count,
+    )
+
+
+def is_issued_actual_projection_cohort(cohort: object) -> bool:
+    if not isinstance(cohort, ActualProjectionCohort):
+        return False
+    try:
+        fingerprint = _actual_projection_cohort_fingerprint(cohort)
+    except Exception:
+        return False
+    with _EVENT_AUTHORITY_LOCK:
+        issued = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(id(cohort))
+        if (
+            issued is None
+            or issued[0]() is not cohort
+            or issued[1] != fingerprint
+        ):
+            return False
+        source = issued[2]()
+    if source is None:
+        return False
+    from .journal import is_verified_journal_replay_source
+
+    return is_verified_journal_replay_source(source)
+
+
+def _issue_actual_projection_from_journal(
+    source: object,
+    state: object,
+) -> ActualProjectionCohort:
+    """Issue open positions from one exact verified Journal/state cohort."""
+    from .journal import (
+        JournalActualReplaySource,
+        is_verified_journal_replay_source,
+    )
+    from .reconciliation import (
+        ActualLedgerState,
+        ActualPositionState,
+        is_verified_actual_ledger_state,
+        is_verified_actual_ledger_state_for_source,
+    )
+
+    if not isinstance(source, JournalActualReplaySource) or not (
+        is_verified_journal_replay_source(source)
+    ):
+        raise RiskBlock("JOURNAL_ACTUAL_REPLAY_SOURCE_UNVERIFIED")
+    if not isinstance(state, ActualLedgerState) or not is_verified_actual_ledger_state(
+        state
+    ):
+        raise RiskBlock("ACTUAL_LEDGER_STATE_UNVERIFIED")
+    if not is_verified_actual_ledger_state_for_source(state, source):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    if (
+        state.query_cutoff != source.query_cutoff
+        or state.through_cursor != source.terminal_cursor
+        or source.through_execution_cursor != source.terminal_cursor
+        or state.journal_source_digest != source.source_digest
+        or state.settlement_ledger != source.postings
+        or source.expected_action_count != len(source.actions)
+        or source.expected_posting_count != len(source.postings)
+        or not state.calendar_release_verified
+        or state.calendar_digest is None
+        or state.policy_digest is None
+    ):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    if any(not isinstance(position, ActualPositionState) for position in state.positions):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    strategy_positions = tuple(
+        position
+        for position in state.positions
+        if position.lineage_kind in {"ACTUAL_EVENT", "ACTUAL_GROUP"}
+    )
+    actions_by_id = {action.event_id: action for action in source.actions}
+    lifecycle_ids = tuple(
+        dict.fromkeys(
+            (
+                *(
+                    event_id
+                    for position in strategy_positions
+                    for event_id in position.lifecycle_event_ids
+                ),
+                *(
+                    event_id
+                    for trade in state.closed_trades
+                    for event_id in trade.source_event_ids
+                ),
+            )
+        )
+    )
+    if any(event_id not in actions_by_id for event_id in lifecycle_ids):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    lifecycle_cursors = tuple(
+        sorted(actions_by_id[event_id].execution_event_id for event_id in lifecycle_ids)
+    )
+    cohort = ActualProjectionCohort(
+        positions=strategy_positions,
+        projection_start_cursor=(
+            lifecycle_cursors[0] if lifecycle_cursors else None
+        ),
+        projection_terminal_cursor=(
+            lifecycle_cursors[-1] if lifecycle_cursors else None
+        ),
+        source_through_cursor=source.through_execution_cursor,
+        physical_source_highwater_cursor=source.source_through_cursor,
+        query_cutoff=source.query_cutoff,
+        journal_source_digest=source.source_digest,
+        actual_state_digest=state.source_digest,
+        calendar_digest=state.calendar_digest,
+        policy_digest=state.policy_digest,
+        expected_action_count=source.expected_action_count,
+        expected_posting_count=source.expected_posting_count,
+    )
+    identity = id(cohort)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _EVENT_AUTHORITY_LOCK:
+            current = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(identity)
+            if current is not None and current[0] is dead:
+                _ACTUAL_PROJECTION_COHORT_AUTHORITIES.pop(identity, None)
+
+    reference = ref(cohort, discard)
+    with _EVENT_AUTHORITY_LOCK:
+        _ACTUAL_PROJECTION_COHORT_AUTHORITIES[identity] = (
+            reference,
+            _actual_projection_cohort_fingerprint(cohort),
+            ref(source),
+        )
+    return cohort
 
 
 def is_issued_verified_replay_cohort(cohort: object) -> bool:

@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -15,8 +16,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Self
+from weakref import ReferenceType, ref
 
-from .domain import stable_execution_event_identity
+from .domain import money_to_micros, stable_execution_event_identity
 
 
 APPLICATION_ID = 0x53544B4D
@@ -52,6 +54,7 @@ _RECONCILIATION_ACTIONS = frozenset(
         "BOUGHT",
         "FEE",
         "PARTIAL_FILL",
+        "PENDING_CLARIFICATION",
         "RECONCILE_CASH",
         "RECONCILE_PENDING_ORDERS",
         "RECONCILE_UNRELATED_POSITION",
@@ -79,6 +82,72 @@ _TABLES = frozenset(
         "actual_cash_projection",
         "reconciliation_projection",
     }
+)
+
+_RAW_MESSAGE_COLUMNS = (
+    "id",
+    "message_id",
+    "message_time",
+    "raw_text",
+    "raw_sha256",
+)
+_EXECUTION_EVENT_COLUMNS = (
+    "id",
+    "event_id",
+    "raw_message_id",
+    "action_ordinal",
+    "idempotency_key",
+    "signal_id",
+    "parsed_action",
+    "symbol",
+    "shares",
+    "price_micros",
+    "bid_micros",
+    "ask_micros",
+    "recommended_stop_micros",
+    "user_confirmed_stop_micros",
+    "event_time",
+    "message_time",
+    "compliance_result",
+    "reconciliation_state",
+    "details_json",
+)
+_ACCOUNT_CHECK_COLUMNS = (
+    "id",
+    "check_id",
+    "raw_message_id",
+    "execution_event_id",
+    "settled_cash_micros",
+    "pending_order_count",
+    "unlogged_position_count",
+    "confirmed_at",
+    "reconciliation_result",
+    "details_json",
+)
+_LEDGER_POSTING_COLUMNS = (
+    "id",
+    "posting_key",
+    "ledger_name",
+    "account_name",
+    "entry_kind",
+    "execution_event_id",
+    "account_check_id",
+    "symbol",
+    "amount_micros",
+    "shares_delta",
+    "unit_price_micros",
+    "occurred_at",
+    "details_json",
+)
+_OUTBOX_COLUMNS = (
+    "id",
+    "idempotency_key",
+    "origin_report_id",
+    "origin_execution_event_id",
+    "destination",
+    "payload_text",
+    "payload_sha256",
+    "created_at",
 )
 
 
@@ -165,6 +234,433 @@ class PendingOutbox:
     next_attempt_ordinal: int
 
 
+@dataclass(frozen=True, slots=True)
+class StoredIngestionAction:
+    """Typed readback for one completely persisted confirmation action."""
+
+    ordinal: int
+    event_row_id: int
+    event_id: str
+    storage_action: str
+    domain_kind: str
+    status: str
+    reason_codes: tuple[str, ...]
+    outbox_id: int
+    outbox_destination: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredIngestionResult:
+    """Typed, content-digested readback for one source message."""
+
+    raw_row_id: int
+    message_id: str
+    message_time: datetime
+    received_at: datetime
+    raw_text: str
+    raw_sha256: str
+    actions: tuple[StoredIngestionAction, ...]
+    state_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRowReference:
+    """Digest of every stored column in one exact Journal row."""
+
+    table: str
+    row_id: int
+    row_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class JournalAccountCheckSource:
+    """Exact immutable account-check row joined to its execution source."""
+
+    row_id: int
+    check_id: str
+    raw_message_id: int
+    execution_event_id: int
+    settled_cash_micros: int
+    pending_order_count: int
+    unlogged_position_count: int
+    confirmed_at: datetime
+    reconciliation_result: str
+    details_json: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class JournalActionSource:
+    """Source-authenticated action reconstructed from raw and event rows."""
+
+    execution_event_id: int
+    event_id: str
+    raw_message_id: int
+    message_id: str
+    action_ordinal: int
+    idempotency_key: str
+    storage_action: str
+    domain_kind: str
+    signal_id: str | None
+    symbol: str | None
+    shares: int | None
+    price_micros: int | None
+    bid_micros: int | None
+    ask_micros: int | None
+    recommended_stop_micros: int | None
+    user_confirmed_stop_micros: int | None
+    event_time: datetime
+    message_time: datetime
+    received_at: datetime
+    compliance_result: str
+    reconciliation_state: str
+    raw_text: str
+    raw_sha256: str
+    details_json: str
+    details_sha256: str
+    parent_order_id: str | None
+    fill_group_planned_shares: int | None
+    event_role: str
+    account_check: JournalAccountCheckSource | None
+    acknowledgement_outbox_id: int
+    acknowledgement_destination: str
+    acknowledgement_idempotency_key: str
+    acknowledgement_payload_sha256: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class JournalAccountCheckWindowSource:
+    """Complete cursor interval from one check through one terminal buy."""
+
+    account_check_action: JournalActionSource
+    terminal_action: JournalActionSource
+    between_actions: tuple[JournalActionSource, ...]
+    after_cursor: int
+    through_cursor: int
+    source_high_water_cursor: int
+    expected_between_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class JournalPostingSource:
+    row_id: int
+    posting_key: str
+    ledger_name: str
+    account_name: str
+    entry_kind: str
+    execution_event_id: int | None
+    account_check_id: int | None
+    symbol: str | None
+    amount_micros: int
+    shares_delta: int | None
+    unit_price_micros: int | None
+    occurred_at: datetime
+    details_json: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True)
+class JournalProjectionRowSource:
+    table: str
+    row_id: int
+    values: tuple[tuple[str, object], ...]
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class JournalActualReplaySource:
+    """Complete bitemporal Journal snapshot through one execution cursor."""
+
+    query_cutoff: datetime
+    actions: tuple[JournalActionSource, ...]
+    postings: tuple[JournalPostingSource, ...]
+    projection_rows: tuple[JournalProjectionRowSource, ...]
+    start_cursor: int | None
+    terminal_cursor: int | None
+    through_execution_cursor: int | None
+    source_through_cursor: int | None
+    projection_through_cursor: int | None
+    projection_stale: bool
+    expected_action_count: int
+    expected_posting_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+_JOURNAL_SOURCE_LOCK = threading.RLock()
+_ACTION_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_WINDOW_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_REPLAY_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+
+
+def _row_reference_fingerprint(
+    reference: JournalRowReference,
+) -> tuple[object, ...]:
+    return (reference.table, reference.row_id, reference.row_digest)
+
+
+def _account_check_source_fingerprint(
+    source: JournalAccountCheckSource,
+) -> tuple[object, ...]:
+    return (
+        source.row_id,
+        source.check_id,
+        source.raw_message_id,
+        source.execution_event_id,
+        source.settled_cash_micros,
+        source.pending_order_count,
+        source.unlogged_position_count,
+        source.confirmed_at,
+        source.reconciliation_result,
+        source.details_json,
+        _row_reference_fingerprint(source.row_reference),
+    )
+
+
+def _action_source_fingerprint(source: JournalActionSource) -> tuple[object, ...]:
+    return (
+        source.execution_event_id,
+        source.event_id,
+        source.raw_message_id,
+        source.message_id,
+        source.action_ordinal,
+        source.idempotency_key,
+        source.storage_action,
+        source.domain_kind,
+        source.signal_id,
+        source.symbol,
+        source.shares,
+        source.price_micros,
+        source.bid_micros,
+        source.ask_micros,
+        source.recommended_stop_micros,
+        source.user_confirmed_stop_micros,
+        source.event_time,
+        source.message_time,
+        source.received_at,
+        source.compliance_result,
+        source.reconciliation_state,
+        source.raw_text,
+        source.raw_sha256,
+        source.details_json,
+        source.details_sha256,
+        source.parent_order_id,
+        source.fill_group_planned_shares,
+        source.event_role,
+        (
+            None
+            if source.account_check is None
+            else _account_check_source_fingerprint(source.account_check)
+        ),
+        source.acknowledgement_outbox_id,
+        source.acknowledgement_destination,
+        source.acknowledgement_idempotency_key,
+        source.acknowledgement_payload_sha256,
+        tuple(
+            _row_reference_fingerprint(reference)
+            for reference in source.row_references
+        ),
+        source.source_digest,
+    )
+
+
+def _window_source_fingerprint(
+    source: JournalAccountCheckWindowSource,
+) -> tuple[object, ...]:
+    return (
+        _action_source_fingerprint(source.account_check_action),
+        _action_source_fingerprint(source.terminal_action),
+        tuple(_action_source_fingerprint(action) for action in source.between_actions),
+        source.after_cursor,
+        source.through_cursor,
+        source.source_high_water_cursor,
+        source.expected_between_count,
+        tuple(
+            _row_reference_fingerprint(reference)
+            for reference in source.row_references
+        ),
+        source.source_digest,
+    )
+
+
+def _posting_source_fingerprint(
+    source: JournalPostingSource,
+) -> tuple[object, ...]:
+    return (
+        source.row_id,
+        source.posting_key,
+        source.ledger_name,
+        source.account_name,
+        source.entry_kind,
+        source.execution_event_id,
+        source.account_check_id,
+        source.symbol,
+        source.amount_micros,
+        source.shares_delta,
+        source.unit_price_micros,
+        source.occurred_at,
+        source.details_json,
+        _row_reference_fingerprint(source.row_reference),
+    )
+
+
+def _projection_row_source_fingerprint(
+    source: JournalProjectionRowSource,
+) -> tuple[object, ...]:
+    return (
+        source.table,
+        source.row_id,
+        tuple(tuple(value) for value in source.values),
+        _row_reference_fingerprint(source.row_reference),
+    )
+
+
+def _replay_source_fingerprint(
+    source: JournalActualReplaySource,
+) -> tuple[object, ...]:
+    return (
+        source.query_cutoff,
+        tuple(_action_source_fingerprint(action) for action in source.actions),
+        tuple(_posting_source_fingerprint(posting) for posting in source.postings),
+        tuple(
+            _projection_row_source_fingerprint(row)
+            for row in source.projection_rows
+        ),
+        source.start_cursor,
+        source.terminal_cursor,
+        source.through_execution_cursor,
+        source.source_through_cursor,
+        source.projection_through_cursor,
+        source.projection_stale,
+        source.expected_action_count,
+        source.expected_posting_count,
+        tuple(
+            _row_reference_fingerprint(reference)
+            for reference in source.row_references
+        ),
+        source.source_digest,
+    )
+
+
+def _has_current_journal_source_authority(
+    registry: dict[
+        int,
+        tuple[
+            ReferenceType[object],
+            tuple[object, ...],
+            ReferenceType[object],
+            int,
+            int,
+        ],
+    ],
+    source: object,
+    fingerprint: tuple[object, ...],
+) -> bool:
+    with _JOURNAL_SOURCE_LOCK:
+        issued = registry.get(id(source))
+        if (
+            issued is None
+            or issued[0]() is not source
+            or issued[1] != fingerprint
+        ):
+            return False
+        owner = issued[2]()
+        issued_generation = issued[3]
+        issued_data_version = issued[4]
+    if owner is None or getattr(owner, "_closed", True):
+        return False
+    try:
+        if (
+            getattr(owner, "_transaction_active")
+            and getattr(owner, "_transaction_dirty")
+        ):
+            return False
+        current_generation = getattr(owner, "_source_generation")
+        current_data_version = owner._source_authority_data_version()
+    except Exception:
+        return False
+    return (
+        current_generation == issued_generation
+        and current_data_version == issued_data_version
+    )
+
+
+def is_verified_journal_action_source(source: object) -> bool:
+    """Return whether Journal issued this exact reconstructed action object."""
+    if not isinstance(source, JournalActionSource):
+        return False
+    try:
+        fingerprint = _action_source_fingerprint(source)
+    except Exception:
+        return False
+    return _has_current_journal_source_authority(
+        _ACTION_SOURCE_AUTHORITIES,
+        source,
+        fingerprint,
+    )
+
+
+def is_verified_journal_window_source(source: object) -> bool:
+    """Return whether Journal issued this exact complete cursor window."""
+    if not isinstance(source, JournalAccountCheckWindowSource):
+        return False
+    try:
+        fingerprint = _window_source_fingerprint(source)
+    except Exception:
+        return False
+    return _has_current_journal_source_authority(
+        _WINDOW_SOURCE_AUTHORITIES,
+        source,
+        fingerprint,
+    )
+
+
+def is_verified_journal_replay_source(source: object) -> bool:
+    """Return whether Journal issued this exact replay snapshot."""
+    if not isinstance(source, JournalActualReplaySource):
+        return False
+    try:
+        fingerprint = _replay_source_fingerprint(source)
+    except Exception:
+        return False
+    return _has_current_journal_source_authority(
+        _REPLAY_SOURCE_AUTHORITIES,
+        source,
+        fingerprint,
+    )
+
+
 @dataclass(frozen=True)
 class _Migration:
     version: int
@@ -182,6 +678,10 @@ class JournalTransaction:
     def __init__(self, journal: Journal) -> None:
         self._journal = journal
         self._active = True
+        self._dirty = False
+        self._source_read = False
+        self._new_execution_event_ids: set[int] = set()
+        self._validated_confirmation_source: tuple[datetime, datetime] | None = None
 
     def _ensure_active(self) -> None:
         if not self._active or not self._journal._transaction_active:
@@ -190,10 +690,27 @@ class JournalTransaction:
     def _deactivate(self) -> None:
         self._active = False
 
+    def _mark_dirty(self) -> None:
+        if self._source_read:
+            raise JournalError(
+                "source authority transaction is sealed read-only"
+            )
+        self._dirty = True
+        self._journal._transaction_dirty = True
+
+    def _ensure_post_commit_source_read(self) -> None:
+        self._ensure_active()
+        if self._dirty:
+            raise JournalError(
+                "source authority requires a post-commit read transaction"
+            )
+        self._source_read = True
+
     def append_raw_message(
         self, message_id: str, message_time: datetime, text: str
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._append_raw_message(message_id, message_time, text)
 
     def append_execution_event(
@@ -216,7 +733,8 @@ class JournalTransaction:
         details: Mapping[str, object] | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
-        return self._journal._append_execution_event(
+        self._mark_dirty()
+        row_id, duplicate = self._journal._append_execution_event(
             raw_message_id=raw_message_id,
             action_ordinal=action_ordinal,
             parsed_action=parsed_action,
@@ -232,7 +750,187 @@ class JournalTransaction:
             compliance_result=compliance_result,
             reconciliation_state=reconciliation_state,
             details=details,
+            prevalidated_confirmation_source=(
+                self._validated_confirmation_source
+            ),
         )
+        if not duplicate:
+            self._new_execution_event_ids.add(row_id)
+        return row_id, duplicate
+
+    def read_confirmation_result(
+        self,
+        *,
+        message_id: str,
+    ) -> StoredIngestionResult | None:
+        self._ensure_active()
+        return self._journal._read_confirmation_result(message_id=message_id)
+
+    def _incremental_ingestion_identity(self) -> tuple[int, int, int | None]:
+        """Return a clean in-transaction identity for a private replay cache."""
+        self._ensure_active()
+        if self._dirty:
+            raise JournalError(
+                "incremental ingestion identity requires a clean transaction"
+            )
+        return self._journal._incremental_ingestion_identity()
+
+    def validate_confirmation_source_order(
+        self,
+        *,
+        message_time: datetime,
+        received_at: datetime,
+    ) -> None:
+        """Reject a new source cursor that regresses knowledge chronology."""
+        self._ensure_active()
+        self._journal._validate_confirmation_source_order(
+            message_time=message_time,
+            received_at=received_at,
+        )
+        self._validated_confirmation_source = (
+            _parse_canonical_timestamp(_canonical_timestamp(message_time)),
+            _parse_canonical_timestamp(_canonical_timestamp(received_at)),
+        )
+
+    def read_action_source(
+        self,
+        *,
+        execution_event_id: int,
+    ) -> JournalActionSource:
+        self._ensure_post_commit_source_read()
+        source = self._journal._read_action_source(
+            execution_event_id=execution_event_id,
+        )
+        owner = ref(self._journal)
+        generation = self._journal._source_generation
+        data_version = self._journal._source_authority_data_version()
+        identity = id(source)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _ACTION_SOURCE_AUTHORITIES.get(identity)
+                if current is not None and current[0] is dead:
+                    _ACTION_SOURCE_AUTHORITIES.pop(identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _ACTION_SOURCE_AUTHORITIES[identity] = (
+                ref(source, discard),
+                _action_source_fingerprint(source),
+                owner,
+                generation,
+                data_version,
+            )
+        return source
+
+    def read_account_check_window(
+        self,
+        *,
+        account_check_event_id: int,
+        terminal_event_id: int,
+    ) -> JournalAccountCheckWindowSource:
+        self._ensure_post_commit_source_read()
+        source = self._journal._read_account_check_window(
+            account_check_event_id=account_check_event_id,
+            terminal_event_id=terminal_event_id,
+        )
+        owner = ref(self._journal)
+        generation = self._journal._source_generation
+        data_version = self._journal._source_authority_data_version()
+        for action in (
+            source.account_check_action,
+            *source.between_actions,
+            source.terminal_action,
+        ):
+            identity = id(action)
+
+            def discard_action(
+                dead: ReferenceType[object],
+                *,
+                identity: int = identity,
+            ) -> None:
+                with _JOURNAL_SOURCE_LOCK:
+                    current = _ACTION_SOURCE_AUTHORITIES.get(identity)
+                    if current is not None and current[0] is dead:
+                        _ACTION_SOURCE_AUTHORITIES.pop(identity, None)
+
+            with _JOURNAL_SOURCE_LOCK:
+                _ACTION_SOURCE_AUTHORITIES[identity] = (
+                    ref(action, discard_action),
+                    _action_source_fingerprint(action),
+                    owner,
+                    generation,
+                    data_version,
+                )
+        identity = id(source)
+
+        def discard_window(dead: ReferenceType[object]) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _WINDOW_SOURCE_AUTHORITIES.get(identity)
+                if current is not None and current[0] is dead:
+                    _WINDOW_SOURCE_AUTHORITIES.pop(identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _WINDOW_SOURCE_AUTHORITIES[identity] = (
+                ref(source, discard_window),
+                _window_source_fingerprint(source),
+                owner,
+                generation,
+                data_version,
+            )
+        return source
+
+    def read_actual_replay(
+        self,
+        *,
+        query_cutoff: datetime,
+        through_execution_cursor: int | None = None,
+    ) -> JournalActualReplaySource:
+        self._ensure_post_commit_source_read()
+        source = self._journal._read_actual_replay(
+            query_cutoff=query_cutoff,
+            through_execution_cursor=through_execution_cursor,
+        )
+        owner = ref(self._journal)
+        generation = self._journal._source_generation
+        data_version = self._journal._source_authority_data_version()
+        for action in source.actions:
+            identity = id(action)
+
+            def discard_action(
+                dead: ReferenceType[object],
+                *,
+                identity: int = identity,
+            ) -> None:
+                with _JOURNAL_SOURCE_LOCK:
+                    current = _ACTION_SOURCE_AUTHORITIES.get(identity)
+                    if current is not None and current[0] is dead:
+                        _ACTION_SOURCE_AUTHORITIES.pop(identity, None)
+
+            with _JOURNAL_SOURCE_LOCK:
+                _ACTION_SOURCE_AUTHORITIES[identity] = (
+                    ref(action, discard_action),
+                    _action_source_fingerprint(action),
+                    owner,
+                    generation,
+                    data_version,
+                )
+        identity = id(source)
+
+        def discard_replay(dead: ReferenceType[object]) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _REPLAY_SOURCE_AUTHORITIES.get(identity)
+                if current is not None and current[0] is dead:
+                    _REPLAY_SOURCE_AUTHORITIES.pop(identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _REPLAY_SOURCE_AUTHORITIES[identity] = (
+                ref(source, discard_replay),
+                _replay_source_fingerprint(source),
+                owner,
+                generation,
+                data_version,
+            )
+        return source
 
     def append_source_observation(
         self,
@@ -250,6 +948,7 @@ class JournalTransaction:
         details: Mapping[str, object] | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._append_source_observation(
             payload=payload,
             source_uri=source_uri,
@@ -278,6 +977,7 @@ class JournalTransaction:
         outbox_payload: str,
     ) -> FinalizedReport:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._finalize_report(
             claim_id=claim_id,
             claim_token=claim_token,
@@ -301,6 +1001,7 @@ class JournalTransaction:
         created_at: datetime,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._append_outbox(
             idempotency_key=idempotency_key,
             origin_report_id=origin_report_id,
@@ -322,6 +1023,7 @@ class JournalTransaction:
         details: Mapping[str, object] | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._record_outbox_delivery_attempt(
             outbox_id=outbox_id,
             attempt_ordinal=attempt_ordinal,
@@ -342,6 +1044,7 @@ class JournalTransaction:
         started_at: datetime,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._start_scheduled_run(
             run_key=run_key,
             run_kind=run_kind,
@@ -362,6 +1065,7 @@ class JournalTransaction:
         error_class: str | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._complete_scheduled_run(
             run_id=run_id,
             finished_at=finished_at,
@@ -389,6 +1093,38 @@ class JournalTransaction:
         details: Mapping[str, object] | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        origin_execution_event_id = execution_event_id
+        if origin_execution_event_id is None and account_check_id is not None:
+            account_origin = _sql(
+                self._journal._connection,
+                "SELECT execution_event_id FROM account_checks WHERE id = ?",
+                (account_check_id,),
+            ).fetchone()
+            if account_origin is not None:
+                origin_execution_event_id = int(account_origin[0])
+        if origin_execution_event_id is not None:
+            row = _sql(
+                self._journal._connection,
+                "SELECT details_json FROM execution_events WHERE id = ?",
+                (origin_execution_event_id,),
+            ).fetchone()
+            if row is not None:
+                event_details = _canonical_stored_details(
+                    str(row[0]),
+                    label="execution event",
+                )
+                source_details = event_details.get("source")
+                if (
+                    isinstance(source_details, dict)
+                    and source_details.get("type")
+                    == "ROBINHOOD_MANUAL_CONFIRMATION"
+                    and origin_execution_event_id
+                    not in self._new_execution_event_ids
+                ):
+                    raise InvalidJournalValue(
+                        "confirmation posting must commit atomically with its event"
+                    )
+        self._mark_dirty()
         return self._journal._append_ledger_posting(
             posting_key=posting_key,
             ledger_name=ledger_name,
@@ -418,6 +1154,7 @@ class JournalTransaction:
         updated_at: datetime,
     ) -> int:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._write_actual_position(
             signal_id=signal_id,
             symbol=symbol,
@@ -444,6 +1181,7 @@ class JournalTransaction:
         updated_at: datetime,
     ) -> int:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._write_actual_cash_projection(
             estimated_settled_cash_micros=estimated_settled_cash_micros,
             user_confirmed_settled_cash_micros=user_confirmed_settled_cash_micros,
@@ -465,6 +1203,7 @@ class JournalTransaction:
         updated_at: datetime,
     ) -> int:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._write_reconciliation_projection(
             reconciliation_required=reconciliation_required,
             reason=reason,
@@ -484,6 +1223,7 @@ class JournalTransaction:
         details: Mapping[str, object] | None = None,
     ) -> tuple[int, bool]:
         self._ensure_active()
+        self._mark_dirty()
         return self._journal._append_account_check(
             execution_event_id=execution_event_id,
             settled_cash_micros=settled_cash_micros,
@@ -508,8 +1248,10 @@ class Journal:
         self._connection = connection
         self._migration_directory = migration_directory
         self._transaction_active = False
+        self._transaction_dirty = False
         self._projection_write_allowed = False
         self._report_claim_write_allowed = False
+        self._source_generation = 0
         self._closed = False
 
     @classmethod
@@ -1141,6 +1883,1315 @@ class Journal:
                 details=details,
             )
 
+    def _read_confirmation_result(
+        self,
+        *,
+        message_id: str,
+    ) -> StoredIngestionResult | None:
+        """Re-read one fully persisted ingestion result from immutable rows."""
+        self._ensure_open()
+        message_id = _require_nonempty_text(message_id, "message ID")
+        raw_identity = _sql(
+            self._connection,
+            "SELECT id FROM raw_messages "
+            "WHERE message_id = ? COLLATE BINARY",
+            (message_id,),
+        ).fetchone()
+        if raw_identity is None:
+            return None
+        sources = self._authenticate_action_source_cohort(
+            raw_message_id=int(raw_identity[0])
+        )
+        first_source = sources[0]
+        raw_row_id = first_source.raw_message_id
+        message_time = first_source.message_time
+        raw_text = first_source.raw_text
+        raw_sha256 = first_source.raw_sha256
+        actions: list[StoredIngestionAction] = []
+        digest_rows: list[dict[str, object]] = []
+        for source in sources:
+            details = _canonical_stored_details(
+                source.details_json,
+                label="confirmation",
+            )
+            reason_codes = details.get("reason_codes")
+            if (
+                not isinstance(reason_codes, list)
+                or any(
+                    not isinstance(reason, str) or not reason
+                    for reason in reason_codes
+                )
+            ):
+                raise MigrationCorruption(
+                    "confirmation details contract is incomplete"
+                )
+            action = StoredIngestionAction(
+                ordinal=source.action_ordinal,
+                event_row_id=source.execution_event_id,
+                event_id=source.event_id,
+                storage_action=source.storage_action,
+                domain_kind=source.domain_kind,
+                status=source.compliance_result,
+                reason_codes=tuple(reason_codes),
+                outbox_id=source.acknowledgement_outbox_id,
+                outbox_destination=source.acknowledgement_destination,
+            )
+            actions.append(action)
+            digest_rows.append(
+                {
+                    "event_row_id": action.event_row_id,
+                    "event_id": action.event_id,
+                    "ordinal": action.ordinal,
+                    "storage_action": action.storage_action,
+                    "status": action.status,
+                    "details_sha256": source.details_sha256,
+                    "outbox_id": action.outbox_id,
+                    "outbox_payload_sha256": (
+                        source.acknowledgement_payload_sha256
+                    ),
+                }
+            )
+        received_at = first_source.received_at
+        state_digest = hashlib.sha256(
+            _canonical_json(
+                {
+                    "version": 1,
+                    "raw_row_id": raw_row_id,
+                    "message_id": message_id,
+                    "message_time": _canonical_timestamp(message_time),
+                    "received_at": _canonical_timestamp(received_at),
+                    "raw_sha256": raw_sha256,
+                    "actions": digest_rows,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        return StoredIngestionResult(
+            raw_row_id=raw_row_id,
+            message_id=message_id,
+            message_time=message_time,
+            received_at=received_at,
+            raw_text=raw_text,
+            raw_sha256=raw_sha256,
+            actions=tuple(actions),
+            state_digest=state_digest,
+        )
+
+    def _validate_action_source_bundle(
+        self,
+        *,
+        event_rows: Sequence[Sequence[object]],
+        outbox_rows: Sequence[Sequence[object]],
+        cursor_span_count: int | None = None,
+    ) -> tuple[
+        dict[int, tuple[int, ...]],
+        dict[tuple[int, str], Sequence[object]],
+    ]:
+        """Validate raw-message cohort boundaries shared by all source reads."""
+        if cursor_span_count is not None and cursor_span_count != len(event_rows):
+            raise MigrationCorruption("CONFIRMATION_ACTION_GROUP_INTERLEAVED")
+
+        ordinals_by_raw: dict[int, list[int]] = {}
+        receipt_by_raw: dict[int, datetime] = {}
+        event_ids: set[int] = set()
+        completed_raws: set[int] = set()
+        current_raw: int | None = None
+        prior_cursor: int | None = None
+        for row in event_rows:
+            event_cursor = int(row[0])
+            raw_message_id = int(row[2])
+            if prior_cursor is not None and event_cursor <= prior_cursor:
+                raise MigrationCorruption(
+                    "CONFIRMATION_ACTION_CURSOR_ORDER_INVALID"
+                )
+            prior_cursor = event_cursor
+            event_ids.add(event_cursor)
+            if raw_message_id != current_raw:
+                if current_raw is not None:
+                    completed_raws.add(current_raw)
+                if raw_message_id in completed_raws:
+                    raise MigrationCorruption(
+                        "CONFIRMATION_ACTION_GROUP_INTERLEAVED"
+                    )
+                current_raw = raw_message_id
+            ordinals_by_raw.setdefault(raw_message_id, []).append(int(row[3]))
+
+            details = _canonical_stored_details(
+                str(row[18]),
+                label="confirmation",
+            )
+            source_details = details.get("source")
+            if (
+                not isinstance(source_details, dict)
+                or source_details.get("type")
+                != "ROBINHOOD_MANUAL_CONFIRMATION"
+                or type(source_details.get("received_at")) is not str
+            ):
+                raise MigrationCorruption(
+                    "confirmation details contract is inconsistent"
+                )
+            received_at = _parse_canonical_timestamp(
+                str(source_details["received_at"])
+            )
+            prior_receipt = receipt_by_raw.setdefault(
+                raw_message_id,
+                received_at,
+            )
+            if received_at != prior_receipt:
+                raise MigrationCorruption(
+                    "CONFIRMATION_RECEIPT_COHORT_MISMATCH"
+                )
+
+        ordinal_tuples_by_raw: dict[int, tuple[int, ...]] = {}
+        for raw_message_id, ordinals in ordinals_by_raw.items():
+            ordered = tuple(ordinals)
+            if tuple(sorted(ordered)) != tuple(range(len(ordered))):
+                raise MigrationCorruption(
+                    "confirmation action ordinals are incomplete"
+                )
+            if ordered != tuple(range(len(ordered))):
+                raise MigrationCorruption(
+                    "CONFIRMATION_ACTION_CURSOR_ORDER_INVALID"
+                )
+            ordinal_tuples_by_raw[raw_message_id] = ordered
+
+        outbox_count_by_event: dict[int, int] = {}
+        outbox_by_key: dict[
+            tuple[int, str], Sequence[object]
+        ] = {}
+        for row in outbox_rows:
+            origin = int(row[3])
+            if origin not in event_ids:
+                raise MigrationCorruption(
+                    "confirmation acknowledgement origin is inconsistent"
+                )
+            outbox_count_by_event[origin] = (
+                outbox_count_by_event.get(origin, 0) + 1
+            )
+            outbox_by_key[(origin, str(row[4]))] = row
+        if any(
+            outbox_count_by_event.get(event_cursor, 0) != 1
+            for event_cursor in event_ids
+        ):
+            raise MigrationCorruption(
+                "CONFIRMATION_ACKNOWLEDGEMENT_COUNT_INVALID"
+            )
+        return ordinal_tuples_by_raw, outbox_by_key
+
+    def _authenticate_action_source_cohort(
+        self,
+        *,
+        raw_message_id: int,
+    ) -> tuple[JournalActionSource, ...]:
+        """Authenticate every immutable action belonging to one raw message."""
+        from zoneinfo import ZoneInfo
+
+        from .confirmations import (
+            ConfirmationParseError,
+            parse_confirmation_batch_or_pending,
+        )
+
+        raw_message_id = _require_integer(
+            raw_message_id,
+            "raw message row ID",
+            minimum=1,
+        )
+        raw_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_RAW_MESSAGE_COLUMNS)
+            + " FROM raw_messages WHERE id = ?",
+            (raw_message_id,),
+        ).fetchone()
+        if raw_row is None:
+            raise MigrationCorruption("execution event raw row is missing")
+        cohort_event_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_EXECUTION_EVENT_COLUMNS)
+            + " FROM execution_events WHERE raw_message_id = ? ORDER BY id",
+            (raw_message_id,),
+        ).fetchall()
+        if not cohort_event_rows:
+            raise MigrationCorruption("confirmation raw row has no completed actions")
+        first_cursor = int(cohort_event_rows[0][0])
+        last_cursor = int(cohort_event_rows[-1][0])
+        span_row = _sql(
+            self._connection,
+            "SELECT COUNT(*) FROM execution_events WHERE id >= ? AND id <= ?",
+            (first_cursor, last_cursor),
+        ).fetchone()
+        if span_row is None:
+            raise JournalError("execution cohort span query returned no result")
+        nested_span_row = _sql(
+            self._connection,
+            "SELECT 1 FROM execution_events WHERE raw_message_id != ? "
+            "GROUP BY raw_message_id "
+            "HAVING MIN(id) < ? AND MAX(id) > ? LIMIT 1",
+            (raw_message_id, first_cursor, last_cursor),
+        ).fetchone()
+        if nested_span_row is not None:
+            raise MigrationCorruption("CONFIRMATION_ACTION_GROUP_INTERLEAVED")
+        account_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(f"account.{column}" for column in _ACCOUNT_CHECK_COLUMNS)
+            + " FROM account_checks AS account "
+            "JOIN execution_events AS event "
+            "ON event.id = account.execution_event_id "
+            "WHERE event.raw_message_id = ? "
+            "ORDER BY account.execution_event_id, account.id",
+            (raw_message_id,),
+        ).fetchall()
+        outbox_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(f"outbox.{column}" for column in _OUTBOX_COLUMNS)
+            + " FROM outbox AS outbox JOIN execution_events AS event "
+            "ON event.id = outbox.origin_execution_event_id "
+            "WHERE event.raw_message_id = ? ORDER BY outbox.id",
+            (raw_message_id,),
+        ).fetchall()
+        ordinal_tuples_by_raw, outbox_by_key = (
+            self._validate_action_source_bundle(
+                event_rows=cohort_event_rows,
+                outbox_rows=outbox_rows,
+                cursor_span_count=int(span_row[0]),
+            )
+        )
+        account_by_event = {int(row[3]): row for row in account_rows}
+        raw_message_time = _parse_canonical_timestamp(str(raw_row[2]))
+        try:
+            parsed = parse_confirmation_batch_or_pending(
+                str(raw_row[3]),
+                session_date=raw_message_time.astimezone(
+                    ZoneInfo("America/New_York")
+                ).date(),
+            )
+        except ConfirmationParseError as error:
+            raise MigrationCorruption(
+                "confirmation action ordinals are incomplete"
+            ) from error
+        sources: list[JournalActionSource] = []
+        for cohort_event_row in cohort_event_rows:
+            cohort_execution_event_id = int(cohort_event_row[0])
+            sources.append(
+                self._action_source_from_rows(
+                    event_row=cohort_event_row,
+                    raw_row=raw_row,
+                    persisted_ordinals=ordinal_tuples_by_raw[raw_message_id],
+                    account_row=account_by_event.get(cohort_execution_event_id),
+                    outbox_by_key=outbox_by_key,
+                    parsed_batch=parsed,
+                )
+            )
+        return tuple(sources)
+
+    def _read_action_source(
+        self,
+        *,
+        execution_event_id: int,
+        validate_chronology: bool = True,
+    ) -> JournalActionSource:
+        """Read and authenticate one exact immutable confirmation action."""
+        execution_event_id = _require_integer(
+            execution_event_id,
+            "execution event row ID",
+            minimum=1,
+        )
+        event_row = _sql(
+            self._connection,
+            "SELECT raw_message_id FROM execution_events WHERE id = ?",
+            (execution_event_id,),
+        ).fetchone()
+        if event_row is None:
+            raise InvalidJournalValue("execution event row does not exist")
+        sources = self._authenticate_action_source_cohort(
+            raw_message_id=int(event_row[0])
+        )
+        source = next(
+            (
+                candidate
+                for candidate in sources
+                if candidate.execution_event_id == execution_event_id
+            ),
+            None,
+        )
+        if source is None:
+            raise MigrationCorruption("execution event cohort is incomplete")
+        if validate_chronology:
+            self._verify_confirmation_chronology(
+                through_cursor=execution_event_id
+            )
+        return source
+
+    def _read_action_sources_bulk(
+        self,
+        *,
+        through_cursor: int,
+    ) -> tuple[JournalActionSource, ...]:
+        """Authenticate a complete execution prefix with bounded SQL reads."""
+        from zoneinfo import ZoneInfo
+
+        from .confirmations import parse_confirmation_batch_or_pending
+
+        through_cursor = _require_integer(
+            through_cursor,
+            "through execution cursor",
+            minimum=1,
+        )
+        event_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_EXECUTION_EVENT_COLUMNS)
+            + " FROM execution_events WHERE id <= ? ORDER BY id",
+            (through_cursor,),
+        ).fetchall()
+        raw_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(f"raw.{column}" for column in _RAW_MESSAGE_COLUMNS)
+            + " FROM raw_messages AS raw JOIN ("
+            "SELECT DISTINCT raw_message_id FROM execution_events WHERE id <= ?"
+            ") AS selected ON selected.raw_message_id = raw.id ORDER BY raw.id",
+            (through_cursor,),
+        ).fetchall()
+        account_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_ACCOUNT_CHECK_COLUMNS)
+            + " FROM account_checks WHERE execution_event_id <= ? "
+            "ORDER BY execution_event_id, id",
+            (through_cursor,),
+        ).fetchall()
+        outbox_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_OUTBOX_COLUMNS)
+            + " FROM outbox WHERE origin_execution_event_id IS NOT NULL "
+            "AND origin_execution_event_id <= ? "
+            "ORDER BY origin_execution_event_id, id",
+            (through_cursor,),
+        ).fetchall()
+
+        raw_by_id = {int(row[0]): row for row in raw_rows}
+        account_by_event = {int(row[3]): row for row in account_rows}
+        ordinal_tuples_by_raw, outbox_by_key = (
+            self._validate_action_source_bundle(
+                event_rows=event_rows,
+                outbox_rows=outbox_rows,
+            )
+        )
+
+        parsed_by_raw: dict[int, object] = {}
+        sources: list[JournalActionSource] = []
+        for event_row in event_rows:
+            raw_message_id = int(event_row[2])
+            raw_row = raw_by_id.get(raw_message_id)
+            if raw_row is None:
+                raise MigrationCorruption("execution event raw row is missing")
+            parsed = parsed_by_raw.get(raw_message_id)
+            if parsed is None:
+                raw_message_time = _parse_canonical_timestamp(str(raw_row[2]))
+                parsed = parse_confirmation_batch_or_pending(
+                    str(raw_row[3]),
+                    session_date=raw_message_time.astimezone(
+                        ZoneInfo("America/New_York")
+                    ).date(),
+                )
+                parsed_by_raw[raw_message_id] = parsed
+            sources.append(
+                self._action_source_from_rows(
+                    event_row=event_row,
+                    raw_row=raw_row,
+                    persisted_ordinals=ordinal_tuples_by_raw[raw_message_id],
+                    account_row=account_by_event.get(int(event_row[0])),
+                    outbox_by_key=outbox_by_key,
+                    parsed_batch=parsed,
+                )
+            )
+        return tuple(sources)
+
+    def _action_source_from_rows(
+        self,
+        *,
+        event_row: Sequence[object],
+        raw_row: Sequence[object],
+        persisted_ordinals: tuple[int, ...],
+        account_row: Sequence[object] | None,
+        outbox_by_key: Mapping[tuple[int, str], Sequence[object]],
+        parsed_batch: object | None,
+    ) -> JournalActionSource:
+        """Build one action through the shared exact semantic validator."""
+        from zoneinfo import ZoneInfo
+
+        from .confirmations import (
+            ConfirmationKind,
+            ParsedConfirmation,
+            PendingConfirmation,
+            parse_confirmation_batch_or_pending,
+        )
+
+        execution_event_id = _require_integer(
+            int(event_row[0]),
+            "execution event row ID",
+            minimum=1,
+        )
+        event_reference = _journal_row_reference(
+            "execution_events",
+            _EXECUTION_EVENT_COLUMNS,
+            event_row,
+        )
+        raw_message_id = int(event_row[2])
+        raw_reference = _journal_row_reference(
+            "raw_messages",
+            _RAW_MESSAGE_COLUMNS,
+            raw_row,
+        )
+        if int(raw_row[0]) != raw_message_id:
+            raise MigrationCorruption("execution event raw identity is inconsistent")
+        raw_text = str(raw_row[3])
+        raw_sha256 = str(raw_row[4])
+        if hashlib.sha256(raw_text.encode("utf-8")).hexdigest() != raw_sha256:
+            raise MigrationCorruption("raw confirmation hash does not match its text")
+        message_id = str(raw_row[1])
+        message_time = _parse_canonical_timestamp(str(raw_row[2]))
+        if str(event_row[15]) != str(raw_row[2]):
+            raise MigrationCorruption("execution event message time conflicts with raw")
+        event_time = _parse_canonical_timestamp(str(event_row[14]))
+        action_ordinal = int(event_row[3])
+        expected_event_id, expected_idempotency_key = stable_execution_event_identity(
+            message_id,
+            action_ordinal,
+        )
+        if (
+            str(event_row[1]) != expected_event_id
+            or str(event_row[4]) != expected_idempotency_key
+        ):
+            raise MigrationCorruption("execution event identity is inconsistent")
+
+        parsed = parsed_batch
+        if parsed is None:
+            parsed = parse_confirmation_batch_or_pending(
+                raw_text,
+                session_date=message_time.astimezone(
+                    ZoneInfo("America/New_York")
+                ).date(),
+            )
+        parsed_action: ParsedConfirmation | PendingConfirmation
+        if isinstance(parsed, PendingConfirmation):
+            expected_action_count = 1
+            if action_ordinal != 0:
+                raise MigrationCorruption("pending confirmation ordinal is inconsistent")
+            parsed_action = parsed
+            expected_storage_action = ConfirmationKind.PENDING_CLARIFICATION.value
+            expected_domain_kind = expected_storage_action
+            expected_event_time = message_time
+            expected_event_time_basis = "MESSAGE_TIME_OBSERVATION"
+            expected_symbol = None
+            expected_shares = None
+            expected_price = None
+            expected_bid = None
+            expected_ask = None
+            expected_stop = None
+            expected_missing: list[str] = []
+            expected_normalized: dict[str, object] = {}
+        else:
+            expected_action_count = len(parsed)
+            if action_ordinal >= len(parsed):
+                raise MigrationCorruption("confirmation action ordinal is incomplete")
+            parsed_action = parsed[action_ordinal]
+            expected_storage_action = parsed_action.kind.value
+            expected_domain_kind = parsed_action.kind.value
+            expected_event_time = (
+                message_time
+                if parsed_action.event_time is None
+                else parsed_action.event_time.astimezone(timezone.utc)
+            )
+            expected_event_time_basis = parsed_action.event_time_basis
+            expected_symbol = parsed_action.symbol
+            expected_shares = parsed_action.quantity
+            expected_price = (
+                None
+                if parsed_action.price is None
+                else money_to_micros(parsed_action.price)
+            )
+            expected_bid = (
+                None
+                if parsed_action.bid is None
+                else money_to_micros(parsed_action.bid)
+            )
+            expected_ask = (
+                None
+                if parsed_action.ask is None
+                else money_to_micros(parsed_action.ask)
+            )
+            expected_stop = (
+                None
+                if parsed_action.stop is None
+                else money_to_micros(parsed_action.stop)
+            )
+            expected_missing = sorted(parsed_action.missing_fields)
+            expected_normalized = _expected_confirmation_normalized(parsed_action)
+
+        if persisted_ordinals != tuple(range(expected_action_count)):
+            raise MigrationCorruption(
+                "confirmation action ordinals are incomplete"
+            )
+
+        if (
+            str(event_row[6]) != expected_storage_action
+            or event_row[7] != expected_symbol
+            or event_row[8] != expected_shares
+            or event_row[9] != expected_price
+            or event_row[10] != expected_bid
+            or event_row[11] != expected_ask
+            or event_row[12] is not None
+            or event_row[13] != expected_stop
+            or event_time != expected_event_time
+        ):
+            raise MigrationCorruption(
+                "execution event fields conflict with reparsed raw confirmation"
+            )
+
+        details_json = str(event_row[18])
+        details = _canonical_stored_details(
+            details_json,
+            label="confirmation",
+        )
+        source_details = details.get("source")
+        acknowledgement = details.get("acknowledgement")
+        reason_codes = details.get("reason_codes")
+        if (
+            details.get("version") != 1
+            or details.get("domain_kind") != expected_domain_kind
+            or details.get("event_time_basis") != expected_event_time_basis
+            or details.get("missing_fields") != expected_missing
+            or details.get("normalized") != expected_normalized
+            or not isinstance(source_details, dict)
+            or source_details.get("type") != "ROBINHOOD_MANUAL_CONFIRMATION"
+            or type(source_details.get("received_at")) is not str
+            or not isinstance(acknowledgement, dict)
+            or type(acknowledgement.get("destination")) is not str
+            or not acknowledgement.get("destination")
+            or type(acknowledgement.get("idempotency_key")) is not str
+            or not isinstance(reason_codes, list)
+            or any(type(reason) is not str or not reason for reason in reason_codes)
+            or len(reason_codes) != len(set(reason_codes))
+        ):
+            raise MigrationCorruption("confirmation details contract is inconsistent")
+        received_at = _parse_canonical_timestamp(str(source_details["received_at"]))
+        if not event_time <= message_time <= received_at:
+            raise MigrationCorruption("confirmation source times are out of order")
+        compliance_result = str(event_row[16])
+        reconciliation_state = str(event_row[17])
+        if (
+            (compliance_result == "COMPLIANT" and reason_codes)
+            or (
+                compliance_result == "NONCOMPLIANT_RECONCILIATION_REQUIRED"
+                and not reason_codes
+            )
+            or (
+                compliance_result == "PENDING_CLARIFICATION"
+                and (not reason_codes or reconciliation_state != "PENDING")
+            )
+            or compliance_result
+            not in {
+                "COMPLIANT",
+                "NONCOMPLIANT_RECONCILIATION_REQUIRED",
+                "PENDING_CLARIFICATION",
+            }
+        ):
+            raise MigrationCorruption("confirmation assessment fields are inconsistent")
+
+        economic_roles = {
+            ConfirmationKind.BUY.value,
+            ConfirmationKind.PARTIAL_FILL.value,
+            ConfirmationKind.SOLD.value,
+            ConfirmationKind.STOP_FILLED.value,
+            ConfirmationKind.STOP_UPDATED.value,
+            ConfirmationKind.FEE.value,
+            ConfirmationKind.RECONCILE_CASH.value,
+            ConfirmationKind.RECONCILE_UNRELATED_POSITION.value,
+        }
+        expected_event_role = (
+            "ECONOMIC"
+            if expected_domain_kind in economic_roles
+            else "OBSERVATION"
+        )
+        event_role = details.get("event_role", expected_event_role)
+        if event_role != expected_event_role:
+            raise MigrationCorruption("confirmation event role is inconsistent")
+
+        account_check: JournalAccountCheckSource | None = None
+        row_references = [raw_reference, event_reference]
+        if expected_domain_kind == ConfirmationKind.ACCOUNT_CHECK.value:
+            if account_row is None or not isinstance(parsed_action, ParsedConfirmation):
+                raise MigrationCorruption("account-check source row is missing")
+            account_reference = _journal_row_reference(
+                "account_checks",
+                _ACCOUNT_CHECK_COLUMNS,
+                account_row,
+            )
+            account_details_json = str(account_row[9])
+            _canonical_stored_details(account_details_json, label="account-check")
+            expected_check_id = "chk_" + hashlib.sha256(
+                (
+                    "stock-monitor/account-check/v1\x00"
+                    + expected_event_id
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                str(account_row[1]) != expected_check_id
+                or int(account_row[2]) != raw_message_id
+                or int(account_row[3]) != execution_event_id
+                or int(account_row[4]) != money_to_micros(parsed_action.settled_cash)
+                or int(account_row[5]) != parsed_action.pending_orders
+                or int(account_row[6]) != parsed_action.unlogged_positions
+                or _parse_canonical_timestamp(str(account_row[7])) != event_time
+                or str(account_row[8])
+                != (
+                    "CLEAR"
+                    if compliance_result == "COMPLIANT"
+                    else "RECONCILIATION_REQUIRED"
+                )
+            ):
+                raise MigrationCorruption(
+                    "account-check row conflicts with reparsed confirmation"
+                )
+            account_check = JournalAccountCheckSource(
+                row_id=int(account_row[0]),
+                check_id=str(account_row[1]),
+                raw_message_id=int(account_row[2]),
+                execution_event_id=int(account_row[3]),
+                settled_cash_micros=int(account_row[4]),
+                pending_order_count=int(account_row[5]),
+                unlogged_position_count=int(account_row[6]),
+                confirmed_at=_parse_canonical_timestamp(str(account_row[7])),
+                reconciliation_result=str(account_row[8]),
+                details_json=account_details_json,
+                row_reference=account_reference,
+            )
+            row_references.append(account_reference)
+        elif account_row is not None:
+            raise MigrationCorruption("non-account event has an account-check row")
+
+        acknowledgement_destination = str(acknowledgement["destination"])
+        acknowledgement_idempotency_key = str(
+            acknowledgement["idempotency_key"]
+        )
+        if acknowledgement_idempotency_key != _confirmation_outbox_key(
+            expected_event_id,
+            acknowledgement_destination,
+        ):
+            raise MigrationCorruption(
+                "confirmation acknowledgement identity is inconsistent"
+            )
+        outbox_row = outbox_by_key.get(
+            (execution_event_id, acknowledgement_destination)
+        )
+        if outbox_row is None:
+            raise MigrationCorruption(
+                "confirmation acknowledgement outbox row is missing"
+            )
+        expected_payload = _canonical_json(
+            {
+                "event_id": expected_event_id,
+                "kind": expected_domain_kind,
+                "ordinal": action_ordinal,
+                "reason_codes": reason_codes,
+                "status": compliance_result,
+                "version": 1,
+            }
+        )
+        expected_payload_sha256 = hashlib.sha256(
+            expected_payload.encode("utf-8")
+        ).hexdigest()
+        if (
+            str(outbox_row[1]) != acknowledgement_idempotency_key
+            or outbox_row[2] is not None
+            or int(outbox_row[3]) != execution_event_id
+            or str(outbox_row[4]) != acknowledgement_destination
+            or str(outbox_row[5]) != expected_payload
+            or str(outbox_row[6]) != expected_payload_sha256
+            or _parse_canonical_timestamp(str(outbox_row[7])) != received_at
+        ):
+            raise MigrationCorruption(
+                "confirmation acknowledgement outbox row is inconsistent"
+            )
+        outbox_reference = _journal_row_reference(
+            "outbox",
+            _OUTBOX_COLUMNS,
+            outbox_row,
+        )
+        row_references.append(outbox_reference)
+
+        ordered_references = tuple(
+            sorted(row_references, key=lambda item: (item.table, item.row_id))
+        )
+        details_sha256 = hashlib.sha256(details_json.encode("utf-8")).hexdigest()
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/journal-action-source/v1",
+            ordered_references,
+            {
+                "action_ordinal": action_ordinal,
+                "execution_event_id": execution_event_id,
+                "message_id": message_id,
+            },
+        )
+        normalized = details["normalized"]
+        assert isinstance(normalized, dict)
+        source = JournalActionSource(
+            execution_event_id=execution_event_id,
+            event_id=expected_event_id,
+            raw_message_id=raw_message_id,
+            message_id=message_id,
+            action_ordinal=action_ordinal,
+            idempotency_key=expected_idempotency_key,
+            storage_action=expected_storage_action,
+            domain_kind=expected_domain_kind,
+            signal_id=None if event_row[5] is None else str(event_row[5]),
+            symbol=expected_symbol,
+            shares=expected_shares,
+            price_micros=expected_price,
+            bid_micros=expected_bid,
+            ask_micros=expected_ask,
+            recommended_stop_micros=None,
+            user_confirmed_stop_micros=expected_stop,
+            event_time=event_time,
+            message_time=message_time,
+            received_at=received_at,
+            compliance_result=compliance_result,
+            reconciliation_state=reconciliation_state,
+            raw_text=raw_text,
+            raw_sha256=raw_sha256,
+            details_json=details_json,
+            details_sha256=details_sha256,
+            parent_order_id=normalized.get("parent_order_id"),  # type: ignore[arg-type]
+            fill_group_planned_shares=normalized.get(
+                "fill_group_planned_shares"
+            ),  # type: ignore[arg-type]
+            event_role=str(event_role),
+            account_check=account_check,
+            acknowledgement_outbox_id=int(outbox_row[0]),
+            acknowledgement_destination=acknowledgement_destination,
+            acknowledgement_idempotency_key=acknowledgement_idempotency_key,
+            acknowledgement_payload_sha256=expected_payload_sha256,
+            row_references=ordered_references,
+            source_digest=source_digest,
+        )
+        return source
+
+    def _validate_confirmation_source_order(
+        self,
+        *,
+        message_time: datetime,
+        received_at: datetime,
+    ) -> None:
+        stored_message_time = _parse_canonical_timestamp(
+            _canonical_timestamp(message_time)
+        )
+        stored_received_at = _parse_canonical_timestamp(
+            _canonical_timestamp(received_at)
+        )
+        if stored_message_time > stored_received_at:
+            raise InvalidJournalValue("CONFIRMATION_SOURCE_TIME_OUT_OF_ORDER")
+        prior_rows = _sql(
+            self._connection,
+            "SELECT message_time, details_json FROM execution_events "
+            "ORDER BY id DESC",
+        ).fetchall()
+        for prior in prior_rows:
+            prior_details = _canonical_stored_details(
+                str(prior[1]),
+                label="execution event",
+            )
+            prior_source = prior_details.get("source")
+            if (
+                not isinstance(prior_source, dict)
+                or prior_source.get("type")
+                != "ROBINHOOD_MANUAL_CONFIRMATION"
+            ):
+                continue
+            if type(prior_source.get("received_at")) is not str:
+                raise MigrationCorruption("confirmation source receipt is missing")
+            prior_message_time = _parse_canonical_timestamp(str(prior[0]))
+            prior_received_at = _parse_canonical_timestamp(
+                str(prior_source["received_at"])
+            )
+            if (
+                stored_message_time < prior_message_time
+                or stored_received_at < prior_received_at
+            ):
+                raise InvalidJournalValue("CONFIRMATION_RECEIPT_TIME_REGRESSION")
+            return
+
+    def _verify_confirmation_chronology(self, *, through_cursor: int) -> None:
+        """Verify nondecreasing source knowledge order through one cursor."""
+        rows = _sql(
+            self._connection,
+            "SELECT id, message_time, details_json FROM execution_events "
+            "WHERE id <= ? ORDER BY id",
+            (through_cursor,),
+        ).fetchall()
+        prior_message: datetime | None = None
+        prior_receipt: datetime | None = None
+        for row in rows:
+            message_time = _parse_canonical_timestamp(str(row[1]))
+            details = _canonical_stored_details(
+                str(row[2]),
+                label="confirmation",
+            )
+            source = details.get("source")
+            if (
+                not isinstance(source, dict)
+                or source.get("type") != "ROBINHOOD_MANUAL_CONFIRMATION"
+            ):
+                continue
+            if type(source.get("received_at")) is not str:
+                raise MigrationCorruption("confirmation source receipt is missing")
+            received_at = _parse_canonical_timestamp(str(source["received_at"]))
+            if (
+                prior_message is not None
+                and (message_time < prior_message or received_at < prior_receipt)
+            ):
+                raise MigrationCorruption("CONFIRMATION_RECEIPT_TIME_REGRESSION")
+            prior_message = message_time
+            prior_receipt = received_at
+
+    def _read_account_check_window(
+        self,
+        *,
+        account_check_event_id: int,
+        terminal_event_id: int,
+    ) -> JournalAccountCheckWindowSource:
+        """Read the exact latest-check interval in one SQLite snapshot."""
+        account_check_event_id = _require_integer(
+            account_check_event_id,
+            "account-check execution cursor",
+            minimum=1,
+        )
+        terminal_event_id = _require_integer(
+            terminal_event_id,
+            "terminal execution cursor",
+            minimum=1,
+        )
+        if terminal_event_id <= account_check_event_id:
+            raise InvalidJournalValue("account-check window endpoints are out of order")
+        latest_prior = _sql(
+            self._connection,
+            "SELECT MAX(execution_event_id) FROM account_checks "
+            "WHERE execution_event_id < ?",
+            (terminal_event_id,),
+        ).fetchone()
+        if (
+            latest_prior is None
+            or latest_prior[0] is None
+            or int(latest_prior[0]) != account_check_event_id
+        ):
+            raise InvalidJournalValue("ACCOUNT_CHECK_ENDPOINT_NOT_LATEST")
+        check_order = _sql(
+            self._connection,
+            "SELECT checkrow.execution_event_id, event.event_time "
+            "FROM account_checks AS checkrow "
+            "JOIN execution_events AS event "
+            "ON event.id = checkrow.execution_event_id "
+            "WHERE checkrow.execution_event_id < ? "
+            "ORDER BY event.event_time DESC, checkrow.execution_event_id DESC",
+            (terminal_event_id,),
+        ).fetchall()
+        if (
+            check_order
+            and int(check_order[0][0]) != account_check_event_id
+        ):
+            raise InvalidJournalValue("ACCOUNT_CHECK_EFFECTIVE_ORDER_AMBIGUOUS")
+        account_action = self._read_action_source(
+            execution_event_id=account_check_event_id,
+            validate_chronology=False,
+        )
+        terminal_action = self._read_action_source(
+            execution_event_id=terminal_event_id,
+            validate_chronology=False,
+        )
+        if account_action.domain_kind != "ACCOUNT_CHECK" or (
+            terminal_action.domain_kind not in {"BOUGHT", "PARTIAL_FILL"}
+        ):
+            raise InvalidJournalValue("account-check window endpoints are invalid")
+        between_rows = _sql(
+            self._connection,
+            "SELECT id FROM execution_events WHERE id > ? AND id < ? ORDER BY id",
+            (account_check_event_id, terminal_event_id),
+        ).fetchall()
+        between_actions = tuple(
+            self._read_action_source(
+                execution_event_id=int(row[0]),
+                validate_chronology=False,
+            )
+            for row in between_rows
+        )
+        self._verify_confirmation_chronology(through_cursor=terminal_event_id)
+        high_water_row = _sql(
+            self._connection,
+            "SELECT COALESCE(MAX(id), 0) FROM execution_events",
+        ).fetchone()
+        if high_water_row is None:
+            raise JournalError("execution high-water query returned no result")
+        source_high_water_cursor = int(high_water_row[0])
+        late_effective_rows = _sql(
+            self._connection,
+            "SELECT id FROM execution_events "
+            "WHERE id > ? ORDER BY id",
+            (terminal_event_id,),
+        ).fetchall()
+        for row in late_effective_rows:
+            late_action = self._read_action_source(
+                execution_event_id=int(row[0]),
+                validate_chronology=False,
+            )
+            if late_action.domain_kind == "PENDING_CLARIFICATION" or (
+                late_action.event_time <= terminal_action.event_time
+                and late_action.domain_kind in _RECONCILIATION_ACTIONS
+            ):
+                raise InvalidJournalValue(
+                    "ACCOUNT_CHECK_LATE_FACT_INVALIDATES_WINDOW"
+                )
+        references_by_key: dict[
+            tuple[str, int], JournalRowReference
+        ] = {}
+        for action in (account_action, *between_actions, terminal_action):
+            for reference in action.row_references:
+                key = (reference.table, reference.row_id)
+                prior = references_by_key.get(key)
+                if prior is not None and prior != reference:
+                    raise MigrationCorruption("account-check window row digest conflicts")
+                references_by_key[key] = reference
+        row_references = tuple(
+            sorted(
+                references_by_key.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/journal-account-window/v1",
+            row_references,
+            {
+                "after_cursor": account_check_event_id,
+                "expected_between_count": len(between_actions),
+                "source_high_water_cursor": source_high_water_cursor,
+                "through_cursor": terminal_event_id,
+            },
+        )
+        return JournalAccountCheckWindowSource(
+            account_check_action=account_action,
+            terminal_action=terminal_action,
+            between_actions=between_actions,
+            after_cursor=account_check_event_id,
+            through_cursor=terminal_event_id,
+            source_high_water_cursor=source_high_water_cursor,
+            expected_between_count=len(between_actions),
+            row_references=row_references,
+            source_digest=source_digest,
+        )
+
+    def _read_actual_replay(
+        self,
+        *,
+        query_cutoff: datetime,
+        through_execution_cursor: int | None,
+    ) -> JournalActualReplaySource:
+        """Read one complete received-by-cutoff confirmation replay snapshot."""
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        orphan_raw = _sql(
+            self._connection,
+            "SELECT raw.id FROM raw_messages AS raw "
+            "LEFT JOIN execution_events AS event ON event.raw_message_id = raw.id "
+            "GROUP BY raw.id HAVING COUNT(event.id) = 0 "
+            "ORDER BY raw.id LIMIT 1",
+        ).fetchone()
+        if orphan_raw is not None:
+            raise MigrationCorruption("INCOMPLETE_CONFIRMATION_RAW_SOURCE")
+        high_water_row = _sql(
+            self._connection,
+            "SELECT MAX(id) FROM execution_events",
+        ).fetchone()
+        if high_water_row is None:
+            raise JournalError("execution high-water query returned no result")
+        source_high_water_cursor = (
+            None if high_water_row[0] is None else int(high_water_row[0])
+        )
+        all_actions: list[JournalActionSource] = []
+        if source_high_water_cursor is not None:
+            all_actions.extend(
+                self._read_action_sources_bulk(
+                    through_cursor=source_high_water_cursor
+                )
+            )
+            self._verify_confirmation_chronology(
+                through_cursor=source_high_water_cursor
+            )
+        actions = tuple(
+            action
+            for action in all_actions
+            if action.received_at <= normalized_cutoff
+        )
+        expected_through = (
+            actions[-1].execution_event_id if actions else None
+        )
+        if through_execution_cursor is not None:
+            requested_through = _require_integer(
+                through_execution_cursor,
+                "through execution cursor",
+                minimum=1,
+            )
+            if requested_through != expected_through:
+                raise InvalidJournalValue("REPLAY_CUTOFF_INCOMPLETE")
+        bounded_through = expected_through
+        action_ids = tuple(action.execution_event_id for action in actions)
+        check_ids = tuple(
+            action.account_check.row_id
+            for action in actions
+            if action.account_check is not None
+        )
+
+        postings: list[JournalPostingSource] = []
+        if action_ids or check_ids:
+            predicates: list[str] = []
+            parameters: list[int] = []
+            if action_ids:
+                predicates.append(
+                    "execution_event_id IN ("
+                    + ",".join("?" for _ in action_ids)
+                    + ")"
+                )
+                parameters.extend(action_ids)
+            if check_ids:
+                predicates.append(
+                    "account_check_id IN ("
+                    + ",".join("?" for _ in check_ids)
+                    + ")"
+                )
+                parameters.extend(check_ids)
+            posting_rows = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_LEDGER_POSTING_COLUMNS)
+                + " FROM ledger_postings WHERE "
+                + " OR ".join(f"({predicate})" for predicate in predicates)
+                + " ORDER BY id",
+                tuple(parameters),
+            ).fetchall()
+        else:
+            posting_rows = ()
+        for row in posting_rows:
+            posting_reference = _journal_row_reference(
+                "ledger_postings",
+                _LEDGER_POSTING_COLUMNS,
+                row,
+            )
+            details_json = str(row[12])
+            _canonical_stored_details(details_json, label="ledger posting")
+            execution_id = None if row[5] is None else int(row[5])
+            account_check_id = None if row[6] is None else int(row[6])
+            if (execution_id is None) == (account_check_id is None):
+                raise MigrationCorruption("ledger posting origin is inconsistent")
+            postings.append(
+                JournalPostingSource(
+                    row_id=int(row[0]),
+                    posting_key=str(row[1]),
+                    ledger_name=str(row[2]),
+                    account_name=str(row[3]),
+                    entry_kind=str(row[4]),
+                    execution_event_id=execution_id,
+                    account_check_id=account_check_id,
+                    symbol=None if row[7] is None else str(row[7]),
+                    amount_micros=int(row[8]),
+                    shares_delta=None if row[9] is None else int(row[9]),
+                    unit_price_micros=None if row[10] is None else int(row[10]),
+                    occurred_at=_parse_canonical_timestamp(str(row[11])),
+                    details_json=details_json,
+                    row_reference=posting_reference,
+                )
+            )
+
+        projection_rows: list[JournalProjectionRowSource] = []
+        projection_through_candidates: list[int] = []
+        actions_by_cursor = {
+            action.execution_event_id: action for action in all_actions
+        }
+        for table in (
+            "actual_positions",
+            "actual_cash_projection",
+            "reconciliation_projection",
+        ):
+            column_rows = _sql(
+                self._connection,
+                f'PRAGMA table_info("{table}")',
+            ).fetchall()
+            columns = tuple(str(row[1]) for row in column_rows)
+            rows = _sql(
+                self._connection,
+                f'SELECT * FROM "{table}" ORDER BY id',
+            ).fetchall()
+            for row in rows:
+                values = dict(zip(columns, tuple(row), strict=True))
+                origin_cursor: int | None = None
+                if table in {"actual_positions", "reconciliation_projection"}:
+                    cursor = values.get("last_execution_event_id")
+                    if cursor is not None:
+                        origin_cursor = int(cursor)
+                elif table == "actual_cash_projection":
+                    posting_id = values.get("last_ledger_posting_id")
+                    if posting_id is not None:
+                        posting_origin = _sql(
+                            self._connection,
+                            "SELECT posting.execution_event_id, "
+                            "checkrow.execution_event_id "
+                            "FROM ledger_postings AS posting "
+                            "LEFT JOIN account_checks AS checkrow "
+                            "ON checkrow.id = posting.account_check_id "
+                            "WHERE posting.id = ?",
+                            (int(posting_id),),
+                        ).fetchone()
+                        if posting_origin is None:
+                            raise MigrationCorruption(
+                                "cash projection posting high-water is missing"
+                            )
+                        cursor = (
+                            posting_origin[0]
+                            if posting_origin[0] is not None
+                            else posting_origin[1]
+                        )
+                        if cursor is not None:
+                            origin_cursor = int(cursor)
+                if origin_cursor is None:
+                    raise MigrationCorruption(
+                        "projection source execution cursor is missing"
+                    )
+                origin_action = actions_by_cursor.get(origin_cursor)
+                if origin_action is None:
+                    raise MigrationCorruption(
+                        "projection source action is not authenticated"
+                    )
+                updated_at = values.get("updated_at")
+                if type(updated_at) is not str:
+                    raise MigrationCorruption("projection update time is missing")
+                projection_updated_at = _parse_canonical_timestamp(updated_at)
+                if (
+                    origin_action.received_at > normalized_cutoff
+                    or projection_updated_at > normalized_cutoff
+                    or bounded_through is None
+                    or origin_cursor > bounded_through
+                ):
+                    continue
+                reference = _journal_row_reference(table, columns, row)
+                projection_rows.append(
+                    JournalProjectionRowSource(
+                        table=table,
+                        row_id=int(row[0]),
+                        values=tuple(zip(columns, tuple(row), strict=True)),
+                        row_reference=reference,
+                    )
+                )
+                projection_through_candidates.append(origin_cursor)
+        projection_through_cursor = (
+            max(projection_through_candidates)
+            if projection_through_candidates
+            else None
+        )
+        last_economic_cursor = max(
+            (
+                action.execution_event_id
+                for action in actions
+                if action.event_role == "ECONOMIC"
+            ),
+            default=None,
+        )
+        projection_stale = last_economic_cursor is not None and (
+            projection_through_cursor is None
+            or projection_through_cursor < last_economic_cursor
+        )
+
+        references_by_key: dict[
+            tuple[str, int], JournalRowReference
+        ] = {}
+        for reference in (
+            *(
+                reference
+                for action in actions
+                for reference in action.row_references
+            ),
+            *(posting.row_reference for posting in postings),
+            *(row.row_reference for row in projection_rows),
+        ):
+            key = (reference.table, reference.row_id)
+            prior = references_by_key.get(key)
+            if prior is not None and prior != reference:
+                raise MigrationCorruption("actual replay row digest conflicts")
+            references_by_key[key] = reference
+        row_references = tuple(
+            sorted(
+                references_by_key.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        start_cursor = action_ids[0] if action_ids else None
+        terminal_cursor = action_ids[-1] if action_ids else None
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/journal-actual-replay/v1",
+            row_references,
+            {
+                "expected_action_count": len(actions),
+                "expected_posting_count": len(postings),
+                "projection_stale": projection_stale,
+                "projection_through_cursor": projection_through_cursor,
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "source_through_cursor": source_high_water_cursor,
+                "start_cursor": start_cursor,
+                "terminal_cursor": terminal_cursor,
+                "through_execution_cursor": bounded_through,
+            },
+        )
+        return JournalActualReplaySource(
+            query_cutoff=normalized_cutoff,
+            actions=actions,
+            postings=tuple(postings),
+            projection_rows=tuple(projection_rows),
+            start_cursor=start_cursor,
+            terminal_cursor=terminal_cursor,
+            through_execution_cursor=bounded_through,
+            source_through_cursor=source_high_water_cursor,
+            projection_through_cursor=projection_through_cursor,
+            projection_stale=projection_stale,
+            expected_action_count=len(actions),
+            expected_posting_count=len(postings),
+            row_references=row_references,
+            source_digest=source_digest,
+        )
+
+    def _incremental_ingestion_identity(self) -> tuple[int, int, int | None]:
+        """Identify one complete snapshot for a private same-process cache."""
+        self._ensure_open()
+        if not self._transaction_active or self._transaction_dirty:
+            raise JournalError(
+                "incremental ingestion identity requires a clean transaction"
+            )
+        orphan_raw = _sql(
+            self._connection,
+            "SELECT raw.id FROM raw_messages AS raw "
+            "LEFT JOIN execution_events AS event ON event.raw_message_id = raw.id "
+            "GROUP BY raw.id HAVING COUNT(event.id) = 0 "
+            "ORDER BY raw.id LIMIT 1",
+        ).fetchone()
+        if orphan_raw is not None:
+            raise MigrationCorruption("INCOMPLETE_CONFIRMATION_RAW_SOURCE")
+        row = _sql(
+            self._connection,
+            "SELECT MAX(id) FROM execution_events",
+        ).fetchone()
+        if row is None:
+            raise JournalError("execution high-water query returned no result")
+        highwater = None if row[0] is None else int(row[0])
+        return (
+            self._source_generation,
+            self._source_authority_data_version(),
+            highwater,
+        )
+
     def count(self, table: str) -> int:
         self._ensure_open()
         table = _whitelisted_table(table)
@@ -1222,6 +3273,7 @@ class Journal:
         compliance_result: str,
         reconciliation_state: str,
         details: Mapping[str, object] | None,
+        prevalidated_confirmation_source: tuple[datetime, datetime] | None = None,
     ) -> tuple[int, bool]:
         raw_message_id = _require_integer(
             raw_message_id, "raw message row ID", minimum=1
@@ -1260,6 +3312,25 @@ class Journal:
         if raw is None:
             raise InvalidJournalValue("raw message row does not exist")
         message_id, stored_message_time = str(raw[0]), str(raw[1])
+        event_details = json.loads(details_json)
+        source_details = event_details.get("source")
+        if (
+            isinstance(source_details, dict)
+            and source_details.get("type")
+            == "ROBINHOOD_MANUAL_CONFIRMATION"
+        ):
+            received_value = source_details.get("received_at")
+            if type(received_value) is not str:
+                raise InvalidJournalValue(
+                    "confirmation source receipt is missing"
+                )
+            received_at = _parse_canonical_timestamp(received_value)
+            message_time = _parse_canonical_timestamp(stored_message_time)
+            if prevalidated_confirmation_source != (message_time, received_at):
+                self._validate_confirmation_source_order(
+                    message_time=message_time,
+                    received_at=received_at,
+                )
         if stored_event_time > stored_message_time:
             raise InvalidJournalValue(
                 "execution event cannot postdate its authoritative message"
@@ -2587,6 +4658,7 @@ class Journal:
     def _projection_write(self) -> Iterator[None]:
         if not self._transaction_active or self._projection_write_allowed:
             raise JournalError("projection writes require an active journal transaction")
+        self._transaction_dirty = True
         self._projection_write_allowed = True
         try:
             yield
@@ -2597,6 +4669,7 @@ class Journal:
     def _report_claim_write(self) -> Iterator[None]:
         if not self._transaction_active or self._report_claim_write_allowed:
             raise JournalError("report claim writes require an active journal transaction")
+        self._transaction_dirty = True
         self._report_claim_write_allowed = True
         try:
             yield
@@ -2607,17 +4680,20 @@ class Journal:
     def _immediate_connection(self) -> Iterator[sqlite3.Connection]:
         if self._transaction_active:
             raise JournalError("nested journal transactions are not supported")
+        changes_before = self._connection.total_changes
         try:
             _sql(self._connection, "BEGIN IMMEDIATE")
         except sqlite3.Error as error:
             raise _translate_sqlite_error(error) from error
         self._transaction_active = True
+        self._transaction_dirty = False
         try:
             yield self._connection
         except BaseException:
             try:
                 self._connection.rollback()
             finally:
+                self._transaction_dirty = False
                 self._transaction_active = False
             raise
         else:
@@ -2627,9 +4703,13 @@ class Journal:
                 try:
                     self._connection.rollback()
                 finally:
+                    self._transaction_dirty = False
                     self._transaction_active = False
                 raise _translate_sqlite_error(error) from error
+            self._transaction_dirty = False
             self._transaction_active = False
+            if self._connection.total_changes != changes_before:
+                self._source_generation += 1
 
     def _configure_connection(self) -> None:
         try:
@@ -2747,6 +4827,13 @@ class Journal:
     def _ensure_open(self) -> None:
         if self._closed:
             raise JournalError("journal is closed")
+
+    def _source_authority_data_version(self) -> int:
+        self._ensure_open()
+        row = _sql(self._connection, "PRAGMA data_version").fetchone()
+        if row is None or type(row[0]) is not int:
+            raise JournalError("journal data version is unavailable")
+        return int(row[0])
 
 
 def _load_migrations(migration_directory: Path | None) -> tuple[_Migration, ...]:
@@ -3054,6 +5141,105 @@ def _parse_canonical_timestamp(value: str) -> datetime:
     except (TypeError, ValueError) as error:
         raise MigrationCorruption("stored timestamp is not canonical") from error
     return parsed.replace(tzinfo=timezone.utc)
+
+
+def _journal_row_reference(
+    table: str,
+    columns: Sequence[str],
+    row: Sequence[object],
+) -> JournalRowReference:
+    """Hash the table name, primary key, column names, and every stored value."""
+    if len(columns) != len(row) or not row:
+        raise MigrationCorruption("journal row shape is inconsistent")
+    try:
+        row_id = int(row[0])
+    except (TypeError, ValueError) as error:
+        raise MigrationCorruption("journal row identity is invalid") from error
+    payload = {
+        "version": 1,
+        "table": table,
+        "row_id": row_id,
+        "columns": list(columns),
+        "values": list(row),
+    }
+    digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return JournalRowReference(table, row_id, digest)
+
+
+def _journal_bundle_digest(
+    namespace: str,
+    references: Sequence[JournalRowReference],
+    bounds: Mapping[str, object],
+) -> str:
+    unique: dict[tuple[str, int], JournalRowReference] = {}
+    for reference in references:
+        key = (reference.table, reference.row_id)
+        prior = unique.get(key)
+        if prior is not None and prior != reference:
+            raise MigrationCorruption("journal bundle row digest conflicts")
+        unique[key] = reference
+    ordered = tuple(
+        sorted(unique.values(), key=lambda item: (item.table, item.row_id))
+    )
+    payload = {
+        "version": 1,
+        "namespace": namespace,
+        "bounds": dict(bounds),
+        "references": [
+            [reference.table, reference.row_id, reference.row_digest]
+            for reference in ordered
+        ],
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _confirmation_outbox_key(event_id: str, destination: str) -> str:
+    digest = hashlib.sha256(
+        b"stock-monitor/confirmation-outbox/v1\x00"
+        + event_id.encode("utf-8")
+        + b"\x00"
+        + destination.encode("utf-8")
+    ).hexdigest()
+    return f"confirmation:{digest}"
+
+
+def _canonical_stored_details(value: object, *, label: str) -> dict[str, object]:
+    if type(value) is not str:
+        raise MigrationCorruption(f"{label} details are not text")
+    try:
+        details = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise MigrationCorruption(f"{label} details are invalid JSON") from error
+    if not isinstance(details, dict) or _canonical_json(details) != value:
+        raise MigrationCorruption(f"{label} details are not canonical")
+    return details
+
+
+def _expected_confirmation_normalized(action: object) -> dict[str, object]:
+    from .confirmations import ParsedConfirmation
+
+    if not isinstance(action, ParsedConfirmation):
+        return {}
+    return {
+        "amount_decimal": (
+            None if action.amount is None else str(action.amount)
+        ),
+        "asset_id": action.asset_id,
+        "delta": None if action.delta is None else str(action.delta),
+        "fill_group_planned_shares": action.fill_group_planned_shares,
+        "occ_symbol": action.occ_symbol,
+        "open_interest": action.open_interest,
+        "parent_order_id": action.parent_order_id,
+        "pending_orders": action.pending_orders,
+        "reason_sha256": (
+            None
+            if action.reason is None
+            else hashlib.sha256(action.reason.encode("utf-8")).hexdigest()
+        ),
+        "signed_shares": action.signed_shares,
+        "unlogged_positions": action.unlogged_positions,
+        "volume": action.volume,
+    }
 
 
 def _add_seconds(value: str, seconds: int) -> str:

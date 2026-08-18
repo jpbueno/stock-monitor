@@ -20,6 +20,14 @@ from .domain import (
     require_aware_timestamp,
     stable_execution_event_identity,
 )
+from .journal import (
+    JournalAccountCheckWindowSource,
+    JournalActionSource,
+    JournalActualReplaySource,
+    is_verified_journal_action_source,
+    is_verified_journal_replay_source,
+    is_verified_journal_window_source,
+)
 from .market_calendar import (
     CalendarError,
     MarketCalendar,
@@ -80,6 +88,10 @@ _SETTLEMENT_LEDGER_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
+_JOURNAL_DERIVED_SOURCE_BINDINGS: dict[
+    int,
+    tuple[ReferenceType[object], ReferenceType[object], str],
+] = {}
 _LONG_PLAN_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
@@ -91,12 +103,14 @@ MAX_WEEKLY_DRAWDOWN = Decimal("100")
 MAX_MONTHLY_DRAWDOWN = Decimal("250")
 _ACCOUNT_INVALIDATING_EVENT_KINDS = frozenset(
     {
+        "ACCOUNT_CHECK",
         "BUY",
         "BOUGHT",
         "CASH_ADJUSTMENT",
         "DEPOSIT",
         "FEE",
         "PARTIAL_FILL",
+        "PENDING_CLARIFICATION",
         "PENDING_ORDER",
         "POSITION_ADJUSTMENT",
         "RECONCILE_CASH",
@@ -106,6 +120,7 @@ _ACCOUNT_INVALIDATING_EVENT_KINDS = frozenset(
         "SELL",
         "SOLD",
         "STOP_FILLED",
+        "STOP_UPDATED",
         "WITHDRAWAL",
     }
 )
@@ -1843,7 +1858,7 @@ def is_issued_confirmed_buy_action(action: object) -> bool:
         _CONFIRMED_BUY_AUTHORITIES,
         action,
         _confirmed_buy_fingerprint(action),
-    )
+    ) and _journal_derived_source_is_current(action)
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -1894,14 +1909,45 @@ class JournalEventWindow:
 def _authority_fingerprint(
     window: JournalEventWindow,
 ) -> tuple[object, ...]:
+    account_check = window.account_check
+    terminal_action = window.terminal_action
     return (
         window.after_cursor,
         window.through_cursor,
-        window.events,
+        tuple(
+            (
+                event.kind,
+                event.at,
+                event.price,
+                event.shares,
+                event.amount,
+                event.cursor,
+                event.message_time,
+                event.received_at,
+                event.parent_order_id,
+                event.fill_group_planned_shares,
+            )
+            for event in window.events
+        ),
         window.complete,
         window.source,
-        window.account_check,
-        window.terminal_action,
+        (
+            None
+            if account_check is None
+            else (
+                account_check.settled_cash,
+                account_check.pending_orders,
+                account_check.unlogged_positions,
+                account_check.at,
+                account_check.reconciliation_result,
+                account_check.cursor,
+            )
+        ),
+        (
+            None
+            if terminal_action is None
+            else _confirmed_buy_fingerprint(terminal_action)
+        ),
     )
 
 
@@ -1937,6 +1983,47 @@ def _has_identity_authority(
         )
 
 
+def _bind_journal_derived_source(
+    value: object,
+    source: object,
+    source_kind: str,
+) -> None:
+    identity = id(value)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _AUTHORITY_LOCK:
+            current = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity)
+            if current is not None and current[0] is dead:
+                _JOURNAL_DERIVED_SOURCE_BINDINGS.pop(identity, None)
+
+    with _AUTHORITY_LOCK:
+        _JOURNAL_DERIVED_SOURCE_BINDINGS[identity] = (
+            ref(value, discard),
+            ref(source),
+            source_kind,
+        )
+
+
+def _journal_derived_source_is_current(value: object) -> bool:
+    with _AUTHORITY_LOCK:
+        binding = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(id(value))
+        if binding is None:
+            return True
+        if binding[0]() is not value:
+            return False
+        source = binding[1]()
+        source_kind = binding[2]
+    if source is None:
+        return False
+    if source_kind == "JOURNAL_WINDOW_SOURCE":
+        return is_verified_journal_window_source(source)
+    if source_kind == "JOURNAL_REPLAY_SOURCE":
+        return is_verified_journal_replay_source(source)
+    if source_kind == "ISSUED_EVENT_WINDOW":
+        return is_issued_journal_event_window(source)
+    return False
+
+
 def _issue_journal_event_window(
     *,
     after_cursor: int,
@@ -1967,13 +2054,322 @@ def _issue_journal_event_window(
     return window
 
 
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _parsed_journal_action(
+    source: JournalActionSource,
+) -> object:
+    """Reparse and cross-check one already identity-sealed Journal action."""
+    from .confirmations import (
+        ConfirmationKind,
+        ParsedConfirmation,
+        PendingConfirmation,
+        parse_confirmation_batch_or_pending,
+    )
+
+    if not is_verified_journal_action_source(source):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_UNVERIFIED")
+    if (
+        sha256(source.raw_text.encode("utf-8")).hexdigest()
+        != source.raw_sha256
+        or sha256(source.details_json.encode("utf-8")).hexdigest()
+        != source.details_sha256
+        or not _is_sha256_digest(source.source_digest)
+        or not _is_sha256_digest(source.acknowledgement_payload_sha256)
+        or any(
+            not _is_sha256_digest(reference.row_digest)
+            for reference in source.row_references
+        )
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_DIGEST_INVALID")
+    expected_event_id, expected_idempotency_key = stable_execution_event_identity(
+        source.message_id,
+        source.action_ordinal,
+    )
+    if (
+        source.event_id != expected_event_id
+        or source.idempotency_key != expected_idempotency_key
+        or not source.event_time <= source.message_time <= source.received_at
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+    try:
+        details = json.loads(source.details_json)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID") from error
+    details_source = details.get("source") if isinstance(details, dict) else None
+    if (
+        not isinstance(details_source, dict)
+        or details_source.get("type") != "ROBINHOOD_MANUAL_CONFIRMATION"
+        or type(details_source.get("received_at")) is not str
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+    try:
+        details_received_at = datetime.fromisoformat(
+            details_source["received_at"].replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID") from error
+    if details_received_at != source.received_at:
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+
+    parsed = parse_confirmation_batch_or_pending(
+        source.raw_text,
+        session_date=source.message_time.astimezone(_ET).date(),
+    )
+    if isinstance(parsed, PendingConfirmation):
+        if source.action_ordinal != 0:
+            raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+        action: ParsedConfirmation | PendingConfirmation = parsed
+        expected_kind = ConfirmationKind.PENDING_CLARIFICATION.value
+        expected_at = source.message_time
+        expected_symbol = None
+        expected_shares = None
+        expected_price = None
+        expected_bid = None
+        expected_ask = None
+        expected_stop = None
+        expected_parent = None
+        expected_group_shares = None
+    else:
+        if source.action_ordinal >= len(parsed):
+            raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+        action = parsed[source.action_ordinal]
+        expected_kind = action.kind.value
+        expected_at = (
+            source.message_time if action.event_time is None else action.event_time
+        )
+        expected_symbol = action.symbol
+        expected_shares = action.quantity
+        expected_price = (
+            None if action.price is None else money_to_micros(action.price)
+        )
+        expected_bid = None if action.bid is None else money_to_micros(action.bid)
+        expected_ask = None if action.ask is None else money_to_micros(action.ask)
+        expected_stop = None if action.stop is None else money_to_micros(action.stop)
+        expected_parent = action.parent_order_id
+        expected_group_shares = action.fill_group_planned_shares
+    if (
+        source.storage_action != expected_kind
+        or source.domain_kind != expected_kind
+        or source.event_time != expected_at
+        or source.symbol != expected_symbol
+        or source.shares != expected_shares
+        or source.price_micros != expected_price
+        or source.bid_micros != expected_bid
+        or source.ask_micros != expected_ask
+        or source.recommended_stop_micros is not None
+        or source.user_confirmed_stop_micros != expected_stop
+        or source.parent_order_id != expected_parent
+        or source.fill_group_planned_shares != expected_group_shares
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+    return action
+
+
+def _execution_event_from_journal_action(
+    source: JournalActionSource,
+    parsed: object,
+) -> ExecutionEvent:
+    from .confirmations import ParsedConfirmation
+
+    price: Decimal | None = None
+    shares: int | None = None
+    amount: Decimal | None = None
+    if isinstance(parsed, ParsedConfirmation):
+        price = parsed.price
+        shares = parsed.quantity
+        amount = parsed.amount
+    return ExecutionEvent(
+        kind=source.domain_kind,
+        at=source.event_time,
+        price=price,
+        shares=shares,
+        amount=amount,
+        cursor=source.execution_event_id,
+        message_time=source.message_time,
+        received_at=source.received_at,
+        parent_order_id=source.parent_order_id,
+        fill_group_planned_shares=source.fill_group_planned_shares,
+    )
+
+
+def _issue_account_buy_authority(
+    source: JournalAccountCheckWindowSource,
+) -> tuple[AccountCheck, ConfirmedBuyAction, JournalEventWindow]:
+    """Issue exact risk authority from one identity-verified Journal window."""
+    from .confirmations import ConfirmationKind, ParsedConfirmation
+
+    if not isinstance(source, JournalAccountCheckWindowSource) or not (
+        is_verified_journal_window_source(source)
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_UNVERIFIED")
+    actions = (
+        source.account_check_action,
+        *source.between_actions,
+        source.terminal_action,
+    )
+    if any(not is_verified_journal_action_source(action) for action in actions):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_UNVERIFIED")
+    between_cursors = tuple(
+        action.execution_event_id for action in source.between_actions
+    )
+    if (
+        source.after_cursor != source.account_check_action.execution_event_id
+        or source.through_cursor != source.terminal_action.execution_event_id
+        or source.through_cursor <= source.after_cursor
+        or source.source_high_water_cursor < source.through_cursor
+        or source.expected_between_count != len(source.between_actions)
+        or between_cursors != tuple(sorted(set(between_cursors)))
+        or any(
+            not source.after_cursor < cursor < source.through_cursor
+            for cursor in between_cursors
+        )
+        or not _is_sha256_digest(source.source_digest)
+        or any(
+            not _is_sha256_digest(reference.row_digest)
+            for reference in source.row_references
+        )
+    ):
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_INVALID")
+
+    references: dict[tuple[str, int], object] = {}
+    for action_source in actions:
+        for reference in action_source.row_references:
+            key = (reference.table, reference.row_id)
+            prior = references.get(key)
+            if prior is not None and prior != reference:
+                raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_DIGEST_INVALID")
+            references[key] = reference
+    expected_references = tuple(
+        sorted(
+            references.values(),
+            key=lambda reference: (reference.table, reference.row_id),
+        )
+    )
+    if source.row_references != expected_references:
+        raise RiskBlock("JOURNAL_ACCOUNT_WINDOW_SOURCE_DIGEST_INVALID")
+
+    parsed_check = _parsed_journal_action(source.account_check_action)
+    check_source = source.account_check_action.account_check
+    if (
+        not isinstance(parsed_check, ParsedConfirmation)
+        or parsed_check.kind is not ConfirmationKind.ACCOUNT_CHECK
+        or source.account_check_action.event_role != "OBSERVATION"
+        or check_source is None
+        or check_source.execution_event_id != source.after_cursor
+        or check_source.raw_message_id
+        != source.account_check_action.raw_message_id
+        or check_source.confirmed_at != source.account_check_action.event_time
+        or check_source.settled_cash_micros
+        != money_to_micros(parsed_check.settled_cash)
+        or check_source.pending_order_count != parsed_check.pending_orders
+        or check_source.unlogged_position_count != parsed_check.unlogged_positions
+    ):
+        raise RiskBlock("ACCOUNT_CHECK_ENDPOINT_INVALID")
+    account_check = AccountCheck(
+        settled_cash=money_from_micros(check_source.settled_cash_micros),
+        pending_orders=check_source.pending_order_count,
+        unlogged_positions=check_source.unlogged_position_count,
+        at=check_source.confirmed_at,
+        reconciliation_result=check_source.reconciliation_result,
+        cursor=check_source.execution_event_id,
+    )
+
+    parsed_terminal = _parsed_journal_action(source.terminal_action)
+    terminal = source.terminal_action
+    if (
+        not isinstance(parsed_terminal, ParsedConfirmation)
+        or parsed_terminal.kind is not ConfirmationKind.BUY
+        or terminal.domain_kind != "BOUGHT"
+        or terminal.event_role != "ECONOMIC"
+        or terminal.account_check is not None
+    ):
+        raise RiskBlock("ACCOUNT_BUY_TERMINAL_ACTION_INVALID")
+    if (
+        terminal.symbol is None
+        or terminal.shares is None
+        or terminal.price_micros is None
+        or terminal.bid_micros is None
+        or terminal.ask_micros is None
+        or terminal.user_confirmed_stop_micros is None
+        or parsed_terminal.missing_fields
+    ):
+        raise RiskBlock("ACCOUNT_BUY_CONFIRMATION_INCOMPLETE")
+    terminal_action = ConfirmedBuyAction(
+        event_id=terminal.event_id,
+        idempotency_key=terminal.idempotency_key,
+        message_id=terminal.message_id,
+        action_ordinal=terminal.action_ordinal,
+        cursor=terminal.execution_event_id,
+        symbol=terminal.symbol,
+        shares=terminal.shares,
+        price=money_from_micros(terminal.price_micros),
+        at=terminal.event_time,
+        message_time=terminal.message_time,
+        received_at=terminal.received_at,
+        bid=money_from_micros(terminal.bid_micros),
+        ask=money_from_micros(terminal.ask_micros),
+        user_confirmed_stop=money_from_micros(
+            terminal.user_confirmed_stop_micros
+        ),
+        source="ROBINHOOD_MANUAL_CONFIRMATION",
+        raw_sha256=terminal.raw_sha256,
+        details_sha256=terminal.details_sha256,
+        parent_order_id=terminal.parent_order_id,
+        fill_group_planned_shares=terminal.fill_group_planned_shares,
+    )
+    events = tuple(
+        _execution_event_from_journal_action(
+            action_source,
+            _parsed_journal_action(action_source),
+        )
+        for action_source in source.between_actions
+    )
+    window = JournalEventWindow(
+        after_cursor=source.after_cursor,
+        through_cursor=source.through_cursor,
+        events=events,
+        complete=True,
+        source="JOURNAL",
+        account_check=account_check,
+        terminal_action=terminal_action,
+    )
+    _register_identity_authority(
+        _CONFIRMED_BUY_AUTHORITIES,
+        terminal_action,
+        _confirmed_buy_fingerprint(terminal_action),
+    )
+    _register_identity_authority(
+        _JOURNAL_WINDOW_AUTHORITIES,
+        window,
+        _authority_fingerprint(window),
+    )
+    _bind_journal_derived_source(
+        terminal_action,
+        source,
+        "JOURNAL_WINDOW_SOURCE",
+    )
+    _bind_journal_derived_source(
+        window,
+        source,
+        "JOURNAL_WINDOW_SOURCE",
+    )
+    return account_check, terminal_action, window
+
+
 def is_issued_journal_event_window(window: object) -> bool:
     """Return whether *window* is the exact unmodified adapter-issued object."""
     return isinstance(window, JournalEventWindow) and _has_identity_authority(
         _JOURNAL_WINDOW_AUTHORITIES,
         window,
         _authority_fingerprint(window),
-    )
+    ) and _journal_derived_source_is_current(window)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2055,6 +2451,12 @@ def _account_check_reasons(
         for event in events
     ):
         reasons.append("INTERVENING_ACCOUNT_EVENT")
+    if any(
+        check.at < event.at < buy.at
+        and event.kind == "PENDING_CLARIFICATION"
+        for event in events
+    ):
+        reasons.append("PENDING_ACCOUNT_EVENT")
     return tuple(reasons)
 
 
@@ -2101,6 +2503,8 @@ def evaluate_account_check_window(
     if window.account_check != check or window.terminal_event != buy:
         reasons.append("EVENT_WINDOW_ENDPOINT_MISMATCH")
     reasons.extend(_account_check_reasons(check, buy, window.events))
+    if any(event.kind == "PENDING_CLARIFICATION" for event in window.events):
+        reasons.append("PENDING_ACCOUNT_EVENT")
     if any(
         event.kind in _ACCOUNT_INVALIDATING_EVENT_KINDS
         and not _same_fill_group_event(event, buy)
@@ -2221,6 +2625,67 @@ class SessionCalendarResolver:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlementReplayAuthority:
+    """Exact Journal/state cohort behind one descriptive settlement replay."""
+
+    query_cutoff: datetime
+    through_execution_cursor: int | None
+    physical_source_highwater_cursor: int | None
+    journal_source_digest: str
+    actual_state_digest: str
+    calendar_digest: str
+    policy_digest: str
+    expected_action_count: int
+    expected_posting_count: int
+    strategy_posting_count: int
+
+    def __post_init__(self) -> None:
+        _require_aware(self.query_cutoff, "INVALID_SETTLEMENT_REPLAY_AUTHORITY")
+        for cursor in (
+            self.through_execution_cursor,
+            self.physical_source_highwater_cursor,
+        ):
+            if cursor is not None:
+                _require_positive_int(
+                    cursor,
+                    "INVALID_SETTLEMENT_REPLAY_AUTHORITY",
+                )
+        if (
+            self.through_execution_cursor is not None
+            and self.physical_source_highwater_cursor is not None
+            and self.through_execution_cursor
+            > self.physical_source_highwater_cursor
+        ):
+            raise RiskBlock("INVALID_SETTLEMENT_REPLAY_AUTHORITY")
+        for digest in (
+            self.journal_source_digest,
+            self.actual_state_digest,
+            self.calendar_digest,
+            self.policy_digest,
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+            ):
+                raise RiskBlock("INVALID_SETTLEMENT_REPLAY_AUTHORITY")
+        for count in (
+            self.expected_action_count,
+            self.expected_posting_count,
+            self.strategy_posting_count,
+        ):
+            _require_nonnegative_int(
+                count,
+                "INVALID_SETTLEMENT_REPLAY_AUTHORITY",
+            )
+        if self.strategy_posting_count > self.expected_posting_count:
+            raise RiskBlock("INVALID_SETTLEMENT_REPLAY_AUTHORITY")
+
+
+@dataclass(frozen=True, slots=True)
 class SettlementPosting:
     kind: str
     amount: Decimal
@@ -2235,7 +2700,7 @@ class SettlementPosting:
     received_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"BUY", "SALE"}:
+        if self.kind not in {"BUY", "FEE", "SALE"}:
             raise RiskBlock("INVALID_SETTLEMENT_POSTING")
         object.__setattr__(
             self,
@@ -2366,6 +2831,7 @@ class SettlementLedger:
     initialized_at: datetime
     calendar_resolver: SessionCalendarResolver
     postings: tuple[SettlementPosting, ...] = ()
+    replay_authority: SettlementReplayAuthority | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -2380,6 +2846,11 @@ class SettlementLedger:
         _require_aware(self.initialized_at, "INVALID_SETTLEMENT_TIME")
         if not isinstance(self.calendar_resolver, SessionCalendarResolver):
             raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+        if self.replay_authority is not None and not isinstance(
+            self.replay_authority,
+            SettlementReplayAuthority,
+        ):
+            raise RiskBlock("INVALID_SETTLEMENT_REPLAY_AUTHORITY")
         supplied_postings = tuple(self.postings)
         if any(
             not isinstance(posting, SettlementPosting)
@@ -2395,11 +2866,13 @@ class SettlementLedger:
         for posting in supplied_postings:
             if posting.at < self.initialized_at:
                 raise RiskBlock("SETTLEMENT_EVENT_BEFORE_INITIALIZATION")
-            session_date = _validate_settlement_event_time(
-                self.calendar_resolver,
-                posting.at,
-            )
-            if posting.kind == "BUY":
+            session_date = posting.at.astimezone(_ET).date()
+            if self.replay_authority is None:
+                session_date = _validate_settlement_event_time(
+                    self.calendar_resolver,
+                    posting.at,
+                )
+            if posting.kind in {"BUY", "FEE"}:
                 expected_available_on = session_date
                 expected_reason = None
             else:
@@ -2450,11 +2923,23 @@ class SettlementLedger:
 
     @property
     def source_verified(self) -> bool:
+        try:
+            if (
+                not isinstance(
+                    self.calendar_resolver,
+                    SessionCalendarResolver,
+                )
+                or not self.calendar_resolver.release_verified
+            ):
+                return False
+            fingerprint = _settlement_ledger_fingerprint(self)
+        except Exception:
+            return False
         return _has_identity_authority(
             _SETTLEMENT_LEDGER_AUTHORITIES,
             self,
-            _settlement_ledger_fingerprint(self),
-        )
+            fingerprint,
+        ) and _journal_derived_source_is_current(self)
 
     @property
     def reason_codes(self) -> tuple[str, ...]:
@@ -2687,7 +3172,7 @@ class SettlementLedger:
         as_of_day = at.astimezone(_ET).date()
         values = [self.initial_settled_cash]
         for posting in self.postings:
-            if posting.kind == "BUY" and posting.source_received_at <= at:
+            if posting.kind in {"BUY", "FEE"} and posting.source_received_at <= at:
                 values.append(-posting.amount)
             elif (
                 posting.kind == "SALE"
@@ -2730,11 +3215,65 @@ class SettlementLedger:
 def _settlement_ledger_fingerprint(
     ledger: SettlementLedger,
 ) -> tuple[object, ...]:
+    replay_authority = getattr(ledger, "replay_authority", None)
     return (
-        ledger.initial_settled_cash,
-        ledger.initialized_at,
-        ledger.calendar_resolver,
-        ledger.postings,
+        money_to_micros(ledger.initial_settled_cash),
+        ledger.initialized_at.astimezone(UTC).isoformat(timespec="microseconds"),
+        _calendar_digest(ledger.calendar_resolver),
+        tuple(
+            (
+                posting.kind,
+                money_to_micros(posting.amount),
+                posting.at.astimezone(UTC).isoformat(timespec="microseconds"),
+                posting.available_on,
+                posting.reason_code,
+                posting.posting_id,
+                posting.cursor,
+                posting.ordinal,
+                posting.source_event_id,
+                (
+                    None
+                    if posting.message_time is None
+                    else posting.message_time.astimezone(UTC).isoformat(
+                        timespec="microseconds"
+                    )
+                ),
+                (
+                    None
+                    if posting.received_at is None
+                    else posting.received_at.astimezone(UTC).isoformat(
+                        timespec="microseconds"
+                    )
+                ),
+            )
+            for posting in ledger.postings
+        ),
+        (
+            None
+            if replay_authority is None
+            else _settlement_replay_authority_fingerprint(
+                replay_authority
+            )
+        ),
+    )
+
+
+def _settlement_replay_authority_fingerprint(
+    authority: SettlementReplayAuthority,
+) -> tuple[object, ...]:
+    return (
+        authority.query_cutoff.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ),
+        authority.through_execution_cursor,
+        authority.physical_source_highwater_cursor,
+        authority.journal_source_digest,
+        authority.actual_state_digest,
+        authority.calendar_digest,
+        authority.policy_digest,
+        authority.expected_action_count,
+        authority.expected_posting_count,
+        authority.strategy_posting_count,
     )
 
 
@@ -2742,8 +3281,9 @@ def _settlement_ledger_content_digest(ledger: SettlementLedger) -> str:
     """Hash the full canonical settlement projection, not only posting IDs."""
     if not isinstance(ledger, SettlementLedger):
         raise RiskBlock("INVALID_SETTLEMENT_AUTHORITY")
+    replay_authority = getattr(ledger, "replay_authority", None)
     payload = {
-        "version": 1,
+        "version": 2,
         "initial_settled_cash_micros": money_to_micros(
             ledger.initial_settled_cash
         ),
@@ -2785,6 +3325,38 @@ def _settlement_ledger_content_digest(ledger: SettlementLedger) -> str:
             }
             for posting in ledger.postings
         ],
+        "replay_authority": (
+            None
+            if replay_authority is None
+            else {
+                "query_cutoff": replay_authority.query_cutoff.astimezone(
+                    UTC
+                ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "through_execution_cursor": (
+                    replay_authority.through_execution_cursor
+                ),
+                "physical_source_highwater_cursor": (
+                    replay_authority.physical_source_highwater_cursor
+                ),
+                "journal_source_digest": (
+                    replay_authority.journal_source_digest
+                ),
+                "actual_state_digest": (
+                    replay_authority.actual_state_digest
+                ),
+                "calendar_digest": replay_authority.calendar_digest,
+                "policy_digest": replay_authority.policy_digest,
+                "expected_action_count": (
+                    replay_authority.expected_action_count
+                ),
+                "expected_posting_count": (
+                    replay_authority.expected_posting_count
+                ),
+                "strategy_posting_count": (
+                    replay_authority.strategy_posting_count
+                ),
+            }
+        ),
     }
     return sha256(
         json.dumps(
@@ -2827,7 +3399,219 @@ def _issue_settlement_ledger_from_account_window(
         ledger,
         _settlement_ledger_fingerprint(ledger),
     )
+    _bind_journal_derived_source(
+        ledger,
+        event_window,
+        "ISSUED_EVENT_WINDOW",
+    )
     return ledger
+
+
+def _validate_journal_actual_replay_cohort(
+    source: JournalActualReplaySource,
+    state: object,
+    calendar_resolver: SessionCalendarResolver,
+) -> None:
+    """Validate exact source/state/calendar identities before issuing bridges."""
+    from .reconciliation import (
+        ActualLedgerState,
+        is_verified_actual_ledger_state,
+        is_verified_actual_ledger_state_for_source,
+    )
+
+    if not is_verified_journal_replay_source(source):
+        raise RiskBlock("JOURNAL_ACTUAL_REPLAY_SOURCE_UNVERIFIED")
+    if not isinstance(state, ActualLedgerState) or not is_verified_actual_ledger_state(
+        state
+    ):
+        raise RiskBlock("ACTUAL_LEDGER_STATE_UNVERIFIED")
+    if not is_verified_actual_ledger_state_for_source(state, source):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("INVALID_CALENDAR_RESOLVER")
+    if not calendar_resolver.release_verified:
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    calendar_digest = _calendar_digest(calendar_resolver)
+    if (
+        state.query_cutoff != source.query_cutoff
+        or state.through_cursor != source.terminal_cursor
+        or source.through_execution_cursor != source.terminal_cursor
+        or state.journal_source_digest != source.source_digest
+        or state.calendar_digest != calendar_digest
+        or not state.calendar_release_verified
+        or state.policy_digest is None
+        or state.settlement_ledger != source.postings
+        or source.expected_action_count != len(source.actions)
+        or source.expected_posting_count != len(source.postings)
+    ):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+
+
+def _strategy_settlement_sources(
+    source: JournalActualReplaySource,
+) -> tuple[tuple[object, JournalActionSource], ...]:
+    actions_by_cursor = {
+        action.execution_event_id: action for action in source.actions
+    }
+    selected: list[tuple[object, JournalActionSource]] = []
+    for posting in source.postings:
+        expected_account = {
+            "BUY": "SETTLED_CASH",
+            "FEE": "STRATEGY_FEES",
+            "SALE": "SETTLED_CASH",
+        }.get(posting.entry_kind)
+        expected_sign = {
+            "BUY": -1,
+            "FEE": -1,
+            "SALE": 1,
+        }.get(posting.entry_kind)
+        if (
+            posting.ledger_name != "ACTUAL"
+            or expected_account is None
+            or posting.account_name != expected_account
+            or posting.execution_event_id is None
+            or posting.account_check_id is not None
+            or (posting.amount_micros > 0) - (posting.amount_micros < 0)
+            != expected_sign
+        ):
+            continue
+        action = actions_by_cursor.get(posting.execution_event_id)
+        if action is None or action.domain_kind not in {
+            "BOUGHT",
+            "FEE",
+            "PARTIAL_FILL",
+            "SOLD",
+            "STOP_FILLED",
+        }:
+            raise RiskBlock("ACTUAL_SETTLEMENT_SOURCE_MISMATCH")
+        if (
+            posting.entry_kind == "BUY"
+            and action.domain_kind not in {"BOUGHT", "PARTIAL_FILL"}
+        ) or (
+            posting.entry_kind == "FEE" and action.domain_kind != "FEE"
+        ) or (
+            posting.entry_kind == "SALE"
+            and action.domain_kind not in {"SOLD", "STOP_FILLED"}
+        ):
+            raise RiskBlock("ACTUAL_SETTLEMENT_SOURCE_MISMATCH")
+        selected.append((posting, action))
+    return tuple(selected)
+
+
+def _issue_settlement_replay(
+    source: JournalActualReplaySource,
+    state: object,
+    calendar_resolver: SessionCalendarResolver,
+) -> SettlementLedger:
+    """Issue descriptive actual cash from one exact Journal replay cohort."""
+    _validate_journal_actual_replay_cohort(
+        source,
+        state,
+        calendar_resolver,
+    )
+    from .reconciliation import ActualLedgerState
+
+    assert isinstance(state, ActualLedgerState)
+    selected = _strategy_settlement_sources(source)
+    postings: list[SettlementPosting] = []
+    for posting_source, action in selected:
+        amount = money_from_micros(abs(posting_source.amount_micros))
+        kind = posting_source.entry_kind
+        session_date = posting_source.occurred_at.astimezone(_ET).date()
+        if kind in {"BUY", "FEE"}:
+            available_on = session_date
+            reason_code = None
+        else:
+            try:
+                available_on = calendar_resolver.add_sessions(session_date, 1)
+                reason_code = None
+            except RiskBlock as error:
+                if error.reason_code != "CALENDAR_COVERAGE_MISSING":
+                    raise
+                available_on = None
+                reason_code = error.reason_code
+        postings.append(
+            SettlementPosting(
+                kind=kind,
+                amount=amount,
+                at=posting_source.occurred_at,
+                available_on=available_on,
+                reason_code=reason_code,
+                posting_id=f"settlement:{action.event_id}",
+                cursor=action.execution_event_id,
+                ordinal=action.action_ordinal,
+                source_event_id=action.event_id,
+                message_time=action.message_time,
+                received_at=action.received_at,
+            )
+        )
+    cutoff_day = source.query_cutoff.astimezone(_ET).date()
+    initial_cash_micros = state.strategy_settled_cash_micros
+    for posting in postings:
+        if posting.source_received_at > source.query_cutoff:
+            raise RiskBlock("ACTUAL_SETTLEMENT_LOOKAHEAD")
+        amount_micros = money_to_micros(posting.amount)
+        if posting.kind in {"BUY", "FEE"}:
+            initial_cash_micros += amount_micros
+        elif (
+            posting.available_on is not None
+            and posting.available_on <= cutoff_day
+        ):
+            initial_cash_micros -= amount_micros
+    if not 0 <= initial_cash_micros <= MAX_MICRODOLLARS:
+        raise RiskBlock("INVALID_INITIAL_SETTLED_CASH")
+    initialized_at = min(
+        (posting.at for posting in postings),
+        default=min(
+            (action.event_time for action in source.actions),
+            default=source.query_cutoff,
+        ),
+    )
+    replay_authority = SettlementReplayAuthority(
+        query_cutoff=source.query_cutoff,
+        through_execution_cursor=source.through_execution_cursor,
+        physical_source_highwater_cursor=source.source_through_cursor,
+        journal_source_digest=source.source_digest,
+        actual_state_digest=state.source_digest,
+        calendar_digest=_calendar_digest(calendar_resolver),
+        policy_digest=state.policy_digest,
+        expected_action_count=source.expected_action_count,
+        expected_posting_count=source.expected_posting_count,
+        strategy_posting_count=len(postings),
+    )
+    ledger = SettlementLedger(
+        initial_settled_cash=money_from_micros(initial_cash_micros),
+        initialized_at=initialized_at,
+        calendar_resolver=calendar_resolver,
+        postings=tuple(postings),
+        replay_authority=replay_authority,
+    )
+    _register_identity_authority(
+        _SETTLEMENT_LEDGER_AUTHORITIES,
+        ledger,
+        _settlement_ledger_fingerprint(ledger),
+    )
+    _bind_journal_derived_source(
+        ledger,
+        source,
+        "JOURNAL_REPLAY_SOURCE",
+    )
+    return ledger
+
+
+def _issue_actual_entry_authorities(
+    *,
+    source: JournalActualReplaySource,
+    state: object,
+    calendar_resolver: SessionCalendarResolver,
+) -> None:
+    """Task 7 validates replay inputs but cannot issue paired entry authority."""
+    _validate_journal_actual_replay_cohort(
+        source,
+        state,
+        calendar_resolver,
+    )
+    raise RiskBlock("ACTUAL_BREAKER_SOURCE_UNAVAILABLE")
 
 
 @dataclass(frozen=True, slots=True)

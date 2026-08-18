@@ -138,7 +138,7 @@ Names and signatures are fixed so later tasks and tests do not invent incompatib
 | Task 4 | `EgressPolicy.validate_get(url: str) -> None`; `HttpGetClient.get(url: str, headers: Mapping[str, str]) -> HttpResponse`; `ContentCache.put(observation: SourceObservation, payload: bytes) -> str`; `AlpacaMarketData.daily_bars(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Bar, ...]]`; `historical_quotes(symbols: Sequence[str], window: TimeWindow) -> Mapping[str, tuple[Quote, ...]]`; `latest_iex_quotes(symbols: Sequence[str]) -> Mapping[str, Quote]`; `option_chain(underlying: str) -> tuple[OptionSnapshot, ...]`; `smoke() -> EntitlementSmoke`; `SecClient.get_submission(cik: str) -> SourceDocument`; `get_archive(path: str) -> SourceDocument`; `ReferenceClient.fetch(url: str) -> SourceDocument`; `classify_evidence(records: Sequence[EvidenceRecord], hold: DateRange) -> EvidenceDecision` |
 | Task 5 | `sma(values: Sequence[Decimal], period: int) -> Decimal`; `ema(values: Sequence[Decimal], period: int) -> Decimal`; `wilder_atr(bars: Sequence[Bar], period: int) -> Decimal`; `evaluate_eligibility(context: CandidateContext) -> EligibilityDecision`; `detect_setup(context: CandidateContext) -> SetupDecision`; `midrank_percentile(value: Decimal, cohort: Sequence[Decimal]) -> Decimal`; `score_candidate(context: CandidateContext) -> ScoreCard`; `rank_candidates(candidates: Sequence[ScoredCandidate]) -> tuple[ScoredCandidate, ...]` |
 | Task 6 | `size_long(entry: Decimal, stop: Decimal, settled_cash: Decimal, deployed: Decimal, open_risk: Decimal) -> PositionPlan`; `evaluate_position(position: Position, mark: MarketMark, policy: Policy) -> PositionAction`; `account_check_eligible(check: AccountCheck, buy: ExecutionEvent, intervening_events: Sequence[ExecutionEvent]) -> bool`; `evaluate_breakers(equity: Sequence[EquityPoint], closes: Sequence[ClosedTrade], calendar: MarketCalendar) -> BreakerState`; `LedgerPair.record_actual_buy(signal_id: str, price: Decimal, shares: int, at: datetime) -> ComplianceDecision`; `LedgerPair.record_canonical_fill(signal_id: str, price: Decimal, shares: int, at: datetime) -> None` |
-| Task 7 | `parse_confirmation(text: str, session_date: date) -> ParsedConfirmation`; `parse_confirmation_or_pending(text: str, session_date: date) -> ParsedConfirmation | PendingConfirmation`; `ingest_confirmation(journal: Journal, message_id: str, message_time: datetime, text: str, session_date: date) -> IngestionResult` |
+| Task 7 | `parse_confirmation(text: str, session_date: date) -> ParsedConfirmation`; `parse_confirmation_or_pending(text: str, session_date: date) -> ParsedConfirmation | PendingConfirmation`; `ConfirmationEnvelope(message_id: str, message_time: datetime, received_at: datetime, text: str, session_date: date)`; `ingest_confirmation(journal: Journal, envelope: ConfirmationEnvelope, *, plans: SignalPlanResolver, calendar: SessionCalendarResolver, policy: Policy, entry_authorities: ActualEntryAuthorityResolver, destination: str = "CODEX_TASK") -> IngestionResult` |
 | Task 8 | `simulate_entry(trigger: Decimal, limit: Decimal, observations: Sequence[IntradayObservation]) -> PaperEntryResult`; `advance_signal(signal: Signal, event: SignalEvent) -> Signal`; `mark_equity(cash: Decimal, positions: Sequence[PaperPosition], marks: Mapping[str, MarketMark]) -> EquityPoint`; `evaluate_phase1(window: Phase1Window) -> PromotionDecision` |
 | Task 9 | `replay_diagnostic(request: ReplayRequest) -> ReplayResult`; `replay_point_in_time(request: ReplayRequest) -> ReplayResult`; `rank_option_contracts(chain: Sequence[OptionContract], signal: Signal) -> tuple[OptionContract, ...]`; `record_option_mark(window: OptionWindow, mark: OptionMark) -> OptionWindow`; `evaluate_option_window(window: OptionWindow) -> OptionPromotionDecision`; `start_next_window(window: OptionWindow, start_event: OptionWindowStart | None) -> OptionWindow` |
 | Task 10 | `render_premarket_report(state: PremarketState) -> Report`; `render_close_report(state: CloseState) -> Report`; `render_validation_report(state: ValidationState) -> Report`; `archive_report(report: Report, root: Path) -> ArchivedReport`; `export_tables(journal: Journal, destination: Path) -> tuple[Path, ...]` |
@@ -668,14 +668,23 @@ Expected: missing confirmation/reconciliation modules.
 - [ ] **Step 3: Implement anchored grammars and one-transaction application**
 
 ```python
-def ingest_confirmation(journal: Journal, message_id: str, message_time: datetime, text: str, session_date: date) -> IngestionResult:
-    with journal.transaction() as tx:
-        raw_id, duplicate = tx.append_raw_message(message_id, message_time, text)
-        if duplicate:
-            return tx.existing_ingestion_result(raw_id)
-        parsed = parse_confirmation_or_pending(text, session_date)
-        return tx.apply_parsed_confirmation(raw_id, parsed)
+def ingest_confirmation(
+    journal: Journal,
+    envelope: ConfirmationEnvelope,
+    *,
+    plans: SignalPlanResolver,
+    calendar: SessionCalendarResolver,
+    policy: Policy,
+    entry_authorities: ActualEntryAuthorityResolver,
+    destination: str = "CODEX_TASK",
+) -> IngestionResult:
+    """Atomically authenticate, assess, persist, and read back one envelope."""
+    ...
 ```
+
+The ellipsis covers private implementation details, not additional public APIs. Parse the entire anchored batch before opening `BEGIN IMMEDIATE`. Inside that one immediate transaction, reconstruct the prior actual state from fully authenticated Journal rows (or use an exact, owner-bound private checkpoint), validate source chronology, and append the raw message, every execution action, ledger postings, projections, account checks, and acknowledgement outbox rows. Commit all rows together or roll them all back. Perform the typed immutable readback in a clean follow-up transaction. A cold process must bulk-authenticate the historical execution, raw-message, account-check, and acknowledgement rows inside `BEGIN IMMEDIATE`; it must not trust projections or weaken row hashes, parsing, stable identities, chronology, posting closure, or acknowledgement checks.
+
+`message_time` and `received_at` are distinct, aware source times and must never be inferred from one another. Task 7 may use `plans` while recording diagnostic compliance reasons, but authoritative actual replay is resolver-independent and remains fail closed with `SIGNAL_PLAN_UNAVAILABLE` plus `AUTHORITY_CONTEXT_UNVERIFIED`. `entry_authorities` cannot authorize an entry during Task 7. Task 8 must persist and authenticate the structured signal, publication cohort, account window, settlement replay, and breaker history before that fail-closed handoff can be replaced.
 
 Support these exact anchored forms:
 

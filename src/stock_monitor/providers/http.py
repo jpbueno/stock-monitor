@@ -64,6 +64,20 @@ class ProviderResponseError(RuntimeError):
     """A source response is unsafe, unavailable, or malformed."""
 
 
+class HttpStatusError(ProviderResponseError):
+    """A source returned one exact non-success HTTP status."""
+
+    def __init__(self, status: int, target: str) -> None:
+        if type(status) is not int or not 100 <= status <= 599:
+            raise ValueError("HTTP error status must be an integer from 100 through 599")
+        self.status = status
+        super().__init__(f"source returned HTTP {status} for {target}")
+
+
+class ProviderMalformedError(ProviderResponseError):
+    """A provider response cannot be safely interpreted."""
+
+
 class ProviderIncompleteError(ProviderResponseError):
     """A paginated or multi-symbol response is incomplete."""
 
@@ -271,28 +285,26 @@ def _validate_success_response(
     max_bytes: int,
 ) -> None:
     if not 200 <= response.status <= 299:
-        raise ProviderResponseError(
-            f"source returned HTTP {response.status} for {_safe_target(requested_url)}"
-        )
+        raise HttpStatusError(response.status, _safe_target(requested_url))
     if not response.body.strip():
-        raise ProviderResponseError(
+        raise ProviderMalformedError(
             f"source returned an empty response for {_safe_target(requested_url)}"
         )
     if len(response.body) > max_bytes:
-        raise ProviderResponseError(
+        raise ProviderMalformedError(
             f"source response exceeded the size limit for {_safe_target(requested_url)}"
         )
     encodings = response.header_values("Content-Encoding")
     if len(encodings) > 1 or (
         encodings and encodings[0].strip().casefold() not in {"", "identity"}
     ):
-        raise ProviderResponseError("source returned an unsupported content encoding")
+        raise ProviderMalformedError("source returned an unsupported content encoding")
     types = response.header_values("Content-Type")
     if len(types) != 1:
-        raise ProviderResponseError("source response needs one content type")
+        raise ProviderMalformedError("source response needs one content type")
     media_type = types[0].split(";", 1)[0].strip().casefold()
     if media_type not in allowed_content_types:
-        raise ProviderResponseError("source returned an unsupported content type")
+        raise ProviderMalformedError("source returned an unsupported content type")
 
 
 def _retry_delay(response: HttpResponse, attempt: int) -> float:
@@ -346,7 +358,7 @@ def get_with_redirects(
         if exact_url_validator is not None:
             exact_url_validator(current_url)
         if current_url in visited:
-            raise ProviderResponseError("source redirect loop detected")
+            raise ProviderMalformedError("source redirect loop detected")
         visited.add(current_url)
 
         response: HttpResponse | None = None
@@ -359,7 +371,7 @@ def get_with_redirects(
                 sleeper(0.1 * (2**attempt))
                 continue
             if candidate.url != current_url:
-                raise ProviderResponseError(
+                raise ProviderMalformedError(
                     "single-hop transport changed the request URL"
                 )
             if candidate.status in _TRANSIENT_STATUSES:
@@ -371,14 +383,14 @@ def get_with_redirects(
             response = candidate
             break
         if response is None:
-            raise ProviderResponseError("source GET did not produce a response")
+            raise ProviderMalformedError("source GET did not produce a response")
 
         if response.status in _REDIRECT_STATUSES:
             locations = response.header_values("Location")
             if len(locations) != 1 or not locations[0].strip():
-                raise ProviderResponseError("source redirect needs one Location header")
+                raise ProviderMalformedError("source redirect needs one Location header")
             if redirects >= max_redirects:
-                raise ProviderResponseError("source exceeded the redirect limit")
+                raise ProviderMalformedError("source exceeded the redirect limit")
             next_url = urllib.parse.urljoin(current_url, locations[0].strip())
             policy.validate_get(next_url)
             if exact_url_validator is not None:
@@ -386,7 +398,7 @@ def get_with_redirects(
             if _origin(next_url) != _origin(current_url):
                 raise NetworkPolicyError("cross-origin redirects are prohibited")
             if next_url in visited:
-                raise ProviderResponseError("source redirect loop detected")
+                raise ProviderMalformedError("source redirect loop detected")
             redirects += 1
             current_url = next_url
             current_headers = _redirect_headers(current_headers)
@@ -400,7 +412,7 @@ def get_with_redirects(
             max_bytes=max_bytes,
         )
         if response.url != current_url:
-            raise ProviderResponseError("single-hop transport changed the request URL")
+            raise ProviderMalformedError("single-hop transport changed the request URL")
         return response
 
 
@@ -463,11 +475,13 @@ class HttpGetClient:
         finally:
             raw.close()
         if len(body) > self._max_bytes:
-            raise ProviderResponseError(
+            raise ProviderMalformedError(
                 f"source response exceeded the size limit for {_safe_target(url)}"
             )
         if final_url != url:
-            raise ProviderResponseError("single-hop transport followed an automatic redirect")
+            raise ProviderMalformedError(
+                "single-hop transport followed an automatic redirect"
+            )
         return HttpResponse(
             status=status,
             headers=response_headers,
@@ -481,10 +495,12 @@ __all__ = [
     "GetTransport",
     "HttpGetClient",
     "HttpResponse",
+    "HttpStatusError",
     "HttpTransportError",
     "NetworkPolicyError",
     "NoAutomaticRedirects",
     "ProviderIncompleteError",
+    "ProviderMalformedError",
     "ProviderResponseError",
     "get_with_redirects",
 ]

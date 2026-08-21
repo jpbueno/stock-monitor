@@ -26,8 +26,10 @@ from .cache import (
 from .http import (
     EgressPolicy,
     GetTransport,
+    HttpStatusError,
     HttpTransportError,
     ProviderIncompleteError,
+    ProviderMalformedError,
     ProviderResponseError,
     get_with_redirects,
 )
@@ -69,8 +71,12 @@ _PAGE_SOURCE_CONTRACTS = {
 }
 
 
-class ProviderDataError(ProviderResponseError):
+class ProviderDataError(ProviderMalformedError):
     """Market data is malformed, stale, or inconsistent with its requested feed."""
+
+
+class ProviderStaleError(ProviderDataError):
+    """A structurally valid current-data observation is too old."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1777,7 +1783,7 @@ def _market_fact_from_raw_provider_item(
             page.source_type == "ALPACA_LATEST_QUOTES"
             and quote.age_seconds > _LATEST_MAX_AGE_SECONDS
         ):
-            raise ProviderDataError("IEX freshness quote is stale")
+            raise ProviderStaleError("IEX freshness quote is stale")
         return quote
     if manifest.collection == "trades":
         if page.source_type != "ALPACA_HISTORICAL_TRADES":
@@ -2768,7 +2774,7 @@ class AlpacaMarketData:
                 observation_id=observation_id,
             )
             if quote.age_seconds > _LATEST_MAX_AGE_SECONDS:
-                raise ProviderDataError("IEX freshness quote is stale")
+                raise ProviderStaleError("IEX freshness quote is stale")
             result[symbol] = quote
             pending_sources.append(
                 (
@@ -2907,38 +2913,61 @@ class AlpacaMarketData:
         connectivity_failed = False
         availability_failed = False
         failures: list[str] = []
+
+        def add_failure(reason: str) -> None:
+            if reason not in failures:
+                failures.append(reason)
+
+        def classify(
+            error: ProviderResponseError,
+            *,
+            check: str,
+        ) -> None:
+            nonlocal authenticated, connectivity_failed, availability_failed
+            if isinstance(error, HttpTransportError):
+                connectivity_failed = True
+                add_failure("CONNECTIVITY_UNAVAILABLE")
+                return
+            if isinstance(error, HttpStatusError):
+                if error.status in {408, 425, 429} or 500 <= error.status <= 599:
+                    availability_failed = True
+                    add_failure("PROVIDER_AVAILABILITY_UNAVAILABLE")
+                elif check == "iex" and error.status in {401, 403}:
+                    add_failure("AUTHENTICATION_UNAVAILABLE")
+                elif check == "sip" and error.status == 401:
+                    authenticated = False
+                    add_failure("AUTHENTICATION_UNAVAILABLE")
+                elif check == "sip" and error.status == 403:
+                    add_failure("HISTORICAL_SIP_ENTITLEMENT_UNAVAILABLE")
+                else:
+                    authenticated = True
+                    add_failure("MALFORMED_PROVIDER_RESPONSE")
+                return
+            authenticated = True
+            if isinstance(error, ProviderStaleError):
+                add_failure("IEX_QUOTE_STALE")
+            elif isinstance(error, ProviderIncompleteError):
+                add_failure("PROVIDER_COHORT_INCOMPLETE")
+            elif isinstance(error, ProviderMalformedError):
+                add_failure("MALFORMED_PROVIDER_RESPONSE")
+            else:
+                add_failure("MALFORMED_PROVIDER_RESPONSE")
+
         try:
             self.latest_iex_quotes(["SPY"])
             authenticated = True
             iex_fresh = True
-        except (ProviderDataError, ProviderIncompleteError):
-            authenticated = True
-            failures.append("IEX_FRESHNESS_UNAVAILABLE")
         except ProviderResponseError as error:
-            text = str(error)
-            if isinstance(error, HttpTransportError):
-                connectivity_failed = True
-            elif "HTTP 429" in text or re.search(r"HTTP 5[0-9]{2}", text):
-                availability_failed = True
-            elif "HTTP 401" not in text and "HTTP 403" not in text:
-                authenticated = True
-            failures.append("IEX_FRESHNESS_UNAVAILABLE")
+            classify(error, check="iex")
         if authenticated:
             if not isinstance(completed_session, TimeWindow):
-                failures.append("COMPLETED_SESSION_UNAVAILABLE")
+                add_failure("COMPLETED_SESSION_RELEASE_UNAVAILABLE")
             else:
                 try:
                     self.daily_bars(["SPY"], completed_session)
                     sip_ok = True
                 except ProviderResponseError as error:
-                    text = str(error)
-                    if isinstance(error, HttpTransportError):
-                        connectivity_failed = True
-                    elif "HTTP 429" in text or re.search(r"HTTP 5[0-9]{2}", text):
-                        availability_failed = True
-                    failures.append("HISTORICAL_SIP_UNAVAILABLE")
-        else:
-            failures.append("AUTHENTICATION_UNAVAILABLE")
+                    classify(error, check="sip")
         if connectivity_failed:
             status = "BLOCKED_CONNECTIVITY"
         elif availability_failed:
@@ -2976,7 +3005,9 @@ __all__ = [
     "ProviderFetchPage",
     "ProviderFetchPageBundle",
     "ProviderIncompleteError",
+    "ProviderMalformedError",
     "ProviderOptionChain",
+    "ProviderStaleError",
     "Quote",
     "TimeWindow",
     "Trade",

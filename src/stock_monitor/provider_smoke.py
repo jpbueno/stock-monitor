@@ -1,0 +1,107 @@
+"""Stateless, GET-only provider readiness projection."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from .config import Settings
+from .market_calendar import (
+    CalendarError,
+    latest_completed_session_window,
+    load_current_market_calendar,
+)
+from .providers.alpaca import AlpacaCredentials, AlpacaMarketData, EntitlementSmoke
+from .providers.http import EgressPolicy, HttpGetClient
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSmokeResult:
+    status: str
+    exit_code: int
+    authentication_ok: bool
+    historical_sip_ok: bool
+    latest_iex_fresh: bool
+    observed_at: datetime
+    reason_codes: tuple[str, ...]
+
+    @classmethod
+    def from_entitlement(cls, smoke: EntitlementSmoke) -> "ProviderSmokeResult":
+        ready = bool(
+            smoke.status == "READY"
+            and smoke.authentication_ok
+            and smoke.historical_sip_ok
+            and smoke.latest_iex_fresh
+        )
+        return cls(
+            status="READY" if ready else smoke.status,
+            exit_code=0 if ready else 3,
+            authentication_ok=smoke.authentication_ok,
+            historical_sip_ok=smoke.historical_sip_ok,
+            latest_iex_fresh=smoke.latest_iex_fresh,
+            observed_at=smoke.observed_at,
+            reason_codes=smoke.failures,
+        )
+
+    def safe_fields(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "observed_at": self.observed_at.isoformat(),
+            "checks": {
+                "authentication": self.authentication_ok,
+                "historical_sip": self.historical_sip_ok,
+                "latest_iex_fresh": self.latest_iex_fresh,
+            },
+            "reason_codes": list(self.reason_codes),
+        }
+
+
+def run_provider_smoke(
+    settings: Settings,
+    *,
+    now: Callable[[], datetime],
+) -> ProviderSmokeResult:
+    observed_at = now()
+    try:
+        calendar = load_current_market_calendar(
+            settings.project_root,
+            as_of=observed_at.astimezone(_ET).date(),
+        )
+        completed = latest_completed_session_window(
+            calendar,
+            observed_at=observed_at,
+        )
+    except CalendarError:
+        return ProviderSmokeResult.from_entitlement(
+            EntitlementSmoke(
+                authentication_ok=False,
+                historical_sip_ok=False,
+                latest_iex_fresh=False,
+                status="BLOCKED_COMPLETED_SESSION",
+                observed_at=observed_at,
+                failures=("COMPLETED_SESSION_RELEASE_UNAVAILABLE",),
+            )
+        )
+    policy = EgressPolicy(("data.alpaca.markets",))
+    provider = AlpacaMarketData(
+        HttpGetClient(policy),
+        AlpacaCredentials(
+            settings.alpaca_api_key_id,
+            settings.alpaca_api_secret_key,
+        ),
+        base_url=settings.sources.alpaca_market_data_url,
+        now=lambda: observed_at,
+        cache=None,
+    )
+    return ProviderSmokeResult.from_entitlement(
+        provider.smoke(completed_session=completed)
+    )
+
+
+__all__ = ["ProviderSmokeResult", "run_provider_smoke"]

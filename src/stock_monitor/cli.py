@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .config import ConfigurationError, Settings, load_settings
 from .domain import DomainValidationError, require_aware_timestamp
+from .provider_smoke import run_provider_smoke
 from .workflows import (
     JournalWorkflowPublisher,
     RecordedScenarioAdapter,
@@ -102,11 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def run(
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str],
+) -> int:
     """Parse, dispatch, and map only declared safe failures to stable exits."""
     try:
         arguments = build_parser().parse_args(argv)
-        return _dispatch(arguments, os.environ)
+        return _dispatch(arguments, environ)
     except ConfigurationError:
         _print_message("CONFIGURATION REQUIRED\nNo candidate or action was produced.")
         return 2
@@ -125,6 +130,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 10
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI with the process environment at the executable boundary."""
+    return run(argv, environ=os.environ)
+
+
 def _dispatch(arguments: argparse.Namespace, environ: Mapping[str, str]) -> int:
     settings = load_settings(_project_root(), environ)
     command = arguments.command
@@ -133,7 +143,11 @@ def _dispatch(arguments: argparse.Namespace, environ: Mapping[str, str]) -> int:
     if command == "verify":
         return _verify(settings, arguments.verify_command, arguments.json)
     if command == "provider":
-        raise CommandBoundaryError("provider smoke adapter is not activated")
+        if arguments.provider_command != "smoke":
+            raise CommandBoundaryError("unsupported provider command")
+        result = run_provider_smoke(settings, now=lambda: datetime.now(timezone.utc))
+        _emit(result.safe_fields(), arguments.json)
+        return result.exit_code
     if command == "run":
         return _run_workflow(settings, arguments)
     if command == "confirm":
@@ -440,4 +454,4 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "main", "run"]

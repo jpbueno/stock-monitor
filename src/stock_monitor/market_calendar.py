@@ -11,10 +11,13 @@ from hashlib import sha256
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from .providers.alpaca import TimeWindow
 
 
 _NEW_YORK = "America/New_York"
@@ -33,6 +36,7 @@ _RELEASE_CALENDARS: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
+_HISTORICAL_RELEASE_DELAY = timedelta(minutes=16)
 
 
 class CalendarError(ValueError):
@@ -445,6 +449,46 @@ def load_current_market_calendar(
     return calendar
 
 
+def latest_completed_session_window(
+    calendar: MarketCalendar,
+    *,
+    observed_at: datetime,
+) -> "TimeWindow":
+    """Return the latest release-eligible completed session as a provider window."""
+    if not is_release_verified_market_calendar(calendar):
+        raise CalendarError("calendar release authority is unverified")
+    if (
+        not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        raise CalendarError("completed-session observation time must be timezone-aware")
+    local_observed = observed_at.astimezone(calendar.timezone)
+    release_cutoff = local_observed - _HISTORICAL_RELEASE_DELAY
+    candidate = local_observed.date()
+    while candidate.year == calendar.year:
+        if calendar.is_open(candidate):
+            session = calendar.session(candidate)
+            session_close = datetime.combine(
+                candidate,
+                session.close_time,
+                tzinfo=session.timezone,
+            )
+            if session_close <= release_cutoff:
+                from .providers.alpaca import TimeWindow
+
+                return TimeWindow(
+                    datetime.combine(
+                        candidate,
+                        session.open_time,
+                        tzinfo=session.timezone,
+                    ),
+                    session_close,
+                )
+        candidate -= timedelta(days=1)
+    raise CalendarError("completed-session release coverage is unavailable")
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -664,5 +708,6 @@ __all__ = [
     "MarketSession",
     "is_release_verified_market_calendar",
     "is_validated_market_calendar",
+    "latest_completed_session_window",
     "load_current_market_calendar",
 ]

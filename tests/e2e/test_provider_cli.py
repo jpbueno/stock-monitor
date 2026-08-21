@@ -4,7 +4,6 @@ import io
 import json
 import os
 import unittest
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,35 +11,12 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 
 import stock_monitor.cli as cli
+from stock_monitor.provider_smoke import ProviderSmokeResult
 
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
 CANARY = "PROVIDER_EXCEPTION_CANARY_MUST_NOT_PRINT"
-
-
-@dataclass(frozen=True)
-class _Result:
-    status: str
-    exit_code: int
-    authentication_ok: bool
-    historical_sip_ok: bool
-    latest_iex_fresh: bool
-    observed_at: datetime
-    reason_codes: tuple[str, ...]
-
-    def safe_fields(self) -> dict[str, object]:
-        return {
-            "status": self.status,
-            "exit_code": self.exit_code,
-            "observed_at": self.observed_at.isoformat(),
-            "checks": {
-                "authentication": self.authentication_ok,
-                "historical_sip": self.historical_sip_ok,
-                "latest_iex_fresh": self.latest_iex_fresh,
-            },
-            "reason_codes": list(self.reason_codes),
-        }
 
 
 def _environment(home: Path) -> dict[str, str]:
@@ -60,7 +36,7 @@ class ProviderCliTests(unittest.TestCase):
         self.environment = _environment(self.home)
 
     def test_provider_smoke_emits_only_safe_json_and_result_exit(self) -> None:
-        result = _Result(
+        result = ProviderSmokeResult(
             status="READY",
             exit_code=0,
             authentication_ok=True,
@@ -82,7 +58,7 @@ class ProviderCliTests(unittest.TestCase):
         self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
 
     def test_expected_provider_failure_returns_exit_three(self) -> None:
-        result = _Result(
+        result = ProviderSmokeResult(
             status="BLOCKED_CONNECTIVITY",
             exit_code=3,
             authentication_ok=False,
@@ -116,7 +92,7 @@ class ProviderCliTests(unittest.TestCase):
         self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
 
     def test_main_delegates_provider_smoke_instead_of_existing_exit_five(self) -> None:
-        result = _Result(
+        result = ProviderSmokeResult(
             status="READY",
             exit_code=0,
             authentication_ok=True,
@@ -129,7 +105,6 @@ class ProviderCliTests(unittest.TestCase):
         with patch(
             "stock_monitor.cli.run_provider_smoke",
             return_value=result,
-            create=True,
         ), patch.dict(os.environ, self.environment, clear=True), redirect_stdout(output):
             code = cli.main(("provider", "smoke", "--json"))
 

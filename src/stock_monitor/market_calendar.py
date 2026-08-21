@@ -11,13 +11,10 @@ from hashlib import sha256
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import urlsplit
 from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-if TYPE_CHECKING:
-    from .providers.alpaca import TimeWindow
 
 
 _NEW_YORK = "America/New_York"
@@ -36,11 +33,14 @@ _RELEASE_CALENDARS: dict[
     int,
     tuple[ReferenceType[object], tuple[object, ...]],
 ] = {}
-_HISTORICAL_RELEASE_DELAY = timedelta(minutes=16)
 
 
 class CalendarError(ValueError):
     """A calendar manifest is absent, inconsistent, or not reviewed."""
+
+
+class CalendarCoverageError(CalendarError):
+    """A verified calendar contains no eligible completed session."""
 
 
 def _current_new_york_date() -> date:
@@ -75,6 +75,32 @@ class MarketSession:
     review_time: time
     timezone: ZoneInfo
     is_early_close: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedMarketSession:
+    """One verified exchange session whose close is release eligible."""
+
+    session_date: date
+    opened_at: datetime
+    closed_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.session_date) is not date:
+            raise CalendarError("completed session date must be an exact date")
+        for value in (self.opened_at, self.closed_at):
+            if (
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() is None
+            ):
+                raise CalendarError("completed session bounds must be timezone-aware")
+        if (
+            self.opened_at.date() != self.session_date
+            or self.closed_at.date() != self.session_date
+            or self.opened_at >= self.closed_at
+        ):
+            raise CalendarError("completed session bounds are inconsistent")
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -453,8 +479,9 @@ def latest_completed_session_window(
     calendar: MarketCalendar,
     *,
     observed_at: datetime,
-) -> "TimeWindow":
-    """Return the latest release-eligible completed session as a provider window."""
+    release_delay: timedelta = timedelta(0),
+) -> CompletedMarketSession:
+    """Return the latest release-eligible session without provider query policy."""
     if not is_release_verified_market_calendar(calendar):
         raise CalendarError("calendar release authority is unverified")
     if (
@@ -463,30 +490,31 @@ def latest_completed_session_window(
         or observed_at.utcoffset() is None
     ):
         raise CalendarError("completed-session observation time must be timezone-aware")
+    if not isinstance(release_delay, timedelta) or release_delay < timedelta(0):
+        raise CalendarError("completed-session release delay is invalid")
     local_observed = observed_at.astimezone(calendar.timezone)
-    release_cutoff = local_observed - _HISTORICAL_RELEASE_DELAY
-    candidate = local_observed.date()
+    candidate = min(local_observed.date(), date(calendar.year, 12, 31))
     while candidate.year == calendar.year:
         if calendar.is_open(candidate):
             session = calendar.session(candidate)
+            session_open = datetime.combine(
+                candidate,
+                session.open_time,
+                tzinfo=session.timezone,
+            )
             session_close = datetime.combine(
                 candidate,
                 session.close_time,
                 tzinfo=session.timezone,
             )
-            if session_close <= release_cutoff:
-                from .providers.alpaca import TimeWindow
-
-                return TimeWindow(
-                    datetime.combine(
-                        candidate,
-                        session.open_time,
-                        tzinfo=session.timezone,
-                    ),
-                    session_close,
+            if session_close + release_delay <= local_observed:
+                return CompletedMarketSession(
+                    session_date=candidate,
+                    opened_at=session_open,
+                    closed_at=session_close,
                 )
         candidate -= timedelta(days=1)
-    raise CalendarError("completed-session release coverage is unavailable")
+    raise CalendarCoverageError("completed-session release coverage is unavailable")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -703,7 +731,9 @@ def _open_session_count(year: int, closed_dates: frozenset[date]) -> int:
 
 __all__ = [
     "CalendarError",
+    "CalendarCoverageError",
     "CalendarSource",
+    "CompletedMarketSession",
     "MarketCalendar",
     "MarketSession",
     "is_release_verified_market_calendar",

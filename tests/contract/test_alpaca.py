@@ -34,7 +34,7 @@ WINDOW = TimeWindow(
     datetime(2026, 8, 13, 20, tzinfo=UTC),
 )
 SMOKE_WINDOW = TimeWindow(
-    datetime(2026, 8, 13, 13, 30, tzinfo=UTC),
+    datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
     datetime(2026, 8, 13, 20, 0, tzinfo=UTC),
 )
 
@@ -650,7 +650,7 @@ class AlpacaContractTests(unittest.TestCase):
         def responder(url: str) -> tuple[int, str]:
             if urlsplit(url).path.endswith("/bars"):
                 return 200, (
-                    '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                    '{"bars":{"SPY":[{"t":"2026-08-13T04:00:00Z",'
                     '"o":1,"h":1,"l":1,"c":1,"v":1}]},'
                     '"next_page_token":null}'
                 )
@@ -669,7 +669,7 @@ class AlpacaContractTests(unittest.TestCase):
         self.assertTrue(result.historical_sip_ok)
         bar_url = next(url for url in transport.requested_urls if urlsplit(url).path.endswith("/bars"))
         query = parse_qs(urlsplit(bar_url).query)
-        self.assertEqual(query["start"], ["2026-08-13T13:30:00Z"])
+        self.assertEqual(query["start"], ["2026-08-13T04:00:00Z"])
         self.assertEqual(query["end"], ["2026-08-13T20:00:00Z"])
 
     def test_smoke_never_claims_authentication_during_provider_availability_failure(self) -> None:
@@ -705,7 +705,7 @@ class AlpacaContractTests(unittest.TestCase):
                 200,
                 '{"quotes":{},"next_page_token":null}',
                 True,
-                "BLOCKED_IEX_FRESHNESS",
+                "BLOCKED_INCOMPLETE_COHORT",
             ),
         )
         for status, body, authenticated, expected in cases:

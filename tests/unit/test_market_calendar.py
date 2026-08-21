@@ -38,6 +38,50 @@ EXPECTED_CLOSED_DATES = (
 
 
 class MarketCalendarTests(unittest.TestCase):
+    def test_completed_session_selector_crosses_new_year_holiday(self) -> None:
+        prior = load_current_market_calendar(
+            PROJECT_ROOT,
+            as_of=REVIEWED_AS_OF,
+        )
+
+        try:
+            completed = market_calendar_module.latest_completed_session_window(
+                prior,
+                observed_at=datetime(2027, 1, 1, 17, 0, tzinfo=timezone.utc),
+            )
+        except CalendarError:
+            completed = None
+
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual(completed.session_date, date(2026, 12, 31))
+        self.assertEqual(
+            completed.closed_at,
+            datetime(2026, 12, 31, 16, 0, tzinfo=prior.timezone),
+        )
+
+    def test_completed_session_selector_uses_first_session_after_release(self) -> None:
+        current = MarketCalendar.from_mapping(
+            calendar_fixture(2027),
+            as_of=date(2027, 1, 4),
+            expected_year=2027,
+        )
+        market_calendar_module._register_calendar_authority(
+            market_calendar_module._RELEASE_CALENDARS,
+            current,
+        )
+
+        completed = market_calendar_module.latest_completed_session_window(
+            current,
+            observed_at=datetime(2027, 1, 4, 21, 16, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(getattr(completed, "session_date", None), date(2027, 1, 4))
+        self.assertEqual(
+            getattr(completed, "closed_at", None),
+            datetime(2027, 1, 4, 16, 0, tzinfo=current.timezone),
+        )
+
     def test_structural_and_pinned_release_authority_are_distinct(self) -> None:
         structural = MarketCalendar.load(
             PUBLISHED_CALENDAR,

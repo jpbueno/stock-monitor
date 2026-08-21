@@ -4,16 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .market_calendar import (
+    CalendarCoverageError,
     CalendarError,
     latest_completed_session_window,
     load_current_market_calendar,
 )
-from .providers.alpaca import AlpacaCredentials, AlpacaMarketData, EntitlementSmoke
+from .providers.alpaca import (
+    HISTORICAL_SIP_RELEASE_DELAY,
+    AlpacaCredentials,
+    AlpacaMarketData,
+    EntitlementSmoke,
+    TimeWindow,
+)
 from .providers.http import EgressPolicy, HttpGetClient
 
 
@@ -31,7 +38,12 @@ class ProviderSmokeResult:
     reason_codes: tuple[str, ...]
 
     @classmethod
-    def from_entitlement(cls, smoke: EntitlementSmoke) -> "ProviderSmokeResult":
+    def from_entitlement(
+        cls,
+        smoke: EntitlementSmoke,
+        *,
+        observed_at: datetime | None = None,
+    ) -> "ProviderSmokeResult":
         ready = bool(
             smoke.status == "READY"
             and smoke.authentication_ok
@@ -44,7 +56,7 @@ class ProviderSmokeResult:
             authentication_ok=smoke.authentication_ok,
             historical_sip_ok=smoke.historical_sip_ok,
             latest_iex_fresh=smoke.latest_iex_fresh,
-            observed_at=smoke.observed_at,
+            observed_at=smoke.observed_at if observed_at is None else observed_at,
             reason_codes=smoke.failures,
         )
 
@@ -69,13 +81,35 @@ def run_provider_smoke(
 ) -> ProviderSmokeResult:
     observed_at = now()
     try:
+        local_date = observed_at.astimezone(_ET).date()
         calendar = load_current_market_calendar(
             settings.project_root,
-            as_of=observed_at.astimezone(_ET).date(),
+            as_of=local_date,
         )
-        completed = latest_completed_session_window(
-            calendar,
-            observed_at=observed_at,
+        try:
+            completed_session = latest_completed_session_window(
+                calendar,
+                observed_at=observed_at,
+                release_delay=HISTORICAL_SIP_RELEASE_DELAY,
+            )
+        except CalendarCoverageError:
+            prior_date = date(local_date.year - 1, 12, 31)
+            prior_calendar = load_current_market_calendar(
+                settings.project_root,
+                as_of=prior_date,
+            )
+            completed_session = latest_completed_session_window(
+                prior_calendar,
+                observed_at=observed_at,
+                release_delay=HISTORICAL_SIP_RELEASE_DELAY,
+            )
+        completed = TimeWindow(
+            datetime.combine(
+                completed_session.session_date,
+                time.min,
+                tzinfo=completed_session.closed_at.tzinfo,
+            ),
+            completed_session.closed_at,
         )
     except CalendarError:
         return ProviderSmokeResult.from_entitlement(
@@ -96,11 +130,12 @@ def run_provider_smoke(
             settings.alpaca_api_secret_key,
         ),
         base_url=settings.sources.alpaca_market_data_url,
-        now=lambda: observed_at,
+        now=now,
         cache=None,
     )
     return ProviderSmokeResult.from_entitlement(
-        provider.smoke(completed_session=completed)
+        provider.smoke(completed_session=completed),
+        observed_at=observed_at,
     )
 
 

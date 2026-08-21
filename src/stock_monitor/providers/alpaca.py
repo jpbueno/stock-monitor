@@ -28,6 +28,7 @@ from .http import (
     GetTransport,
     HttpStatusError,
     HttpTransportError,
+    ProviderDataError,
     ProviderIncompleteError,
     ProviderMalformedError,
     ProviderResponseError,
@@ -40,7 +41,7 @@ _SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,9}\Z")
 _OCC_SYMBOL = re.compile(
     r"(?P<root>[A-Z]{1,6})(?P<date>[0-9]{6})(?P<right>[CP])(?P<strike>[0-9]{8})\Z"
 )
-_HISTORICAL_DELAY = timedelta(minutes=16)
+HISTORICAL_SIP_RELEASE_DELAY = timedelta(minutes=16)
 _LATEST_MAX_AGE_SECONDS = 300
 _MAX_PAGES = 100
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -71,10 +72,6 @@ _PAGE_SOURCE_CONTRACTS = {
 }
 
 
-class ProviderDataError(ProviderMalformedError):
-    """Market data is malformed, stale, or inconsistent with its requested feed."""
-
-
 class ProviderStaleError(ProviderDataError):
     """A structurally valid current-data observation is too old."""
 
@@ -103,26 +100,26 @@ def _utc(value: datetime, name: str) -> datetime:
 
 def _timestamp(value: object, name: str) -> datetime:
     if not isinstance(value, str) or not value:
-        raise ProviderDataError(f"{name} timestamp is missing")
+        raise ProviderMalformedError(f"{name} timestamp is missing")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        raise ProviderDataError(f"{name} timestamp is malformed") from None
+        raise ProviderMalformedError(f"{name} timestamp is malformed") from None
     try:
         return _utc(parsed, f"{name} timestamp")
     except ValueError:
-        raise ProviderDataError(f"{name} timestamp is malformed") from None
+        raise ProviderMalformedError(f"{name} timestamp is malformed") from None
 
 
 def _decimal(value: object, name: str, *, positive: bool = True) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
-        raise ProviderDataError(f"{name} is malformed")
+        raise ProviderMalformedError(f"{name} is malformed")
     try:
         result = Decimal(str(value))
     except InvalidOperation:
-        raise ProviderDataError(f"{name} is malformed") from None
+        raise ProviderMalformedError(f"{name} is malformed") from None
     if not result.is_finite() or (positive and result <= 0):
-        raise ProviderDataError(f"{name} is malformed")
+        raise ProviderMalformedError(f"{name} is malformed")
     return result
 
 
@@ -130,17 +127,17 @@ def _integer(value: object, name: str, *, optional: bool = False) -> int | None:
     if value is None and optional:
         return None
     if isinstance(value, bool):
-        raise ProviderDataError(f"{name} is malformed")
+        raise ProviderMalformedError(f"{name} is malformed")
     try:
         result = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError):
-        raise ProviderDataError(f"{name} is malformed") from None
+        raise ProviderMalformedError(f"{name} is malformed") from None
     if str(result) != str(value) and not (
         isinstance(value, str) and value.isdigit() and int(value) == result
     ):
-        raise ProviderDataError(f"{name} is malformed")
+        raise ProviderMalformedError(f"{name} is malformed")
     if result < 0:
-        raise ProviderDataError(f"{name} is malformed")
+        raise ProviderMalformedError(f"{name} is malformed")
     return result
 
 
@@ -148,7 +145,7 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for name, value in pairs:
         if name in result:
-            raise ProviderDataError("provider JSON contains duplicate fields")
+            raise ProviderMalformedError("provider JSON contains duplicate fields")
         result[name] = value
     return result
 
@@ -157,9 +154,9 @@ def _json_object(payload: bytes) -> dict[str, object]:
     try:
         value = json.loads(payload, object_pairs_hook=_object_pairs)
     except (UnicodeError, json.JSONDecodeError):
-        raise ProviderDataError("provider response is not valid JSON") from None
+        raise ProviderMalformedError("provider response is not valid JSON") from None
     if not isinstance(value, dict):
-        raise ProviderDataError("provider JSON root must be an object")
+        raise ProviderMalformedError("provider JSON root must be an object")
     return value
 
 
@@ -200,13 +197,13 @@ class AlpacaPageMetadata:
             or type(self.delay_seconds) is not int
             or self.delay_seconds < 0
         ):
-            raise ProviderDataError("Alpaca page metadata is malformed")
+            raise ProviderMalformedError("Alpaca page metadata is malformed")
         source_time = _utc(self.source_time, "source time")
         retrieved_at = _utc(self.retrieved_at, "retrieved time")
         if source_time > retrieved_at:
-            raise ProviderDataError("provider source timestamp is in the future")
+            raise ProviderMalformedError("provider source timestamp is in the future")
         if int((retrieved_at - source_time).total_seconds()) != self.delay_seconds:
-            raise ProviderDataError("Alpaca page delay is inconsistent")
+            raise ProviderMalformedError("Alpaca page delay is inconsistent")
         object.__setattr__(self, "source_time", source_time)
         object.__setattr__(self, "retrieved_at", retrieved_at)
 
@@ -223,19 +220,19 @@ class ProviderFetchPage:
 
     def __post_init__(self) -> None:
         if type(self.page_ordinal) is not int or self.page_ordinal <= 0:
-            raise ProviderDataError("provider fetch page ordinal is malformed")
+            raise ProviderMalformedError("provider fetch page ordinal is malformed")
         for value in (
             self.source_observation_id,
             self.source_type,
             self.request_url,
         ):
             if type(value) is not str or not value:
-                raise ProviderDataError("provider fetch page identity is malformed")
+                raise ProviderMalformedError("provider fetch page identity is malformed")
         for token in (self.request_page_token, self.next_page_token):
             if token is not None and (type(token) is not str or not token):
-                raise ProviderDataError("provider fetch page token is malformed")
+                raise ProviderMalformedError("provider fetch page token is malformed")
         if _SHA256_HEX.fullmatch(self.payload_sha256) is None:
-            raise ProviderDataError("provider fetch page digest is malformed")
+            raise ProviderMalformedError("provider fetch page digest is malformed")
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -272,7 +269,7 @@ class ProviderFetchManifest:
                 for prior, successor in zip(pages, pages[1:], strict=False)
             )
         ):
-            raise ProviderDataError("provider fetch manifest is malformed")
+            raise ProviderMalformedError("provider fetch manifest is malformed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,7 +303,7 @@ class NormalizedMarketFactSource:
             or _SHA256_HEX.fullmatch(self.normalized_fields_digest) is None
             or not isinstance(self.fetch_manifest, ProviderFetchManifest)
         ):
-            raise ProviderDataError("normalized market fact source is malformed")
+            raise ProviderMalformedError("normalized market fact source is malformed")
         matching_pages = tuple(
             page
             for page in self.fetch_manifest.pages
@@ -318,7 +315,7 @@ class NormalizedMarketFactSource:
             != self.source_observation_id
             or matching_pages[0].payload_sha256 != self.page_payload_sha256
         ):
-            raise ProviderDataError("normalized market fact page is inconsistent")
+            raise ProviderMalformedError("normalized market fact page is inconsistent")
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -408,7 +405,7 @@ class ProviderFetchCohort(Mapping[str, tuple[Bar | Quote | Trade, ...]]):
                 for symbol, values in entries
             )
         ):
-            raise ProviderDataError("provider fetch cohort is malformed")
+            raise ProviderMalformedError("provider fetch cohort is malformed")
 
     def __getitem__(self, symbol: str) -> tuple[Bar | Quote | Trade, ...]:
         for candidate, values in self._entries:
@@ -723,12 +720,12 @@ def _issue_provider_fetch_cohort(
 ) -> ProviderFetchCohort:
     issued_fetch = _issued_provider_fetch_manifest(owner, manifest)
     if issued_fetch is None:
-        raise ProviderDataError("provider fetch cohort authority is unverified")
+        raise ProviderMalformedError("provider fetch cohort authority is unverified")
     entries = tuple(
         (symbol, tuple(values[symbol])) for symbol in sorted(values)
     )
     if tuple(symbol for symbol, _facts in entries) != manifest.requested_symbols:
-        raise ProviderDataError("provider fetch cohort symbols are incomplete")
+        raise ProviderMalformedError("provider fetch cohort symbols are incomplete")
     actual_by_coordinate: dict[
         tuple[int, int, str],
         Bar | Quote | Trade,
@@ -741,7 +738,7 @@ def _issue_provider_fetch_cohort(
                 or authority.owner is not owner
                 or authority.source.fetch_manifest is not manifest
             ):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider fetch cohort fact authority is unverified"
                 )
             coordinate = (
@@ -750,7 +747,7 @@ def _issue_provider_fetch_cohort(
                 authority.source.source_item_path,
             )
             if coordinate in actual_by_coordinate:
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider fetch cohort duplicates a raw provider item"
                 )
             actual_by_coordinate[coordinate] = fact
@@ -787,7 +784,7 @@ def _issue_provider_fetch_cohort(
             for coordinate, expected_fact in expected_by_coordinate.items()
         )
     ):
-        raise ProviderDataError(
+        raise ProviderMalformedError(
             "provider fetch cohort is not the complete raw provider item cohort"
         )
     cohort = ProviderFetchCohort(entries)
@@ -871,7 +868,7 @@ def _mark_provider_fetch_cohort_replay_only(
     """Irreversibly narrow one issued cohort to restart-read use only."""
     authority = _provider_fetch_cohort_authority(cohort)
     if authority is None or not isinstance(cohort, ProviderFetchCohort):
-        raise ProviderDataError("provider fetch cohort authority is unverified")
+        raise ProviderMalformedError("provider fetch cohort authority is unverified")
     with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
         _REPLAY_ONLY_PROVIDER_FETCH_SCOPES[
             (id(authority.owner), id(authority.manifest))
@@ -879,7 +876,7 @@ def _mark_provider_fetch_cohort_replay_only(
         with _ISSUED_PROVIDER_FETCH_COHORTS_LOCK:
             current = _ISSUED_PROVIDER_FETCH_COHORTS.get(id(cohort))
             if current is None or current.reference() is not cohort:
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider fetch cohort authority changed during narrowing"
                 )
             for identity, candidate in tuple(
@@ -996,7 +993,7 @@ class ProviderOptionChain(Sequence[OptionSnapshot]):
             or len({item.occ_symbol for item in snapshots}) != len(snapshots)
             or len({item.underlying for item in snapshots}) != 1
         ):
-            raise ProviderDataError("provider option chain is malformed")
+            raise ProviderMalformedError("provider option chain is malformed")
 
     def __getitem__(self, index: int | slice):
         return self._snapshots[index]
@@ -1036,7 +1033,7 @@ def _issue_provider_option_chain(
 ) -> ProviderOptionChain:
     issued_fetch = _issued_provider_fetch_manifest(owner, manifest)
     if issued_fetch is None or manifest.collection != "snapshots":
-        raise ProviderDataError("provider option chain authority is unverified")
+        raise ProviderMalformedError("provider option chain authority is unverified")
     values = tuple(sorted(snapshots, key=lambda item: item.occ_symbol))
     actual_by_coordinate: dict[tuple[int, int, str], OptionSnapshot] = {}
     for snapshot in values:
@@ -1047,7 +1044,7 @@ def _issue_provider_option_chain(
             or authority.source.fetch_manifest is not manifest
             or authority.source.kind != "OPTION_SNAPSHOT"
         ):
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "provider option chain fact authority is unverified"
             )
         coordinate = (
@@ -1056,7 +1053,7 @@ def _issue_provider_option_chain(
             authority.source.source_item_path,
         )
         if coordinate in actual_by_coordinate:
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "provider option chain duplicates a raw provider item"
             )
         actual_by_coordinate[coordinate] = snapshot
@@ -1082,7 +1079,7 @@ def _issue_provider_option_chain(
                 source_item_path=item_path,
             )
             if not isinstance(expected, OptionSnapshot):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider option chain raw item is malformed"
                 )
             expected_by_coordinate[coordinate] = expected
@@ -1093,7 +1090,7 @@ def _issue_provider_option_chain(
             for coordinate, expected in expected_by_coordinate.items()
         )
     ):
-        raise ProviderDataError(
+        raise ProviderMalformedError(
             "provider option chain is not the complete raw snapshot cohort"
         )
     chain = ProviderOptionChain(values)
@@ -1167,7 +1164,7 @@ def _mark_provider_option_chain_replay_only(
     """Irreversibly narrow one exact option-fetch scope to replay use."""
     authority = _provider_option_chain_authority(chain)
     if authority is None or not isinstance(chain, ProviderOptionChain):
-        raise ProviderDataError("provider option chain authority is unverified")
+        raise ProviderMalformedError("provider option chain authority is unverified")
     with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
         _REPLAY_ONLY_PROVIDER_FETCH_SCOPES[
             (id(authority.owner), id(authority.manifest))
@@ -1175,7 +1172,7 @@ def _mark_provider_option_chain_replay_only(
         with _ISSUED_PROVIDER_OPTION_CHAINS_LOCK:
             current = _ISSUED_PROVIDER_OPTION_CHAINS.get(id(chain))
             if current is None or current.reference() is not chain:
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider option chain authority changed during narrowing"
                 )
             for identity, candidate in tuple(
@@ -1249,15 +1246,15 @@ def recompute_alpaca_page_metadata(
 ) -> AlpacaPageMetadata:
     """Purely recompute raw-page identity and chronology for persistence."""
     if not isinstance(payload, bytes) or not payload:
-        raise ProviderDataError("Alpaca page payload is malformed")
+        raise ProviderMalformedError("Alpaca page payload is malformed")
     contract = _PAGE_SOURCE_CONTRACTS.get(source_type)
     if contract is None:
-        raise ProviderDataError("Alpaca page source type is unsupported")
+        raise ProviderMalformedError("Alpaca page source type is unsupported")
     collection, expected_path, latest_shape = contract
     try:
         parsed_url = urllib.parse.urlsplit(request_url)
     except (TypeError, ValueError):
-        raise ProviderDataError("Alpaca page request URL is malformed") from None
+        raise ProviderMalformedError("Alpaca page request URL is malformed") from None
     option_underlying: str | None = None
     path_matches = parsed_url.path == expected_path
     if source_type == "ALPACA_OPTION_SNAPSHOTS":
@@ -1274,11 +1271,11 @@ def recompute_alpaca_page_metadata(
         or not path_matches
         or parsed_url.fragment
     ):
-        raise ProviderDataError("Alpaca page request URL is inconsistent")
+        raise ProviderMalformedError("Alpaca page request URL is inconsistent")
     document = _json_object(payload)
     raw_collection = document.get(collection)
     if not isinstance(raw_collection, dict):
-        raise ProviderDataError("Alpaca page collection is malformed")
+        raise ProviderMalformedError("Alpaca page collection is malformed")
     safe_retrieved_at = _utc(retrieved_at, "retrieved time")
     timestamps: list[datetime] = []
     for symbol in sorted(raw_collection):
@@ -1290,11 +1287,11 @@ def recompute_alpaca_page_metadata(
                 or match.group("root") != option_underlying
                 or not isinstance(raw_values, dict)
             ):
-                raise ProviderDataError("Alpaca option snapshot item is malformed")
+                raise ProviderMalformedError("Alpaca option snapshot item is malformed")
             quote = raw_values.get("latestQuote")
             if quote is not None:
                 if not isinstance(quote, dict):
-                    raise ProviderDataError(
+                    raise ProviderMalformedError(
                         "Alpaca option snapshot quote is malformed"
                     )
                 timestamps.append(
@@ -1302,16 +1299,16 @@ def recompute_alpaca_page_metadata(
                 )
             continue
         if not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None:
-            raise ProviderDataError("Alpaca page symbol is malformed")
+            raise ProviderMalformedError("Alpaca page symbol is malformed")
         if latest_shape:
             values = (raw_values,)
         else:
             if not isinstance(raw_values, list):
-                raise ProviderDataError("Alpaca page collection is malformed")
+                raise ProviderMalformedError("Alpaca page collection is malformed")
             values = tuple(raw_values)
         for value in values:
             if not isinstance(value, dict):
-                raise ProviderDataError("Alpaca page item is malformed")
+                raise ProviderMalformedError("Alpaca page item is malformed")
             timestamps.append(_timestamp(value.get("t"), collection[:-1]))
     if timestamps:
         source_time = max(timestamps)
@@ -1326,12 +1323,12 @@ def recompute_alpaca_page_metadata(
             strict_parsing=True,
         ).get("end", [])
         if len(end_values) != 1:
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "empty Alpaca page request has no exact end boundary"
             )
         source_time = _timestamp(end_values[0], "request end")
     if source_time > safe_retrieved_at:
-        raise ProviderDataError("provider source timestamp is in the future")
+        raise ProviderMalformedError("provider source timestamp is in the future")
     return AlpacaPageMetadata(
         source_observation_id=_source_observation_id_for_payload(
             source_type=source_type,
@@ -1352,9 +1349,9 @@ def _register_provider_fetch_manifest(
     pages: tuple[tuple[str, dict[str, object], bytes, str, str], ...],
 ) -> None:
     if not isinstance(owner, AlpacaMarketData):
-        raise ProviderDataError("provider fetch authority owner is unverified")
+        raise ProviderMalformedError("provider fetch authority owner is unverified")
     if len(pages) != len(manifest.pages):
-        raise ProviderDataError("provider fetch authority pages are incomplete")
+        raise ProviderMalformedError("provider fetch authority pages are incomplete")
     raw_pages: list[bytes] = []
     observations: list[SourceObservation] = []
     for manifest_page, (
@@ -1367,8 +1364,8 @@ def _register_provider_fetch_manifest(
         observation = owner._observations.get(observation_id)
         try:
             reparsed = _json_object(payload)
-        except ProviderDataError:
-            raise ProviderDataError(
+        except ProviderMalformedError:
+            raise ProviderMalformedError(
                 "provider fetch authority payload is malformed"
             ) from None
         if (
@@ -1389,7 +1386,7 @@ def _register_provider_fetch_manifest(
             != observation_id
             or reparsed != document
         ):
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "provider fetch authority does not match pinned raw pages"
             )
         raw_pages.append(payload)
@@ -1586,32 +1583,32 @@ def _raw_provider_items(
     document = _json_object(payload)
     raw_collection = document.get(manifest.collection)
     if not isinstance(raw_collection, dict):
-        raise ProviderDataError("provider fetch raw collection is malformed")
+        raise ProviderMalformedError("provider fetch raw collection is malformed")
     current_ordinal = 0
     result: list[tuple[int, str, str, dict[str, object]]] = []
     latest_quote = page.source_type == "ALPACA_LATEST_QUOTES"
     option_snapshot = page.source_type == "ALPACA_OPTION_SNAPSHOTS"
     if (manifest.collection == "snapshots") != option_snapshot:
-        raise ProviderDataError("provider fetch snapshot source is inconsistent")
+        raise ProviderMalformedError("provider fetch snapshot source is inconsistent")
     for symbol in sorted(raw_collection):
         raw_values = raw_collection[symbol]
         if option_snapshot:
             match = _OCC_SYMBOL.fullmatch(symbol) if isinstance(symbol, str) else None
             if match is None or match.group("root") not in manifest.requested_symbols:
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider fetch contains an unrequested option snapshot"
                 )
         elif not isinstance(symbol, str) or symbol not in manifest.requested_symbols:
-            raise ProviderDataError("provider fetch contains an unrequested symbol")
+            raise ProviderMalformedError("provider fetch contains an unrequested symbol")
         if latest_quote or option_snapshot:
             values = (raw_values,)
         else:
             if not isinstance(raw_values, list):
-                raise ProviderDataError("provider fetch raw collection is malformed")
+                raise ProviderMalformedError("provider fetch raw collection is malformed")
             values = tuple(raw_values)
         for item_index, value in enumerate(values):
             if not isinstance(value, dict):
-                raise ProviderDataError("provider fetch raw item is malformed")
+                raise ProviderMalformedError("provider fetch raw item is malformed")
             current_ordinal += 1
             item_path = (
                 f"$.{manifest.collection}.{symbol}"
@@ -1640,7 +1637,7 @@ def _raw_provider_item(
             and item_path == source_item_path
         ):
             return symbol, value
-    raise ProviderDataError(
+    raise ProviderMalformedError(
         "normalized market fact does not match an exact raw provider item"
     )
 
@@ -1663,49 +1660,49 @@ def _market_fact_from_raw_provider_item(
     )
     if manifest.collection == "snapshots":
         if page.source_type != "ALPACA_OPTION_SNAPSHOTS":
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "provider OPTION_SNAPSHOT source type is inconsistent"
             )
         match = _OCC_SYMBOL.fullmatch(symbol)
         if match is None or match.group("root") not in manifest.requested_symbols:
-            raise ProviderDataError("indicative option snapshot is malformed")
+            raise ProviderMalformedError("indicative option snapshot is malformed")
         quote = value.get("latestQuote")
         bid: Decimal | None = None
         ask: Decimal | None = None
         observed_at: datetime | None = None
         if quote is not None:
             if not isinstance(quote, dict):
-                raise ProviderDataError("indicative option quote is malformed")
+                raise ProviderMalformedError("indicative option quote is malformed")
             bid = _decimal(quote.get("bp"), "option bid", positive=False)
             ask = _decimal(quote.get("ap"), "option ask", positive=False)
             if bid < 0 or ask < 0:
-                raise ProviderDataError("indicative option quote is negative")
+                raise ProviderMalformedError("indicative option quote is negative")
             if ask < bid:
-                raise ProviderDataError("indicative option quote is crossed")
+                raise ProviderMalformedError("indicative option quote is crossed")
             observed_at = _timestamp(quote.get("t"), "option quote")
             if observed_at > observation.retrieved_at:
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider option timestamp is in the future"
                 )
         greeks = value.get("greeks")
         delta: Decimal | None = None
         if greeks is not None:
             if not isinstance(greeks, dict):
-                raise ProviderDataError("indicative option greeks are malformed")
+                raise ProviderMalformedError("indicative option greeks are malformed")
             delta = _decimal(
                 greeks.get("delta"),
                 "option delta",
                 positive=False,
             )
             if not Decimal("-1") <= delta <= Decimal("1"):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "indicative option delta is outside its bounds"
                 )
         daily_bar = value.get("dailyBar")
         volume: int | None = None
         if daily_bar is not None:
             if not isinstance(daily_bar, dict):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "indicative option daily bar is malformed"
                 )
             volume = _integer(
@@ -1716,7 +1713,7 @@ def _market_fact_from_raw_provider_item(
         try:
             expiration = datetime.strptime(match.group("date"), "%y%m%d").date()
         except ValueError:
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "indicative option expiration is malformed"
             ) from None
         return OptionSnapshot(
@@ -1739,7 +1736,7 @@ def _market_fact_from_raw_provider_item(
             "ALPACA_DAILY_BARS",
             "ALPACA_INTRADAY_BARS",
         }:
-            raise ProviderDataError("provider BAR source type is inconsistent")
+            raise ProviderMalformedError("provider BAR source type is inconsistent")
         open_price = _decimal(value.get("o"), "bar open")
         high = _decimal(value.get("h"), "bar high")
         low = _decimal(value.get("l"), "bar low")
@@ -1751,7 +1748,7 @@ def _market_fact_from_raw_provider_item(
             close,
             high,
         ):
-            raise ProviderDataError("provider bar OHLC values are inconsistent")
+            raise ProviderMalformedError("provider bar OHLC values are inconsistent")
         return Bar(
             symbol=symbol,
             timestamp=timestamp,
@@ -1770,7 +1767,7 @@ def _market_fact_from_raw_provider_item(
         elif page.source_type == "ALPACA_LATEST_QUOTES":
             feed = "iex"
         else:
-            raise ProviderDataError("provider QUOTE source type is inconsistent")
+            raise ProviderMalformedError("provider QUOTE source type is inconsistent")
         quote = AlpacaMarketData._quote(
             symbol,
             timestamp,
@@ -1787,10 +1784,10 @@ def _market_fact_from_raw_provider_item(
         return quote
     if manifest.collection == "trades":
         if page.source_type != "ALPACA_HISTORICAL_TRADES":
-            raise ProviderDataError("provider TRADE source type is inconsistent")
+            raise ProviderMalformedError("provider TRADE source type is inconsistent")
         payload_feed = value.get("feed")
         if payload_feed is not None and payload_feed != "sip":
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "provider trade feed conflicts with requested feed"
             )
         price = _decimal(value.get("p"), "trade price")
@@ -1799,7 +1796,7 @@ def _market_fact_from_raw_provider_item(
         assert size is not None
         assert sequence is not None
         if size <= 0:
-            raise ProviderDataError("trade size is malformed")
+            raise ProviderMalformedError("trade size is malformed")
         return Trade(
             symbol=symbol,
             timestamp=timestamp,
@@ -1809,7 +1806,7 @@ def _market_fact_from_raw_provider_item(
             sequence=sequence,
             source_observation_id=page.source_observation_id,
         )
-    raise ProviderDataError("normalized market fact collection is unsupported")
+    raise ProviderMalformedError("normalized market fact collection is unsupported")
 
 
 def _issue_market_fact_from_fetch(
@@ -1823,13 +1820,13 @@ def _issue_market_fact_from_fetch(
 ) -> Bar | Quote | Trade | OptionSnapshot:
     issued_fetch = _issued_provider_fetch_manifest(owner, fetch_manifest)
     if issued_fetch is None:
-        raise ProviderDataError("provider fetch authority is unverified")
+        raise ProviderMalformedError("provider fetch authority is unverified")
     try:
         page_index = tuple(
             page.page_ordinal for page in fetch_manifest.pages
         ).index(page_ordinal)
     except ValueError:
-        raise ProviderDataError("normalized market fact page is missing") from None
+        raise ProviderMalformedError("normalized market fact page is missing") from None
     matching_page = fetch_manifest.pages[page_index]
     normalized_fact = _market_fact_from_raw_provider_item(
         manifest=fetch_manifest,
@@ -1841,10 +1838,10 @@ def _issue_market_fact_from_fetch(
     )
     if fact is not None:
         if fact != normalized_fact:
-            raise ProviderDataError(
+            raise ProviderMalformedError(
                 "normalized market fact does not match the raw provider item"
             )
-        raise ProviderDataError(
+        raise ProviderMalformedError(
             "caller-supplied normalized market fact registrar is unavailable"
         )
     kind = (
@@ -1962,7 +1959,7 @@ class AlpacaMarketData:
         retrieved_at = self._current_time()
         safe_timestamp = _utc(source_timestamp, "source timestamp")
         if safe_timestamp > retrieved_at:
-            raise ProviderDataError("provider source timestamp is in the future")
+            raise ProviderMalformedError("provider source timestamp is in the future")
         if source_type in _PAGE_SOURCE_CONTRACTS:
             metadata = recompute_alpaca_page_metadata(
                 payload=payload,
@@ -1974,7 +1971,7 @@ class AlpacaMarketData:
                 source_type != "ALPACA_OPTION_SNAPSHOTS"
                 and metadata.source_time != safe_timestamp
             ):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider source timestamp conflicts with its raw page"
                 )
             safe_timestamp = metadata.source_time
@@ -2017,8 +2014,8 @@ class AlpacaMarketData:
     def _validate_historical_window(self, window: TimeWindow) -> None:
         if not isinstance(window, TimeWindow):
             raise TypeError("historical window has the wrong type")
-        if self._current_time() - window.end < _HISTORICAL_DELAY:
-            raise ProviderDataError(
+        if self._current_time() - window.end < HISTORICAL_SIP_RELEASE_DELAY:
+            raise ProviderMalformedError(
                 "historical SIP window must end at least sixteen minutes ago"
             )
 
@@ -2095,7 +2092,7 @@ class AlpacaMarketData:
             assert isinstance(raw_collection, dict)
             unknown = set(raw_collection) - set(requested)
             if unknown:
-                raise ProviderDataError("provider bars contain an unrequested symbol")
+                raise ProviderMalformedError("provider bars contain an unrequested symbol")
             parsed_page: list[
                 tuple[str, datetime, dict[str, object], int, str]
             ] = []
@@ -2103,13 +2100,13 @@ class AlpacaMarketData:
             for symbol in sorted(raw_collection):
                 values = raw_collection[symbol]
                 if not isinstance(symbol, str) or not isinstance(values, list):
-                    raise ProviderDataError("provider bars collection is malformed")
+                    raise ProviderMalformedError("provider bars collection is malformed")
                 for index, value in enumerate(values):
                     if not isinstance(value, dict):
-                        raise ProviderDataError("provider bar is malformed")
+                        raise ProviderMalformedError("provider bar is malformed")
                     timestamp = _timestamp(value.get("t"), "bar")
                     if not window.start <= timestamp <= window.end:
-                        raise ProviderDataError(
+                        raise ProviderMalformedError(
                             "provider bar lies outside the requested window"
                         )
                     source_item_ordinal += 1
@@ -2150,7 +2147,7 @@ class AlpacaMarketData:
                 volume = _integer(value.get("v"), "bar volume")
                 assert volume is not None
                 if high < max(open_price, close, low) or low > min(open_price, close, high):
-                    raise ProviderDataError("provider bar OHLC values are inconsistent")
+                    raise ProviderMalformedError("provider bar OHLC values are inconsistent")
                 bar = Bar(
                     symbol=symbol,
                     timestamp=timestamp,
@@ -2186,7 +2183,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, Bar):
-                raise ProviderDataError("provider BAR authority is malformed")
+                raise ProviderMalformedError("provider BAR authority is malformed")
             issued_result[fact.symbol].append(fact)
         issued_values = self._complete_bars(
             issued_result,
@@ -2263,7 +2260,7 @@ class AlpacaMarketData:
             raw_collection = document["bars"]
             assert isinstance(raw_collection, dict)
             if set(raw_collection) - set(requested):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider bars contain an unrequested symbol"
                 )
             parsed_page: list[
@@ -2273,15 +2270,15 @@ class AlpacaMarketData:
             for symbol in sorted(raw_collection):
                 values = raw_collection[symbol]
                 if not isinstance(symbol, str) or not isinstance(values, list):
-                    raise ProviderDataError(
+                    raise ProviderMalformedError(
                         "provider bars collection is malformed"
                     )
                 for index, value in enumerate(values):
                     if not isinstance(value, dict):
-                        raise ProviderDataError("provider bar is malformed")
+                        raise ProviderMalformedError("provider bar is malformed")
                     timestamp = _timestamp(value.get("t"), "bar")
                     if not window.start <= timestamp <= window.end:
-                        raise ProviderDataError(
+                        raise ProviderMalformedError(
                             "provider bar lies outside the requested window"
                         )
                     source_item_ordinal += 1
@@ -2328,7 +2325,7 @@ class AlpacaMarketData:
                     close,
                     high,
                 ):
-                    raise ProviderDataError(
+                    raise ProviderMalformedError(
                         "provider bar OHLC values are inconsistent"
                     )
                 result[symbol].append(
@@ -2377,7 +2374,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, Bar):
-                raise ProviderDataError("provider BAR authority is malformed")
+                raise ProviderMalformedError("provider BAR authority is malformed")
             issued_result[fact.symbol].append(fact)
         issued_values = self._complete_bars(
             issued_result,
@@ -2421,7 +2418,7 @@ class AlpacaMarketData:
             raw_collection = document["trades"]
             assert isinstance(raw_collection, dict)
             if set(raw_collection) - set(requested):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider trades contain an unrequested symbol"
                 )
             parsed_page: list[
@@ -2431,15 +2428,15 @@ class AlpacaMarketData:
             for symbol in sorted(raw_collection):
                 values = raw_collection[symbol]
                 if not isinstance(symbol, str) or not isinstance(values, list):
-                    raise ProviderDataError(
+                    raise ProviderMalformedError(
                         "provider trades collection is malformed"
                     )
                 for index, value in enumerate(values):
                     if not isinstance(value, dict):
-                        raise ProviderDataError("provider trade is malformed")
+                        raise ProviderMalformedError("provider trade is malformed")
                     timestamp = _timestamp(value.get("t"), "trade")
                     if not window.start <= timestamp <= window.end:
-                        raise ProviderDataError(
+                        raise ProviderMalformedError(
                             "provider trade lies outside the requested window"
                         )
                     source_item_ordinal += 1
@@ -2480,7 +2477,7 @@ class AlpacaMarketData:
             ) in parsed_page:
                 payload_feed = value.get("feed")
                 if payload_feed is not None and payload_feed != "sip":
-                    raise ProviderDataError(
+                    raise ProviderMalformedError(
                         "provider trade feed conflicts with requested feed"
                     )
                 price = _decimal(value.get("p"), "trade price")
@@ -2489,7 +2486,7 @@ class AlpacaMarketData:
                 assert size is not None
                 assert sequence is not None
                 if size <= 0:
-                    raise ProviderDataError("trade size is malformed")
+                    raise ProviderMalformedError("trade size is malformed")
                 trade = Trade(
                     symbol=symbol,
                     timestamp=timestamp,
@@ -2537,7 +2534,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, Trade):
-                raise ProviderDataError("provider TRADE authority is malformed")
+                raise ProviderMalformedError("provider TRADE authority is malformed")
             issued_result[fact.symbol].append(fact)
         issued_values = {
             symbol: tuple(
@@ -2586,7 +2583,7 @@ class AlpacaMarketData:
             assert isinstance(raw_collection, dict)
             unknown = set(raw_collection) - set(requested)
             if unknown:
-                raise ProviderDataError("provider quotes contain an unrequested symbol")
+                raise ProviderMalformedError("provider quotes contain an unrequested symbol")
             parsed_page: list[
                 tuple[str, datetime, dict[str, object], int, str]
             ] = []
@@ -2594,13 +2591,13 @@ class AlpacaMarketData:
             for symbol in sorted(raw_collection):
                 values = raw_collection[symbol]
                 if not isinstance(symbol, str) or not isinstance(values, list):
-                    raise ProviderDataError("provider quotes collection is malformed")
+                    raise ProviderMalformedError("provider quotes collection is malformed")
                 for index, value in enumerate(values):
                     if not isinstance(value, dict):
-                        raise ProviderDataError("provider quote is malformed")
+                        raise ProviderMalformedError("provider quote is malformed")
                     timestamp = _timestamp(value.get("t"), "quote")
                     if not window.start <= timestamp <= window.end:
-                        raise ProviderDataError(
+                        raise ProviderMalformedError(
                             "provider quote lies outside the requested window"
                         )
                     source_item_ordinal += 1
@@ -2679,7 +2676,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, Quote):
-                raise ProviderDataError("provider QUOTE authority is malformed")
+                raise ProviderMalformedError("provider QUOTE authority is malformed")
             issued_result[fact.symbol].append(fact)
         issued_values = {
             symbol: tuple(
@@ -2708,14 +2705,14 @@ class AlpacaMarketData:
     ) -> Quote:
         payload_feed = value.get("feed")
         if payload_feed is not None and payload_feed != feed:
-            raise ProviderDataError("provider quote feed conflicts with requested feed")
+            raise ProviderMalformedError("provider quote feed conflicts with requested feed")
         bid = _decimal(value.get("bp"), "quote bid")
         ask = _decimal(value.get("ap"), "quote ask")
         if ask < bid:
-            raise ProviderDataError("provider quote is crossed")
+            raise ProviderMalformedError("provider quote is crossed")
         exact_age = (now - timestamp).total_seconds()
         if exact_age < 0:
-            raise ProviderDataError("provider quote timestamp is in the future")
+            raise ProviderMalformedError("provider quote timestamp is in the future")
         age = math.ceil(exact_age)
         sequence = _integer(value.get("i"), "quote sequence", optional=True)
         return Quote(
@@ -2749,7 +2746,7 @@ class AlpacaMarketData:
         for symbol in requested:
             value = raw[symbol]
             if not isinstance(value, dict):
-                raise ProviderDataError("provider latest quote is malformed")
+                raise ProviderMalformedError("provider latest quote is malformed")
             parsed.append((symbol, _timestamp(value.get("t"), "latest quote"), value))
         observation_id = self._pin(
             url=url,
@@ -2809,7 +2806,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, Quote):
-                raise ProviderDataError("provider QUOTE authority is malformed")
+                raise ProviderMalformedError("provider QUOTE authority is malformed")
             issued_result[fact.symbol] = fact
         return issued_result
 
@@ -2840,7 +2837,7 @@ class AlpacaMarketData:
                 value = raw[occ_symbol]
                 match = _OCC_SYMBOL.fullmatch(occ_symbol) if isinstance(occ_symbol, str) else None
                 if match is None or not isinstance(value, dict) or match.group("root") != symbol:
-                    raise ProviderDataError("indicative option snapshot is malformed")
+                    raise ProviderMalformedError("indicative option snapshot is malformed")
                 if occ_symbol in seen_occ_symbols:
                     raise ProviderIncompleteError(
                         "option snapshot is duplicated across pages"
@@ -2890,7 +2887,7 @@ class AlpacaMarketData:
                 source_item_path=item_path,
             )
             if not isinstance(fact, OptionSnapshot):
-                raise ProviderDataError(
+                raise ProviderMalformedError(
                     "provider OPTION_SNAPSHOT authority is malformed"
                 )
             snapshots[fact.occ_symbol] = fact
@@ -2910,8 +2907,6 @@ class AlpacaMarketData:
         authenticated = False
         iex_fresh = False
         sip_ok = False
-        connectivity_failed = False
-        availability_failed = False
         failures: list[str] = []
 
         def add_failure(reason: str) -> None:
@@ -2923,14 +2918,12 @@ class AlpacaMarketData:
             *,
             check: str,
         ) -> None:
-            nonlocal authenticated, connectivity_failed, availability_failed
+            nonlocal authenticated
             if isinstance(error, HttpTransportError):
-                connectivity_failed = True
                 add_failure("CONNECTIVITY_UNAVAILABLE")
                 return
             if isinstance(error, HttpStatusError):
                 if error.status in {408, 425, 429} or 500 <= error.status <= 599:
-                    availability_failed = True
                     add_failure("PROVIDER_AVAILABILITY_UNAVAILABLE")
                 elif check == "iex" and error.status in {401, 403}:
                     add_failure("AUTHENTICATION_UNAVAILABLE")
@@ -2968,18 +2961,26 @@ class AlpacaMarketData:
                     sip_ok = True
                 except ProviderResponseError as error:
                     classify(error, check="sip")
-        if connectivity_failed:
-            status = "BLOCKED_CONNECTIVITY"
-        elif availability_failed:
-            status = "BLOCKED_AVAILABILITY"
-        elif not authenticated:
-            status = "BLOCKED_AUTHENTICATION"
-        elif not iex_fresh:
-            status = "BLOCKED_IEX_FRESHNESS"
-        elif not sip_ok:
-            status = "BLOCKED_ENTITLEMENT"
-        else:
-            status = "READY"
+        status = "READY"
+        for reason, blocked_status in (
+            ("CONNECTIVITY_UNAVAILABLE", "BLOCKED_CONNECTIVITY"),
+            ("PROVIDER_AVAILABILITY_UNAVAILABLE", "BLOCKED_AVAILABILITY"),
+            ("AUTHENTICATION_UNAVAILABLE", "BLOCKED_AUTHENTICATION"),
+            ("MALFORMED_PROVIDER_RESPONSE", "BLOCKED_MALFORMED_RESPONSE"),
+            ("PROVIDER_COHORT_INCOMPLETE", "BLOCKED_INCOMPLETE_COHORT"),
+            ("IEX_QUOTE_STALE", "BLOCKED_IEX_FRESHNESS"),
+            (
+                "COMPLETED_SESSION_RELEASE_UNAVAILABLE",
+                "BLOCKED_COMPLETED_SESSION",
+            ),
+            (
+                "HISTORICAL_SIP_ENTITLEMENT_UNAVAILABLE",
+                "BLOCKED_ENTITLEMENT",
+            ),
+        ):
+            if reason in failures:
+                status = blocked_status
+                break
         return EntitlementSmoke(
             authentication_ok=authenticated,
             historical_sip_ok=sip_ok,
@@ -2996,6 +2997,7 @@ __all__ = [
     "AlpacaPageMetadata",
     "Bar",
     "EntitlementSmoke",
+    "HISTORICAL_SIP_RELEASE_DELAY",
     "OptionSnapshot",
     "NormalizedMarketFactSource",
     "ProviderDataError",

@@ -74,7 +74,11 @@ class HttpStatusError(ProviderResponseError):
         super().__init__(f"source returned HTTP {status} for {target}")
 
 
-class ProviderMalformedError(ProviderResponseError):
+class ProviderDataError(ProviderResponseError):
+    """Provider data cannot be accepted without identifying one subtype."""
+
+
+class ProviderMalformedError(ProviderDataError):
     """A provider response cannot be safely interpreted."""
 
 
@@ -500,6 +504,7 @@ __all__ = [
     "NetworkPolicyError",
     "NoAutomaticRedirects",
     "ProviderIncompleteError",
+    "ProviderDataError",
     "ProviderMalformedError",
     "ProviderResponseError",
     "get_with_redirects",

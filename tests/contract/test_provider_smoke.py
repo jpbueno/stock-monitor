@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 from stock_monitor.config import load_settings
-from stock_monitor.market_calendar import CalendarError
+import stock_monitor.market_calendar as market_calendar_module
+from stock_monitor.market_calendar import (
+    CalendarError,
+    MarketCalendar,
+    load_current_market_calendar,
+)
 from stock_monitor.provider_smoke import ProviderSmokeResult, run_provider_smoke
 from stock_monitor.providers.alpaca import (
     AlpacaCredentials,
     AlpacaMarketData,
+    ProviderDataError,
     ProviderMalformedError,
     ProviderStaleError,
     TimeWindow,
@@ -23,14 +29,16 @@ from stock_monitor.providers.http import (
     HttpResponse,
     HttpStatusError,
     HttpTransportError,
+    ProviderResponseError,
     get_with_redirects,
 )
+from tests.support import calendar_fixture
 
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
 COMPLETED = TimeWindow(
-    datetime(2026, 8, 13, 13, 30, tzinfo=UTC),
+    datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
     datetime(2026, 8, 13, 20, 0, tzinfo=UTC),
 )
 
@@ -54,16 +62,20 @@ class RoutingTransport:
         )
 
 
-def _fresh_iex() -> str:
+def _fresh_iex(timestamp: str = "2026-08-14T12:59:00Z") -> str:
     return (
-        '{"quotes":{"SPY":{"t":"2026-08-14T12:59:00Z",'
+        '{"quotes":{"SPY":{"t":"'
+        + timestamp
+        + '",'
         '"bp":"651.9","ap":"652.1"}},"next_page_token":null}'
     )
 
 
-def _completed_sip() -> str:
+def _completed_sip(timestamp: str = "2026-08-13T04:00:00Z") -> str:
     return (
-        '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+        '{"bars":{"SPY":[{"t":"'
+        + timestamp
+        + '",'
         '"o":1,"h":1,"l":1,"c":1,"v":1}]},"next_page_token":null}'
     )
 
@@ -107,11 +119,14 @@ class ProviderSmokeContractTests(unittest.TestCase):
         sip_url = next(
             url for url in transport.requested_urls if urlsplit(url).path.endswith("/bars")
         )
-        self.assertEqual(parse_qs(urlsplit(sip_url).query)["feed"], ["sip"])
+        sip_query = parse_qs(urlsplit(sip_url).query)
+        self.assertEqual(sip_query["feed"], ["sip"])
+        self.assertEqual(sip_query["start"], ["2026-08-13T04:00:00Z"])
+        self.assertEqual(sip_query["end"], ["2026-08-13T20:00:00Z"])
         self.assertFalse((self.home / ".stock-monitor").exists())
         self.assertFalse((self.home / "reports").exists())
 
-    def test_expected_typed_failures_are_safe_exit_three(self) -> None:
+    def test_expected_typed_failures_have_exact_safe_results(self) -> None:
         def smoke(responder, *, completed_session=COMPLETED) -> ProviderSmokeResult:
             provider = AlpacaMarketData(
                 RoutingTransport(responder),
@@ -128,25 +143,53 @@ class ProviderSmokeContractTests(unittest.TestCase):
                 "authentication",
                 lambda _: (401, '{"message":"unauthorized"}'),
                 COMPLETED,
-                "AUTHENTICATION_UNAVAILABLE",
+                (
+                    "BLOCKED_AUTHENTICATION",
+                    3,
+                    False,
+                    False,
+                    False,
+                    ("AUTHENTICATION_UNAVAILABLE",),
+                ),
             ),
             (
                 "connectivity",
                 lambda _: HttpTransportError("canary transport detail"),
                 COMPLETED,
-                "CONNECTIVITY_UNAVAILABLE",
+                (
+                    "BLOCKED_CONNECTIVITY",
+                    3,
+                    False,
+                    False,
+                    False,
+                    ("CONNECTIVITY_UNAVAILABLE",),
+                ),
             ),
             (
                 "availability",
                 lambda _: (503, '{"message":"unavailable"}'),
                 COMPLETED,
-                "PROVIDER_AVAILABILITY_UNAVAILABLE",
+                (
+                    "BLOCKED_AVAILABILITY",
+                    3,
+                    False,
+                    False,
+                    False,
+                    ("PROVIDER_AVAILABILITY_UNAVAILABLE",),
+                ),
             ),
             (
                 "malformed",
                 lambda _: (200, "not-json"),
                 COMPLETED,
-                "MALFORMED_PROVIDER_RESPONSE",
+                (
+                    "BLOCKED_MALFORMED_RESPONSE",
+                    3,
+                    True,
+                    False,
+                    False,
+                    ("MALFORMED_PROVIDER_RESPONSE",),
+                ),
             ),
             (
                 "stale_iex",
@@ -158,7 +201,14 @@ class ProviderSmokeContractTests(unittest.TestCase):
                     '"bp":1,"ap":1.01}},"next_page_token":null}',
                 ),
                 COMPLETED,
-                "IEX_QUOTE_STALE",
+                (
+                    "BLOCKED_IEX_FRESHNESS",
+                    3,
+                    True,
+                    True,
+                    False,
+                    ("IEX_QUOTE_STALE",),
+                ),
             ),
             (
                 "incomplete_cohort",
@@ -166,7 +216,14 @@ class ProviderSmokeContractTests(unittest.TestCase):
                 if urlsplit(url).path.endswith("/bars")
                 else (200, '{"quotes":{},"next_page_token":null}'),
                 COMPLETED,
-                "PROVIDER_COHORT_INCOMPLETE",
+                (
+                    "BLOCKED_INCOMPLETE_COHORT",
+                    3,
+                    True,
+                    True,
+                    False,
+                    ("PROVIDER_COHORT_INCOMPLETE",),
+                ),
             ),
             (
                 "sip_entitlement",
@@ -174,20 +231,74 @@ class ProviderSmokeContractTests(unittest.TestCase):
                 if urlsplit(url).path.endswith("/bars")
                 else (200, _fresh_iex()),
                 COMPLETED,
-                "HISTORICAL_SIP_ENTITLEMENT_UNAVAILABLE",
+                (
+                    "BLOCKED_ENTITLEMENT",
+                    3,
+                    True,
+                    False,
+                    True,
+                    ("HISTORICAL_SIP_ENTITLEMENT_UNAVAILABLE",),
+                ),
             ),
             (
                 "completed_session",
                 lambda _: (200, _fresh_iex()),
                 None,
-                "COMPLETED_SESSION_RELEASE_UNAVAILABLE",
+                (
+                    "BLOCKED_COMPLETED_SESSION",
+                    3,
+                    True,
+                    False,
+                    True,
+                    ("COMPLETED_SESSION_RELEASE_UNAVAILABLE",),
+                ),
+            ),
+            (
+                "malformed_sip",
+                lambda url: (200, "not-json")
+                if urlsplit(url).path.endswith("/bars")
+                else (200, _fresh_iex()),
+                COMPLETED,
+                (
+                    "BLOCKED_MALFORMED_RESPONSE",
+                    3,
+                    True,
+                    False,
+                    True,
+                    ("MALFORMED_PROVIDER_RESPONSE",),
+                ),
+            ),
+            (
+                "incomplete_sip",
+                lambda url: (200, '{"bars":{},"next_page_token":null}')
+                if urlsplit(url).path.endswith("/bars")
+                else (200, _fresh_iex()),
+                COMPLETED,
+                (
+                    "BLOCKED_INCOMPLETE_COHORT",
+                    3,
+                    True,
+                    False,
+                    True,
+                    ("PROVIDER_COHORT_INCOMPLETE",),
+                ),
             ),
         )
-        for name, responder, completed_session, reason in cases:
+        for name, responder, completed_session, expected in cases:
             with self.subTest(name=name):
                 result = smoke(responder, completed_session=completed_session)
-                self.assertEqual(result.exit_code, 3)
-                self.assertIn(reason, result.reason_codes)
+                self.assertEqual(
+                    (
+                        result.status,
+                        result.exit_code,
+                        result.authentication_ok,
+                        result.historical_sip_ok,
+                        result.latest_iex_fresh,
+                        result.reason_codes,
+                    ),
+                    expected,
+                )
+                self.assertEqual(result.observed_at, NOW)
                 self.assertEqual(
                     set(result.safe_fields()),
                     {"status", "exit_code", "observed_at", "checks", "reason_codes"},
@@ -229,6 +340,117 @@ class ProviderSmokeContractTests(unittest.TestCase):
         )
         with self.assertRaises(ProviderStaleError):
             stale.latest_iex_quotes(("SPY",))
+
+        self.assertTrue(issubclass(ProviderStaleError, ProviderDataError))
+        self.assertTrue(issubclass(ProviderStaleError, ProviderResponseError))
+        self.assertFalse(issubclass(ProviderStaleError, ProviderMalformedError))
+
+    def test_provider_clock_advances_while_observed_at_stays_at_invocation_start(
+        self,
+    ) -> None:
+        instants = iter(
+            (
+                datetime(2026, 8, 14, 13, 0, 0, tzinfo=UTC),
+                datetime(2026, 8, 14, 13, 0, 0, 100_000, tzinfo=UTC),
+                datetime(2026, 8, 14, 13, 0, 2, tzinfo=UTC),
+                datetime(2026, 8, 14, 13, 0, 3, tzinfo=UTC),
+                datetime(2026, 8, 14, 13, 0, 4, tzinfo=UTC),
+            )
+        )
+        calls: list[datetime] = []
+
+        def clock() -> datetime:
+            value = next(instants)
+            calls.append(value)
+            return value
+
+        transport = RoutingTransport(
+            lambda url: (200, _completed_sip())
+            if urlsplit(url).path.endswith("/bars")
+            else (200, _fresh_iex("2026-08-14T13:00:01Z"))
+        )
+        with patch("stock_monitor.provider_smoke.HttpGetClient", return_value=transport):
+            result = run_provider_smoke(self.settings, now=clock)
+
+        self.assertEqual((result.status, result.exit_code), ("READY", 0))
+        self.assertEqual(result.observed_at, calls[0])
+        self.assertEqual(len(calls), 5)
+
+    def test_new_year_premarket_uses_verified_prior_year_completed_session(
+        self,
+    ) -> None:
+        current = MarketCalendar.from_mapping(
+            calendar_fixture(2027),
+            as_of=date(2027, 1, 4),
+            expected_year=2027,
+        )
+        market_calendar_module._register_calendar_authority(
+            market_calendar_module._RELEASE_CALENDARS,
+            current,
+        )
+        prior = load_current_market_calendar(ROOT, as_of=date(2026, 8, 14))
+        observed_at = datetime(2027, 1, 4, 13, 0, tzinfo=UTC)
+        transport = RoutingTransport(
+            lambda url: (200, _completed_sip("2026-12-31T05:00:00Z"))
+            if urlsplit(url).path.endswith("/bars")
+            else (200, _fresh_iex("2027-01-04T12:59:00Z"))
+        )
+        with patch(
+            "stock_monitor.provider_smoke.load_current_market_calendar",
+            side_effect=(current, prior),
+        ) as loader, patch(
+            "stock_monitor.provider_smoke.HttpGetClient",
+            return_value=transport,
+        ):
+            result = run_provider_smoke(self.settings, now=lambda: observed_at)
+
+        self.assertEqual((result.status, result.exit_code), ("READY", 0))
+        self.assertEqual(loader.call_count, 2)
+        self.assertEqual(loader.call_args_list[1].kwargs["as_of"], date(2026, 12, 31))
+        sip_url = next(
+            url for url in transport.requested_urls if urlsplit(url).path.endswith("/bars")
+        )
+        query = parse_qs(urlsplit(sip_url).query)
+        self.assertEqual(query["start"], ["2026-12-31T05:00:00Z"])
+        self.assertEqual(query["end"], ["2026-12-31T21:00:00Z"])
+
+    def test_new_year_fails_closed_when_prior_release_is_unavailable(self) -> None:
+        current = MarketCalendar.from_mapping(
+            calendar_fixture(2027),
+            as_of=date(2027, 1, 4),
+            expected_year=2027,
+        )
+        market_calendar_module._register_calendar_authority(
+            market_calendar_module._RELEASE_CALENDARS,
+            current,
+        )
+        observed_at = datetime(2027, 1, 4, 13, 0, tzinfo=UTC)
+        with patch(
+            "stock_monitor.provider_smoke.load_current_market_calendar",
+            side_effect=(current, CalendarError("prior release canary")),
+        ) as loader, patch("stock_monitor.provider_smoke.HttpGetClient") as client:
+            result = run_provider_smoke(self.settings, now=lambda: observed_at)
+
+        self.assertEqual(
+            (
+                result.status,
+                result.exit_code,
+                result.authentication_ok,
+                result.historical_sip_ok,
+                result.latest_iex_fresh,
+                result.reason_codes,
+            ),
+            (
+                "BLOCKED_COMPLETED_SESSION",
+                3,
+                False,
+                False,
+                False,
+                ("COMPLETED_SESSION_RELEASE_UNAVAILABLE",),
+            ),
+        )
+        self.assertEqual(loader.call_count, 2)
+        client.assert_not_called()
 
     def test_calendar_release_failure_is_safe_and_does_not_touch_network(self) -> None:
         with patch(

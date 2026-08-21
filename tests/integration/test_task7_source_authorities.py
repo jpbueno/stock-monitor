@@ -233,7 +233,7 @@ class Task7SourceAuthorityTests(unittest.TestCase):
         )
 
     def test_dirty_commit_revokes_replay_state_and_derived_authorities(self) -> None:
-        _buy, _fee, _sale, _check, _cutoff, source, state = self.build_replay()
+        _buy, _fee, _sale, _check, cutoff, source, state = self.build_replay()
         settlement = risk_module._issue_settlement_replay(
             source,
             state,
@@ -285,10 +285,44 @@ class Task7SourceAuthorityTests(unittest.TestCase):
                     (False, False, False, False),
                 )
                 raise RuntimeError("rollback")
-        self.assertTrue(is_verified_journal_replay_source(source))
-        self.assertTrue(is_verified_actual_ledger_state(state))
-        self.assertTrue(settlement.source_verified)
-        self.assertTrue(ledger_module.is_issued_actual_projection_cohort(cohort))
+        self.assertEqual(
+            (
+                is_verified_journal_replay_source(source),
+                is_verified_actual_ledger_state(state),
+                settlement.source_verified,
+                ledger_module.is_issued_actual_projection_cohort(cohort),
+            ),
+            (False, False, False, False),
+        )
+
+        with self.journal.transaction() as transaction:
+            fresh_source = transaction.read_actual_replay(query_cutoff=cutoff)
+        fresh_state = replay_actual(
+            fresh_source,
+            plans=self.plans,
+            calendar=self.calendar,
+            policy=policy_fixture(),
+        )
+        fresh_settlement = risk_module._issue_settlement_replay(
+            fresh_source,
+            fresh_state,
+            self.calendar,
+        )
+        fresh_cohort = ledger_module._issue_actual_projection_from_journal(
+            fresh_source,
+            fresh_state,
+        )
+        self.assertIsNot(fresh_source, source)
+        self.assertIsNot(fresh_state, state)
+        self.assertEqual(
+            (
+                is_verified_journal_replay_source(fresh_source),
+                is_verified_actual_ledger_state(fresh_state),
+                fresh_settlement.source_verified,
+                ledger_module.is_issued_actual_projection_cohort(fresh_cohort),
+            ),
+            (True, True, True, True),
+        )
 
         self.ingest(
             envelope(
@@ -305,8 +339,12 @@ class Task7SourceAuthorityTests(unittest.TestCase):
                 is_verified_actual_ledger_state(state),
                 settlement.source_verified,
                 ledger_module.is_issued_actual_projection_cohort(cohort),
+                is_verified_journal_replay_source(fresh_source),
+                is_verified_actual_ledger_state(fresh_state),
+                fresh_settlement.source_verified,
+                ledger_module.is_issued_actual_projection_cohort(fresh_cohort),
             ),
-            (False, False, False, False),
+            (False, False, False, False, False, False, False, False),
         )
 
     def test_second_connection_commit_revokes_replay_and_derived_authorities(

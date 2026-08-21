@@ -21,6 +21,7 @@ from stock_monitor.journal import (
     JournalBusy,
     MigrationCorruption,
     MigrationDrift,
+    ScheduledRunResultEnvelope,
     report_archive_relative_path,
     stable_report_id,
 )
@@ -119,9 +120,40 @@ class JournalMigrationTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 2)
+                self.assertEqual(journal.count("schema_migrations"), 4)
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 2)
+                self.assertEqual(journal.count("schema_migrations"), 4)
+
+    def test_result_envelope_migration_is_packaged_hashed_and_applied_fourth(self) -> None:
+        packaged = importlib.resources.files("stock_monitor.sql").joinpath(
+            "004_scheduled_result_envelope.sql"
+        )
+        self.assertTrue(packaged.is_file(), "packaged migration 004 is missing")
+        expected_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                rows = connection.execute(
+                    "SELECT version, name, sha256 FROM schema_migrations "
+                    "ORDER BY version"
+                ).fetchall()
+                user_version = connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+
+        self.assertEqual(
+            [(int(row[0]), str(row[1])) for row in rows],
+            [
+                (1, "001_core.sql"),
+                (2, "002_phase1.sql"),
+                (3, "003_phase2_paper.sql"),
+                (4, "004_scheduled_result_envelope.sql"),
+            ],
+        )
+        self.assertEqual(str(rows[3][2]), expected_sha256)
+        self.assertEqual(user_version, 4)
 
     def test_migration_source_can_be_loaded_independently_of_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -268,7 +300,7 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA application_id").fetchone()[0], 0)
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 2)
+                self.assertEqual(journal.count("schema_migrations"), 4)
 
     def test_migration_transaction_control_cannot_escape_atomic_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -534,7 +566,7 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(wrong_version_path):
                 pass
             with closing(sqlite3.connect(wrong_version_path)) as connection:
-                connection.execute("PRAGMA user_version = 3")
+                connection.execute("PRAGMA user_version = 5")
             with self.assertRaises(MigrationCorruption):
                 Journal.open(wrong_version_path)
 
@@ -574,9 +606,9 @@ class JournalMigrationTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 counts = tuple(executor.map(lambda _: open_and_count(), range(2)))
 
-            self.assertEqual(counts, (2, 2))
+            self.assertEqual(counts, (4, 4))
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 2)
+                self.assertEqual(journal.count("schema_migrations"), 4)
 
     def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -619,10 +651,10 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertTrue(application_id_read.wait(timeout=10))
                 try:
                     with Journal.open(path) as journal:
-                        self.assertEqual(journal.count("schema_migrations"), 2)
+                        self.assertEqual(journal.count("schema_migrations"), 4)
                 finally:
                     release_preflight.set()
-                self.assertEqual(victim.result(timeout=10), 2)
+                self.assertEqual(victim.result(timeout=10), 4)
 
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -712,10 +744,856 @@ class JournalMigrationTests(unittest.TestCase):
                 "phase1_equity_point_marks",
                 "phase1_closed_trades",
                 "phase1_adherence_checks",
+                "phase2_windows",
+                "phase2_authorizations",
+                "phase2_fee_schedules",
+                "phase2_option_chain_sets",
+                "phase2_option_chain_pages",
+                "phase2_underlying_review_sets",
+                "phase2_underlying_review_pages",
+                "phase2_underlying_review_facts",
+                "phase2_contract_snapshots",
+                "phase2_contract_selections",
+                "phase2_entries",
+                "phase2_marks",
+                "phase2_exit_reviews",
+                "phase2_exits",
+                "phase2_fee_records",
+                "phase2_equity_points",
+                "phase2_window_failures",
+                "phase2_window_restarts",
+                "phase2_adherence_checks",
+                "phase2_gate_decisions",
+                "historical_replay_runs",
+                "historical_replay_dates",
+                "historical_replay_evidence",
+                "historical_replay_run_seals",
             },
         )
         self.assertIn("phase1_signals", tables)
-        self.assertFalse(any("option" in table for table in tables))
+        self.assertEqual(
+            {table for table in tables if table.startswith("phase2_")},
+            {
+                "phase2_windows",
+                "phase2_authorizations",
+                "phase2_fee_schedules",
+                "phase2_option_chain_sets",
+                "phase2_option_chain_pages",
+                "phase2_underlying_review_sets",
+                "phase2_underlying_review_pages",
+                "phase2_underlying_review_facts",
+                "phase2_contract_snapshots",
+                "phase2_contract_selections",
+                "phase2_entries",
+                "phase2_marks",
+                "phase2_exit_reviews",
+                "phase2_exits",
+                "phase2_fee_records",
+                "phase2_equity_points",
+                "phase2_window_failures",
+                "phase2_window_restarts",
+                "phase2_adherence_checks",
+                "phase2_gate_decisions",
+            },
+        )
+        self.assertEqual(
+            {table for table in tables if table.startswith("historical_replay_")},
+            {
+                "historical_replay_runs",
+                "historical_replay_dates",
+                "historical_replay_evidence",
+                "historical_replay_run_seals",
+            },
+        )
+
+    def test_phase2_schema_binds_promotion_signal_and_manual_source_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+        self.assertIn("phase2_windows_validate_start_source", definitions)
+        window_source = definitions["phase2_windows_validate_start_source"]
+        self.assertIn("option_paper_window_start", window_source)
+        self.assertIn("raw_message_id = new.start_raw_message_id", window_source)
+        window_definition = definitions["phase2_windows"]
+        self.assertIn("promotion_through_session", window_definition)
+        authorization_source = definitions[
+            "phase2_authorizations_validate_signal_lineage"
+        ]
+        self.assertIn("signal.role = 'primary'", authorization_source)
+        self.assertIn(
+            "signal.validation_window_id = window.phase1_validation_window_id",
+            authorization_source,
+        )
+        self.assertIn(
+            "signal.published_at > window.promotion_query_cutoff",
+            authorization_source,
+        )
+        self.assertIn("signal.published_at > window.started_at", authorization_source)
+
+        snapshot_definition = definitions["phase2_contract_snapshots"]
+        self.assertIn("source_kind = 'provider_indicative'", snapshot_definition)
+        self.assertIn("source_item_ordinal is not null", snapshot_definition)
+        self.assertIn("open_interest is null", snapshot_definition)
+        for optional_provider_field in (
+            "delta_micros",
+            "bid_micros",
+            "ask_micros",
+            "daily_volume",
+            "observed_at",
+        ):
+            self.assertIn(
+                f"{optional_provider_field} is null or",
+                snapshot_definition,
+            )
+        self.assertIn("source_kind = 'manual_review'", snapshot_definition)
+        self.assertIn("execution_event_id is not null", snapshot_definition)
+        self.assertIn("open_interest is not null", snapshot_definition)
+        self.assertIn("delta_micros is not null", snapshot_definition)
+        self.assertIn("bid_micros is not null", snapshot_definition)
+        self.assertIn("ask_micros is not null", snapshot_definition)
+        self.assertIn("daily_volume is not null", snapshot_definition)
+        self.assertIn("observed_at is not null", snapshot_definition)
+        self.assertNotIn("tick_size_micros", snapshot_definition)
+        selection_source = definitions[
+            "phase2_contract_selections_validate_snapshots"
+        ]
+        for field in (
+            "underlying",
+            "expiration",
+            "strike_micros",
+            "delta_micros",
+            "bid_micros",
+            "ask_micros",
+            "daily_volume",
+        ):
+            self.assertIn(
+                f"provider.{field} = manual.{field}",
+                selection_source,
+            )
+        self.assertIn(
+            "provider.observed_at <= manual.observed_at",
+            selection_source,
+        )
+        self.assertIn(
+            "manual.observed_at < new.selected_at",
+            selection_source,
+        )
+        manual_actions = {
+            "phase2_contract_snapshots_validate_manual_source": "option_paper_review",
+            "phase2_entries_validate_manual_source": "option_paper_open",
+            "phase2_marks_validate_manual_source": "option_paper_mark",
+            "phase2_exits_validate_manual_source": "option_paper_close",
+            "phase2_window_restarts_validate_start_source": (
+                "option_paper_window_start"
+            ),
+        }
+        for trigger, action in manual_actions.items():
+            with self.subTest(trigger=trigger):
+                definition = definitions[trigger]
+                self.assertIn(action, definition)
+                self.assertIn("raw_message_id", definition)
+        fee_source = definitions["phase2_fee_records_validate_actual_source"]
+        self.assertIn("fee_kind = 'exit_actual'", fee_source)
+        self.assertIn("parsed_action = 'fee'", fee_source)
+        self.assertIn("raw_message_id", fee_source)
+        self.assertIn("$.normalized.asset_id", fee_source)
+        self.assertNotIn(" as real", fee_source)
+        self.assertIn("substr(json_extract", fee_source)
+        self.assertNotIn("= '-'", fee_source)
+        self.assertIn("exit.exit_id = new.exit_id", fee_source)
+        self.assertIn("event.event_time >= exit.exited_at", fee_source)
+        self.assertIn(
+            "execution_event_id integer unique",
+            definitions["phase2_fee_records"],
+        )
+        mark_definition = definitions["phase2_marks"]
+        for source_kind in (
+            "manual_mark",
+            "invalid_raw",
+            "missing_deadline",
+        ):
+            self.assertIn(source_kind, mark_definition)
+        self.assertIn("bid_micros is null", mark_definition)
+        self.assertIn("liquidation_value_micros = 0", mark_definition)
+        invalid_raw = definitions["phase2_marks_validate_invalid_raw_source"]
+        self.assertIn("pending_clarification", invalid_raw)
+        self.assertIn(
+            "'option paper mark ' || manual.occ_symbol || ' *'",
+            invalid_raw,
+        )
+        manual_mark = definitions["phase2_marks_validate_manual_source"]
+        self.assertIn("$.normalized.occ_symbol", manual_mark)
+        self.assertIn("manual.occ_symbol", manual_mark)
+        missing = definitions["phase2_marks_validate_missing_deadline"]
+        self.assertIn("calendar_digest = window.calendar_digest", missing)
+        self.assertIn("deadline_at <= new.received_at", missing)
+        one_open = definitions["phase2_entries_require_no_open_position"]
+        self.assertIn("phase2_entries", one_open)
+        self.assertIn("phase2_exits", one_open)
+        self.assertNotIn("existing.window_id = new.window_id", one_open)
+        exit_definition = definitions["phase2_exits"]
+        for reason in ("stop", "target", "max_hold_10_sessions", "dte_21"):
+            self.assertIn(reason, exit_definition)
+        self.assertNotIn("'manual'", exit_definition)
+        self.assertNotIn("'expiry'", exit_definition)
+        window_definition = definitions["phase2_windows"]
+        self.assertIn(
+            "starting_capital_micros = 5000000000",
+            window_definition,
+        )
+        self.assertIn(
+            "restart_required",
+            definitions["phase2_gate_decisions"],
+        )
+        self.assertIn(
+            "quantity = 1",
+            definitions["phase2_contract_selections"],
+        )
+        entry_definition = definitions["phase2_entries"]
+        self.assertIn("quantity = 1", entry_definition)
+        self.assertIn("all_in_initial_risk_micros <= 50000000", entry_definition)
+        self.assertIn(
+            "entry_ask_micros * 100 + entry_fee_micros + reserve_fee_micros",
+            entry_definition,
+        )
+        fee_lineage = definitions["phase2_fee_records_validate_lineage"]
+        self.assertIn("new.fee_kind = 'entry'", fee_lineage)
+        self.assertIn("entry.entry_fee_micros", fee_lineage)
+        self.assertIn("new.fee_kind = 'reserve'", fee_lineage)
+        self.assertIn("entry.reserve_fee_micros", fee_lineage)
+        archived_fee = definitions["phase2_fee_schedules"]
+        self.assertIn("reviewed_bytes", archived_fee)
+        self.assertIn("currency = 'usd'", archived_fee)
+        self.assertIn("contract_multiplier = 100", archived_fee)
+        selection_definition = definitions["phase2_contract_selections"]
+        for field in (
+            "event_exclusion_source_digest",
+            "event_exclusion_authority_digest",
+            "event_exclusion_row_references_json",
+            "event_exclusion_highwaters_json",
+            "selection_portfolio_source_digest",
+            "selection_portfolio_query_cutoff",
+            "selection_portfolio_row_references_json",
+            "selection_portfolio_highwaters_json",
+            "fee_schedule_id",
+            "fee_schedule_digest",
+        ):
+            self.assertIn(field, selection_definition)
+
+    def test_every_phase2_authority_table_requires_the_journal_write_gate(
+        self,
+    ) -> None:
+        authority_tables = (
+            "phase2_windows",
+            "phase2_authorizations",
+            "phase2_fee_schedules",
+            "phase2_option_chain_sets",
+            "phase2_option_chain_pages",
+            "phase2_underlying_review_sets",
+            "phase2_underlying_review_pages",
+            "phase2_underlying_review_facts",
+            "phase2_contract_snapshots",
+            "phase2_contract_selections",
+            "phase2_entries",
+            "phase2_marks",
+            "phase2_exit_reviews",
+            "phase2_exits",
+            "phase2_fee_records",
+            "phase2_equity_points",
+            "phase2_window_failures",
+            "phase2_window_restarts",
+            "phase2_adherence_checks",
+            "phase2_gate_decisions",
+            "historical_replay_runs",
+            "historical_replay_dates",
+            "historical_replay_evidence",
+            "historical_replay_run_seals",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.sqlite3"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'"
+                    )
+                    if row[1] is not None
+                }
+                columns_by_table = {
+                    table: tuple(
+                        str(row[1])
+                        for row in connection.execute(
+                            f"PRAGMA table_info({table})"
+                        )
+                        if str(row[1]) not in {"id", "record_sha256"}
+                    )
+                    for table in authority_tables
+                }
+
+        for table in authority_tables:
+            with self.subTest(table=table):
+                trigger = definitions.get(
+                    f"{table}_require_journal_phase2_writer"
+                )
+                self.assertIsNotNone(trigger)
+                assert trigger is not None
+                material_arguments = ", ".join(
+                    f"new.{column}" for column in columns_by_table[table]
+                )
+                self.assertIn(
+                    "journal_phase2_write_allowed("
+                    f"'{table}', new.record_sha256, {material_arguments})",
+                    trigger,
+                )
+
+    def test_phase2_schema_persists_complete_chain_and_exit_decision_lineage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        chain = definitions["phase2_option_chain_sets"]
+        for field in (
+            "authorization_id",
+            "underlying",
+            "requested_symbols_json",
+            "request_digest",
+            "manifest_digest",
+            "expected_page_count",
+            "expected_fact_count",
+            "review_candidate_fact_digests_json",
+            "expected_manual_review_count",
+            "terminal",
+            "query_cutoff",
+        ):
+            self.assertIn(field, chain)
+        self.assertIn(
+            "json_extract(requested_symbols_json, '$[0]') = underlying",
+            chain,
+        )
+        pages = definitions["phase2_option_chain_pages"]
+        for field in (
+            "chain_set_id",
+            "page_ordinal",
+            "source_observation_id",
+            "external_source_observation_id",
+            "request_url",
+            "request_page_token",
+            "next_page_token",
+            "payload_sha256",
+            "source_time",
+            "retrieved_at",
+        ):
+            self.assertIn(field, pages)
+        page_lineage = definitions["phase2_option_chain_pages_validate_lineage"]
+        self.assertIn("prior.next_page_token = new.request_page_token", page_lineage)
+        self.assertIn("new.page_ordinal = 1", page_lineage)
+
+        snapshots = definitions["phase2_contract_snapshots"]
+        self.assertIn("chain_set_id", snapshots)
+        self.assertIn("source_kind = 'provider_indicative'", snapshots)
+        self.assertIn("chain_set_id is not null", snapshots)
+        self.assertIn("source_kind = 'manual_review'", snapshots)
+        self.assertIn("chain_set_id is not null", snapshots)
+        self.assertIn("reviewed_provider_snapshot_id is not null", snapshots)
+        self.assertIn(
+            "unique(chain_set_id, fetch_page_ordinal, source_item_ordinal, source_item_path)",
+            snapshots,
+        )
+        completeness = definitions[
+            "phase2_contract_selections_validate_chain_completeness"
+        ]
+        self.assertIn("count(*)", completeness)
+        self.assertIn("expected_page_count", completeness)
+        self.assertIn("expected_fact_count", completeness)
+        self.assertIn("next_page_token is null", completeness)
+        self.assertIn("provider.chain_set_id", completeness)
+        self.assertIn("expected_manual_review_count", completeness)
+
+        manual = definitions["phase2_contract_snapshots_validate_manual_source"]
+        self.assertIn("option_paper_review", manual)
+        self.assertNotIn("option_paper_open", manual)
+        for normalized_field in (
+            "occ_symbol",
+            "delta",
+            "open_interest",
+            "volume",
+        ):
+            self.assertIn(f"$.normalized.{normalized_field}", manual)
+        self.assertIn("review_candidate_fact_digests_json", manual)
+        selection_definition = definitions["phase2_contract_selections"]
+        self.assertIn("manual_review_terminal_cursor", selection_definition)
+        self.assertIn("expected_manual_review_count", selection_definition)
+        entry = definitions["phase2_entries_validate_manual_source"]
+        self.assertIn("option_paper_open", entry)
+        self.assertIn("event.action_ordinal = new.action_ordinal", entry)
+        self.assertIn("action_source_digest", definitions["phase2_entries"])
+        self.assertNotIn("event.id = manual.execution_event_id", entry)
+
+        exit_definition = definitions["phase2_exits"]
+        for field in (
+            "action_ordinal",
+            "action_source_digest",
+            "underlying_review_set_id",
+            "underlying_source_observation_id",
+            "underlying_external_source_observation_id",
+            "underlying_fetch_page_ordinal",
+            "underlying_source_item_ordinal",
+            "underlying_source_item_path",
+            "underlying_payload_sha256",
+            "underlying_fact_digest",
+            "underlying_bar_at",
+            "underlying_open_micros",
+            "underlying_high_micros",
+            "underlying_low_micros",
+            "underlying_close_micros",
+            "underlying_volume",
+            "exit_decision_digest",
+        ):
+            self.assertIn(field, exit_definition)
+        exit_lineage = definitions["phase2_exits_validate_underlying_source"]
+        self.assertIn("phase1_source_payloads", exit_lineage)
+        self.assertIn("source_observations", exit_lineage)
+        self.assertIn("underlying_payload_sha256", exit_lineage)
+        review = definitions["phase2_underlying_review_sets"]
+        for field in (
+            "entry_id",
+            "underlying",
+            "review_session",
+            "timeframe",
+            "adjustment",
+            "feed",
+            "requested_symbols_json",
+            "request_digest",
+            "manifest_digest",
+            "expected_page_count",
+            "expected_fact_count",
+            "terminal",
+            "request_start",
+            "request_end",
+            "query_cutoff",
+        ):
+            self.assertIn(field, review)
+        self.assertIn("timeframe = '1min'", review)
+        self.assertIn("adjustment = 'split'", review)
+        self.assertIn("feed = 'sip'", review)
+        review_pages = definitions["phase2_underlying_review_pages"]
+        for field in (
+            "review_set_id",
+            "page_ordinal",
+            "source_observation_id",
+            "request_url",
+            "request_page_token",
+            "next_page_token",
+            "payload_sha256",
+        ):
+            self.assertIn(field, review_pages)
+        underlying_complete = definitions[
+            "phase2_exits_validate_underlying_completeness"
+        ]
+        self.assertIn("expected_page_count", underlying_complete)
+        self.assertIn("expected_fact_count", underlying_complete)
+        self.assertIn("next_page_token is null", underlying_complete)
+        review_facts = definitions["phase2_underlying_review_facts"]
+        for field in (
+            "review_set_id",
+            "source_observation_id",
+            "fetch_page_ordinal",
+            "source_item_ordinal",
+            "source_item_path",
+            "payload_sha256",
+            "symbol",
+            "bar_at",
+            "open_micros",
+            "high_micros",
+            "low_micros",
+            "close_micros",
+            "volume",
+            "fact_digest",
+        ):
+            self.assertIn(field, review_facts)
+        self.assertIn(
+            "unique(review_set_id, fetch_page_ordinal, source_item_ordinal, source_item_path)",
+            review_facts,
+        )
+        self.assertIn("underlying_review_fact_id", exit_definition)
+        compact_exit_definition = " ".join(exit_definition.split())
+        self.assertIn(
+            "exit_reason in ('stop', 'target') "
+            "and underlying_review_fact_id is not null",
+            compact_exit_definition,
+        )
+        self.assertIn(
+            "exit_reason in ('max_hold_10_sessions', 'dte_21') "
+            "and underlying_review_fact_id is null",
+            compact_exit_definition,
+        )
+        for predicate in (
+            "fact.source_item_ordinal = new.underlying_source_item_ordinal",
+            "fact.source_item_path = new.underlying_source_item_path",
+            "fact.fact_digest = new.underlying_fact_digest",
+            "fact.open_micros = new.underlying_open_micros",
+            "fact.high_micros = new.underlying_high_micros",
+            "fact.low_micros = new.underlying_low_micros",
+            "fact.close_micros = new.underlying_close_micros",
+            "fact.volume = new.underlying_volume",
+        ):
+            self.assertIn(predicate, exit_lineage)
+
+    def test_phase2_schema_scopes_missing_marks_and_derives_genesis_equity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger', 'index')"
+                    )
+                    if row[1] is not None
+                }
+
+        mark = definitions["phase2_marks"]
+        self.assertIn("deadline_start_at", mark)
+        missing = definitions["phase2_marks_validate_missing_deadline"]
+        self.assertIn("event.event_time >= new.deadline_start_at", missing)
+        self.assertIn("event.event_time <= new.deadline_at", missing)
+        genesis = definitions["phase2_equity_points_validate_start"]
+        for predicate in (
+            "new.cash_micros = 5000000000",
+            "new.position_value_micros = 0",
+            "new.equity_micros = 5000000000",
+            "new.high_water_micros = 5000000000",
+            "new.drawdown_micros = 0",
+            "new.session_date = window.started_session",
+            "new.at = window.started_at",
+            "new.received_at = window.received_at",
+        ):
+            self.assertIn(predicate, genesis)
+        self.assertIn(
+            "phase2 start equity already exists",
+            definitions["phase2_equity_points_one_start_per_window"],
+        )
+        unique_start = definitions[
+            "phase2_equity_points_unique_start_per_window"
+        ]
+        self.assertIn("create unique index", unique_start)
+        self.assertIn("where point_kind = 'start'", unique_start)
+
+    def test_phase2_option_sale_settlement_gates_the_next_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        exit_definition = definitions["phase2_exits"]
+        self.assertIn("settlement_available_session", exit_definition)
+        self.assertIn("settlement_calendar_digest", exit_definition)
+        self.assertIn(
+            "settlement_available_session > substr(exited_at, 1, 10)",
+            exit_definition,
+        )
+        settlement_source = definitions[
+            "phase2_exits_validate_settlement_calendar"
+        ]
+        self.assertIn(
+            "new.settlement_calendar_digest = window.calendar_digest",
+            settlement_source,
+        )
+        next_entry = definitions[
+            "phase2_entries_require_prior_exit_settlement"
+        ]
+        self.assertIn(
+            "prior_exit.settlement_available_session > substr(new.entered_at, 1, 10)",
+            next_entry,
+        )
+        self.assertNotIn("prior_entry.window_id = new.window_id", next_entry)
+
+    def test_phase2_persists_every_exit_review_including_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        reviews = definitions["phase2_exit_reviews"]
+        for field in (
+            "exit_review_id",
+            "window_id",
+            "entry_id",
+            "underlying_review_set_id",
+            "review_session",
+            "decision_kind",
+            "decision_digest",
+            "holding_sessions",
+            "dte",
+            "query_cutoff",
+            "evaluated_at",
+            "received_at",
+        ):
+            self.assertIn(field, reviews)
+        for decision in (
+            "hold",
+            "stop",
+            "target",
+            "max_hold_10_sessions",
+            "dte_21",
+        ):
+            self.assertIn(decision, reviews)
+        compact_reviews = " ".join(reviews.split())
+        self.assertIn(
+            "decision_kind in ('stop', 'target') and decision_fact_id is not null",
+            compact_reviews,
+        )
+        self.assertIn(
+            "decision_kind in ('hold', 'max_hold_10_sessions', 'dte_21') "
+            "and decision_fact_id is null",
+            compact_reviews,
+        )
+        self.assertIn("unique(entry_id, review_session)", reviews)
+        self.assertIn("exit_review_id", definitions["phase2_exits"])
+        required_close = definitions["phase2_exits_validate_review_decision"]
+        compact_required_close = " ".join(required_close.split())
+        self.assertIn("review.decision_kind = new.exit_reason", required_close)
+        self.assertIn(
+            "review.decision_fact_id = new.underlying_review_fact_id",
+            required_close,
+        )
+        self.assertIn(
+            "review.decision_kind in ('max_hold_10_sessions', 'dte_21') "
+            "and review.decision_fact_id is null "
+            "and new.underlying_review_fact_id is null",
+            compact_required_close,
+        )
+        self.assertIn("review.review_session = substr(new.exited_at, 1, 10)", required_close)
+        self.assertIn("review.decision_kind <> 'hold'", required_close)
+        next_review = definitions[
+            "phase2_exit_reviews_reject_ignored_required_close"
+        ]
+        self.assertIn("prior.decision_kind <> 'hold'", next_review)
+        self.assertIn("phase2_exits", next_review)
+        gate = definitions["phase2_gate_decisions"]
+        self.assertIn("expected_exit_review_count", gate)
+        self.assertIn("actual_exit_review_count", gate)
+        self.assertIn("exit_review_terminal_cursor", gate)
+        coverage = definitions["phase2_gate_decisions_validate_exit_reviews"]
+        self.assertIn("expected_exit_review_count", coverage)
+        self.assertIn("decision_kind <> 'hold'", coverage)
+
+    def test_phase2_gate_adherence_is_fixed_and_source_derived(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        checks = definitions["phase2_adherence_checks"]
+        for field in (
+            "check_id",
+            "window_id",
+            "entry_id",
+            "check_name",
+            "applicable",
+            "passed",
+            "hard_breach",
+            "evidence_row_references_json",
+            "evidence_highwaters_json",
+            "evidence_digest",
+            "authority_digest",
+            "evaluated_at",
+            "received_at",
+            "source_digest",
+            "record_sha256",
+        ):
+            self.assertIn(field, checks)
+        for check_name in (
+            "QUOTE_FRESHNESS",
+            "CONTRACT_LIQUIDITY",
+            "SETTLED_FUNDS_ELIGIBILITY",
+            "EXPIRATION_WINDOW",
+            "EVENT_EXCLUSION",
+            "ONE_POSITION_LIMIT",
+            "ALL_IN_INITIAL_RISK",
+            "ENTRY_EXECUTION",
+            "EXIT_EXECUTION",
+            "RECORD_COMPLETENESS",
+        ):
+            self.assertIn(check_name.lower(), checks)
+        self.assertIn(
+            "journal_phase2_adherence_write_allowed",
+            definitions["phase2_adherence_checks_require_derived_writer"],
+        )
+        gate = definitions["phase2_gate_decisions"]
+        for field in (
+            "elapsed_days",
+            "expected_adherence_count",
+            "adherence_terminal_cursor",
+            "adherence_source_highwater",
+        ):
+            self.assertIn(field, gate)
+        for passed_boundary in (
+            "closed_trade_count >= 20",
+            "elapsed_days >= 28",
+            "mean_net_r_numerator_micros > 0",
+            "max_drawdown_micros <= 250000000",
+        ):
+            self.assertIn(passed_boundary, gate)
+        elapsed_gate = definitions[
+            "phase2_gate_decisions_validate_elapsed_days"
+        ]
+        for predicate in (
+            "new.elapsed_days",
+            "window.started_session",
+            "new.query_cutoff",
+            "julianday",
+        ):
+            self.assertIn(predicate, elapsed_gate)
+        source_gate = definitions[
+            "phase2_gate_decisions_validate_adherence"
+        ]
+        for predicate in (
+            "new.adherence_passed_count",
+            "new.adherence_applicable_count",
+            "new.hard_breach",
+            "new.expected_adherence_count",
+            "new.adherence_terminal_cursor",
+            "new.adherence_source_highwater",
+            "phase2_adherence_checks",
+            "check_row.window_id = new.window_id",
+            "check_row.received_at <= new.query_cutoff",
+        ):
+            self.assertIn(predicate, source_gate)
+
+    def test_historical_replay_schema_requires_three_roles_and_cutoff_lineage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        self.assertIn("historical_replay_runs", definitions)
+        self.assertIn("tier = 'strict_point_in_time'", definitions["historical_replay_runs"])
+        date_definition = definitions["historical_replay_dates"]
+        self.assertIn("expected_role_count = 3", date_definition)
+        self.assertIn("expected_evidence_count = 3", date_definition)
+        evidence_definition = definitions["historical_replay_evidence"]
+        for role in ("universe_membership", "event_state", "source_evidence"):
+            self.assertIn(role, evidence_definition)
+        self.assertIn("source_kind", evidence_definition)
+        self.assertIn("source_item_ordinal", evidence_definition)
+        self.assertIn("source_item_path", evidence_definition)
+        self.assertIn("authority_digest", evidence_definition)
+        self.assertIn("published_at <= retrieved_at", evidence_definition)
+        cutoff_trigger = definitions["historical_replay_evidence_validate_cutoff"]
+        self.assertIn("retrieved_at <= date_source.report_cutoff", cutoff_trigger)
+        self.assertIn("source_time <= new.retrieved_at", cutoff_trigger)
+
+    def test_historical_replay_run_is_sealed_before_it_can_issue_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                definitions = {
+                    str(row[0]): str(row[1]).lower()
+                    for row in connection.execute(
+                        "SELECT name, sql FROM sqlite_schema "
+                        "WHERE type IN ('table', 'trigger')"
+                    )
+                    if row[1] is not None
+                }
+
+        seal = definitions["historical_replay_run_seals"]
+        for field in (
+            "replay_run_id",
+            "expected_date_count",
+            "actual_date_count",
+            "actual_evidence_count",
+            "date_terminal_cursor",
+            "evidence_terminal_cursor",
+            "source_observation_highwater",
+            "sealed_at",
+            "source_digest",
+            "record_sha256",
+        ):
+            self.assertIn(field, seal)
+        self.assertIn(
+            "historical_replay_dates_reject_after_seal",
+            definitions,
+        )
+        self.assertIn(
+            "historical_replay_evidence_reject_after_seal",
+            definitions,
+        )
+        validate = definitions["historical_replay_run_seals_validate_counts"]
+        self.assertIn("count(*)", validate)
+        self.assertIn("max(replay_date.id)", validate)
+        self.assertIn("max(evidence.id)", validate)
+        self.assertIn("expected_date_count", validate)
 
     def test_core_tables_are_strict_and_expose_required_audit_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -846,6 +1724,8 @@ class JournalMigrationTests(unittest.TestCase):
                 "report_path",
                 "outcome",
                 "error_class",
+                "result_envelope_json",
+                "result_envelope_sha256",
             },
             "ledger_postings": {
                 "posting_key",
@@ -901,7 +1781,6 @@ class JournalMigrationTests(unittest.TestCase):
                 "recommended_stop_micros",
                 "target_micros",
                 "planned_shares",
-                "tick_size_micros",
                 "trigger_price_micros",
                 "publication_report_id",
                 "publication_rank",
@@ -1322,6 +2201,345 @@ class JournalMigrationTests(unittest.TestCase):
                 "details_json",
                 "record_sha256",
             },
+            "phase2_windows": {
+                "window_id",
+                "phase1_validation_window_id",
+                "promotion_source_digest",
+                "promotion_decision_digest",
+                "promotion_signal_ids_json",
+                "promotion_through_session",
+                "promotion_query_cutoff",
+                "start_execution_event_id",
+                "start_raw_message_id",
+                "started_session",
+                "started_at",
+                "received_at",
+                "starting_capital_micros",
+                "calendar_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_authorizations": {
+                "authorization_id",
+                "window_id",
+                "signal_id",
+                "signal_source_digest",
+                "authorization_digest",
+                "authorized_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_fee_schedules": {
+                "schedule_id",
+                "effective_session",
+                "reviewed_at",
+                "currency",
+                "contract_multiplier",
+                "entry_fee_per_contract_micros",
+                "exit_fee_per_contract_micros",
+                "close_fee_reserve_per_contract_micros",
+                "source_sha256",
+                "schedule_digest",
+                "reviewed_bytes",
+                "archived_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_underlying_review_facts": {
+                "fact_id",
+                "review_set_id",
+                "source_observation_id",
+                "external_source_observation_id",
+                "fetch_page_ordinal",
+                "source_item_ordinal",
+                "source_item_path",
+                "payload_sha256",
+                "symbol",
+                "bar_at",
+                "open_micros",
+                "high_micros",
+                "low_micros",
+                "close_micros",
+                "volume",
+                "fact_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_contract_snapshots": {
+                "snapshot_id",
+                "authorization_id",
+                "source_kind",
+                "occ_symbol",
+                "underlying",
+                "expiration",
+                "strike_micros",
+                "delta_micros",
+                "bid_micros",
+                "ask_micros",
+                "open_interest",
+                "daily_volume",
+                "source_observation_id",
+                "external_source_observation_id",
+                "fetch_page_ordinal",
+                "source_item_ordinal",
+                "source_item_path",
+                "payload_sha256",
+                "provider_fact_digest",
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+                "action_source_digest",
+                "observed_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_contract_selections": {
+                "selection_id",
+                "authorization_id",
+                "provider_snapshot_id",
+                "manual_snapshot_id",
+                "selection_session",
+                "quantity",
+                "fee_schedule_id",
+                "fee_schedule_digest",
+                "event_exclusion_source_digest",
+                "event_exclusion_authority_digest",
+                "event_exclusion_row_references_json",
+                "event_exclusion_highwaters_json",
+                "selected_at",
+                "received_at",
+                "ranking_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_entries": {
+                "entry_id",
+                "window_id",
+                "selection_id",
+                "execution_event_id",
+                "raw_message_id",
+                "quantity",
+                "entry_ask_micros",
+                "entry_fee_micros",
+                "reserve_fee_micros",
+                "all_in_initial_risk_micros",
+                "fee_schedule_id",
+                "fee_schedule_digest",
+                "entered_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_marks": {
+                "mark_id",
+                "window_id",
+                "entry_id",
+                "session_date",
+                "source_kind",
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+                "action_source_digest",
+                "bid_micros",
+                "ask_micros",
+                "liquidation_value_micros",
+                "valid",
+                "failure_reason",
+                "calendar_digest",
+                "deadline_at",
+                "marked_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_exit_reviews": {
+                "exit_review_id",
+                "window_id",
+                "entry_id",
+                "underlying_review_set_id",
+                "decision_fact_id",
+                "review_session",
+                "decision_kind",
+                "decision_digest",
+                "holding_sessions",
+                "dte",
+                "query_cutoff",
+                "evaluated_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_exits": {
+                "exit_id",
+                "exit_review_id",
+                "window_id",
+                "entry_id",
+                "execution_event_id",
+                "raw_message_id",
+                "exit_reason",
+                "bid_micros",
+                "ask_micros",
+                "gross_proceeds_micros",
+                "net_pnl_micros",
+                "net_r_numerator_micros",
+                "initial_risk_micros",
+                "underlying_review_set_id",
+                "underlying_review_fact_id",
+                "underlying_fact_digest",
+                "exit_decision_digest",
+                "settlement_available_session",
+                "settlement_calendar_digest",
+                "exited_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_fee_records": {
+                "fee_id",
+                "window_id",
+                "entry_id",
+                "exit_id",
+                "fee_kind",
+                "amount_micros",
+                "fee_schedule_id",
+                "fee_schedule_digest",
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+                "action_source_digest",
+                "recorded_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_equity_points": {
+                "point_id",
+                "window_id",
+                "entry_id",
+                "mark_id",
+                "exit_id",
+                "session_date",
+                "point_kind",
+                "cash_micros",
+                "position_value_micros",
+                "equity_micros",
+                "high_water_micros",
+                "drawdown_micros",
+                "at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_window_failures": {
+                "failure_id",
+                "window_id",
+                "session_date",
+                "reason_code",
+                "mark_id",
+                "detected_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_window_restarts": {
+                "restart_id",
+                "failed_window_id",
+                "next_window_id",
+                "start_execution_event_id",
+                "start_raw_message_id",
+                "restarted_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_gate_decisions": {
+                "decision_id",
+                "window_id",
+                "query_cutoff",
+                "status",
+                "closed_trade_count",
+                "elapsed_days",
+                "mean_net_r_numerator_micros",
+                "mean_net_r_denominator_micros",
+                "adherence_passed_count",
+                "adherence_applicable_count",
+                "max_drawdown_micros",
+                "hard_breach",
+                "failure_id",
+                "expected_exit_review_count",
+                "actual_exit_review_count",
+                "exit_review_terminal_cursor",
+                "window_row_references_json",
+                "window_highwaters_json",
+                "window_source_digest",
+                "evaluated_at",
+                "received_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_runs": {
+                "replay_run_id",
+                "tier",
+                "started_session",
+                "ended_session",
+                "query_cutoff",
+                "calendar_digest",
+                "policy_digest",
+                "expected_date_count",
+                "recorded_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_dates": {
+                "replay_date_id",
+                "replay_run_id",
+                "session_date",
+                "report_cutoff",
+                "expected_role_count",
+                "expected_evidence_count",
+                "case_digest",
+                "domain_input_digest",
+                "mechanics_digest",
+                "completion_digest",
+                "completed_at",
+                "recorded_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_evidence": {
+                "replay_evidence_id",
+                "replay_date_id",
+                "role",
+                "evidence_ordinal",
+                "subject",
+                "source_kind",
+                "source_observation_id",
+                "external_source_observation_id",
+                "source_item_ordinal",
+                "source_item_path",
+                "payload_sha256",
+                "content_sha256",
+                "authority_digest",
+                "effective_at",
+                "published_at",
+                "retrieved_at",
+                "recorded_at",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_run_seals": {
+                "replay_run_id",
+                "expected_date_count",
+                "actual_date_count",
+                "actual_evidence_count",
+                "date_terminal_cursor",
+                "evidence_terminal_cursor",
+                "source_observation_highwater",
+                "sealed_at",
+                "source_digest",
+                "record_sha256",
+            },
         }
         for table, required in expected_columns.items():
             with self.subTest(table=table):
@@ -1330,6 +2548,31 @@ class JournalMigrationTests(unittest.TestCase):
             for name, type_name in table.items():
                 if name.endswith("_micros"):
                     self.assertEqual(type_name, "INTEGER")
+        prohibited_phase2_fields = {
+            "broker",
+            "brokerage",
+            "client_order_id",
+            "limit_price",
+            "order",
+            "order_id",
+            "order_type",
+            "route",
+            "side",
+            "stop_price",
+            "time_in_force",
+        }
+        for table, table_columns in columns.items():
+            if not table.startswith("phase2_"):
+                continue
+            for name in table_columns:
+                with self.subTest(table=table, prohibited_field=name):
+                    self.assertFalse(
+                        name in prohibited_phase2_fields
+                        or any(
+                            token in name.split("_")
+                            for token in {"broker", "brokerage", "order", "route"}
+                        )
+                    )
 
     def test_audit_hash_columns_require_lowercase_sha256_values(self) -> None:
         hash_fields = {
@@ -1342,6 +2585,7 @@ class JournalMigrationTests(unittest.TestCase):
                 "observation_set_sha256",
             },
             "outbox": {"payload_sha256"},
+            "scheduled_runs": {"result_envelope_sha256"},
             "phase1_signals": {
                 "publication_source_digest",
                 "publication_state_digest",
@@ -1399,6 +2643,134 @@ class JournalMigrationTests(unittest.TestCase):
                 "evidence_digest",
                 "review_source_digest",
                 "authority_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_windows": {
+                "window_id",
+                "promotion_source_digest",
+                "promotion_decision_digest",
+                "calendar_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_authorizations": {
+                "authorization_id",
+                "signal_source_digest",
+                "authorization_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_fee_schedules": {
+                "source_sha256",
+                "schedule_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_underlying_review_facts": {
+                "fact_id",
+                "payload_sha256",
+                "fact_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_contract_snapshots": {
+                "snapshot_id",
+                "payload_sha256",
+                "provider_fact_digest",
+                "action_source_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_contract_selections": {
+                "selection_id",
+                "fee_schedule_digest",
+                "event_exclusion_source_digest",
+                "event_exclusion_authority_digest",
+                "ranking_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_entries": {
+                "entry_id",
+                "fee_schedule_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_marks": {
+                "mark_id",
+                "action_source_digest",
+                "calendar_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_exit_reviews": {
+                "exit_review_id",
+                "decision_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_exits": {
+                "exit_id",
+                "underlying_payload_sha256",
+                "underlying_fact_digest",
+                "exit_decision_digest",
+                "settlement_calendar_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_fee_records": {
+                "fee_id",
+                "fee_schedule_digest",
+                "action_source_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_equity_points": {
+                "point_id",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_window_failures": {
+                "failure_id",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_window_restarts": {
+                "restart_id",
+                "source_digest",
+                "record_sha256",
+            },
+            "phase2_gate_decisions": {
+                "decision_id",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_runs": {
+                "replay_run_id",
+                "calendar_digest",
+                "policy_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_dates": {
+                "replay_date_id",
+                "case_digest",
+                "domain_input_digest",
+                "mechanics_digest",
+                "completion_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_evidence": {
+                "replay_evidence_id",
+                "payload_sha256",
+                "content_sha256",
+                "authority_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "historical_replay_run_seals": {
                 "source_digest",
                 "record_sha256",
             },
@@ -1627,6 +2999,29 @@ class JournalMigrationTests(unittest.TestCase):
             "phase1_equity_point_marks",
             "phase1_closed_trades",
             "phase1_adherence_checks",
+            "phase2_windows",
+            "phase2_authorizations",
+            "phase2_fee_schedules",
+            "phase2_option_chain_sets",
+            "phase2_option_chain_pages",
+            "phase2_underlying_review_sets",
+            "phase2_underlying_review_pages",
+            "phase2_underlying_review_facts",
+            "phase2_contract_snapshots",
+            "phase2_contract_selections",
+            "phase2_entries",
+            "phase2_marks",
+            "phase2_exit_reviews",
+            "phase2_exits",
+            "phase2_fee_records",
+            "phase2_equity_points",
+            "phase2_window_failures",
+            "phase2_window_restarts",
+            "phase2_gate_decisions",
+            "historical_replay_runs",
+            "historical_replay_dates",
+            "historical_replay_evidence",
+            "historical_replay_run_seals",
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -1961,6 +3356,134 @@ class JournalMigrationTests(unittest.TestCase):
                 ("equity_point_id", "phase1_equity_points"),
                 ("observation_id", "phase1_equity_mark_facts"),
             },
+            "phase2_windows": {
+                ("phase1_validation_window_id", "phase1_validation_windows"),
+                ("start_execution_event_id", "execution_events"),
+                ("start_raw_message_id", "raw_messages"),
+            },
+            "phase2_authorizations": {
+                ("window_id", "phase2_windows"),
+                ("signal_id", "phase1_signals"),
+            },
+            "phase2_option_chain_sets": {
+                ("authorization_id", "phase2_authorizations"),
+            },
+            "phase2_option_chain_pages": {
+                ("chain_set_id", "phase2_option_chain_sets"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase2_underlying_review_sets": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+            },
+            "phase2_underlying_review_pages": {
+                ("review_set_id", "phase2_underlying_review_sets"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase2_underlying_review_facts": {
+                ("review_set_id", "phase2_underlying_review_sets"),
+                ("review_set_id", "phase2_underlying_review_pages"),
+                ("fetch_page_ordinal", "phase2_underlying_review_pages"),
+                ("source_observation_id", "phase2_underlying_review_pages"),
+                ("payload_sha256", "phase2_underlying_review_pages"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "phase2_contract_snapshots": {
+                ("authorization_id", "phase2_authorizations"),
+                ("chain_set_id", "phase2_option_chain_sets"),
+                ("reviewed_provider_snapshot_id", "phase2_contract_snapshots"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+                ("execution_event_id", "execution_events"),
+                ("raw_message_id", "raw_messages"),
+            },
+            "phase2_contract_selections": {
+                ("authorization_id", "phase2_authorizations"),
+                ("provider_snapshot_id", "phase2_contract_snapshots"),
+                ("manual_snapshot_id", "phase2_contract_snapshots"),
+                ("fee_schedule_id", "phase2_fee_schedules"),
+                ("fee_schedule_digest", "phase2_fee_schedules"),
+            },
+            "phase2_entries": {
+                ("window_id", "phase2_windows"),
+                ("selection_id", "phase2_contract_selections"),
+                ("execution_event_id", "execution_events"),
+                ("raw_message_id", "raw_messages"),
+                ("fee_schedule_id", "phase2_fee_schedules"),
+                ("fee_schedule_digest", "phase2_fee_schedules"),
+            },
+            "phase2_marks": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+                ("execution_event_id", "execution_events"),
+                ("raw_message_id", "raw_messages"),
+            },
+            "phase2_exit_reviews": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+                ("underlying_review_set_id", "phase2_underlying_review_sets"),
+                ("decision_fact_id", "phase2_underlying_review_facts"),
+            },
+            "phase2_exits": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+                ("exit_review_id", "phase2_exit_reviews"),
+                ("execution_event_id", "execution_events"),
+                ("raw_message_id", "raw_messages"),
+                ("underlying_review_set_id", "phase2_underlying_review_sets"),
+                ("underlying_review_fact_id", "phase2_underlying_review_facts"),
+                ("underlying_source_observation_id", "source_observations"),
+                ("underlying_source_observation_id", "phase1_source_payloads"),
+                ("underlying_payload_sha256", "phase1_source_payloads"),
+            },
+            "phase2_fee_records": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+                ("exit_id", "phase2_exits"),
+                ("execution_event_id", "execution_events"),
+                ("raw_message_id", "raw_messages"),
+                ("fee_schedule_id", "phase2_fee_schedules"),
+                ("fee_schedule_digest", "phase2_fee_schedules"),
+            },
+            "phase2_equity_points": {
+                ("window_id", "phase2_windows"),
+                ("entry_id", "phase2_entries"),
+                ("mark_id", "phase2_marks"),
+                ("exit_id", "phase2_exits"),
+            },
+            "phase2_window_failures": {
+                ("window_id", "phase2_windows"),
+                ("mark_id", "phase2_marks"),
+            },
+            "phase2_window_restarts": {
+                ("failed_window_id", "phase2_windows"),
+                ("next_window_id", "phase2_windows"),
+                ("start_execution_event_id", "execution_events"),
+                ("start_raw_message_id", "raw_messages"),
+            },
+            "phase2_gate_decisions": {
+                ("window_id", "phase2_windows"),
+                ("failure_id", "phase2_window_failures"),
+            },
+            "historical_replay_dates": {
+                ("replay_run_id", "historical_replay_runs"),
+            },
+            "historical_replay_evidence": {
+                ("replay_date_id", "historical_replay_dates"),
+                ("source_observation_id", "source_observations"),
+                ("source_observation_id", "phase1_source_payloads"),
+                ("payload_sha256", "phase1_source_payloads"),
+            },
+            "historical_replay_run_seals": {
+                ("replay_run_id", "historical_replay_runs"),
+            },
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -2089,7 +3612,6 @@ class JournalMigrationTests(unittest.TestCase):
                 "recommended_stop_micros",
                 "target_micros",
                 "planned_shares",
-                "tick_size_micros",
                 "trigger_price_micros",
                 "publication_rank",
             },
@@ -2153,6 +3675,131 @@ class JournalMigrationTests(unittest.TestCase):
                 "applicable",
                 "passed",
                 "hard_breach",
+            },
+            "phase2_windows": {
+                "start_execution_event_id",
+                "start_raw_message_id",
+                "starting_capital_micros",
+            },
+            "phase2_underlying_review_sets": {
+                "expected_page_count",
+                "expected_fact_count",
+                "terminal",
+            },
+            "phase2_underlying_review_pages": {
+                "page_ordinal",
+                "source_observation_id",
+            },
+            "phase2_underlying_review_facts": {
+                "source_observation_id",
+                "fetch_page_ordinal",
+                "source_item_ordinal",
+                "open_micros",
+                "high_micros",
+                "low_micros",
+                "close_micros",
+                "volume",
+            },
+            "phase2_contract_snapshots": {
+                "strike_micros",
+                "delta_micros",
+                "bid_micros",
+                "ask_micros",
+                "open_interest",
+                "daily_volume",
+                "source_observation_id",
+                "fetch_page_ordinal",
+                "source_item_ordinal",
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+            },
+            "phase2_contract_selections": {"quantity"},
+            "phase2_fee_schedules": {
+                "contract_multiplier",
+                "entry_fee_per_contract_micros",
+                "exit_fee_per_contract_micros",
+                "close_fee_reserve_per_contract_micros",
+            },
+            "phase2_entries": {
+                "execution_event_id",
+                "raw_message_id",
+                "quantity",
+                "entry_ask_micros",
+                "entry_fee_micros",
+                "reserve_fee_micros",
+                "all_in_initial_risk_micros",
+            },
+            "phase2_marks": {
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+                "bid_micros",
+                "ask_micros",
+                "liquidation_value_micros",
+                "valid",
+            },
+            "phase2_exit_reviews": {
+                "holding_sessions",
+                "dte",
+            },
+            "phase2_exits": {
+                "execution_event_id",
+                "raw_message_id",
+                "bid_micros",
+                "ask_micros",
+                "gross_proceeds_micros",
+                "net_pnl_micros",
+                "net_r_numerator_micros",
+                "initial_risk_micros",
+            },
+            "phase2_fee_records": {
+                "amount_micros",
+                "execution_event_id",
+                "raw_message_id",
+                "action_ordinal",
+            },
+            "phase2_equity_points": {
+                "cash_micros",
+                "position_value_micros",
+                "equity_micros",
+                "high_water_micros",
+                "drawdown_micros",
+            },
+            "phase2_window_restarts": {
+                "start_execution_event_id",
+                "start_raw_message_id",
+            },
+            "phase2_gate_decisions": {
+                "closed_trade_count",
+                "elapsed_days",
+                "mean_net_r_numerator_micros",
+                "mean_net_r_denominator_micros",
+                "adherence_passed_count",
+                "adherence_applicable_count",
+                "max_drawdown_micros",
+                "hard_breach",
+                "expected_exit_review_count",
+                "actual_exit_review_count",
+                "exit_review_terminal_cursor",
+            },
+            "historical_replay_runs": {"expected_date_count"},
+            "historical_replay_dates": {
+                "expected_role_count",
+                "expected_evidence_count",
+            },
+            "historical_replay_evidence": {
+                "evidence_ordinal",
+                "source_observation_id",
+                "source_item_ordinal",
+            },
+            "historical_replay_run_seals": {
+                "expected_date_count",
+                "actual_date_count",
+                "actual_evidence_count",
+                "date_terminal_cursor",
+                "evidence_terminal_cursor",
+                "source_observation_highwater",
             },
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2235,6 +3882,34 @@ class JournalMigrationTests(unittest.TestCase):
             "phase1_equity_points": {"at", "message_time", "received_at"},
             "phase1_closed_trades": {"at", "message_time", "received_at"},
             "phase1_adherence_checks": {"evaluated_at", "received_at"},
+            "phase2_windows": {
+                "promotion_query_cutoff",
+                "started_at",
+                "received_at",
+            },
+            "phase2_authorizations": {"authorized_at", "received_at"},
+            "phase2_fee_schedules": {"reviewed_at", "archived_at"},
+            "phase2_contract_snapshots": {"observed_at", "received_at"},
+            "phase2_contract_selections": {"selected_at", "received_at"},
+            "phase2_entries": {"entered_at", "received_at"},
+            "phase2_marks": {"deadline_at", "marked_at", "received_at"},
+            "phase2_exits": {"exited_at", "received_at"},
+            "phase2_fee_records": {"recorded_at"},
+            "phase2_equity_points": {"at", "received_at"},
+            "phase2_window_failures": {"detected_at", "received_at"},
+            "phase2_window_restarts": {"restarted_at", "received_at"},
+            "phase2_gate_decisions": {
+                "query_cutoff",
+                "evaluated_at",
+                "received_at",
+            },
+            "historical_replay_runs": {"query_cutoff", "recorded_at"},
+            "historical_replay_dates": {"report_cutoff", "completed_at"},
+            "historical_replay_evidence": {
+                "effective_at",
+                "published_at",
+                "retrieved_at",
+            },
         }
         date_fields = {
             "report_claims": {"session_date"},
@@ -2249,6 +3924,18 @@ class JournalMigrationTests(unittest.TestCase):
             "phase1_canonical_postings": {"settlement_available_session"},
             "phase1_equity_points": {"session_date"},
             "phase1_closed_trades": {"session_date"},
+            "phase2_windows": {
+                "promotion_through_session",
+                "started_session",
+            },
+            "phase2_fee_schedules": {"effective_session"},
+            "phase2_contract_snapshots": {"expiration"},
+            "phase2_contract_selections": {"selection_session"},
+            "phase2_marks": {"session_date"},
+            "phase2_equity_points": {"session_date"},
+            "phase2_window_failures": {"session_date"},
+            "historical_replay_runs": {"started_session", "ended_session"},
+            "historical_replay_dates": {"session_date"},
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -3401,21 +5088,55 @@ class JournalMigrationTests(unittest.TestCase):
                     outbox_destination="TASK",
                     outbox_payload="close",
                 )
-                run_id, _ = journal.start_scheduled_run(
-                    run_key="close-2026-08-14",
-                    run_kind="CLOSE",
-                    session_date=date(2026, 8, 14),
-                    intended_run_at=now,
-                    started_at=now,
+                run_id = int(
+                    journal._connection.execute(
+                        "INSERT INTO scheduled_runs("
+                        "run_key, run_kind, session_date, intended_run_at, started_at"
+                        ") VALUES (?, ?, ?, ?, ?)",
+                        (
+                            "close-2026-08-14",
+                            "CLOSE",
+                            "2026-08-14",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:45:00.000000Z",
+                        ),
+                    ).lastrowid
                 )
-                journal.complete_scheduled_run(
-                    run_id=run_id,
-                    finished_at=now + timedelta(seconds=2),
-                    market_session_decision="OPEN",
-                    outcome="REPORT_EMITTED",
-                    report_id=report.report_row_id,
-                    report_path=report_archive_relative_path(
-                        "CLOSE", session_date, report_id
+                archive_path = report_archive_relative_path(
+                    "CLOSE", session_date, report_id
+                )
+                envelope = ScheduledRunResultEnvelope(
+                    outcome="EMITTED",
+                    message="# Close\n",
+                    exit_code=0,
+                    reason_codes=("SCHEDULED_EMITTED",),
+                    execution_mode="FIXTURE",
+                    candidates=(),
+                    report_id=report_id,
+                    report_row_id=report.report_row_id,
+                    report_path=archive_path,
+                    report_body="# Close\n",
+                    report_content_sha256=hashlib.sha256(
+                        b"# Close\n"
+                    ).hexdigest(),
+                    report_state_sha256=state_sha256,
+                )
+                envelope_json, envelope_sha256 = (
+                    journal_module._scheduled_result_envelope_storage(envelope)
+                )
+                journal._connection.execute(
+                    "UPDATE scheduled_runs SET finished_at = ?, "
+                    "market_session_decision = 'OPEN', report_id = ?, "
+                    "report_path = ?, outcome = 'REPORT_EMITTED', "
+                    "result_envelope_json = ?, result_envelope_sha256 = ? "
+                    "WHERE id = ?",
+                    (
+                        "2026-08-14T12:45:02.000000Z",
+                        report.report_row_id,
+                        archive_path,
+                        envelope_json,
+                        envelope_sha256,
+                        run_id,
                     ),
                 )
 
@@ -3562,6 +5283,8 @@ class JournalMigrationTests(unittest.TestCase):
     def test_scheduled_completion_tokens_are_canonical_in_sql(self) -> None:
         timestamp = "2026-08-14T14:00:00.000000Z"
         finished = "2026-08-14T14:00:01.000000Z"
+        envelope_json = "{}"
+        envelope_sha256 = hashlib.sha256(envelope_json.encode("utf-8")).hexdigest()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
             with Journal.open(path):
@@ -3584,8 +5307,14 @@ class JournalMigrationTests(unittest.TestCase):
                     connection.execute(
                         "UPDATE scheduled_runs SET finished_at = ?, "
                         "market_session_decision = 'open', "
-                        "outcome = 'report_emitted' WHERE run_key = ?",
-                        (finished, "lowercase-completion"),
+                        "outcome = 'report_emitted', result_envelope_json = ?, "
+                        "result_envelope_sha256 = ? WHERE run_key = ?",
+                        (
+                            finished,
+                            envelope_json,
+                            envelope_sha256,
+                            "lowercase-completion",
+                        ),
                     )
 
     def test_report_links_enforce_claim_identity_and_no_future_evidence(self) -> None:
@@ -3621,12 +5350,19 @@ class JournalMigrationTests(unittest.TestCase):
                     delay_seconds=None,
                     health_result="OK",
                 )
-                run_id, _ = journal.start_scheduled_run(
-                    run_key="close-2026-08-14",
-                    run_kind="CLOSE",
-                    session_date=date(2026, 8, 14),
-                    intended_run_at=now,
-                    started_at=now,
+                run_id = int(
+                    journal._connection.execute(
+                        "INSERT INTO scheduled_runs("
+                        "run_key, run_kind, session_date, intended_run_at, started_at"
+                        ") VALUES (?, ?, ?, ?, ?)",
+                        (
+                            "close-2026-08-14",
+                            "CLOSE",
+                            "2026-08-14",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:45:00.000000Z",
+                        ),
+                    ).lastrowid
                 )
 
             canonical_report_time = report_time.strftime(
@@ -3661,17 +5397,24 @@ class JournalMigrationTests(unittest.TestCase):
                     "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     report_values,
                 )
+                envelope_json = "{}"
+                envelope_sha256 = hashlib.sha256(
+                    envelope_json.encode("utf-8")
+                ).hexdigest()
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
                         "UPDATE scheduled_runs SET finished_at = ?, "
                         "market_session_decision = 'OPEN', "
                         "outcome = 'REPORT_EMITTED', report_id = 1, "
-                        "report_path = ? WHERE id = ?",
+                        "report_path = ?, result_envelope_json = ?, "
+                        "result_envelope_sha256 = ? WHERE id = ?",
                         (
                             (report_time + timedelta(seconds=1)).strftime(
                                 "%Y-%m-%dT%H:%M:%S.%fZ"
                             ),
                             report_values[9],
+                            envelope_json,
+                            envelope_sha256,
                             run_id,
                         ),
                     )

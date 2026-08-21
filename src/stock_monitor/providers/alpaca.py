@@ -61,6 +61,11 @@ _PAGE_SOURCE_CONTRACTS = {
         "/v2/stocks/quotes/latest",
         True,
     ),
+    "ALPACA_OPTION_SNAPSHOTS": (
+        "snapshots",
+        "/v1beta1/options/snapshots/",
+        True,
+    ),
 }
 
 
@@ -242,7 +247,7 @@ class ProviderFetchManifest:
         object.__setattr__(self, "requested_symbols", symbols)
         object.__setattr__(self, "pages", pages)
         if (
-            self.collection not in {"bars", "quotes", "trades"}
+            self.collection not in {"bars", "quotes", "trades", "snapshots"}
             or not symbols
             or symbols != tuple(sorted(set(symbols)))
             or any(_SYMBOL.fullmatch(symbol) is None for symbol in symbols)
@@ -279,7 +284,7 @@ class NormalizedMarketFactSource:
 
     def __post_init__(self) -> None:
         if (
-            self.kind not in {"BAR", "QUOTE", "TRADE"}
+            self.kind not in {"BAR", "QUOTE", "TRADE", "OPTION_SNAPSHOT"}
             or _SYMBOL.fullmatch(self.symbol) is None
             or type(self.feed) is not str
             or not self.feed
@@ -440,6 +445,7 @@ class _IssuedProviderFetchManifest:
     fingerprint: str
     raw_pages: tuple[bytes, ...]
     observations: tuple[SourceObservation, ...]
+    observation_fingerprints: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +461,26 @@ _ISSUED_NORMALIZED_MARKET_FACTS: dict[int, _IssuedNormalizedMarketFact] = {}
 _ISSUED_NORMALIZED_MARKET_FACTS_LOCK = RLock()
 _ISSUED_PROVIDER_FETCH_COHORTS: dict[int, _IssuedProviderFetchCohort] = {}
 _ISSUED_PROVIDER_FETCH_COHORTS_LOCK = RLock()
+_REPLAY_ONLY_PROVIDER_FETCH_SCOPES: dict[
+    tuple[int, int],
+    tuple[object, ProviderFetchManifest],
+] = {}
+_REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK = RLock()
+
+
+def _provider_fetch_scope_is_replay_only(
+    owner: object,
+    manifest: ProviderFetchManifest,
+) -> bool:
+    with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
+        scope = _REPLAY_ONLY_PROVIDER_FETCH_SCOPES.get(
+            (id(owner), id(manifest))
+        )
+        return (
+            scope is not None
+            and scope[0] is owner
+            and scope[1] is manifest
+        )
 
 
 def _canonical_digest(namespace: str, payload: object) -> str:
@@ -468,7 +494,29 @@ def _canonical_digest(namespace: str, payload: object) -> str:
     ).hexdigest()
 
 
-def _market_fact_payload(fact: Bar | Quote | Trade) -> dict[str, object]:
+def _market_fact_payload(
+    fact: Bar | Quote | Trade | OptionSnapshot,
+) -> dict[str, object]:
+    if isinstance(fact, OptionSnapshot):
+        return {
+            "kind": "OPTION_SNAPSHOT",
+            "occ_symbol": fact.occ_symbol,
+            "underlying": fact.underlying,
+            "expiration": fact.expiration.isoformat(),
+            "strike": str(fact.strike),
+            "delta": None if fact.delta is None else str(fact.delta),
+            "bid": None if fact.bid is None else str(fact.bid),
+            "ask": None if fact.ask is None else str(fact.ask),
+            "daily_volume": fact.daily_volume,
+            "open_interest": fact.open_interest,
+            "feed": fact.feed,
+            "observed_at": (
+                None
+                if fact.observed_at is None
+                else _format_utc(fact.observed_at)
+            ),
+            "source_observation_id": fact.source_observation_id,
+        }
     timestamp = _format_utc(fact.timestamp)
     if isinstance(fact, Bar):
         return {
@@ -510,7 +558,9 @@ def _market_fact_payload(fact: Bar | Quote | Trade) -> dict[str, object]:
     raise TypeError("normalized market fact has the wrong type")
 
 
-def _market_fact_fingerprint(fact: Bar | Quote | Trade) -> str:
+def _market_fact_fingerprint(
+    fact: Bar | Quote | Trade | OptionSnapshot,
+) -> str:
     return _canonical_digest(
         "stock-monitor/alpaca-normalized-market-fact/v1",
         _market_fact_payload(fact),
@@ -550,6 +600,26 @@ def _provider_fetch_manifest_fingerprint(
     )
 
 
+def _source_observation_fingerprint(observation: SourceObservation) -> str:
+    if type(observation) is not SourceObservation:
+        raise TypeError("source observation has the wrong type")
+    return _canonical_digest(
+        "stock-monitor/alpaca-source-observation/v1",
+        {
+            "observation_id": observation.observation_id,
+            "url": observation.url,
+            "source_type": observation.source_type,
+            "source_timestamp": _format_utc(
+                observation.source_timestamp
+            ),
+            "retrieved_at": _format_utc(observation.retrieved_at),
+            "feed": observation.feed,
+            "delay_seconds": observation.delay_seconds,
+            "content_hash": observation.content_hash,
+        },
+    )
+
+
 def _normalized_market_fact_source_fingerprint(
     source: NormalizedMarketFactSource,
 ) -> str:
@@ -575,7 +645,7 @@ def _normalized_market_fact_source_fingerprint(
 def _normalized_market_fact_authority(
     fact: object,
 ) -> _IssuedNormalizedMarketFact | None:
-    if not isinstance(fact, (Bar, Quote, Trade)):
+    if not isinstance(fact, (Bar, Quote, Trade, OptionSnapshot)):
         return None
     try:
         fingerprint = _market_fact_fingerprint(fact)
@@ -723,15 +793,19 @@ def _issue_provider_fetch_cohort(
             if current is not None and current.reference is dead:
                 _ISSUED_PROVIDER_FETCH_COHORTS.pop(identity, None)
 
-    authority = _IssuedProviderFetchCohort(
-        reference=ref(cohort, discard),
-        fingerprint=_provider_fetch_cohort_fingerprint(cohort),
-        owner=owner,
-        manifest=manifest,
-        ingestible=True,
-    )
-    with _ISSUED_PROVIDER_FETCH_COHORTS_LOCK:
-        _ISSUED_PROVIDER_FETCH_COHORTS[identity] = authority
+    with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
+        authority = _IssuedProviderFetchCohort(
+            reference=ref(cohort, discard),
+            fingerprint=_provider_fetch_cohort_fingerprint(cohort),
+            owner=owner,
+            manifest=manifest,
+            ingestible=not _provider_fetch_scope_is_replay_only(
+                owner,
+                manifest,
+            ),
+        )
+        with _ISSUED_PROVIDER_FETCH_COHORTS_LOCK:
+            _ISSUED_PROVIDER_FETCH_COHORTS[identity] = authority
     return cohort
 
 
@@ -792,31 +866,44 @@ def _mark_provider_fetch_cohort_replay_only(
     authority = _provider_fetch_cohort_authority(cohort)
     if authority is None or not isinstance(cohort, ProviderFetchCohort):
         raise ProviderDataError("provider fetch cohort authority is unverified")
-    if not authority.ingestible:
-        return cohort
-    narrowed = _IssuedProviderFetchCohort(
-        reference=authority.reference,
-        fingerprint=authority.fingerprint,
-        owner=authority.owner,
-        manifest=authority.manifest,
-        ingestible=False,
-    )
-    with _ISSUED_PROVIDER_FETCH_COHORTS_LOCK:
-        current = _ISSUED_PROVIDER_FETCH_COHORTS.get(id(cohort))
-        if current is not authority or current.reference() is not cohort:
-            raise ProviderDataError(
-                "provider fetch cohort authority changed during narrowing"
-            )
-        _ISSUED_PROVIDER_FETCH_COHORTS[id(cohort)] = narrowed
+    with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
+        _REPLAY_ONLY_PROVIDER_FETCH_SCOPES[
+            (id(authority.owner), id(authority.manifest))
+        ] = (authority.owner, authority.manifest)
+        with _ISSUED_PROVIDER_FETCH_COHORTS_LOCK:
+            current = _ISSUED_PROVIDER_FETCH_COHORTS.get(id(cohort))
+            if current is None or current.reference() is not cohort:
+                raise ProviderDataError(
+                    "provider fetch cohort authority changed during narrowing"
+                )
+            for identity, candidate in tuple(
+                _ISSUED_PROVIDER_FETCH_COHORTS.items()
+            ):
+                if (
+                    candidate.owner is authority.owner
+                    and candidate.manifest is authority.manifest
+                    and candidate.ingestible
+                ):
+                    _ISSUED_PROVIDER_FETCH_COHORTS[identity] = (
+                        _IssuedProviderFetchCohort(
+                            reference=candidate.reference,
+                            fingerprint=candidate.fingerprint,
+                            owner=candidate.owner,
+                            manifest=candidate.manifest,
+                            ingestible=False,
+                        )
+                    )
     return cohort
 
 
 def provider_fetch_cohorts_share_owner(*cohorts: object) -> bool:
-    """Return whether every current issued cohort belongs to one client."""
+    """Return whether every current issued cohort/option chain has one owner."""
     if not cohorts:
         return False
     authorities = tuple(
-        _provider_fetch_cohort_authority(cohort) for cohort in cohorts
+        _provider_fetch_cohort_authority(cohort)
+        or _provider_option_chain_authority(cohort)
+        for cohort in cohorts
     )
     if any(authority is None for authority in authorities):
         return False
@@ -837,12 +924,16 @@ def read_provider_fetch_bundle(value: object) -> ProviderFetchBundle:
     """Return immutable raw evidence only for a current issued fact/cohort."""
     fact_authority = _normalized_market_fact_authority(value)
     cohort_authority = _provider_fetch_cohort_authority(value)
+    option_chain_authority = _provider_option_chain_authority(value)
     if fact_authority is not None:
         owner = fact_authority.owner
         manifest = fact_authority.source.fetch_manifest
     elif cohort_authority is not None:
         owner = cohort_authority.owner
         manifest = cohort_authority.manifest
+    elif option_chain_authority is not None:
+        owner = option_chain_authority.owner
+        manifest = option_chain_authority.manifest
     else:
         raise ValueError("provider fetch authority is unverified")
     issued_fetch = _issued_provider_fetch_manifest(owner, manifest)
@@ -866,7 +957,7 @@ def read_provider_fetch_bundle(value: object) -> ProviderFetchBundle:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class OptionSnapshot:
     occ_symbol: str
     underlying: str
@@ -880,6 +971,225 @@ class OptionSnapshot:
     feed: str
     observed_at: datetime | None
     source_observation_id: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ProviderOptionChain(Sequence[OptionSnapshot]):
+    """Exact complete option-snapshot sequence for one terminal fetch."""
+
+    _snapshots: tuple[OptionSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        snapshots = tuple(self._snapshots)
+        object.__setattr__(self, "_snapshots", snapshots)
+        if (
+            not snapshots
+            or any(not isinstance(item, OptionSnapshot) for item in snapshots)
+            or snapshots
+            != tuple(sorted(snapshots, key=lambda item: item.occ_symbol))
+            or len({item.occ_symbol for item in snapshots}) != len(snapshots)
+            or len({item.underlying for item in snapshots}) != 1
+        ):
+            raise ProviderDataError("provider option chain is malformed")
+
+    def __getitem__(self, index: int | slice):
+        return self._snapshots[index]
+
+    def __iter__(self) -> Iterator[OptionSnapshot]:
+        return iter(self._snapshots)
+
+    def __len__(self) -> int:
+        return len(self._snapshots)
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedProviderOptionChain:
+    reference: ReferenceType[ProviderOptionChain]
+    fingerprint: str
+    owner: object
+    manifest: ProviderFetchManifest
+    ingestible: bool
+
+
+_ISSUED_PROVIDER_OPTION_CHAINS: dict[int, _IssuedProviderOptionChain] = {}
+_ISSUED_PROVIDER_OPTION_CHAINS_LOCK = RLock()
+
+
+def _provider_option_chain_fingerprint(chain: ProviderOptionChain) -> str:
+    return _canonical_digest(
+        "stock-monitor/alpaca-provider-option-chain/v1",
+        [_market_fact_payload(snapshot) for snapshot in chain],
+    )
+
+
+def _issue_provider_option_chain(
+    *,
+    owner: object,
+    manifest: ProviderFetchManifest,
+    snapshots: Sequence[OptionSnapshot],
+) -> ProviderOptionChain:
+    issued_fetch = _issued_provider_fetch_manifest(owner, manifest)
+    if issued_fetch is None or manifest.collection != "snapshots":
+        raise ProviderDataError("provider option chain authority is unverified")
+    values = tuple(sorted(snapshots, key=lambda item: item.occ_symbol))
+    actual_by_coordinate: dict[tuple[int, int, str], OptionSnapshot] = {}
+    for snapshot in values:
+        authority = _normalized_market_fact_authority(snapshot)
+        if (
+            authority is None
+            or authority.owner is not owner
+            or authority.source.fetch_manifest is not manifest
+            or authority.source.kind != "OPTION_SNAPSHOT"
+        ):
+            raise ProviderDataError(
+                "provider option chain fact authority is unverified"
+            )
+        coordinate = (
+            authority.source.page_ordinal,
+            authority.source.source_item_ordinal,
+            authority.source.source_item_path,
+        )
+        if coordinate in actual_by_coordinate:
+            raise ProviderDataError(
+                "provider option chain duplicates a raw provider item"
+            )
+        actual_by_coordinate[coordinate] = snapshot
+    expected_by_coordinate: dict[tuple[int, int, str], OptionSnapshot] = {}
+    for page, payload, observation in zip(
+        manifest.pages,
+        issued_fetch.raw_pages,
+        issued_fetch.observations,
+        strict=True,
+    ):
+        for item_ordinal, item_path, _symbol, _value in _raw_provider_items(
+            manifest=manifest,
+            page=page,
+            payload=payload,
+        ):
+            coordinate = (page.page_ordinal, item_ordinal, item_path)
+            expected = _market_fact_from_raw_provider_item(
+                manifest=manifest,
+                page=page,
+                observation=observation,
+                payload=payload,
+                source_item_ordinal=item_ordinal,
+                source_item_path=item_path,
+            )
+            if not isinstance(expected, OptionSnapshot):
+                raise ProviderDataError(
+                    "provider option chain raw item is malformed"
+                )
+            expected_by_coordinate[coordinate] = expected
+    if (
+        actual_by_coordinate.keys() != expected_by_coordinate.keys()
+        or any(
+            actual_by_coordinate[coordinate] != expected
+            for coordinate, expected in expected_by_coordinate.items()
+        )
+    ):
+        raise ProviderDataError(
+            "provider option chain is not the complete raw snapshot cohort"
+        )
+    chain = ProviderOptionChain(values)
+    identity = id(chain)
+
+    def discard(dead: ReferenceType[ProviderOptionChain]) -> None:
+        with _ISSUED_PROVIDER_OPTION_CHAINS_LOCK:
+            current = _ISSUED_PROVIDER_OPTION_CHAINS.get(identity)
+            if current is not None and current.reference is dead:
+                _ISSUED_PROVIDER_OPTION_CHAINS.pop(identity, None)
+
+    with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
+        authority = _IssuedProviderOptionChain(
+            reference=ref(chain, discard),
+            fingerprint=_provider_option_chain_fingerprint(chain),
+            owner=owner,
+            manifest=manifest,
+            ingestible=not _provider_fetch_scope_is_replay_only(
+                owner,
+                manifest,
+            ),
+        )
+        with _ISSUED_PROVIDER_OPTION_CHAINS_LOCK:
+            _ISSUED_PROVIDER_OPTION_CHAINS[identity] = authority
+    return chain
+
+
+def _provider_option_chain_authority(
+    chain: object,
+) -> _IssuedProviderOptionChain | None:
+    if not isinstance(chain, ProviderOptionChain):
+        return None
+    try:
+        fingerprint = _provider_option_chain_fingerprint(chain)
+    except Exception:
+        return None
+    with _ISSUED_PROVIDER_OPTION_CHAINS_LOCK:
+        issued = _ISSUED_PROVIDER_OPTION_CHAINS.get(id(chain))
+        if (
+            issued is None
+            or issued.reference() is not chain
+            or issued.fingerprint != fingerprint
+            or _issued_provider_fetch_manifest(issued.owner, issued.manifest)
+            is None
+        ):
+            return None
+        for snapshot in chain:
+            fact_authority = _normalized_market_fact_authority(snapshot)
+            if (
+                fact_authority is None
+                or fact_authority.owner is not issued.owner
+                or fact_authority.source.fetch_manifest is not issued.manifest
+            ):
+                return None
+        return issued
+
+
+def is_issued_provider_option_chain(chain: object) -> bool:
+    return _provider_option_chain_authority(chain) is not None
+
+
+def is_ingestible_provider_option_chain(chain: object) -> bool:
+    """Return whether *chain* retains live-ingest authority."""
+    authority = _provider_option_chain_authority(chain)
+    return authority is not None and authority.ingestible
+
+
+def _mark_provider_option_chain_replay_only(
+    chain: object,
+) -> ProviderOptionChain:
+    """Irreversibly narrow one exact option-fetch scope to replay use."""
+    authority = _provider_option_chain_authority(chain)
+    if authority is None or not isinstance(chain, ProviderOptionChain):
+        raise ProviderDataError("provider option chain authority is unverified")
+    with _REPLAY_ONLY_PROVIDER_FETCH_SCOPES_LOCK:
+        _REPLAY_ONLY_PROVIDER_FETCH_SCOPES[
+            (id(authority.owner), id(authority.manifest))
+        ] = (authority.owner, authority.manifest)
+        with _ISSUED_PROVIDER_OPTION_CHAINS_LOCK:
+            current = _ISSUED_PROVIDER_OPTION_CHAINS.get(id(chain))
+            if current is None or current.reference() is not chain:
+                raise ProviderDataError(
+                    "provider option chain authority changed during narrowing"
+                )
+            for identity, candidate in tuple(
+                _ISSUED_PROVIDER_OPTION_CHAINS.items()
+            ):
+                if (
+                    candidate.owner is authority.owner
+                    and candidate.manifest is authority.manifest
+                    and candidate.ingestible
+                ):
+                    _ISSUED_PROVIDER_OPTION_CHAINS[identity] = (
+                        _IssuedProviderOptionChain(
+                            reference=candidate.reference,
+                            fingerprint=candidate.fingerprint,
+                            owner=candidate.owner,
+                            manifest=candidate.manifest,
+                            ingestible=False,
+                        )
+                    )
+    return chain
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,9 +1252,20 @@ def recompute_alpaca_page_metadata(
         parsed_url = urllib.parse.urlsplit(request_url)
     except (TypeError, ValueError):
         raise ProviderDataError("Alpaca page request URL is malformed") from None
+    option_underlying: str | None = None
+    path_matches = parsed_url.path == expected_path
+    if source_type == "ALPACA_OPTION_SNAPSHOTS":
+        encoded_underlying = parsed_url.path.removeprefix(expected_path)
+        option_underlying = urllib.parse.unquote(encoded_underlying)
+        path_matches = (
+            parsed_url.path.startswith(expected_path)
+            and _SYMBOL.fullmatch(option_underlying) is not None
+            and parsed_url.path
+            == expected_path + urllib.parse.quote(option_underlying)
+        )
     if (
         f"{parsed_url.scheme}://{parsed_url.netloc}" != _BASE_URL
-        or parsed_url.path != expected_path
+        or not path_matches
         or parsed_url.fragment
     ):
         raise ProviderDataError("Alpaca page request URL is inconsistent")
@@ -952,9 +1273,28 @@ def recompute_alpaca_page_metadata(
     raw_collection = document.get(collection)
     if not isinstance(raw_collection, dict):
         raise ProviderDataError("Alpaca page collection is malformed")
+    safe_retrieved_at = _utc(retrieved_at, "retrieved time")
     timestamps: list[datetime] = []
     for symbol in sorted(raw_collection):
         raw_values = raw_collection[symbol]
+        if source_type == "ALPACA_OPTION_SNAPSHOTS":
+            match = _OCC_SYMBOL.fullmatch(symbol) if isinstance(symbol, str) else None
+            if (
+                match is None
+                or match.group("root") != option_underlying
+                or not isinstance(raw_values, dict)
+            ):
+                raise ProviderDataError("Alpaca option snapshot item is malformed")
+            quote = raw_values.get("latestQuote")
+            if quote is not None:
+                if not isinstance(quote, dict):
+                    raise ProviderDataError(
+                        "Alpaca option snapshot quote is malformed"
+                    )
+                timestamps.append(
+                    _timestamp(quote.get("t"), "option quote")
+                )
+            continue
         if not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None:
             raise ProviderDataError("Alpaca page symbol is malformed")
         if latest_shape:
@@ -969,6 +1309,8 @@ def recompute_alpaca_page_metadata(
             timestamps.append(_timestamp(value.get("t"), collection[:-1]))
     if timestamps:
         source_time = max(timestamps)
+    elif source_type == "ALPACA_OPTION_SNAPSHOTS":
+        source_time = safe_retrieved_at
     else:
         if latest_shape:
             raise ProviderIncompleteError("latest Alpaca page is empty")
@@ -982,7 +1324,6 @@ def recompute_alpaca_page_metadata(
                 "empty Alpaca page request has no exact end boundary"
             )
         source_time = _timestamp(end_values[0], "request end")
-    safe_retrieved_at = _utc(retrieved_at, "retrieved time")
     if source_time > safe_retrieved_at:
         raise ProviderDataError("provider source timestamp is in the future")
     return AlpacaPageMetadata(
@@ -1052,6 +1393,10 @@ def _register_provider_fetch_manifest(
         fingerprint=_provider_fetch_manifest_fingerprint(manifest),
         raw_pages=tuple(raw_pages),
         observations=tuple(observations),
+        observation_fingerprints=tuple(
+            _source_observation_fingerprint(observation)
+            for observation in observations
+        ),
     )
     with owner._provider_authority_lock:
         owner._issued_fetch_manifests[id(manifest)] = entry
@@ -1078,15 +1423,24 @@ def _issued_provider_fetch_manifest(
             or issued.fingerprint != fingerprint
             or len(issued.raw_pages) != len(manifest.pages)
             or len(issued.observations) != len(manifest.pages)
+            or len(issued.observation_fingerprints) != len(manifest.pages)
         ):
             return None
-        for page, payload, observation in zip(
+        for page, payload, observation, observation_fingerprint in zip(
             manifest.pages,
             issued.raw_pages,
             issued.observations,
+            issued.observation_fingerprints,
             strict=True,
         ):
-            if (
+            try:
+                is_current = (
+                    _source_observation_fingerprint(observation)
+                    == observation_fingerprint
+                )
+            except (TypeError, ValueError):
+                return None
+            if not is_current or (
                 hashlib.sha256(payload).hexdigest()
                 != page.payload_sha256
                 or owner._observations.get(page.source_observation_id)
@@ -1230,11 +1584,20 @@ def _raw_provider_items(
     current_ordinal = 0
     result: list[tuple[int, str, str, dict[str, object]]] = []
     latest_quote = page.source_type == "ALPACA_LATEST_QUOTES"
+    option_snapshot = page.source_type == "ALPACA_OPTION_SNAPSHOTS"
+    if (manifest.collection == "snapshots") != option_snapshot:
+        raise ProviderDataError("provider fetch snapshot source is inconsistent")
     for symbol in sorted(raw_collection):
         raw_values = raw_collection[symbol]
-        if not isinstance(symbol, str) or symbol not in manifest.requested_symbols:
+        if option_snapshot:
+            match = _OCC_SYMBOL.fullmatch(symbol) if isinstance(symbol, str) else None
+            if match is None or match.group("root") not in manifest.requested_symbols:
+                raise ProviderDataError(
+                    "provider fetch contains an unrequested option snapshot"
+                )
+        elif not isinstance(symbol, str) or symbol not in manifest.requested_symbols:
             raise ProviderDataError("provider fetch contains an unrequested symbol")
-        if latest_quote:
+        if latest_quote or option_snapshot:
             values = (raw_values,)
         else:
             if not isinstance(raw_values, list):
@@ -1246,7 +1609,7 @@ def _raw_provider_items(
             current_ordinal += 1
             item_path = (
                 f"$.{manifest.collection}.{symbol}"
-                if latest_quote
+                if latest_quote or option_snapshot
                 else f"$.{manifest.collection}.{symbol}[{item_index}]"
             )
             result.append((current_ordinal, item_path, symbol, value))
@@ -1284,7 +1647,7 @@ def _market_fact_from_raw_provider_item(
     payload: bytes,
     source_item_ordinal: int,
     source_item_path: str,
-) -> Bar | Quote | Trade:
+) -> Bar | Quote | Trade | OptionSnapshot:
     symbol, value = _raw_provider_item(
         manifest=manifest,
         page=page,
@@ -1292,6 +1655,78 @@ def _market_fact_from_raw_provider_item(
         source_item_ordinal=source_item_ordinal,
         source_item_path=source_item_path,
     )
+    if manifest.collection == "snapshots":
+        if page.source_type != "ALPACA_OPTION_SNAPSHOTS":
+            raise ProviderDataError(
+                "provider OPTION_SNAPSHOT source type is inconsistent"
+            )
+        match = _OCC_SYMBOL.fullmatch(symbol)
+        if match is None or match.group("root") not in manifest.requested_symbols:
+            raise ProviderDataError("indicative option snapshot is malformed")
+        quote = value.get("latestQuote")
+        bid: Decimal | None = None
+        ask: Decimal | None = None
+        observed_at: datetime | None = None
+        if quote is not None:
+            if not isinstance(quote, dict):
+                raise ProviderDataError("indicative option quote is malformed")
+            bid = _decimal(quote.get("bp"), "option bid", positive=False)
+            ask = _decimal(quote.get("ap"), "option ask", positive=False)
+            if bid < 0 or ask < 0:
+                raise ProviderDataError("indicative option quote is negative")
+            if ask < bid:
+                raise ProviderDataError("indicative option quote is crossed")
+            observed_at = _timestamp(quote.get("t"), "option quote")
+            if observed_at > observation.retrieved_at:
+                raise ProviderDataError(
+                    "provider option timestamp is in the future"
+                )
+        greeks = value.get("greeks")
+        delta: Decimal | None = None
+        if greeks is not None:
+            if not isinstance(greeks, dict):
+                raise ProviderDataError("indicative option greeks are malformed")
+            delta = _decimal(
+                greeks.get("delta"),
+                "option delta",
+                positive=False,
+            )
+            if not Decimal("-1") <= delta <= Decimal("1"):
+                raise ProviderDataError(
+                    "indicative option delta is outside its bounds"
+                )
+        daily_bar = value.get("dailyBar")
+        volume: int | None = None
+        if daily_bar is not None:
+            if not isinstance(daily_bar, dict):
+                raise ProviderDataError(
+                    "indicative option daily bar is malformed"
+                )
+            volume = _integer(
+                daily_bar.get("v"),
+                "option daily volume",
+                optional=True,
+            )
+        try:
+            expiration = datetime.strptime(match.group("date"), "%y%m%d").date()
+        except ValueError:
+            raise ProviderDataError(
+                "indicative option expiration is malformed"
+            ) from None
+        return OptionSnapshot(
+            occ_symbol=symbol,
+            underlying=match.group("root"),
+            expiration=expiration,
+            strike=Decimal(int(match.group("strike"))) / Decimal("1000"),
+            delta=delta,
+            bid=bid,
+            ask=ask,
+            daily_volume=volume,
+            open_interest=None,
+            feed="indicative",
+            observed_at=observed_at,
+            source_observation_id=page.source_observation_id,
+        )
     timestamp = _timestamp(value.get("t"), manifest.collection[:-1])
     if manifest.collection == "bars":
         if page.source_type not in {
@@ -1372,14 +1807,14 @@ def _market_fact_from_raw_provider_item(
 
 
 def _issue_market_fact_from_fetch(
-    fact: Bar | Quote | Trade | None = None,
+    fact: Bar | Quote | Trade | OptionSnapshot | None = None,
     *,
     owner: object,
     fetch_manifest: ProviderFetchManifest,
     page_ordinal: int,
     source_item_ordinal: int,
     source_item_path: str,
-) -> Bar | Quote | Trade:
+) -> Bar | Quote | Trade | OptionSnapshot:
     issued_fetch = _issued_provider_fetch_manifest(owner, fetch_manifest)
     if issued_fetch is None:
         raise ProviderDataError("provider fetch authority is unverified")
@@ -1412,6 +1847,8 @@ def _issue_market_fact_from_fetch(
         else "QUOTE"
         if isinstance(normalized_fact, Quote)
         else "TRADE"
+        if isinstance(normalized_fact, Trade)
+        else "OPTION_SNAPSHOT"
     )
     normalized_fields_digest = _canonical_digest(
         "stock-monitor/alpaca-normalized-fields/v1",
@@ -1424,7 +1861,11 @@ def _issue_market_fact_from_fetch(
     )
     source = NormalizedMarketFactSource(
         kind=kind,
-        symbol=normalized_fact.symbol,
+        symbol=(
+            normalized_fact.underlying
+            if isinstance(normalized_fact, OptionSnapshot)
+            else normalized_fact.symbol
+        ),
         feed=normalized_fact.feed,
         source_observation_id=normalized_fact.source_observation_id,
         page_ordinal=page_ordinal,
@@ -1523,10 +1964,14 @@ class AlpacaMarketData:
                 source_type=source_type,
                 retrieved_at=retrieved_at,
             )
-            if metadata.source_time != safe_timestamp:
+            if (
+                source_type != "ALPACA_OPTION_SNAPSHOTS"
+                and metadata.source_time != safe_timestamp
+            ):
                 raise ProviderDataError(
                     "provider source timestamp conflicts with its raw page"
                 )
+            safe_timestamp = metadata.source_time
             observation_id = metadata.source_observation_id
             delay_seconds = metadata.delay_seconds
         else:
@@ -2362,28 +2807,49 @@ class AlpacaMarketData:
             issued_result[fact.symbol] = fact
         return issued_result
 
-    def option_chain(self, underlying: str) -> tuple[OptionSnapshot, ...]:
+    def option_chain(self, underlying: str) -> ProviderOptionChain:
         symbol = _symbols([underlying])[0]
         query = [("feed", "indicative"), ("limit", "1000")]
-        pages = self._pages(
+        raw_pages = self._pages(
             path=f"/v1beta1/options/snapshots/{urllib.parse.quote(symbol)}",
             query=query,
             collection="snapshots",
         )
-        snapshots: dict[str, OptionSnapshot] = {}
-        for url, document, payload in pages:
+        pinned_pages: list[
+            tuple[str, dict[str, object], bytes, str, str]
+        ] = []
+        pending_sources: list[tuple[int, int, str]] = []
+        seen_occ_symbols: set[str] = set()
+        for page_ordinal, (url, document, payload) in enumerate(
+            raw_pages,
+            start=1,
+        ):
             raw = document["snapshots"]
             assert isinstance(raw, dict)
             observed_values: list[datetime] = []
-            parsed_values: list[tuple[str, dict[str, object], re.Match[str]]] = []
-            for occ_symbol, value in raw.items():
+            for source_item_ordinal, occ_symbol in enumerate(
+                sorted(raw),
+                start=1,
+            ):
+                value = raw[occ_symbol]
                 match = _OCC_SYMBOL.fullmatch(occ_symbol) if isinstance(occ_symbol, str) else None
                 if match is None or not isinstance(value, dict) or match.group("root") != symbol:
                     raise ProviderDataError("indicative option snapshot is malformed")
+                if occ_symbol in seen_occ_symbols:
+                    raise ProviderIncompleteError(
+                        "option snapshot is duplicated across pages"
+                    )
+                seen_occ_symbols.add(occ_symbol)
                 quote = value.get("latestQuote")
                 if isinstance(quote, dict) and quote.get("t") is not None:
                     observed_values.append(_timestamp(quote.get("t"), "option quote"))
-                parsed_values.append((occ_symbol, value, match))
+                pending_sources.append(
+                    (
+                        page_ordinal,
+                        source_item_ordinal,
+                        f"$.snapshots.{occ_symbol}",
+                    )
+                )
             observation_id = self._pin(
                 url=url,
                 payload=payload,
@@ -2391,67 +2857,42 @@ class AlpacaMarketData:
                 feed="indicative",
                 source_timestamp=max(observed_values, default=self._current_time()),
             )
-            for occ_symbol, value, match in parsed_values:
-                if occ_symbol in snapshots:
-                    raise ProviderIncompleteError("option snapshot is duplicated across pages")
-                quote = value.get("latestQuote")
-                greeks = value.get("greeks")
-                daily_bar = value.get("dailyBar")
-                bid: Decimal | None = None
-                ask: Decimal | None = None
-                observed_at: datetime | None = None
-                if quote is not None:
-                    if not isinstance(quote, dict):
-                        raise ProviderDataError("indicative option quote is malformed")
-                    bid = _decimal(quote.get("bp"), "option bid", positive=False)
-                    ask = _decimal(quote.get("ap"), "option ask", positive=False)
-                    if bid < 0 or ask < 0:
-                        raise ProviderDataError("indicative option quote is negative")
-                    if ask < bid:
-                        raise ProviderDataError("indicative option quote is crossed")
-                    observed_at = _timestamp(quote.get("t"), "option quote")
-                delta: Decimal | None = None
-                if greeks is not None:
-                    if not isinstance(greeks, dict):
-                        raise ProviderDataError("indicative option greeks are malformed")
-                    delta = _decimal(greeks.get("delta"), "option delta", positive=False)
-                    if not Decimal("-1") <= delta <= Decimal("1"):
-                        raise ProviderDataError("indicative option delta is outside its bounds")
-                volume: int | None = None
-                if daily_bar is not None:
-                    if not isinstance(daily_bar, dict):
-                        raise ProviderDataError("indicative option daily bar is malformed")
-                    volume = _integer(
-                        daily_bar.get("v"),
-                        "option daily volume",
-                        optional=True,
-                    )
-                try:
-                    expiration = datetime.strptime(
-                        match.group("date"), "%y%m%d"
-                    ).date()
-                except ValueError:
-                    raise ProviderDataError(
-                        "indicative option expiration is malformed"
-                    ) from None
-                strike = Decimal(int(match.group("strike"))) / Decimal("1000")
-                snapshots[occ_symbol] = OptionSnapshot(
-                    occ_symbol=occ_symbol,
-                    underlying=symbol,
-                    expiration=expiration,
-                    strike=strike,
-                    delta=delta,
-                    bid=bid,
-                    ask=ask,
-                    daily_volume=volume,
-                    open_interest=None,
-                    feed="indicative",
-                    observed_at=observed_at,
-                    source_observation_id=observation_id,
+            pinned_pages.append(
+                (
+                    url,
+                    document,
+                    payload,
+                    observation_id,
+                    "ALPACA_OPTION_SNAPSHOTS",
                 )
-        if not snapshots:
+            )
+        if not pending_sources:
             raise ProviderIncompleteError("indicative option snapshot response is empty")
-        return tuple(snapshots[name] for name in sorted(snapshots))
+        fetch_manifest = _provider_fetch_manifest(
+            owner=self,
+            collection="snapshots",
+            requested_symbols=(symbol,),
+            pages=pinned_pages,
+        )
+        snapshots: dict[str, OptionSnapshot] = {}
+        for page_ordinal, item_ordinal, item_path in pending_sources:
+            fact = _issue_market_fact_from_fetch(
+                owner=self,
+                fetch_manifest=fetch_manifest,
+                page_ordinal=page_ordinal,
+                source_item_ordinal=item_ordinal,
+                source_item_path=item_path,
+            )
+            if not isinstance(fact, OptionSnapshot):
+                raise ProviderDataError(
+                    "provider OPTION_SNAPSHOT authority is malformed"
+                )
+            snapshots[fact.occ_symbol] = fact
+        return _issue_provider_option_chain(
+            owner=self,
+            manifest=fetch_manifest,
+            snapshots=tuple(snapshots[name] for name in sorted(snapshots)),
+        )
 
     def smoke(
         self,
@@ -2535,11 +2976,14 @@ __all__ = [
     "ProviderFetchPage",
     "ProviderFetchPageBundle",
     "ProviderIncompleteError",
+    "ProviderOptionChain",
     "Quote",
     "TimeWindow",
     "Trade",
     "is_ingestible_provider_fetch_cohort",
+    "is_ingestible_provider_option_chain",
     "is_issued_normalized_market_fact",
+    "is_issued_provider_option_chain",
     "is_issued_provider_fetch_cohort",
     "normalized_market_facts_share_owner",
     "provider_fetch_cohorts_share_owner",

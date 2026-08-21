@@ -119,9 +119,21 @@ _APPROVED_URLLIB_IMPORTS = frozenset(
         *_APPROVED_URLLIB_CONFIGURATION,
     }
 )
-# No shell launcher is approved in Task 4. A future launcher must be added here
-# with its exact reviewed bytes; the scanner never infers safety from commands.
-_REVIEWED_SHELL_LAUNCHERS: dict[Path, bytes] = {}
+_REVIEWED_SHELL_LAUNCHERS: dict[Path, bytes] = {
+    Path("scripts/run_monitor.sh"): (
+        b"#!/bin/sh\n"
+        b"set -eu\n"
+        b"\n"
+        b'script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+        b'repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)\n'
+        b'cd -- "$repo_root"\n'
+        b'if [ -x "$repo_root/.venv/bin/python3" ]; then\n'
+        b'    PATH="$repo_root/.venv/bin:$PATH"\n'
+        b"    export PATH\n"
+        b"fi\n"
+        b'exec python3 -m stock_monitor "$@"\n'
+    ),
+}
 _NON_PRODUCTION_DIRECTORIES = frozenset(
     {
         ".git",
@@ -846,6 +858,72 @@ def _static_string(node: ast.AST) -> str | None:
     return None
 
 
+def _approved_export_sqlite_execute_attributes(
+    tree: ast.AST,
+    relative: Path,
+) -> set[int]:
+    """Return only exact read-snapshot ``connection.execute`` attributes."""
+    if relative != Path("exports.py"):
+        return set()
+    approved: set[int] = set()
+    static_statements = {
+        "PRAGMA query_only = ON",
+        "BEGIN",
+        (
+            "SELECT name FROM sqlite_schema WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name COLLATE BINARY"
+        ),
+    }
+    for node in ast.walk(tree):
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr != "execute"
+            or not isinstance(node.func.value, ast.Name)
+            or node.func.value.id != "connection"
+            or len(node.args) != 1
+            or node.keywords
+        ):
+            continue
+        statement = node.args[0]
+        static = _static_string(statement)
+        if static in static_statements or _approved_read_snapshot_fstring(statement):
+            approved.add(id(node.func))
+    return approved
+
+
+def _approved_read_snapshot_fstring(node: ast.AST) -> bool:
+    if not isinstance(node, ast.JoinedStr):
+        return False
+    shapes = (
+        (
+            ("text", "PRAGMA table_info("),
+            ("name", "quoted_table"),
+            ("text", ")"),
+        ),
+        (
+            ("text", "SELECT * FROM "),
+            ("name", "quoted_table"),
+            ("text", " ORDER BY "),
+            ("name", "order_sql"),
+        ),
+    )
+    actual: list[tuple[str, str]] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            actual.append(("text", value.value))
+        elif (
+            isinstance(value, ast.FormattedValue)
+            and value.conversion == -1
+            and value.format_spec is None
+            and isinstance(value.value, ast.Name)
+        ):
+            actual.append(("name", value.value.id))
+        else:
+            return False
+    return tuple(actual) in shapes
+
+
 def _boundary_violations(package: Path) -> list[str]:
     violations: list[str] = []
     if package.is_file():
@@ -885,6 +963,10 @@ def _boundary_violations(package: Path) -> list[str]:
             provider_exports,
             request_names,
         )
+        approved_export_execute = _approved_export_sqlite_execute_attributes(
+            tree,
+            relative,
+        )
         for node in ast.walk(tree):
             line = getattr(node, "lineno", 0)
             if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -911,7 +993,11 @@ def _boundary_violations(package: Path) -> list[str]:
                 violations.append(
                     f"network capability:{relative}:{line}:Request subclass"
                 )
-            if isinstance(node, ast.Attribute) and _is_forbidden_api(node.attr):
+            if (
+                isinstance(node, ast.Attribute)
+                and _is_forbidden_api(node.attr)
+                and id(node) not in approved_export_execute
+            ):
                 violations.append(f"forbidden API:{relative}:{line}:{node.attr}")
             if isinstance(node, ast.Call):
                 action = _brokerage_action(node)
@@ -1111,6 +1197,108 @@ class BrokerageBoundaryTests(unittest.TestCase):
         package = PROJECT_ROOT / "src" / "stock_monitor"
 
         self.assertEqual(_boundary_violations(package), [])
+
+    def test_exports_allows_only_the_reviewed_sqlite_read_snapshot(self) -> None:
+        exports = PROJECT_ROOT / "src" / "stock_monitor" / "exports.py"
+        execute_violations = [
+            value
+            for value in _boundary_violations(exports)
+            if value.endswith(":execute")
+        ]
+        self.assertEqual(execute_violations, [])
+
+        source = exports.read_text(encoding="utf-8")
+        mutating = source.replace(
+            'connection.execute("PRAGMA query_only = ON")',
+            'connection.execute("DELETE FROM reports")',
+            1,
+        )
+        self.assertNotEqual(mutating, source)
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "exports.py"
+            candidate.write_text(mutating, encoding="utf-8")
+            violations = _boundary_violations(candidate)
+
+        self.assertTrue(
+            any(value.endswith(":execute") for value in violations),
+            violations,
+        )
+
+    def test_reviewed_launcher_is_exact_and_tamper_evident(self) -> None:
+        relative = Path("scripts/run_monitor.sh")
+        launcher = PROJECT_ROOT / relative
+
+        self.assertEqual(_shell_boundary_violations(launcher, relative), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            changed = Path(directory) / "run_monitor.sh"
+            changed.write_bytes(launcher.read_bytes() + b"echo unsafe\n")
+            violations = _shell_boundary_violations(changed, relative)
+
+        self.assertEqual(
+            violations,
+            [
+                "unreviewed executable shell:scripts/run_monitor.sh:1:"
+                "launcher shape changed"
+            ],
+        )
+
+    def test_phase2_domain_modules_are_pure_and_paper_only(self) -> None:
+        package = PROJECT_ROOT / "src" / "stock_monitor"
+        module_paths = {
+            "replay": package / "replay.py",
+            "options_paper": package / "options_paper.py",
+        }
+        for name, path in module_paths.items():
+            with self.subTest(module=name, boundary="exists"):
+                self.assertTrue(path.is_file(), f"missing Phase 2 module: {path.name}")
+            if not path.is_file():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            all_imports = tuple(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+            )
+            imported_modules = {
+                imported
+                for node in all_imports
+                for imported in _imported_paths(node)
+            }
+            with self.subTest(module=name, boundary="provider-network"):
+                self.assertFalse(
+                    any(
+                        "providers" in module.split(".")
+                        or _could_lead_to_network(module)
+                        for module in imported_modules
+                    )
+                )
+            if name == "replay":
+                with self.subTest(module=name, boundary="journal"):
+                    self.assertFalse(
+                        any(
+                            "journal" in module.split(".")
+                            for module in imported_modules
+                        )
+                    )
+            else:
+                top_level_modules = {
+                    imported
+                    for node in tree.body
+                    if isinstance(node, (ast.Import, ast.ImportFrom))
+                    for imported in _imported_paths(node)
+                }
+                with self.subTest(module=name, boundary="local-authority-imports"):
+                    self.assertFalse(
+                        any(
+                            {"journal", "validation"}.intersection(
+                                module.split(".")
+                            )
+                            for module in top_level_modules
+                        )
+                    )
+            with self.subTest(module=name, boundary="paper-only"):
+                self.assertEqual(_boundary_violations(path), [])
 
     def test_permanent_boundary_covers_every_production_executable_surface(self) -> None:
         self.assertEqual(_project_boundary_violations(PROJECT_ROOT), [])

@@ -2076,11 +2076,6 @@ class SeparateLedgerTests(unittest.TestCase):
             aware_et(signal.publication_session, "10:00"),
             resolver,
         )
-        risk_module._register_identity_authority(
-            risk_module._SETTLEMENT_LEDGER_AUTHORITIES,
-            settlement,
-            risk_module._settlement_ledger_fingerprint(settlement),
-        )
         refresh_one = risk_module.ActualBreakerRefreshAuthority(
             as_of=first_at,
             through_execution_cursor=12,
@@ -2099,6 +2094,11 @@ class SeparateLedgerTests(unittest.TestCase):
         )
         policy = policy_fixture()
         with (
+            patch.object(
+                risk_module.SettlementLedger,
+                "source_verified",
+                new=property(lambda _self: True),
+            ),
             patch.object(
                 risk_module,
                 "is_issued_paired_breaker_state",

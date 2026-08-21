@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import date, timedelta
 from decimal import MAX_PREC, Decimal, localcontext
@@ -95,6 +97,91 @@ def authorized_plan(request: LongPlanRequest):
     )
 
 
+@contextmanager
+def issued_actual_entry_authority() -> Iterator[
+    risk_module.PortfolioRiskAuthority
+]:
+    """Issue one exact authority through the typed production boundary."""
+    import stock_monitor.ledger as ledger_module
+
+    signal = seeded_ledgers().signals[0]
+    as_of = aware_et(signal.publication_session, "10:14")
+    state = authorized_state()
+    resolver = state.calendar_resolver
+    assert resolver is not None
+    breaker = state.breaker_states[0]
+    cohort = ledger_module.VerifiedLedgerReplayCohort(
+        ledger_name="ACTUAL",
+        references=(),
+        expected_count=0,
+        start_cursor=None,
+        terminal_cursor=None,
+        query_cutoff=as_of,
+        source_digest="a" * 64,
+    )
+    with patch.object(
+        ledger_module,
+        "is_issued_verified_replay_cohort",
+        return_value=True,
+    ):
+        pair = ledger_module.LedgerPair(
+            signals=(signal,),
+            verified_replay_cohorts=(cohort,),
+        )
+    settlement = risk_module.SettlementLedger(
+        Decimal("5000"),
+        aware_et(signal.publication_session, "10:10"),
+        resolver,
+    )
+    refresh = risk_module.ActualBreakerRefreshAuthority(
+        as_of=as_of,
+        through_execution_cursor=12,
+        through_close_cursor=0,
+        paired_breaker=breaker,
+        calendar_digest=risk_module._calendar_digest(resolver),
+        source_digest="b" * 64,
+    )
+    request = LongPlanRequest(
+        Decimal("100"),
+        signal.recommended_stop,
+        signal.tick_size,
+        signal.publication_session,
+        symbol=signal.symbol,
+        published_target=signal.target,
+    )
+    with (
+        patch.object(
+            risk_module.SettlementLedger,
+            "source_verified",
+            new=property(lambda _self: True),
+        ),
+        patch.object(
+            risk_module,
+            "is_issued_paired_breaker_state",
+            return_value=True,
+        ),
+        patch.object(
+            risk_module,
+            "is_issued_actual_breaker_refresh_authority",
+            return_value=True,
+        ),
+    ):
+        authority = risk_module._issue_portfolio_risk_authority(
+            request=request,
+            ledger_pair=pair,
+            ledger_name="ACTUAL",
+            breaker_state=breaker,
+            calendar_resolver=resolver,
+            policy=policy_fixture(),
+            scope="ACTUAL_ENTRY",
+            as_of=as_of,
+            settlement_ledger=settlement,
+            settled_at=as_of,
+            actual_breaker_refresh=refresh,
+        )
+        yield authority
+
+
 class SizingTests(unittest.TestCase):
     def test_portfolio_authority_digest_binds_request_and_capacity_state(
         self,
@@ -155,153 +242,43 @@ class SizingTests(unittest.TestCase):
         )
 
     def test_plan_issuer_recomputes_content_from_exact_authority(self) -> None:
-        request = LongPlanRequest(
-            Decimal("100"),
-            Decimal("97.50"),
-            Decimal("0.01"),
-            date(2026, 8, 14),
-            symbol="SPY",
-            published_target=Decimal("105"),
-        )
-        state = authorized_state()
-        resolver = state.calendar_resolver
-        assert resolver is not None
-        policy = policy_fixture()
-        as_of = aware_et(request.session_date, "10:14")
-        authority = risk_module.PortfolioRiskAuthority(
-            request=request,
-            portfolio_state=state,
-            scope="ACTUAL_ENTRY",
-            as_of=as_of,
-            ledger_name="ACTUAL",
-            projection_through_cursor=None,
-            settlement_through_cursor=None,
-            projection_digest="1" * 64,
-            settlement_source="ACTUAL_SETTLEMENT_LEDGER",
-            settlement_digest="2" * 64,
-            policy_digest=risk_module._policy_digest(policy),
-            calendar_digest=risk_module._calendar_digest(resolver),
-            breaker_refresh_digest="4" * 64,
-            breaker_refresh_through_execution_cursor=12,
-            breaker_refresh_through_close_cursor=0,
-        )
-        forged = risk_module.LongPlanDecision(
-            eligible=True,
-            reason_codes=(),
-            plan=risk_module.PositionPlan(
-                1,
-                Decimal("100"),
-                Decimal("2.50"),
-            ),
-            target=Decimal("105"),
-            request=request,
-            authority_scope="ACTUAL_ENTRY",
-            authority_digest=risk_module._portfolio_authority_digest(
-                authority
-            ),
-            as_of=as_of,
-            portfolio_authority=authority,
-        )
+        with issued_actual_entry_authority() as authority:
+            request = authority.request
+            policy = policy_fixture()
+            forged = risk_module.LongPlanDecision(
+                eligible=True,
+                reason_codes=(),
+                plan=risk_module.PositionPlan(
+                    1,
+                    Decimal("100"),
+                    Decimal("2.50"),
+                ),
+                target=Decimal("105"),
+                request=request,
+                authority_scope="ACTUAL_ENTRY",
+                authority_digest=risk_module._portfolio_authority_digest(
+                    authority
+                ),
+                as_of=authority.as_of,
+                portfolio_authority=authority,
+            )
 
-        with (
-            patch.object(
-                risk_module,
-                "is_issued_portfolio_risk_authority",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(
+            with self.assertRaisesRegex(
                 RiskBlock,
                 "^PLAN_DECISION_CONTENT_MISMATCH$",
-            ),
-        ):
-            risk_module._issue_long_plan_decision(
-                forged,
-                authority,
-                policy,
-            )
+            ):
+                risk_module._issue_long_plan_decision(
+                    forged,
+                    authority,
+                    policy,
+                )
 
     def test_actual_entry_sizes_prebuy_projection_through_terminal_buy(
         self,
     ) -> None:
-        import stock_monitor.ledger as ledger_module
-
-        signal = seeded_ledgers().signals[0]
-        as_of = aware_et(signal.publication_session, "10:14")
-        state = authorized_state()
-        resolver = state.calendar_resolver
-        assert resolver is not None
-        breaker = state.breaker_states[0]
-        cohort = ledger_module.VerifiedLedgerReplayCohort(
-            ledger_name="ACTUAL",
-            references=(),
-            expected_count=0,
-            start_cursor=None,
-            terminal_cursor=None,
-            query_cutoff=as_of,
-            source_digest="a" * 64,
-        )
-        with patch.object(
-            ledger_module,
-            "is_issued_verified_replay_cohort",
-            return_value=True,
-        ):
-            pair = ledger_module.LedgerPair(
-                signals=(signal,),
-                verified_replay_cohorts=(cohort,),
-            )
-        settlement = risk_module.SettlementLedger(
-            Decimal("5000"),
-            aware_et(signal.publication_session, "10:10"),
-            resolver,
-        )
-        risk_module._register_identity_authority(
-            risk_module._SETTLEMENT_LEDGER_AUTHORITIES,
-            settlement,
-            risk_module._settlement_ledger_fingerprint(settlement),
-        )
-        refresh = risk_module.ActualBreakerRefreshAuthority(
-            as_of=as_of,
-            through_execution_cursor=12,
-            through_close_cursor=0,
-            paired_breaker=breaker,
-            calendar_digest=risk_module._calendar_digest(resolver),
-            source_digest="b" * 64,
-        )
-        request = LongPlanRequest(
-            Decimal("100"),
-            signal.recommended_stop,
-            signal.tick_size,
-            signal.publication_session,
-            symbol=signal.symbol,
-            published_target=signal.target,
-        )
-        with (
-            patch.object(
-                risk_module,
-                "is_issued_paired_breaker_state",
-                return_value=True,
-            ),
-            patch.object(
-                risk_module,
-                "is_issued_actual_breaker_refresh_authority",
-                return_value=True,
-            ),
-        ):
-            authority = risk_module._issue_portfolio_risk_authority(
-                request=request,
-                ledger_pair=pair,
-                ledger_name="ACTUAL",
-                breaker_state=breaker,
-                calendar_resolver=resolver,
-                policy=policy_fixture(),
-                scope="ACTUAL_ENTRY",
-                as_of=as_of,
-                settlement_ledger=settlement,
-                settled_at=as_of,
-                actual_breaker_refresh=refresh,
-            )
+        with issued_actual_entry_authority() as authority:
             decision = plan_long(
-                request,
+                authority.request,
                 authority.portfolio_state,
                 policy_fixture(),
                 portfolio_authority=authority,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
+import inspect
 import json
 import math
 import re
@@ -11,13 +12,13 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
-from typing import Self
+from typing import NamedTuple, Self
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import ReferenceType, ref
 
@@ -29,6 +30,29 @@ BUSY_TIMEOUT_MILLISECONDS = 5_000
 REPORT_ID_PATH_PREFIX_LENGTH = 12
 _SQLITE_BIND_BATCH_SIZE = 500
 _REPORT_CLAIM_LEASE_SECONDS = 300
+_SCHEDULED_RESULT_SCHEMA = "stock-monitor/scheduled-result/v1"
+_LEGACY_SCHEDULED_RESULT_KEYS = frozenset(
+    {
+        "schema",
+        "outcome",
+        "message",
+        "exit_code",
+        "reason_codes",
+        "execution_mode",
+        "candidates",
+        "report_id",
+        "report_row_id",
+        "report_path",
+    }
+)
+_SCHEDULED_RESULT_KEYS = _LEGACY_SCHEDULED_RESULT_KEYS | {
+    "report_body",
+    "report_content_sha256",
+    "report_state_sha256",
+    "report_observation_row_ids",
+    "report_observation_sha256s",
+}
+_SCHEDULED_RESULT_EXIT_CODES = frozenset({0, 2, 3, 4, 5, 10})
 _PHASE1_ALPACA_SOURCE_CONTRACTS = {
     "ALPACA_HISTORICAL_TRADES": ("trades", "/v2/stocks/trades", "SIP", True),
     "ALPACA_HISTORICAL_QUOTES": ("quotes", "/v2/stocks/quotes", "SIP", True),
@@ -138,6 +162,30 @@ _TABLES = frozenset(
         "phase1_equity_point_marks",
         "phase1_closed_trades",
         "phase1_adherence_checks",
+        "phase2_windows",
+        "phase2_authorizations",
+        "phase2_fee_schedules",
+        "phase2_option_chain_sets",
+        "phase2_option_chain_pages",
+        "phase2_underlying_review_sets",
+        "phase2_underlying_review_pages",
+        "phase2_underlying_review_facts",
+        "phase2_contract_snapshots",
+        "phase2_contract_selections",
+        "phase2_entries",
+        "phase2_marks",
+        "phase2_exit_reviews",
+        "phase2_exits",
+        "phase2_fee_records",
+        "phase2_equity_points",
+        "phase2_window_failures",
+        "phase2_window_restarts",
+        "phase2_adherence_checks",
+        "phase2_gate_decisions",
+        "historical_replay_runs",
+        "historical_replay_dates",
+        "historical_replay_evidence",
+        "historical_replay_run_seals",
     }
 )
 
@@ -789,6 +837,148 @@ _PHASE1_CANONICAL_POSTING_COLUMNS = (
     "record_sha256",
     "details_json",
 )
+_PHASE2_WINDOW_COLUMNS = (
+    "id",
+    "window_id",
+    "phase1_validation_window_id",
+    "promotion_source_digest",
+    "promotion_decision_digest",
+    "promotion_signal_ids_json",
+    "promotion_through_session",
+    "promotion_query_cutoff",
+    "start_execution_event_id",
+    "start_raw_message_id",
+    "started_session",
+    "started_at",
+    "received_at",
+    "starting_capital_micros",
+    "calendar_digest",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE2_AUTHORIZATION_COLUMNS = (
+    "id",
+    "authorization_id",
+    "window_id",
+    "signal_id",
+    "signal_source_digest",
+    "authorization_digest",
+    "authorized_at",
+    "received_at",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE2_EQUITY_POINT_COLUMNS = (
+    "id",
+    "point_id",
+    "window_id",
+    "entry_id",
+    "mark_id",
+    "exit_id",
+    "session_date",
+    "point_kind",
+    "cash_micros",
+    "position_value_micros",
+    "equity_micros",
+    "high_water_micros",
+    "drawdown_micros",
+    "at",
+    "received_at",
+    "source_digest",
+    "record_sha256",
+)
+_PHASE2_FEE_SCHEDULE_COLUMNS = (
+    "id",
+    "schedule_id",
+    "effective_session",
+    "reviewed_at",
+    "currency",
+    "contract_multiplier",
+    "entry_fee_per_contract_micros",
+    "exit_fee_per_contract_micros",
+    "close_fee_reserve_per_contract_micros",
+    "source_sha256",
+    "schedule_digest",
+    "reviewed_bytes",
+    "archived_at",
+    "source_digest",
+    "record_sha256",
+)
+_HISTORICAL_REPLAY_RUN_COLUMNS = (
+    "id",
+    "replay_run_id",
+    "tier",
+    "started_session",
+    "ended_session",
+    "query_cutoff",
+    "calendar_digest",
+    "policy_digest",
+    "expected_date_count",
+    "cursors_json",
+    "highwaters_json",
+    "row_references_json",
+    "recorded_at",
+    "source_digest",
+    "record_sha256",
+)
+_HISTORICAL_REPLAY_DATE_COLUMNS = (
+    "id",
+    "replay_date_id",
+    "replay_run_id",
+    "session_date",
+    "report_cutoff",
+    "expected_role_count",
+    "expected_evidence_count",
+    "case_digest",
+    "domain_input_digest",
+    "mechanics_digest",
+    "completion_digest",
+    "row_references_json",
+    "completed_at",
+    "recorded_at",
+    "source_digest",
+    "record_sha256",
+)
+_HISTORICAL_REPLAY_EVIDENCE_COLUMNS = (
+    "id",
+    "replay_evidence_id",
+    "replay_date_id",
+    "role",
+    "evidence_ordinal",
+    "subject",
+    "source_kind",
+    "source_observation_id",
+    "external_source_observation_id",
+    "source_item_ordinal",
+    "source_item_path",
+    "payload_sha256",
+    "content_sha256",
+    "authority_digest",
+    "effective_at",
+    "published_at",
+    "retrieved_at",
+    "recorded_at",
+    "source_digest",
+    "record_sha256",
+)
+_HISTORICAL_REPLAY_SEAL_COLUMNS = (
+    "id",
+    "replay_run_id",
+    "expected_date_count",
+    "actual_date_count",
+    "actual_evidence_count",
+    "date_terminal_cursor",
+    "evidence_terminal_cursor",
+    "source_observation_highwater",
+    "sealed_at",
+    "source_digest",
+    "record_sha256",
+)
+_HISTORICAL_REPLAY_ROLES = (
+    "UNIVERSE_MEMBERSHIP",
+    "EVENT_STATE",
+    "SOURCE_EVIDENCE",
+)
 
 
 class JournalError(Exception):
@@ -872,6 +1062,29 @@ class PendingOutbox:
     payload_sha256: str
     created_at: datetime
     next_attempt_ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledRunResultEnvelope:
+    """Canonical, secret-safe truth returned by one scheduled workflow."""
+
+    outcome: str
+    message: str
+    exit_code: int
+    reason_codes: tuple[str, ...]
+    execution_mode: str
+    candidates: tuple[tuple[str, str], ...]
+    report_id: str | None
+    report_row_id: int | None
+    report_path: str | None
+    report_body: str | None = None
+    report_content_sha256: str | None = None
+    report_state_sha256: str | None = None
+    report_observation_row_ids: tuple[int, ...] = ()
+    report_observation_sha256s: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _scheduled_result_envelope_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1722,6 +1935,40 @@ class Phase1EquityMarkSource:
     source_digest: str
 
 
+_Phase1PromotionMarkCacheKey = tuple[
+    str,
+    str,
+    date,
+    datetime,
+    datetime,
+    str,
+    str,
+]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class _Phase1PromotionMarkCacheCapability:
+    """Empty, invocation-local access to one promotion mark cache."""
+
+
+class _Phase1PromotionMarkCacheEntry(NamedTuple):
+    key: _Phase1PromotionMarkCacheKey
+    source: Phase1EquityMarkSource
+    authority: object
+
+
+class _Phase1PromotionMarkCacheAuthority(NamedTuple):
+    capability_reference: ReferenceType[object]
+    owner_reference: ReferenceType[object]
+    validation_window_id: str
+    final_query_cutoff: datetime
+    calendar_digest: str
+    policy_digest: str
+    total_changes: int
+    data_version: int
+    entries: tuple[_Phase1PromotionMarkCacheEntry, ...]
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class Phase1BreakerHistorySource:
     validation_window_id: str
@@ -1857,6 +2104,517 @@ class Phase1ValidationWindowSource:
     expected_adherence_count: int
     row_references: tuple[JournalRowReference, ...]
     source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2WindowSource:
+    """Exact persisted Phase 2 window-start authority."""
+
+    row_id: int
+    window_id: str
+    validation_window_id: str
+    promotion_source: Phase1ValidationWindowSource
+    promotion_decision_digest: str
+    promotion_signal_ids: tuple[str, ...]
+    promotion_query_cutoff: datetime
+    start_action: JournalActionSource
+    started_session: date
+    started_at: datetime
+    received_at: datetime
+    starting_capital_micros: int
+    calendar_digest: str
+    query_cutoff: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2AuthorizationSource:
+    """Exact persisted authorization for a new Phase 2 signal."""
+
+    row_id: int
+    authorization_id: str
+    window_source: Phase2WindowSource
+    signal_source: Phase1SignalSource
+    authorized_at: datetime
+    received_at: datetime
+    authorization_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2FeeScheduleSource:
+    """Archived reviewed fee-schedule bytes and their parsed durable fields."""
+
+    row_id: int
+    schedule_id: str
+    effective_session: date
+    reviewed_at: datetime
+    currency: str
+    contract_multiplier: int
+    entry_fee_per_contract_micros: int
+    exit_fee_per_contract_micros: int
+    close_fee_reserve_per_contract_micros: int
+    source_sha256: str
+    schedule_digest: str
+    reviewed_bytes: bytes
+    archived_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+    def _is_current_phase2_fee_schedule_source(self) -> bool:
+        """Source-only bridge used by the reviewed config reissuer."""
+        return is_verified_phase2_fee_schedule_source(self)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2EventExclusionSource:
+    """Reviewed ten-session event exclusion authority for one signal."""
+
+    signal_source: Phase1SignalSource
+    signal_evidence_source: Phase1SignalEvidenceSource
+    covered_sessions: tuple[date, ...]
+    event_sessions: tuple[date, ...]
+    reviewed_at: datetime
+    query_cutoff: datetime
+    calendar_digest: str
+    evidence_source_row_ids: tuple[int, ...]
+    evidence_source_highwater: int
+    expected_evidence_source_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+    authority_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2OptionChainPageSource:
+    """One exact raw page in a terminal option-chain fetch."""
+
+    row_id: int
+    page_id: str
+    chain_set_id: str
+    page_ordinal: int
+    source_observation_row_id: int
+    external_source_observation_id: str
+    source_type: str
+    request_url: str
+    request_page_token: str | None
+    next_page_token: str | None
+    payload_sha256: str
+    source_time: datetime | None
+    retrieved_at: datetime
+    raw_payload: bytes
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2OptionChainFactSource:
+    """One raw-reparsed provider option fact and its exact page coordinates."""
+
+    row_id: int
+    snapshot_id: str
+    authorization_id: str
+    chain_set_id: str
+    occ_symbol: str
+    underlying: str
+    expiration: date
+    strike_micros: int
+    delta_micros: int | None
+    bid_micros: int | None
+    ask_micros: int | None
+    daily_volume: int | None
+    source_observation_row_id: int
+    external_source_observation_id: str
+    fetch_page_ordinal: int
+    source_item_ordinal: int
+    source_item_path: str
+    payload_sha256: str
+    provider_fact_digest: str
+    observed_at: datetime | None
+    received_at: datetime
+    snapshot: object = dataclass_field(repr=False, compare=False)
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2OptionChainSource:
+    """Complete terminal provider option-chain cohort for one authorization."""
+
+    row_id: int
+    chain_set_id: str
+    authorization_source: Phase2AuthorizationSource
+    underlying: str
+    collection_name: str
+    requested_symbols: tuple[str, ...]
+    request_digest: str
+    manifest_digest: str
+    pages: tuple[Phase2OptionChainPageSource, ...]
+    facts: tuple[Phase2OptionChainFactSource, ...]
+    provider_chain: object = dataclass_field(repr=False, compare=False)
+    review_candidate_fact_digests: tuple[str, ...]
+    expected_manual_review_count: int
+    expected_page_count: int
+    expected_fact_count: int
+    terminal: bool
+    query_cutoff: datetime
+    received_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2ManualOptionReviewSource:
+    """Exact pre-selection OPTION_PAPER_REVIEW action and provider binding."""
+
+    row_id: int
+    snapshot_id: str
+    authorization_id: str
+    chain_set_id: str
+    provider_fact_source: Phase2OptionChainFactSource
+    action_source: JournalActionSource
+    occ_symbol: str
+    underlying: str
+    expiration: date
+    strike_micros: int
+    delta_micros: int
+    bid_micros: int
+    ask_micros: int
+    open_interest: int
+    daily_volume: int
+    observed_at: datetime
+    received_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2SelectionSource:
+    """Durable reissuer input for one fully reviewed ranked selection."""
+
+    row_id: int
+    selection_id: str
+    authorization_source: Phase2AuthorizationSource
+    option_chain_source: Phase2OptionChainSource
+    provider_fact_source: Phase2OptionChainFactSource
+    manual_review_sources: tuple[Phase2ManualOptionReviewSource, ...]
+    selected_manual_review_source: Phase2ManualOptionReviewSource
+    fee_schedule_source: Phase2FeeScheduleSource
+    event_exclusion_source: Phase2EventExclusionSource
+    portfolio_source: Phase2PortfolioSource
+    selection_session: date
+    quantity: int
+    selected_at: datetime
+    received_at: datetime
+    ranking_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2OptionOpenSource:
+    """Exact post-selection OPTION_PAPER_OPEN execution authority."""
+
+    row_id: int
+    entry_id: str
+    window_id: str
+    selection_source: Phase2SelectionSource
+    open_action: JournalActionSource
+    quantity: int
+    entry_ask_micros: int
+    entry_fee_micros: int
+    reserve_fee_micros: int
+    all_in_initial_risk_micros: int
+    fee_schedule_source: Phase2FeeScheduleSource
+    portfolio_source_digest: str
+    entered_at: datetime
+    received_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2OpenPositionSource:
+    """Current single open option position derived from the durable ledger."""
+
+    entry_id: str
+    selection_id: str
+    authorization_id: str
+    occ_symbol: str
+    quantity: int
+    entry_ask_micros: int
+    entry_fee_micros: int
+    reserve_fee_micros: int
+    all_in_initial_risk_micros: int
+    entered_at: datetime
+    entry_source: Phase2OptionOpenSource
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2SettlementSource:
+    """One option-sale economic posting and its calendar-derived availability."""
+
+    exit_id: str
+    gross_proceeds_micros: int
+    economic_at: datetime
+    settlement_available_session: date
+    settled: bool
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2PortfolioSource:
+    """Global cash-account authority at one exact Journal cutoff."""
+
+    window_id: str
+    as_of: datetime
+    query_cutoff: datetime
+    settled_cash_micros: int
+    economic_cash_micros: int
+    equity_micros: int
+    open_position_source: Phase2OpenPositionSource | None
+    settlement_sources: tuple[Phase2SettlementSource, ...]
+    unsettled_proceeds_micros: int
+    calendar_digest: str
+    ledger_row_references: tuple[JournalRowReference, ...]
+    ledger_terminal_cursor: int | None
+    ledger_source_highwater: int
+    expected_entry_count: int
+    expected_exit_count: int
+    expected_fee_count: int
+    expected_equity_count: int
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+    authority_digest: str
+
+
+class _Phase2PortfolioWindowAuthority(NamedTuple):
+    """Private exact-identity dependency retained for one portfolio source."""
+
+    portfolio_reference: ReferenceType[object]
+    window_source: Phase2WindowSource
+    portfolio_issued: object
+    window_issued: object
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2UnderlyingReviewPageSource:
+    """One exact raw page in a terminal 1Min SIP review cohort."""
+
+    row_id: int
+    page_id: str
+    review_set_id: str
+    page_ordinal: int
+    source_observation_row_id: int
+    external_source_observation_id: str
+    source_type: str
+    request_url: str
+    request_page_token: str | None
+    next_page_token: str | None
+    payload_sha256: str
+    source_time: datetime | None
+    retrieved_at: datetime
+    raw_payload: bytes
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2UnderlyingReviewFactSource:
+    """One exact raw-reparsed underlying bar in a review cohort."""
+
+    row_id: int
+    fact_id: str
+    review_set_id: str
+    source_observation_row_id: int
+    external_source_observation_id: str
+    fetch_page_ordinal: int
+    source_item_ordinal: int
+    source_item_path: str
+    payload_sha256: str
+    symbol: str
+    bar_at: datetime
+    open_micros: int
+    high_micros: int
+    low_micros: int
+    close_micros: int
+    volume: int
+    fact_digest: str
+    bar: object = dataclass_field(repr=False, compare=False)
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2UnderlyingReviewSource:
+    """Complete ordered 1Min SIP/split cohort for one open-session review."""
+
+    row_id: int
+    review_set_id: str
+    window_id: str
+    entry_source: Phase2OptionOpenSource
+    underlying: str
+    review_session: date
+    collection_name: str
+    timeframe: str
+    adjustment: str
+    feed: str
+    requested_symbols: tuple[str, ...]
+    request_digest: str
+    manifest_digest: str
+    pages: tuple[Phase2UnderlyingReviewPageSource, ...]
+    facts: tuple[Phase2UnderlyingReviewFactSource, ...]
+    provider_cohort: object = dataclass_field(repr=False, compare=False)
+    expected_page_count: int
+    expected_fact_count: int
+    terminal: bool
+    request_start: datetime
+    request_end: datetime
+    query_cutoff: datetime
+    received_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class Phase2ExitReviewSource:
+    """One persisted per-session HOLD or required-close decision."""
+
+    row_id: int
+    exit_review_id: str
+    window_id: str
+    entry_source: Phase2OptionOpenSource
+    underlying_review_source: Phase2UnderlyingReviewSource
+    decision_fact_source: Phase2UnderlyingReviewFactSource | None
+    review_session: date
+    decision_kind: str
+    decision_digest: str
+    decision: object = dataclass_field(repr=False, compare=False)
+    holding_sessions: int
+    dte: int
+    query_cutoff: datetime
+    evaluated_at: datetime
+    received_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class HistoricalReplayEvidenceSource:
+    """One exact persisted historical evidence role and source coordinate."""
+
+    row_id: int
+    replay_evidence_id: str
+    replay_date_id: str
+    role: str
+    evidence_ordinal: int
+    subject: str
+    source_kind: str
+    source_observation_row_id: int
+    external_source_observation_id: str
+    source_item_ordinal: int
+    source_item_path: str
+    payload_sha256: str
+    content_sha256: str
+    authority_digest: str
+    effective_at: datetime
+    published_at: datetime
+    retrieved_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class HistoricalReplayDateSource:
+    """One sealed date in a source-authenticated historical replay run."""
+
+    row_id: int
+    replay_date_id: str
+    run_id: str
+    session_date: date
+    report_cutoff: datetime
+    evidence_sources: tuple[HistoricalReplayEvidenceSource, ...]
+    expected_role_count: int
+    expected_evidence_count: int
+    case_digest: str
+    domain_input_digest: str
+    mechanics_digest: str
+    completion_digest: str
+    completed_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+    def _rederive_historical_replay_case(self) -> object | None:
+        """Rebuild this date's case from current durable rows, never a cache."""
+        owner = _phase2_source_owner(self)
+        if owner is None:
+            return None
+        rederive = getattr(owner, "_rederive_historical_replay_case_source", None)
+        if not callable(rederive):
+            return None
+        try:
+            return rederive(self)
+        except Exception:
+            return None
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class HistoricalReplaySource:
+    """Exact sealed historical replay run issued from durable evidence."""
+
+    row_id: int
+    run_id: str
+    tier: str
+    query_cutoff: datetime
+    calendar_digest: str
+    policy_digest: str
+    date_sources: tuple[HistoricalReplayDateSource, ...]
+    expected_date_count: int
+    cursors: tuple[tuple[str, int | None], ...]
+    highwaters: tuple[tuple[str, int], ...]
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+    def _is_current_historical_replay_source(self) -> bool:
+        """Source-only bridge used by the replay identity registry."""
+        return is_verified_historical_replay_source(self)
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalReplayEvidencePlan:
+    role: str
+    evidence_ordinal: int
+    subject: str
+    source_kind: str
+    source_observation_row_id: int
+    external_source_observation_id: str
+    source_item_ordinal: int
+    source_item_path: str
+    payload_sha256: str
+    content_sha256: str
+    authority_digest: str
+    effective_at: datetime
+    published_at: datetime
+    retrieved_at: datetime
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalReplayDatePlan:
+    session_date: date
+    report_cutoff: datetime
+    replay_case: object | None
+    evidence: tuple[_HistoricalReplayEvidencePlan, ...]
+    row_references: tuple[JournalRowReference, ...]
+    case_digest: str
+    domain_input_digest: str
+    mechanics_digest: str
+    completion_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -2865,6 +3623,10 @@ def _phase1_recomputed_normalized_fields_digest(
 
 
 _JOURNAL_SOURCE_LOCK = threading.RLock()
+_PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES: dict[
+    int,
+    _Phase1PromotionMarkCacheAuthority,
+] = {}
 _ACTION_SOURCE_AUTHORITIES: dict[
     int,
     tuple[
@@ -3065,8 +3827,7 @@ _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES: dict[
         int,
     ],
 ] = {}
-
-_JournalSourceRegistry = dict[
+_PHASE2_SOURCE_AUTHORITIES: dict[
     int,
     tuple[
         ReferenceType[object],
@@ -3075,18 +3836,296 @@ _JournalSourceRegistry = dict[
         int,
         int,
     ],
+] = {}
+_PHASE2_PORTFOLIO_WINDOW_AUTHORITIES: dict[
+    int,
+    _Phase2PortfolioWindowAuthority,
+] = {}
+
+
+_JournalSourceRegistry = dict[
+    int,
+    tuple[ReferenceType[object], object, ReferenceType[object], int, int],
 ]
+_JournalFingerprintFactory = Callable[[], object]
+_JournalAuthorityCandidate = tuple[
+    _JournalSourceRegistry,
+    object,
+    object,
+    int,
+    int,
+    object,
+    _JournalFingerprintFactory,
+    object,
+]
+
+_PHASE2_SOURCE_TYPES = frozenset(
+    {
+        Phase2WindowSource,
+        Phase2AuthorizationSource,
+        Phase2FeeScheduleSource,
+        Phase2EventExclusionSource,
+        Phase2OptionChainPageSource,
+        Phase2OptionChainFactSource,
+        Phase2OptionChainSource,
+        Phase2ManualOptionReviewSource,
+        Phase2SelectionSource,
+        Phase2OptionOpenSource,
+        Phase2OpenPositionSource,
+        Phase2SettlementSource,
+        Phase2PortfolioSource,
+        Phase2UnderlyingReviewPageSource,
+        Phase2UnderlyingReviewFactSource,
+        Phase2UnderlyingReviewSource,
+        Phase2ExitReviewSource,
+        HistoricalReplayEvidenceSource,
+        HistoricalReplayDateSource,
+        HistoricalReplaySource,
+    }
+)
+_PHASE1_SOURCE_TYPES = frozenset(
+    {
+        Phase1PublicationSource,
+        Phase1SignalSource,
+        Phase1EntrySource,
+        Phase1ShadowFillSource,
+        Phase1SignalEvidenceSource,
+        Phase1ExpiryDeadlineSource,
+        Phase1ExitReviewSource,
+        Phase1ExitReviewMarketSource,
+        _Phase1ExitProviderReplaySource,
+        Phase1CanonicalReplaySource,
+        Phase1EquityMarkSource,
+        _Phase1EquityProviderReplaySource,
+        Phase1BreakerHistorySource,
+        Phase1PublishedSignalDispositionSource,
+        Phase1AdherenceCheckEvidenceSource,
+        Phase1AdherenceReviewSource,
+        Phase1ValidationWindowSource,
+    }
+)
+_PHASE1_SOURCE_REGISTRIES = (
+    _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
+    _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+    _PHASE1_ENTRY_SOURCE_AUTHORITIES,
+    _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
+    _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
+    _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES,
+    _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES,
+    _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES,
+    _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
+    _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES,
+    _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
+    _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
+    _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES,
+    _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES,
+    _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES,
+    _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES,
+    _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES,
+)
+class _Phase1ReaderDependencyField(NamedTuple):
+    name: str
+    expected_type: type[object]
+    many: bool = False
+    optional: bool = False
+
+
+_PHASE1_READER_DIRECT_DEPENDENCY_FIELDS = (
+    (Phase1PublicationSource, ()),
+    (
+        Phase1SignalSource,
+        (_Phase1ReaderDependencyField(
+            "publication_source",
+            Phase1PublicationSource,
+        ),),
+    ),
+    (
+        Phase1EntrySource,
+        (_Phase1ReaderDependencyField("signal_source", Phase1SignalSource),),
+    ),
+    (
+        Phase1ShadowFillSource,
+        (_Phase1ReaderDependencyField("signal_source", Phase1SignalSource),),
+    ),
+    (
+        Phase1SignalEvidenceSource,
+        (_Phase1ReaderDependencyField("signal_source", Phase1SignalSource),),
+    ),
+    (
+        Phase1ExpiryDeadlineSource,
+        (_Phase1ReaderDependencyField("signal_source", Phase1SignalSource),),
+    ),
+    (
+        Phase1ExitReviewSource,
+        (
+            _Phase1ReaderDependencyField(
+                "market_source",
+                Phase1ExitReviewMarketSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "canonical_replay_source",
+                Phase1CanonicalReplaySource,
+            ),
+        ),
+    ),
+    (
+        Phase1ExitReviewMarketSource,
+        (
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "signal_evidence_source",
+                Phase1SignalEvidenceSource,
+                optional=True,
+            ),
+        ),
+    ),
+    (_Phase1ExitProviderReplaySource, ()),
+    (
+        Phase1CanonicalReplaySource,
+        (
+            _Phase1ReaderDependencyField(
+                "signal_sources",
+                Phase1SignalSource,
+                many=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "entry_sources",
+                Phase1EntrySource,
+                many=True,
+            ),
+        ),
+    ),
+    (
+        Phase1EquityMarkSource,
+        (
+            _Phase1ReaderDependencyField(
+                "canonical_replay_source",
+                Phase1CanonicalReplaySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "actual_replay_source",
+                JournalActualReplaySource,
+            ),
+        ),
+    ),
+    (_Phase1EquityProviderReplaySource, ()),
+    (
+        Phase1BreakerHistorySource,
+        (_Phase1ReaderDependencyField(
+            "equity_mark_sources",
+            Phase1EquityMarkSource,
+            many=True,
+        ),),
+    ),
+    (
+        Phase1PublishedSignalDispositionSource,
+        (
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "expiry_deadline_source",
+                Phase1ExpiryDeadlineSource,
+                optional=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "signal_evidence_source",
+                Phase1SignalEvidenceSource,
+                optional=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "shadow_fill_source",
+                Phase1ShadowFillSource,
+                optional=True,
+            ),
+        ),
+    ),
+    (Phase1AdherenceCheckEvidenceSource, ()),
+    (
+        Phase1AdherenceReviewSource,
+        (
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "disposition_source",
+                Phase1PublishedSignalDispositionSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "canonical_replay_source",
+                Phase1CanonicalReplaySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "breaker_history_source",
+                Phase1BreakerHistorySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "actual_action_sources",
+                JournalActionSource,
+                many=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "check_evidence_sources",
+                Phase1AdherenceCheckEvidenceSource,
+                many=True,
+            ),
+        ),
+    ),
+    (
+        Phase1ValidationWindowSource,
+        (
+            _Phase1ReaderDependencyField(
+                "signal_sources",
+                Phase1SignalSource,
+                many=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "disposition_sources",
+                Phase1PublishedSignalDispositionSource,
+                many=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "canonical_history",
+                Phase1BreakerHistorySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "actual_history",
+                Phase1BreakerHistorySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "adherence_review_sources",
+                Phase1AdherenceReviewSource,
+                many=True,
+            ),
+        ),
+    ),
+)
 
 
 def _row_reference_fingerprint(
     reference: JournalRowReference,
 ) -> tuple[object, ...]:
+    if type(reference) is not JournalRowReference:
+        raise TypeError("Journal row-reference topology is malformed")
     return (reference.table, reference.row_id, reference.row_digest)
 
 
 def _account_check_source_fingerprint(
     source: JournalAccountCheckSource,
 ) -> tuple[object, ...]:
+    if type(source) is not JournalAccountCheckSource or (
+        type(source.row_reference) is not JournalRowReference
+    ):
+        raise TypeError("Journal account-check topology is malformed")
     return (
         source.row_id,
         source.check_id,
@@ -3103,6 +4142,18 @@ def _account_check_source_fingerprint(
 
 
 def _action_source_fingerprint(source: JournalActionSource) -> tuple[object, ...]:
+    if type(source) is not JournalActionSource:
+        raise TypeError("Journal action topology is malformed")
+    account_check = source.account_check
+    row_references = source.row_references
+    if (
+        account_check is not None
+        and type(account_check) is not JournalAccountCheckSource
+    ) or type(row_references) is not tuple or any(
+        type(reference) is not JournalRowReference
+        for reference in row_references
+    ):
+        raise TypeError("Journal action topology is malformed")
     return (
         source.execution_event_id,
         source.event_id,
@@ -3134,8 +4185,8 @@ def _action_source_fingerprint(source: JournalActionSource) -> tuple[object, ...
         source.event_role,
         (
             None
-            if source.account_check is None
-            else _account_check_source_fingerprint(source.account_check)
+            if account_check is None
+            else _account_check_source_fingerprint(account_check)
         ),
         source.acknowledgement_outbox_id,
         source.acknowledgement_destination,
@@ -3143,7 +4194,7 @@ def _action_source_fingerprint(source: JournalActionSource) -> tuple[object, ...
         source.acknowledgement_payload_sha256,
         tuple(
             _row_reference_fingerprint(reference)
-            for reference in source.row_references
+            for reference in row_references
         ),
         source.source_digest,
     )
@@ -3152,17 +4203,35 @@ def _action_source_fingerprint(source: JournalActionSource) -> tuple[object, ...
 def _window_source_fingerprint(
     source: JournalAccountCheckWindowSource,
 ) -> tuple[object, ...]:
+    if type(source) is not JournalAccountCheckWindowSource:
+        raise TypeError("Journal account-check window topology is malformed")
+    account_check_action = source.account_check_action
+    terminal_action = source.terminal_action
+    between_actions = source.between_actions
+    row_references = source.row_references
+    if (
+        type(account_check_action) is not JournalActionSource
+        or type(terminal_action) is not JournalActionSource
+        or type(between_actions) is not tuple
+        or any(type(action) is not JournalActionSource for action in between_actions)
+        or type(row_references) is not tuple
+        or any(
+            type(reference) is not JournalRowReference
+            for reference in row_references
+        )
+    ):
+        raise TypeError("Journal account-check window topology is malformed")
     return (
-        _action_source_fingerprint(source.account_check_action),
-        _action_source_fingerprint(source.terminal_action),
-        tuple(_action_source_fingerprint(action) for action in source.between_actions),
+        _action_source_fingerprint(account_check_action),
+        _action_source_fingerprint(terminal_action),
+        tuple(_action_source_fingerprint(action) for action in between_actions),
         source.after_cursor,
         source.through_cursor,
         source.source_high_water_cursor,
         source.expected_between_count,
         tuple(
             _row_reference_fingerprint(reference)
-            for reference in source.row_references
+            for reference in row_references
         ),
         source.source_digest,
     )
@@ -3171,6 +4240,10 @@ def _window_source_fingerprint(
 def _posting_source_fingerprint(
     source: JournalPostingSource,
 ) -> tuple[object, ...]:
+    if type(source) is not JournalPostingSource or (
+        type(source.row_reference) is not JournalRowReference
+    ):
+        raise TypeError("Journal posting topology is malformed")
     return (
         source.row_id,
         source.posting_key,
@@ -3192,10 +4265,19 @@ def _posting_source_fingerprint(
 def _projection_row_source_fingerprint(
     source: JournalProjectionRowSource,
 ) -> tuple[object, ...]:
+    if type(source) is not JournalProjectionRowSource:
+        raise TypeError("Journal projection topology is malformed")
+    values = source.values
+    if (
+        type(values) is not tuple
+        or any(type(value) is not tuple or len(value) != 2 for value in values)
+        or type(source.row_reference) is not JournalRowReference
+    ):
+        raise TypeError("Journal projection topology is malformed")
     return (
         source.table,
         source.row_id,
-        tuple(tuple(value) for value in source.values),
+        tuple(tuple(value) for value in values),
         _row_reference_fingerprint(source.row_reference),
     )
 
@@ -3203,13 +4285,36 @@ def _projection_row_source_fingerprint(
 def _replay_source_fingerprint(
     source: JournalActualReplaySource,
 ) -> tuple[object, ...]:
+    if type(source) is not JournalActualReplaySource:
+        raise TypeError("Journal replay topology is malformed")
+    actions = source.actions
+    postings = source.postings
+    projection_rows = source.projection_rows
+    row_references = source.row_references
+    if (
+        type(actions) is not tuple
+        or any(type(action) is not JournalActionSource for action in actions)
+        or type(postings) is not tuple
+        or any(type(posting) is not JournalPostingSource for posting in postings)
+        or type(projection_rows) is not tuple
+        or any(
+            type(row) is not JournalProjectionRowSource
+            for row in projection_rows
+        )
+        or type(row_references) is not tuple
+        or any(
+            type(reference) is not JournalRowReference
+            for reference in row_references
+        )
+    ):
+        raise TypeError("Journal replay topology is malformed")
     return (
         source.query_cutoff,
-        tuple(_action_source_fingerprint(action) for action in source.actions),
-        tuple(_posting_source_fingerprint(posting) for posting in source.postings),
+        tuple(_action_source_fingerprint(action) for action in actions),
+        tuple(_posting_source_fingerprint(posting) for posting in postings),
         tuple(
             _projection_row_source_fingerprint(row)
-            for row in source.projection_rows
+            for row in projection_rows
         ),
         source.start_cursor,
         source.terminal_cursor,
@@ -3221,89 +4326,1146 @@ def _replay_source_fingerprint(
         source.expected_posting_count,
         tuple(
             _row_reference_fingerprint(reference)
-            for reference in source.row_references
+            for reference in row_references
         ),
         source.source_digest,
     )
 
 
+_FINGERPRINT_ACTIVE = object()
+_FingerprintPairMemo = dict[tuple[int, int], object]
 _Phase1FingerprintReadCache = dict[int, tuple[object, object]]
+
+_SOURCE_FINGERPRINT_ROOT_DOMAIN = (
+    b"stock-monitor/source-fingerprint-seal/v1"
+)
+_PHASE1_FINGERPRINT_DOMAIN = b"phase1-normal/v1"
+_PHASE2_OPAQUE_FINGERPRINT_DOMAIN = b"phase2-opaque/v1"
+_MERKLE_PHASE1_NORMAL = "phase1-normal"
+_MERKLE_PHASE2_NORMAL = "phase2-normal"
+_MERKLE_OPAQUE_IDENTITY = "opaque-identity"
+_MERKLE_OPAQUE_STRUCTURAL = "opaque-structural"
+_LEDGER_PAIR_STRUCTURAL_SLOTS = (
+    "_signals",
+    "_canonical",
+    "_actual",
+    "_events",
+    "_canonical_replay_cohort",
+    "_actual_replay_cohort",
+    "_canonical_replay_verified",
+    "_actual_replay_verified",
+    "_replay_verified",
+    "_sealed",
+)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _SourceFingerprintSeal:
+    """One fixed-size Merkle root plus exact identity liveness pins."""
+
+    digest: bytes
+    identity_anchors: tuple[object, ...]
+
+
+def _source_fingerprint_unsigned(value: int) -> bytes:
+    if type(value) is not int or value < 0:
+        raise TypeError("source fingerprint integer is invalid")
+    return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def _source_fingerprint_signed(value: int) -> bytes:
+    if type(value) is not int:
+        raise TypeError("source fingerprint integer is invalid")
+    return (
+        (b"\x01" if value < 0 else b"\x00")
+        + _source_fingerprint_unsigned(abs(value))
+    )
+
+
+def _source_fingerprint_frame(
+    domain: bytes,
+    tag: bytes,
+    parts: Sequence[bytes],
+) -> bytes:
+    """Hash one unambiguous, domain-separated Merkle node."""
+    if type(domain) is not bytes or type(tag) is not bytes:
+        raise TypeError("source fingerprint frame is malformed")
+    framed = hashlib.sha256()
+    components = (
+        _SOURCE_FINGERPRINT_ROOT_DOMAIN,
+        domain,
+        tag,
+        _source_fingerprint_unsigned(len(parts)),
+        *parts,
+    )
+    for component in components:
+        if type(component) is not bytes:
+            raise TypeError("source fingerprint frame is malformed")
+        framed.update(len(component).to_bytes(8, "big"))
+        framed.update(component)
+    return framed.digest()
+
+
+def _source_fingerprint_seal(
+    value: object,
+    *,
+    domain: bytes,
+    root_mode: str,
+) -> _SourceFingerprintSeal:
+    """Iteratively seal one acyclic source graph without retaining its tree."""
+    from .ledger import LedgerPair
+
+    anchors: list[object] = []
+    anchor_indices: dict[int, tuple[object, int]] = {}
+    memo: dict[tuple[str, int], tuple[object, object]] = {}
+    descriptors: dict[
+        tuple[str, int],
+        tuple[
+            object,
+            bytes,
+            tuple[bytes, ...],
+            tuple[tuple[bytes, object, str], ...],
+        ],
+    ] = {}
+
+    def anchor_token(kind: bytes, current: object) -> bytes:
+        identity = id(current)
+        prior = anchor_indices.get(identity)
+        if prior is not None and prior[0] is current:
+            ordinal = prior[1]
+        else:
+            ordinal = len(anchors)
+            anchors.append(current)
+            anchor_indices[identity] = (current, ordinal)
+        return _source_fingerprint_frame(
+            domain,
+            kind,
+            (
+                _source_fingerprint_unsigned(ordinal),
+                _source_fingerprint_unsigned(identity),
+            ),
+        )
+
+    def scalar_descriptor(
+        current: object,
+        *,
+        mode: str,
+    ) -> tuple[bytes, tuple[bytes, ...]]:
+        prefix = mode.encode("ascii")
+        current_type = type(current)
+        if current is None:
+            return prefix + b"/none", ()
+        if current_type is bool:
+            return prefix + b"/bool", (b"\x01" if current else b"\x00",)
+        if current_type is int:
+            return prefix + b"/int", (_source_fingerprint_signed(current),)
+        if current_type is str:
+            return prefix + b"/str", (current.encode("utf-8"),)
+        if current_type is bytes:
+            return prefix + b"/bytes", (bytes(current),)
+        if current_type is date:
+            return (
+                prefix + b"/date",
+                (
+                    object.__getattribute__(current, "year").to_bytes(4, "big"),
+                    object.__getattribute__(current, "month").to_bytes(1, "big"),
+                    object.__getattribute__(current, "day").to_bytes(1, "big"),
+                ),
+            )
+        if current_type is datetime:
+            return (
+                prefix + b"/datetime-anchor",
+                (anchor_token(b"datetime-anchor", current),),
+            )
+        if mode == _MERKLE_OPAQUE_STRUCTURAL and current_type is Decimal:
+            decimal_tuple = Decimal.as_tuple(current)
+            exponent = decimal_tuple.exponent
+            exponent_kind: bytes
+            exponent_value: bytes
+            if type(exponent) is int:
+                exponent_kind = b"integer"
+                exponent_value = _source_fingerprint_signed(exponent)
+            elif type(exponent) is str:
+                exponent_kind = b"special"
+                exponent_value = exponent.encode("ascii")
+            else:
+                raise TypeError("unsupported Decimal exponent")
+            return (
+                prefix + b"/decimal",
+                (
+                    b"\x01" if decimal_tuple.sign else b"\x00",
+                    bytes(decimal_tuple.digits),
+                    exponent_kind,
+                    exponent_value,
+                ),
+            )
+        if mode == _MERKLE_PHASE2_NORMAL:
+            return prefix + b"/ignored-leaf", ()
+        if mode == _MERKLE_OPAQUE_STRUCTURAL:
+            return (
+                prefix + b"/opaque-leaf-identity",
+                (
+                    anchor_token(b"type-anchor", current_type),
+                    anchor_token(b"opaque-identity-anchor", current),
+                ),
+            )
+        raise TypeError("unsupported Phase 1 source fingerprint value")
+
+    def describe(
+        current: object,
+        mode: str,
+    ) -> tuple[
+        bytes,
+        tuple[bytes, ...],
+        tuple[tuple[bytes, object, str], ...],
+    ]:
+        current_type = type(current)
+        if mode == _MERKLE_OPAQUE_IDENTITY:
+            return (
+                b"opaque-identity/value",
+                (
+                    anchor_token(b"type-anchor", current_type),
+                    anchor_token(b"opaque-identity-anchor", current),
+                ),
+                ((b"structural", current, _MERKLE_OPAQUE_STRUCTURAL),),
+            )
+        if is_dataclass(current) and not isinstance(current, type):
+            dataclass_fields = fields(current_type)
+            children: list[tuple[bytes, object, str]] = []
+            for item in dataclass_fields:
+                item_value = object.__getattribute__(current, item.name)
+                if mode in {
+                    _MERKLE_PHASE1_NORMAL,
+                    _MERKLE_PHASE2_NORMAL,
+                }:
+                    child_mode = (
+                        mode
+                        if item.compare
+                        else _MERKLE_OPAQUE_IDENTITY
+                    )
+                else:
+                    child_mode = mode
+                children.append(
+                    (item.name.encode("utf-8"), item_value, child_mode)
+                )
+            return (
+                mode.encode("ascii") + b"/dataclass",
+                (
+                    anchor_token(b"type-anchor", current_type),
+                    _source_fingerprint_unsigned(len(children)),
+                ),
+                tuple(children),
+            )
+        if current_type is tuple:
+            return (
+                mode.encode("ascii") + b"/tuple",
+                (_source_fingerprint_unsigned(len(current)),),
+                tuple(
+                    (
+                        _source_fingerprint_unsigned(ordinal),
+                        item,
+                        mode,
+                    )
+                    for ordinal, item in enumerate(current)
+                ),
+            )
+        if (
+            mode == _MERKLE_OPAQUE_STRUCTURAL
+            and current_type is LedgerPair
+        ):
+            children = tuple(
+                (
+                    name.encode("ascii"),
+                    object.__getattribute__(current, name),
+                    _MERKLE_OPAQUE_STRUCTURAL,
+                )
+                for name in _LEDGER_PAIR_STRUCTURAL_SLOTS
+            )
+            return (
+                b"opaque-structural/ledger-pair/v1",
+                (
+                    anchor_token(b"type-anchor", current_type),
+                    _source_fingerprint_unsigned(len(children)),
+                ),
+                children,
+            )
+        tag, parts = scalar_descriptor(current, mode=mode)
+        return tag, parts, ()
+
+    root_key = (root_mode, id(value))
+    stack: list[tuple[object, str, bool]] = [(value, root_mode, False)]
+    while stack:
+        current, mode, expanded = stack.pop()
+        key = (mode, id(current))
+        cached = memo.get(key)
+        if not expanded:
+            if cached is not None and cached[0] is current:
+                if cached[1] is _FINGERPRINT_ACTIVE:
+                    raise TypeError("cyclic source fingerprint graph")
+                continue
+            memo[key] = (current, _FINGERPRINT_ACTIVE)
+            try:
+                tag, static_parts, children = describe(current, mode)
+            except BaseException:
+                memo.pop(key, None)
+                raise
+            descriptors[key] = (current, tag, static_parts, children)
+            stack.append((current, mode, True))
+            for _label, child, child_mode in reversed(children):
+                stack.append((child, child_mode, False))
+            continue
+
+        descriptor = descriptors.pop(key, None)
+        if descriptor is None or descriptor[0] is not current:
+            raise TypeError("source fingerprint traversal is malformed")
+        _retained, tag, static_parts, children = descriptor
+        parts = list(static_parts)
+        for label, child, child_mode in children:
+            child_result = memo.get((child_mode, id(child)))
+            if (
+                child_result is None
+                or child_result[0] is not child
+                or child_result[1] is _FINGERPRINT_ACTIVE
+                or type(child_result[1]) is not bytes
+            ):
+                raise TypeError("source fingerprint traversal is malformed")
+            parts.extend((label, child_result[1]))
+        digest = _source_fingerprint_frame(domain, tag, tuple(parts))
+        memo[key] = (current, digest)
+
+    root_result = memo.get(root_key)
+    if (
+        root_result is None
+        or root_result[0] is not value
+        or type(root_result[1]) is not bytes
+    ):
+        raise TypeError("source fingerprint traversal is malformed")
+    return _SourceFingerprintSeal(
+        digest=_source_fingerprint_frame(
+            domain,
+            b"root/" + root_mode.encode("ascii"),
+            (root_result[1],),
+        ),
+        identity_anchors=tuple(anchors),
+    )
 
 
 def _phase1_fingerprint_value(
     value: object,
     *,
     read_cache: _Phase1FingerprintReadCache | None = None,
-) -> object:
-    """Freeze nested Phase 1 DTO material without relying on repr/str hooks."""
-    if is_dataclass(value) and not isinstance(value, type):
-        if read_cache is not None:
-            cached = read_cache.get(id(value))
-            if cached is not None and cached[0] is value:
-                return cached[1]
-        fingerprint = (
-            type(value).__module__,
-            type(value).__qualname__,
-            tuple(
-                (
-                    field.name,
-                    _phase1_fingerprint_value(
-                        getattr(value, field.name),
-                        read_cache=read_cache,
-                    ),
-                )
-                for field in fields(value)
-                if field.compare
-            ),
-        )
-        if read_cache is not None:
-            # The scope retaining this strong reference is private to one
-            # synchronous reconstruction.  Once its source escapes to the
-            # caller the cache is cleared and mutation checks recompute the
-            # complete structural fingerprint.
-            read_cache[id(value)] = (value, fingerprint)
-        return fingerprint
-    if type(value) is tuple:
-        return tuple(
-            _phase1_fingerprint_value(item, read_cache=read_cache)
-            for item in value
-        )
-    if type(value) is bytes:
-        return bytes(value)
-    if value is None or type(value) in {str, int, bool, date, datetime}:
-        return value
-    raise TypeError("unsupported Phase 1 source fingerprint value")
+) -> _SourceFingerprintSeal:
+    """Seal nested Phase 1 DTO material without repr/equality hooks."""
+    # ``read_cache`` remains accepted for existing private reader call sites,
+    # but authority verification must never reuse a prior invocation's bytes.
+    del read_cache
+    return _source_fingerprint_seal(
+        value,
+        domain=_PHASE1_FINGERPRINT_DOMAIN,
+        root_mode=_MERKLE_PHASE1_NORMAL,
+    )
 
 
 def _phase1_source_fingerprint(
     source: object,
     *,
     read_cache: _Phase1FingerprintReadCache | None = None,
-) -> tuple[object, ...]:
-    # Even outside a private Journal read scope, one verification must walk
-    # the source as an object graph rather than repeatedly expanding shared
-    # subgraphs as a tree.  This memo is deliberately ephemeral: a later
-    # verification recomputes every reachable value and therefore still
-    # detects caller-side ``object.__setattr__`` mutation.
-    effective_cache = {} if read_cache is None else read_cache
-    fingerprint = _phase1_fingerprint_value(
+) -> _SourceFingerprintSeal:
+    # One invocation walks an object graph into a fixed-size seal.  Traversal
+    # state is deliberately local so every verification sees later mutations.
+    return _phase1_fingerprint_value(
         source,
-        read_cache=effective_cache,
+        read_cache=read_cache,
     )
-    if type(fingerprint) is not tuple:
-        raise TypeError("Phase 1 source fingerprint is malformed")
-    return fingerprint
 
 
-def _register_journal_source_authority(
+def _phase2_opaque_identity_fingerprint(
+    value: object,
+) -> _SourceFingerprintSeal:
+    """Seal issued opaque inputs by exact identity and complete structure."""
+    return _source_fingerprint_seal(
+        value,
+        domain=_PHASE2_OPAQUE_FINGERPRINT_DOMAIN,
+        root_mode=_MERKLE_PHASE2_NORMAL,
+    )
+
+
+def _phase2_source_fingerprint(
+    source: object,
+) -> tuple[_SourceFingerprintSeal, _SourceFingerprintSeal]:
+    """Fingerprint all durable fields plus identities of issued opaque inputs."""
+    return (
+        _phase1_source_fingerprint(source),
+        _phase2_opaque_identity_fingerprint(source),
+    )
+
+
+def _source_fingerprint_seals_equal(
+    left: _SourceFingerprintSeal,
+    right: _SourceFingerprintSeal,
+) -> bool:
+    """Compare compact seals without invoking equality on identity anchors."""
+    if type(left) is not _SourceFingerprintSeal or (
+        type(right) is not _SourceFingerprintSeal
+    ):
+        return False
+    left_digest = object.__getattribute__(left, "digest")
+    right_digest = object.__getattribute__(right, "digest")
+    left_anchors = object.__getattribute__(left, "identity_anchors")
+    right_anchors = object.__getattribute__(right, "identity_anchors")
+    if (
+        type(left_digest) is not bytes
+        or type(right_digest) is not bytes
+        or len(left_digest) != 32
+        or len(right_digest) != 32
+        or left_digest != right_digest
+        or type(left_anchors) is not tuple
+        or type(right_anchors) is not tuple
+        or len(left_anchors) != len(right_anchors)
+    ):
+        return False
+    return all(
+        left_anchor is right_anchor
+        for left_anchor, right_anchor in zip(
+            left_anchors,
+            right_anchors,
+            strict=True,
+        )
+    )
+
+
+def _fingerprints_equal(left: object, right: object) -> bool:
+    """Iteratively compare shared fingerprint DAGs by tuple-pair identity."""
+    pair_memo: _FingerprintPairMemo = {}
+
+    if isinstance(left, _SourceFingerprintSeal) or isinstance(
+        right,
+        _SourceFingerprintSeal,
+    ):
+        return _source_fingerprint_seals_equal(left, right)
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if type(left) is datetime:
+        # ``datetime.__eq__`` delegates to caller-supplied ``tzinfo``.
+        # Registry fingerprints strongly retain the original leaf, so
+        # identity is both sufficient for unchanged sources and prevents
+        # replacement values from running equality hooks.
+        return False
+    if isinstance(left, type):
+        return False
+    if type(left) is not tuple:
+        return left == right
+    if len(left) != len(right):
+        return False
+
+    # The roots retain every tuple in both DAGs, so invocation-local identity
+    # pairs cannot be reused.  Keep only their integer identities in the memo;
+    # parallel stacks retain at most the active DFS path and avoid recursive
+    # generators or one object-retaining memo record per completed pair.
+    left_stack = [left]
+    right_stack = [right]
+    index_stack = [0]
+    pair_memo[(id(left), id(right))] = _FINGERPRINT_ACTIVE
+
+    while left_stack:
+        left_tuple = left_stack[-1]
+        right_tuple = right_stack[-1]
+        index = index_stack[-1]
+        if index == len(left_tuple):
+            pair_memo[(id(left_tuple), id(right_tuple))] = True
+            left_stack.pop()
+            right_stack.pop()
+            index_stack.pop()
+            continue
+
+        index_stack[-1] = index + 1
+        left_value = left_tuple[index]
+        right_value = right_tuple[index]
+        if isinstance(left_value, _SourceFingerprintSeal) or isinstance(
+            right_value,
+            _SourceFingerprintSeal,
+        ):
+            if not _source_fingerprint_seals_equal(
+                left_value,
+                right_value,
+            ):
+                return False
+            continue
+        if left_value is right_value:
+            continue
+        if type(left_value) is not type(right_value):
+            return False
+        if type(left_value) is datetime:
+            return False
+        if isinstance(left_value, type):
+            return False
+        if type(left_value) is not tuple:
+            if not (left_value == right_value):
+                return False
+            continue
+        if len(left_value) != len(right_value):
+            return False
+
+        pair = (id(left_value), id(right_value))
+        cached = pair_memo.get(pair)
+        if cached is _FINGERPRINT_ACTIVE:
+            raise TypeError("cyclic fingerprint comparison")
+        if cached is True:
+            continue
+        pair_memo[pair] = _FINGERPRINT_ACTIVE
+        left_stack.append(left_value)
+        right_stack.append(right_value)
+        index_stack.append(0)
+
+    return True
+
+
+def _phase2_stable_id(namespace: str, *parts: str) -> str:
+    return hashlib.sha256(
+        (namespace + "\x00" + "\x00".join(parts)).encode("utf-8")
+    ).hexdigest()
+
+
+def _phase2_promotion_semantics(decision: object) -> tuple[object, ...]:
+    """Compare promotion results without trusting cutoff-specific digests."""
+    from .validation import PromotionDecision
+
+    if type(decision) is not PromotionDecision:
+        raise InvalidJournalValue("Phase 2 promotion decision is malformed")
+    return (
+        decision.passed,
+        decision.status,
+        decision.reason_codes,
+        decision.closed_primary_trades,
+        decision.elapsed_days,
+        decision.mean_net_r,
+        decision.adherence,
+        decision.canonical_max_drawdown,
+        decision.actual_max_drawdown,
+    )
+
+
+def _phase2_plain_record_digest(
+    columns: Sequence[str],
+    values_without_hash: Sequence[object],
+) -> str:
+    if len(values_without_hash) != len(columns) - 2:
+        raise JournalError("Phase 2 row shape is malformed")
+    return hashlib.sha256(
+        _canonical_audit_json(
+            dict(zip(columns[1:-1], values_without_hash, strict=True))
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _phase2_row_references(
+    *groups: Sequence[JournalRowReference],
+) -> tuple[JournalRowReference, ...]:
+    unique: dict[tuple[str, int], JournalRowReference] = {}
+    for reference in (item for group in groups for item in group):
+        key = (reference.table, reference.row_id)
+        prior = unique.get(key)
+        if prior is not None and prior != reference:
+            raise MigrationCorruption("Phase 2 row references conflict")
+        unique[key] = reference
+    return tuple(
+        sorted(unique.values(), key=lambda item: (item.table, item.row_id))
+    )
+
+
+def _phase2_window_genesis_record(
+    window_reference: JournalRowReference,
+    *,
+    window_id: str,
+    window_source_digest: str,
+    started_session: date,
+    started_at: datetime,
+    received_at: datetime,
+) -> tuple[object, ...]:
+    """Build the exact content-addressed $5,000 START equity row."""
+    started_at_text = _canonical_timestamp(started_at)
+    received_at_text = _canonical_timestamp(received_at)
+    point_id = _phase2_stable_id(
+        "stock-monitor/phase2-equity-point/v1",
+        window_id,
+        "START",
+        started_session.isoformat(),
+        started_at_text,
+    )
+    source_digest = _journal_bundle_digest(
+        "stock-monitor/phase2-equity-point-source/v1",
+        (window_reference,),
+        {
+            "point_id": point_id,
+            "window_id": window_id,
+            "window_source_digest": window_source_digest,
+            "session_date": started_session.isoformat(),
+            "point_kind": "START",
+            "cash_micros": 5_000_000_000,
+            "position_value_micros": 0,
+            "equity_micros": 5_000_000_000,
+            "high_water_micros": 5_000_000_000,
+            "drawdown_micros": 0,
+            "at": started_at_text,
+            "received_at": received_at_text,
+        },
+    )
+    values_without_hash: tuple[object, ...] = (
+        point_id,
+        window_id,
+        None,
+        None,
+        None,
+        started_session.isoformat(),
+        "START",
+        5_000_000_000,
+        0,
+        5_000_000_000,
+        5_000_000_000,
+        0,
+        started_at_text,
+        received_at_text,
+        source_digest,
+    )
+    return (
+        *values_without_hash,
+        _phase2_plain_record_digest(
+            _PHASE2_EQUITY_POINT_COLUMNS,
+            values_without_hash,
+        ),
+    )
+
+
+def _phase2_fee_schedule_source_digest(
+    *,
+    schedule_id: str,
+    effective_session: str,
+    reviewed_at: str,
+    currency: str,
+    contract_multiplier: int,
+    entry_fee_per_contract_micros: int,
+    exit_fee_per_contract_micros: int,
+    close_fee_reserve_per_contract_micros: int,
+    source_sha256: str,
+    schedule_digest: str,
+    archived_at: str,
+) -> str:
+    material = {
+        "version": 1,
+        "namespace": "stock-monitor/phase2-fee-schedule-source/v1",
+        "schedule_id": schedule_id,
+        "effective_session": effective_session,
+        "reviewed_at": reviewed_at,
+        "currency": currency,
+        "contract_multiplier": contract_multiplier,
+        "entry_fee_per_contract_micros": entry_fee_per_contract_micros,
+        "exit_fee_per_contract_micros": exit_fee_per_contract_micros,
+        "close_fee_reserve_per_contract_micros": (
+            close_fee_reserve_per_contract_micros
+        ),
+        "source_sha256": source_sha256,
+        "schedule_digest": schedule_digest,
+        "archived_at": archived_at,
+    }
+    return hashlib.sha256(
+        _canonical_audit_json(material).encode("utf-8")
+    ).hexdigest()
+
+
+def _phase2_fee_schedule_record_digest(
+    values_without_hash: Sequence[object],
+) -> str:
+    if len(values_without_hash) != len(_PHASE2_FEE_SCHEDULE_COLUMNS) - 2:
+        raise JournalError("Phase 2 fee schedule row shape is malformed")
+    material = dict(
+        zip(
+            _PHASE2_FEE_SCHEDULE_COLUMNS[1:-1],
+            values_without_hash,
+            strict=True,
+        )
+    )
+    reviewed_bytes = material.pop("reviewed_bytes")
+    if type(reviewed_bytes) is not bytes:
+        raise JournalError("Phase 2 fee schedule bytes are malformed")
+    material["reviewed_bytes_length"] = len(reviewed_bytes)
+    material["reviewed_bytes_sha256"] = hashlib.sha256(reviewed_bytes).hexdigest()
+    return hashlib.sha256(
+        _canonical_audit_json(material).encode("utf-8")
+    ).hexdigest()
+
+
+def _historical_replay_record_digest(
+    columns: Sequence[str],
+    values_without_hash: Sequence[object],
+) -> str:
+    if len(values_without_hash) != len(columns) - 2:
+        raise JournalError("historical replay row shape is malformed")
+    return hashlib.sha256(
+        _canonical_audit_json(
+            dict(zip(columns[1:-1], values_without_hash, strict=True))
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _historical_replay_stable_id(namespace: str, *parts: str) -> str:
+    return hashlib.sha256(
+        (namespace + "\x00" + "\x00".join(parts)).encode("utf-8")
+    ).hexdigest()
+
+
+def _historical_replay_references_json(
+    references: Sequence[JournalRowReference],
+) -> str:
+    unique: dict[tuple[str, int], JournalRowReference] = {}
+    for reference in references:
+        key = (reference.table, reference.row_id)
+        prior = unique.get(key)
+        if prior is not None and prior != reference:
+            raise MigrationCorruption("historical replay row references conflict")
+        unique[key] = reference
+    return _canonical_audit_json(
+        [
+            [reference.table, reference.row_id, reference.row_digest]
+            for reference in sorted(
+                unique.values(), key=lambda item: (item.table, item.row_id)
+            )
+        ]
+    )
+
+
+def _historical_replay_case_material(case: object) -> dict[str, object]:
+    from .replay import ReplayCase
+
+    if type(case) is not ReplayCase:
+        raise InvalidJournalValue("historical replay case is malformed")
+    mechanics = case.mechanics
+
+    def decimal_text(value: Decimal | None) -> str | None:
+        return None if value is None else format(value, "f")
+
+    return {
+        "session_date": case.session_date.isoformat(),
+        "domain_results": [
+            {
+                "component": result.component.value,
+                "status": result.status.value,
+                "reason_codes": list(result.reason_codes),
+            }
+            for result in case.domain_results
+        ],
+        "mechanics": {
+            "status": mechanics.status.value,
+            "reason_codes": list(mechanics.reason_codes),
+            "exit_reason": mechanics.exit_reason,
+            "fill_price": decimal_text(mechanics.fill_price),
+            "exited_at": (
+                None
+                if mechanics.exited_at is None
+                else _canonical_timestamp(mechanics.exited_at)
+            ),
+            "observation_ids": list(mechanics.observation_ids),
+            "entry_fill_price": decimal_text(mechanics.entry_fill_price),
+            "reference_price": decimal_text(mechanics.reference_price),
+            "evidence_kind": mechanics.evidence_kind.value,
+            "is_exact": mechanics.is_exact,
+            "labels": list(mechanics.labels),
+            "entry_status": mechanics.entry_status,
+        },
+    }
+
+
+def _historical_replay_case_digests(
+    case: object,
+    *,
+    phase1_source_digest: str,
+) -> tuple[str, str, str]:
+    material = _historical_replay_case_material(case)
+    domain_input_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                "version": 1,
+                "namespace": "stock-monitor/historical-replay-domain/v1",
+                "phase1_source_digest": phase1_source_digest,
+                "session_date": material["session_date"],
+                "domain_results": material["domain_results"],
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    mechanics_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                "version": 1,
+                "namespace": "stock-monitor/historical-replay-mechanics/v1",
+                "phase1_source_digest": phase1_source_digest,
+                "session_date": material["session_date"],
+                "mechanics": material["mechanics"],
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    case_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                "version": 1,
+                "namespace": "stock-monitor/historical-replay-case/v1",
+                "case": material,
+                "domain_input_digest": domain_input_digest,
+                "mechanics_digest": mechanics_digest,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    return case_digest, domain_input_digest, mechanics_digest
+
+
+def _historical_replay_missing_case_digests(
+    *,
+    session_date: date,
+    report_cutoff: datetime,
+) -> tuple[str, str, str]:
+    base = {
+        "version": 1,
+        "session_date": session_date.isoformat(),
+        "report_cutoff": _canonical_timestamp(report_cutoff),
+        "state": "INCOMPLETE_SOURCE",
+    }
+    domain_input_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                **base,
+                "namespace": "stock-monitor/historical-replay-domain/v1",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    mechanics_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                **base,
+                "namespace": "stock-monitor/historical-replay-mechanics/v1",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    case_digest = hashlib.sha256(
+        _canonical_audit_json(
+            {
+                **base,
+                "namespace": "stock-monitor/historical-replay-case/v1",
+                "domain_input_digest": domain_input_digest,
+                "mechanics_digest": mechanics_digest,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    return case_digest, domain_input_digest, mechanics_digest
+
+
+def _historical_replay_completion_digest(
+    *,
+    session_date: date,
+    report_cutoff: datetime,
+    evidence: Sequence[_HistoricalReplayEvidencePlan],
+    case_digest: str,
+    domain_input_digest: str,
+    mechanics_digest: str,
+) -> str:
+    return hashlib.sha256(
+        _canonical_audit_json(
+            {
+                "version": 1,
+                "namespace": "stock-monitor/historical-replay-completion/v1",
+                "session_date": session_date.isoformat(),
+                "report_cutoff": _canonical_timestamp(report_cutoff),
+                "expected_roles": list(_HISTORICAL_REPLAY_ROLES),
+                "evidence": [
+                    {
+                        "role": item.role,
+                        "ordinal": item.evidence_ordinal,
+                        "subject": item.subject,
+                        "source_kind": item.source_kind,
+                        "source_observation_row_id": (
+                            item.source_observation_row_id
+                        ),
+                        "external_source_observation_id": (
+                            item.external_source_observation_id
+                        ),
+                        "source_item_ordinal": item.source_item_ordinal,
+                        "source_item_path": item.source_item_path,
+                        "payload_sha256": item.payload_sha256,
+                        "content_sha256": item.content_sha256,
+                        "authority_digest": item.authority_digest,
+                        "effective_at": _canonical_timestamp(item.effective_at),
+                        "published_at": _canonical_timestamp(item.published_at),
+                        "retrieved_at": _canonical_timestamp(item.retrieved_at),
+                    }
+                    for item in evidence
+                ],
+                "case_digest": case_digest,
+                "domain_input_digest": domain_input_digest,
+                "mechanics_digest": mechanics_digest,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _phase1_reader_nested_authority_candidates(
+    source: object,
+) -> tuple[_JournalAuthorityCandidate, ...]:
+    """Collect exact direct dependencies from a closed parent-type topology."""
+    source_type = type(source)
+    dependency_fields: tuple[_Phase1ReaderDependencyField, ...] | None = None
+    for parent_type, configured_fields in (
+        _PHASE1_READER_DIRECT_DEPENDENCY_FIELDS
+    ):
+        if source_type is parent_type:
+            dependency_fields = configured_fields
+            break
+    if dependency_fields is None:
+        raise JournalError("Phase 1 reader source topology is unverified")
+
+    dependencies: list[object] = []
+    for dependency_field in dependency_fields:
+        try:
+            value = object.__getattribute__(
+                source,
+                dependency_field.name,
+            )
+        except BaseException as error:
+            raise JournalError(
+                "Phase 1 reader dependency topology is malformed"
+            ) from error
+        if dependency_field.optional and value is None:
+            continue
+        if dependency_field.many:
+            if type(value) is not tuple or any(
+                type(item) is not dependency_field.expected_type
+                for item in value
+            ):
+                raise JournalError(
+                    "Phase 1 reader dependency topology is malformed"
+                )
+            dependencies.extend(value)
+        elif type(value) is dependency_field.expected_type:
+            dependencies.append(value)
+        else:
+            raise JournalError(
+                "Phase 1 reader dependency topology is malformed"
+            )
+
+    candidates: list[_JournalAuthorityCandidate] = []
+    seen: dict[int, object] = {}
+    for dependency in dependencies:
+        prior = seen.get(id(dependency))
+        if prior is dependency:
+            continue
+        seen[id(dependency)] = dependency
+        candidate: _JournalAuthorityCandidate | None
+        if type(dependency) in _PHASE1_SOURCE_TYPES:
+            candidate = _phase1_source_authority_candidate(dependency)
+        elif type(dependency) is JournalActionSource:
+            candidate = _journal_action_source_authority_candidate(dependency)
+        elif type(dependency) is JournalActualReplaySource:
+            candidate = _journal_replay_source_authority_candidate(dependency)
+        else:
+            candidate = None
+        if candidate is None:
+            raise JournalError(
+                "Phase 1 reader nested authority is unverified"
+            )
+        candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _phase1_reader_source_registration_material(
+    registry: _JournalSourceRegistry,
+    source: object,
+    owner: Journal,
+) -> tuple[int, tuple[ReferenceType[object], object, ReferenceType[object], int, int]]:
+    """Prepare, but never install, one exact persisted-reader authority."""
+    if (
+        type(owner) is not Journal
+        or type(source) not in _PHASE1_SOURCE_TYPES
+        or not any(
+            registry is phase1_registry
+            for phase1_registry in _PHASE1_SOURCE_REGISTRIES
+        )
+        or _phase1_source_registry(source) is not registry
+    ):
+        raise JournalError("Phase 1 reader authority material is invalid")
+    identity = id(source)
+    owner_reference = ref(owner)
+    nested_candidates = _phase1_reader_nested_authority_candidates(source)
+    before_fingerprint = _phase1_source_fingerprint(source)
+    if nested_candidates:
+        nested_owner = _current_journal_source_authority_owner(
+            nested_candidates
+        )
+        total_changes = nested_candidates[0][3]
+        data_version = nested_candidates[0][4]
+        if nested_owner is not owner or any(
+            candidate[2] is not owner
+            or candidate[3] != total_changes
+            or candidate[4] != data_version
+            for candidate in nested_candidates
+        ):
+            raise JournalError(
+                "Phase 1 reader nested authority changed during registration"
+            )
+    else:
+        total_changes_before = _journal_source_authority_total_changes(owner)
+        data_version = owner._source_authority_data_version()
+        total_changes = _journal_source_authority_total_changes(owner)
+        if total_changes != total_changes_before:
+            raise JournalError(
+                "Phase 1 reader source changed during authority registration"
+            )
+    if type(source) is Phase1EquityMarkSource:
+        from .ledger import (
+            Phase1CanonicalLedgerReplay,
+            _is_current_phase1_canonical_ledger_replay_authority,
+        )
+        from .providers.alpaca import (
+            _normalized_market_fact_source,
+            is_issued_normalized_market_fact,
+            is_issued_provider_fetch_cohort,
+            provider_fetch_cohorts_share_owner,
+        )
+        from .reconciliation import (
+            ActualLedgerState,
+            _is_current_actual_ledger_state_authority_for_source,
+        )
+
+        marks = object.__getattribute__(source, "position_marks")
+        canonical_source = object.__getattribute__(
+            source,
+            "canonical_replay_source",
+        )
+        canonical_replay = object.__getattribute__(
+            source,
+            "canonical_replay",
+        )
+        actual_source = object.__getattribute__(
+            source,
+            "actual_replay_source",
+        )
+        actual_replay = object.__getattribute__(source, "actual_replay")
+        if (
+            type(marks) is not tuple
+            or any(
+                type(mark) is not Phase1EquityPositionMarkSource
+                for mark in marks
+            )
+            or type(canonical_replay) is not Phase1CanonicalLedgerReplay
+            or type(actual_replay) is not ActualLedgerState
+            or not _is_current_phase1_canonical_ledger_replay_authority(
+                canonical_replay,
+                canonical_source,
+            )
+            or not _is_current_actual_ledger_state_authority_for_source(
+                actual_replay,
+                actual_source,
+            )
+        ):
+            raise JournalError(
+                "Phase 1 reader derived replay authority is unverified"
+            )
+        cohorts = tuple(
+            cohort
+            for mark in marks
+            for cohort in (
+                object.__getattribute__(mark, "quote_cohort"),
+                object.__getattribute__(mark, "daily_bar_cohort"),
+            )
+        )
+        fact_tuples = tuple(
+            fact_tuple
+            for mark in marks
+            for fact_tuple in (
+                object.__getattribute__(mark, "quote_facts"),
+                object.__getattribute__(mark, "daily_bar_facts"),
+            )
+        )
+        if any(type(fact_tuple) is not tuple for fact_tuple in fact_tuples):
+            raise JournalError(
+                "Phase 1 reader provider authority is malformed"
+            )
+        facts = tuple(
+            fact
+            for fact_tuple in fact_tuples
+            for fact in fact_tuple
+        )
+        if (
+            (cohorts and not provider_fetch_cohorts_share_owner(*cohorts))
+            or any(
+                not is_issued_provider_fetch_cohort(cohort)
+                for cohort in cohorts
+            )
+            or any(not is_issued_normalized_market_fact(fact) for fact in facts)
+            or any(
+                not is_issued_normalized_market_fact(
+                    object.__getattribute__(mark, "selected_observation")
+                )
+                or _normalized_market_fact_source(
+                    object.__getattribute__(mark, "selected_observation")
+                )
+                is not object.__getattribute__(
+                    mark,
+                    "selected_provider_fact_source",
+                )
+                for mark in marks
+            )
+        ):
+            raise JournalError(
+                "Phase 1 reader provider authority is unverified"
+            )
+    fingerprint = _phase1_source_fingerprint(
+        source,
+    )
+    if not _source_fingerprint_seals_equal(
+        before_fingerprint,
+        fingerprint,
+    ):
+        raise JournalError(
+            "Phase 1 reader source changed during authority registration"
+        )
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _JOURNAL_SOURCE_LOCK:
+            current = registry.get(identity)
+            if current is not None and current[0] is dead:
+                registry.pop(identity, None)
+
+    return (
+        identity,
+        (
+            ref(source, discard),
+            fingerprint,
+            owner_reference,
+            total_changes,
+            data_version,
+        ),
+    )
+
+
+def _remember_journal_source_authority(
     registry: _JournalSourceRegistry,
     source: object,
     owner: Journal,
 ) -> None:
-    """Register one exact source object against a live Journal snapshot."""
+    """Remember one already-validated source against a live Journal snapshot."""
+    if (
+        registry is _PHASE2_SOURCE_AUTHORITIES
+        or any(
+            registry is phase1_registry
+            for phase1_registry in _PHASE1_SOURCE_REGISTRIES
+        )
+        or type(source) in _PHASE2_SOURCE_TYPES
+        or type(source) in _PHASE1_SOURCE_TYPES
+    ):
+        raise JournalError(
+            "source registration requires a persisted Journal reader"
+        )
     identity = id(source)
     owner_reference = ref(owner)
-    generation = owner._source_generation
+    total_changes = _journal_source_authority_total_changes(owner)
     data_version = owner._source_authority_data_version()
 
     def discard(dead: ReferenceType[object]) -> None:
@@ -3313,52 +5475,78 @@ def _register_journal_source_authority(
                 registry.pop(identity, None)
 
     with _JOURNAL_SOURCE_LOCK:
-        registry[identity] = (
-            ref(source, discard),
-            _phase1_source_fingerprint(
+        fingerprint = (
+            _phase2_source_fingerprint(source)
+            if type(source) in _PHASE2_SOURCE_TYPES
+            else _phase1_source_fingerprint(
                 source,
                 read_cache=owner._phase1_fingerprint_read_cache,
-            ),
+            )
+        )
+        registry[identity] = (
+            ref(source, discard),
+            fingerprint,
             owner_reference,
-            generation,
+            total_changes,
             data_version,
         )
 
 
+def _register_journal_source_authority(
+    registry: _JournalSourceRegistry,
+    source: object,
+    owner: Journal,
+) -> None:
+    """Register Phase 1 sources; Phase 2 issuance is reader-private."""
+    if (
+        registry is _PHASE2_SOURCE_AUTHORITIES
+        or any(
+            registry is phase1_registry
+            for phase1_registry in _PHASE1_SOURCE_REGISTRIES
+        )
+        or type(source) in _PHASE2_SOURCE_TYPES
+        or type(source) in _PHASE1_SOURCE_TYPES
+    ):
+        raise JournalError(
+            "source registration requires a persisted Journal reader"
+        )
+    _remember_journal_source_authority(registry, source, owner)
+
+
 def _phase1_source_registry(source: object) -> _JournalSourceRegistry | None:
-    if isinstance(source, Phase1PublicationSource):
+    if type(source) is Phase1PublicationSource:
         return _PHASE1_PUBLICATION_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1SignalSource):
+    if type(source) is Phase1SignalSource:
         return _PHASE1_SIGNAL_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1EntrySource):
+    if type(source) is Phase1EntrySource:
         return _PHASE1_ENTRY_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1ShadowFillSource):
+    if type(source) is Phase1ShadowFillSource:
         return _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1SignalEvidenceSource):
+    if type(source) is Phase1SignalEvidenceSource:
         return _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1ExpiryDeadlineSource):
+    if type(source) is Phase1ExpiryDeadlineSource:
         return _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1ExitReviewSource):
+    if type(source) is Phase1ExitReviewSource:
         return _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1ExitReviewMarketSource):
+    if type(source) is Phase1ExitReviewMarketSource:
         return _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES
-    if isinstance(source, _Phase1ExitProviderReplaySource):
+    if type(source) is _Phase1ExitProviderReplaySource:
         return _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1CanonicalReplaySource):
+    if type(source) is Phase1CanonicalReplaySource:
         return _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1EquityMarkSource):
+    if type(source) is Phase1EquityMarkSource:
         return _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES
-    if isinstance(source, _Phase1EquityProviderReplaySource):
+    if type(source) is _Phase1EquityProviderReplaySource:
         return _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1BreakerHistorySource):
+    if type(source) is Phase1BreakerHistorySource:
         return _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1PublishedSignalDispositionSource):
+    if type(source) is Phase1PublishedSignalDispositionSource:
         return _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1AdherenceCheckEvidenceSource):
+    if type(source) is Phase1AdherenceCheckEvidenceSource:
         return _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1AdherenceReviewSource):
+    if type(source) is Phase1AdherenceReviewSource:
         return _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES
-    if isinstance(source, Phase1ValidationWindowSource):
+    if type(source) is Phase1ValidationWindowSource:
         return _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES
     return None
 
@@ -3381,34 +5569,327 @@ def _phase1_registered_owner_and_read_cache(
     return owner, cache
 
 
-def _phase1_source_owner(source: object) -> object | None:
-    registry = _phase1_source_registry(source)
-    if registry is None:
-        return None
-    owner, read_cache = _phase1_registered_owner_and_read_cache(
-        registry,
-        source,
-    )
-    if owner is None:
-        return None
-    try:
-        fingerprint = _phase1_source_fingerprint(
-            source,
-            read_cache=read_cache,
-        )
-    except Exception:
-        return None
-    if not _has_current_journal_source_authority(
-        registry,
-        source,
-        fingerprint,
-    ):
-        return None
+def _registered_journal_source_authority_candidate(
+    registry: _JournalSourceRegistry,
+    source: object,
+    fingerprint_factory: _JournalFingerprintFactory,
+) -> _JournalAuthorityCandidate | None:
+    """Capture one exact registry identity without granting authority yet."""
     with _JOURNAL_SOURCE_LOCK:
         issued = registry.get(id(source))
         if issued is None or issued[0]() is not source:
             return None
-        return issued[2]()
+        owner = issued[2]()
+        if owner is None:
+            return None
+        return (
+            registry,
+            source,
+            owner,
+            issued[3],
+            issued[4],
+            issued[1],
+            fingerprint_factory,
+            issued,
+        )
+
+
+def _journal_source_authority_total_changes(owner: object) -> int:
+    """Return the read-only same-connection authority revision token."""
+    if type(owner) is not Journal:
+        raise JournalError("source authority owner is invalid")
+    connection = object.__getattribute__(owner, "_connection")
+    if type(connection) is not sqlite3.Connection:
+        raise JournalError("source authority connection is invalid")
+    total_changes = connection.total_changes
+    if type(total_changes) is not int or total_changes < 0:
+        raise JournalError("source authority change count is invalid")
+    return total_changes
+
+
+def _current_journal_source_authority_owner(
+    candidates: Sequence[_JournalAuthorityCandidate],
+) -> object | None:
+    """Verify one same-owner batch with all callbacks before fingerprints."""
+    if not candidates:
+        return None
+
+    unique: list[_JournalAuthorityCandidate] = []
+    seen: dict[tuple[int, int], tuple[object, object]] = {}
+    for candidate in candidates:
+        registry, source = candidate[0], candidate[1]
+        key = (id(registry), id(source))
+        prior = seen.get(key)
+        if prior is not None and prior[0] is registry and prior[1] is source:
+            continue
+        seen[key] = (registry, source)
+        unique.append(candidate)
+
+    owner = unique[0][2]
+    if any(candidate[2] is not owner for candidate in unique[1:]):
+        return None
+
+    # ``PRAGMA data_version`` can invoke a caller-installed SQLite trace
+    # callback.  Complete that and every other owner-currentness read before
+    # computing any fingerprint that can confer authority.
+    try:
+        if getattr(owner, "_closed", True) or (
+            getattr(owner, "_transaction_active")
+            and getattr(owner, "_transaction_dirty")
+        ):
+            return None
+        current_data_version = owner._source_authority_data_version()
+        if getattr(owner, "_closed", True) or (
+            getattr(owner, "_transaction_active")
+            and getattr(owner, "_transaction_dirty")
+        ):
+            return None
+        current_total_changes = _journal_source_authority_total_changes(owner)
+    except Exception:
+        return None
+    if any(
+        candidate[3] != current_total_changes
+        or candidate[4] != current_data_version
+        for candidate in unique
+    ):
+        return None
+
+    # From this point through the return there must be no SQL or currentness
+    # callback.  Every source retains its own exact seal; no parent source may
+    # confer transitive authority on a detached child identity.
+    for candidate in unique:
+        expected_fingerprint = candidate[5]
+        try:
+            fingerprint = candidate[6]()
+        except Exception:
+            return None
+        if not _fingerprints_equal(expected_fingerprint, fingerprint):
+            return None
+        with _JOURNAL_SOURCE_LOCK:
+            registry, source = candidate[0], candidate[1]
+            issued = registry.get(id(source))
+            if (
+                issued is not candidate[7]
+                or issued[0]() is not source
+                or issued[2]() is not owner
+                or issued[3] != candidate[3]
+                or issued[4] != candidate[4]
+                or issued[1] is not candidate[5]
+            ):
+                return None
+        del fingerprint
+
+    # Recheck all registry identities and snapshot tokens together under the
+    # lock after the streamed comparisons, without another SQL call or source
+    # fingerprint traversal.
+    with _JOURNAL_SOURCE_LOCK:
+        for candidate in unique:
+            registry, source = candidate[0], candidate[1]
+            issued = registry.get(id(source))
+            if (
+                issued is not candidate[7]
+                or issued[0]() is not source
+                or issued[2]() is not owner
+                or issued[3] != candidate[3]
+                or issued[4] != candidate[4]
+                or issued[1] is not candidate[5]
+            ):
+                return None
+    return owner
+
+
+def _phase1_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    registry = _phase1_source_registry(source)
+    if registry is None:
+        return None
+    return _registered_journal_source_authority_candidate(
+        registry,
+        source,
+        lambda: _phase1_source_fingerprint(source),
+    )
+
+
+def _phase2_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    if type(source) not in _PHASE2_SOURCE_TYPES:
+        return None
+    return _registered_journal_source_authority_candidate(
+        _PHASE2_SOURCE_AUTHORITIES,
+        source,
+        lambda: _phase2_source_fingerprint(source),
+    )
+
+
+_Phase2SourceAuthorityExpansion = tuple[
+    tuple[_JournalAuthorityCandidate, ...],
+    _Phase2PortfolioWindowAuthority | None,
+]
+
+
+def _phase2_source_authority_expansion(
+    source: object,
+) -> _Phase2SourceAuthorityExpansion | None:
+    """Capture a Phase 2 source and any private transitive dependency."""
+    source_candidate = _phase2_source_authority_candidate(source)
+    if source_candidate is None:
+        return None
+    if type(source) is not Phase2PortfolioSource:
+        return ((source_candidate,), None)
+
+    with _JOURNAL_SOURCE_LOCK:
+        binding = _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(id(source))
+        if (
+            binding is None
+            or binding.portfolio_reference() is not source
+            or binding.portfolio_issued is not source_candidate[7]
+            or type(binding.window_source) is not Phase2WindowSource
+        ):
+            return None
+        window_candidate = _phase2_source_authority_candidate(
+            binding.window_source
+        )
+        if (
+            window_candidate is None
+            or binding.window_issued is not window_candidate[7]
+        ):
+            return None
+    return ((source_candidate, window_candidate), binding)
+
+
+def _phase2_source_authority_expansion_is_current(
+    source: object,
+    expansion: _Phase2SourceAuthorityExpansion,
+) -> bool:
+    """Recheck a captured private dependency without callbacks or SQL."""
+    candidates, binding = expansion
+    if binding is None:
+        return True
+    if len(candidates) != 2:
+        return False
+    with _JOURNAL_SOURCE_LOCK:
+        return (
+            _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(id(source)) is binding
+            and _PHASE2_SOURCE_AUTHORITIES.get(id(source))
+            is binding.portfolio_issued
+            and _PHASE2_SOURCE_AUTHORITIES.get(id(binding.window_source))
+            is binding.window_issued
+            and binding.portfolio_reference() is source
+            and binding.portfolio_issued is candidates[0][7]
+            and binding.window_source is candidates[1][1]
+            and binding.window_issued is candidates[1][7]
+        )
+
+
+def _journal_action_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    if type(source) is not JournalActionSource:
+        return None
+    return _registered_journal_source_authority_candidate(
+        _ACTION_SOURCE_AUTHORITIES,
+        source,
+        lambda: _action_source_fingerprint(source),
+    )
+
+
+def _journal_window_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    if type(source) is not JournalAccountCheckWindowSource:
+        return None
+    return _registered_journal_source_authority_candidate(
+        _WINDOW_SOURCE_AUTHORITIES,
+        source,
+        lambda: _window_source_fingerprint(source),
+    )
+
+
+def _journal_replay_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    if type(source) is not JournalActualReplaySource:
+        return None
+    return _registered_journal_source_authority_candidate(
+        _REPLAY_SOURCE_AUTHORITIES,
+        source,
+        lambda: _replay_source_fingerprint(source),
+    )
+
+
+def _journal_any_source_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    candidate = _phase2_source_authority_candidate(source)
+    if candidate is None:
+        candidate = _phase1_source_authority_candidate(source)
+    if candidate is None:
+        candidate = _journal_action_source_authority_candidate(source)
+    if candidate is None:
+        candidate = _journal_window_source_authority_candidate(source)
+    if candidate is None:
+        candidate = _journal_replay_source_authority_candidate(source)
+    return candidate
+
+
+def _phase1_source_owner(source: object) -> object | None:
+    candidate = _phase1_source_authority_candidate(source)
+    if candidate is None:
+        return None
+    return _current_journal_source_authority_owner((candidate,))
+
+
+def _is_current_journal_authority_candidate_without_callbacks(
+    candidate: _JournalAuthorityCandidate,
+) -> bool:
+    """Recheck one captured Journal candidate without owner callbacks."""
+    registry, candidate_source = candidate[0], candidate[1]
+    expected_fingerprint = candidate[5]
+    captured = candidate[7]
+    try:
+        fingerprint = candidate[6]()
+    except Exception:
+        return False
+    if not _fingerprints_equal(expected_fingerprint, fingerprint):
+        return False
+    with _JOURNAL_SOURCE_LOCK:
+        issued = registry.get(id(candidate_source))
+        return (
+            issued is captured
+            and issued[0]() is candidate_source
+            and issued[1] is expected_fingerprint
+            and issued[2]() is candidate[2]
+            and issued[3] == candidate[3]
+            and issued[4] == candidate[4]
+        )
+
+
+def _is_current_journal_source_authority_without_callbacks(
+    source: object,
+) -> bool:
+    """Recheck any already-current Journal source without callbacks."""
+    candidate = _journal_any_source_authority_candidate(source)
+    return candidate is not None and (
+        _is_current_journal_authority_candidate_without_callbacks(candidate)
+    )
+
+
+def _is_current_phase1_source_authority_without_callbacks(
+    source: object,
+) -> bool:
+    """Recheck one already-current Phase 1 source without owner callbacks.
+
+    Callers must first complete the ordinary owner/currentness verification.
+    This final predicate intentionally performs no SQLite reads: it compares a
+    fresh hook-free source seal with the exact captured registry record so a
+    later domain-object check cannot bless material changed by a callback.
+    """
+    candidate = _phase1_source_authority_candidate(source)
+    if candidate is None:
+        return False
+    return _is_current_journal_authority_candidate_without_callbacks(candidate)
 
 
 def _phase1_registered_source_owner(source: object) -> object | None:
@@ -3430,160 +5911,284 @@ def _phase1_registered_source_owner(source: object) -> object | None:
     if owner is None:
         return None
     try:
+        with _JOURNAL_SOURCE_LOCK:
+            captured = registry.get(id(source))
         fingerprint = _phase1_source_fingerprint(
             source,
             read_cache=read_cache,
         )
+        expected_fingerprint = None if captured is None else captured[1]
     except Exception:
         return None
     with _JOURNAL_SOURCE_LOCK:
         issued = registry.get(id(source))
         if (
+            issued is not captured
+            or issued is None
+            or issued[0]() is not source
+            or issued[1] is not expected_fingerprint
+            or not _fingerprints_equal(expected_fingerprint, fingerprint)
+        ):
+            return None
+        return issued[2]()
+
+
+def _registered_promotion_decision_source(
+    decision: object,
+) -> tuple[object, object] | None:
+    """Resolve one exact issued promotion even after its required next write."""
+    from .validation import (
+        PromotionDecision,
+        _ISSUED_PROMOTION_DECISIONS,
+        _ISSUED_PROMOTION_DECISIONS_LOCK,
+        _promotion_decision_fingerprint,
+    )
+
+    if type(decision) is not PromotionDecision:
+        return None
+    try:
+        fingerprint = _promotion_decision_fingerprint(decision)
+    except Exception:
+        return None
+    with _ISSUED_PROMOTION_DECISIONS_LOCK:
+        issued = _ISSUED_PROMOTION_DECISIONS.get(id(decision))
+        if (
+            issued is None
+            or issued[0]() is not decision
+            or not _fingerprints_equal(issued[1], fingerprint)
+        ):
+            return None
+        source = issued[2]()
+    if source is None:
+        return None
+    owner = _phase1_registered_source_owner(source)
+    if owner is None:
+        return None
+    return source, owner
+
+
+def _journal_registered_action_source_owner(source: object) -> object | None:
+    """Resolve an exact action identity after a successful dependent write."""
+    if type(source) is not JournalActionSource:
+        return None
+    try:
+        fingerprint = _action_source_fingerprint(source)
+    except Exception:
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = _ACTION_SOURCE_AUTHORITIES.get(id(source))
+        if (
             issued is None
             or issued[0]() is not source
-            or issued[1] != fingerprint
+            or not _fingerprints_equal(issued[1], fingerprint)
+        ):
+            return None
+        return issued[2]()
+
+
+def _phase2_source_owner(source: object) -> object | None:
+    """Return the live owner of one exact current Phase 2/replay source."""
+    expansion = _phase2_source_authority_expansion(source)
+    if expansion is None:
+        return None
+    owner = _current_journal_source_authority_owner(expansion[0])
+    if owner is None or not _phase2_source_authority_expansion_is_current(
+        source,
+        expansion,
+    ):
+        return None
+    return owner
+
+
+def _phase2_registered_source_owner(source: object) -> object | None:
+    """Return an exact issued owner for semantic retry of an existing row.
+
+    Unlike current authority checks, this deliberately tolerates generation or
+    data-version advancement.  Callers must use it only after resolving the
+    immutable stored identity they intend to alias; copied or mutated objects
+    still fail the exact registration fingerprint.
+    """
+    if type(source) not in _PHASE2_SOURCE_TYPES:
+        return None
+    owner, _ = _phase1_registered_owner_and_read_cache(
+        _PHASE2_SOURCE_AUTHORITIES,
+        source,
+    )
+    if owner is None:
+        return None
+    try:
+        fingerprint = _phase2_source_fingerprint(source)
+    except Exception:
+        return None
+    with _JOURNAL_SOURCE_LOCK:
+        issued = _PHASE2_SOURCE_AUTHORITIES.get(id(source))
+        if (
+            issued is None
+            or issued[0]() is not source
+            or not _fingerprints_equal(issued[1], fingerprint)
         ):
             return None
         return issued[2]()
 
 
 def _journal_action_source_owner(source: object) -> object | None:
-    if not isinstance(source, JournalActionSource):
+    candidate = _journal_action_source_authority_candidate(source)
+    if candidate is None:
         return None
-    try:
-        fingerprint = _action_source_fingerprint(source)
-    except Exception:
-        return None
-    if not _has_current_journal_source_authority(
-        _ACTION_SOURCE_AUTHORITIES,
-        source,
-        fingerprint,
-    ):
-        return None
-    with _JOURNAL_SOURCE_LOCK:
-        issued = _ACTION_SOURCE_AUTHORITIES.get(id(source))
-        if issued is None or issued[0]() is not source:
-            return None
-        return issued[2]()
+    return _current_journal_source_authority_owner((candidate,))
 
 
 def _journal_replay_source_owner(source: object) -> object | None:
     """Return the live Journal owner of one exact current ACTUAL replay."""
-    if not isinstance(source, JournalActualReplaySource):
+    candidate = _journal_replay_source_authority_candidate(source)
+    if candidate is None:
         return None
-    try:
-        fingerprint = _replay_source_fingerprint(source)
-    except Exception:
+    return _current_journal_source_authority_owner((candidate,))
+
+
+def phase1_sources_share_owner(left: object, *rights: object) -> bool:
+    """Return whether exact current sources share one Journal instance."""
+    candidates: list[_JournalAuthorityCandidate] = []
+    seen: dict[int, object] = {}
+    for ordinal, source in enumerate((left, *rights)):
+        prior = seen.get(id(source))
+        if prior is source:
+            continue
+        seen[id(source)] = source
+        candidate = (
+            _phase1_source_authority_candidate(source)
+            if ordinal == 0
+            else (
+                _phase1_source_authority_candidate(source)
+                or _journal_action_source_authority_candidate(source)
+                or _journal_replay_source_authority_candidate(source)
+            )
+        )
+        if candidate is None:
+            return False
+        candidates.append(candidate)
+    return _current_journal_source_authority_owner(candidates) is not None
+
+
+def _journal_any_source_owner(source: object) -> object | None:
+    if type(source) is Phase2PortfolioSource:
+        return _phase2_source_owner(source)
+    candidate = _journal_any_source_authority_candidate(source)
+    if candidate is None:
         return None
-    if not _has_current_journal_source_authority(
-        _REPLAY_SOURCE_AUTHORITIES,
-        source,
-        fingerprint,
+    return _current_journal_source_authority_owner((candidate,))
+
+
+def _journal_any_source_authority_expansion(
+    source: object,
+) -> _Phase2SourceAuthorityExpansion | None:
+    if type(source) is Phase2PortfolioSource:
+        return _phase2_source_authority_expansion(source)
+    candidate = _journal_any_source_authority_candidate(source)
+    if candidate is None:
+        return None
+    return ((candidate,), None)
+
+
+def phase2_portfolio_source_binds_window(
+    portfolio_source: object,
+    window_source: object,
+) -> bool:
+    """Return whether this portfolio retains this exact current window."""
+    if (
+        type(portfolio_source) is not Phase2PortfolioSource
+        or type(window_source) is not Phase2WindowSource
     ):
-        return None
-    with _JOURNAL_SOURCE_LOCK:
-        issued = _REPLAY_SOURCE_AUTHORITIES.get(id(source))
-        if issued is None or issued[0]() is not source:
-            return None
-        return issued[2]()
+        return False
+    expansion = _phase2_source_authority_expansion(portfolio_source)
+    if expansion is None:
+        return False
+    binding = expansion[1]
+    if binding is None or binding.window_source is not window_source:
+        return False
+    if _current_journal_source_authority_owner(expansion[0]) is None:
+        return False
+    return _phase2_source_authority_expansion_is_current(
+        portfolio_source,
+        expansion,
+    )
 
 
-def phase1_sources_share_owner(left: object, right: object) -> bool:
-    """Return whether two exact current sources came from one Journal instance."""
-    left_owner = _phase1_source_owner(left)
-    right_owner = _phase1_source_owner(right)
-    if right_owner is None:
-        right_owner = _journal_action_source_owner(right)
-    if right_owner is None:
-        right_owner = _journal_replay_source_owner(right)
-    return left_owner is not None and left_owner is right_owner
+def phase2_sources_share_owner(left: object, right: object) -> bool:
+    """Return whether two exact current Journal sources share one owner."""
+    sources = (left,) if right is left else (left, right)
+    expansions: list[tuple[object, _Phase2SourceAuthorityExpansion]] = []
+    candidates: list[_JournalAuthorityCandidate] = []
+    for source in sources:
+        expansion = _journal_any_source_authority_expansion(source)
+        if expansion is None:
+            return False
+        expansions.append((source, expansion))
+        candidates.extend(expansion[0])
+
+    windows = tuple(
+        source for source in sources if type(source) is Phase2WindowSource
+    )
+    for _source, expansion in expansions:
+        binding = expansion[1]
+        if binding is not None and any(
+            binding.window_source is not window for window in windows
+        ):
+            return False
+
+    if _current_journal_source_authority_owner(candidates) is None:
+        return False
+    return all(
+        _phase2_source_authority_expansion_is_current(source, expansion)
+        for source, expansion in expansions
+    )
 
 
 def _has_current_journal_source_authority(
-    registry: dict[
-        int,
-        tuple[
-            ReferenceType[object],
-            tuple[object, ...],
-            ReferenceType[object],
-            int,
-            int,
-        ],
-    ],
+    registry: _JournalSourceRegistry,
     source: object,
-    fingerprint: tuple[object, ...],
+    fingerprint_factory: _JournalFingerprintFactory,
 ) -> bool:
-    with _JOURNAL_SOURCE_LOCK:
-        issued = registry.get(id(source))
-        if (
-            issued is None
-            or issued[0]() is not source
-            or issued[1] != fingerprint
-        ):
-            return False
-        owner = issued[2]()
-        issued_generation = issued[3]
-        issued_data_version = issued[4]
-    if owner is None or getattr(owner, "_closed", True):
-        return False
-    try:
-        if (
-            getattr(owner, "_transaction_active")
-            and getattr(owner, "_transaction_dirty")
-        ):
-            return False
-        current_generation = getattr(owner, "_source_generation")
-        current_data_version = owner._source_authority_data_version()
-    except Exception:
-        return False
-    return (
-        current_generation == issued_generation
-        and current_data_version == issued_data_version
+    candidate = _registered_journal_source_authority_candidate(
+        registry,
+        source,
+        fingerprint_factory,
+    )
+    return candidate is not None and (
+        _current_journal_source_authority_owner((candidate,)) is not None
     )
 
 
 def is_verified_journal_action_source(source: object) -> bool:
     """Return whether Journal issued this exact reconstructed action object."""
-    if not isinstance(source, JournalActionSource):
-        return False
-    try:
-        fingerprint = _action_source_fingerprint(source)
-    except Exception:
+    if type(source) is not JournalActionSource:
         return False
     return _has_current_journal_source_authority(
         _ACTION_SOURCE_AUTHORITIES,
         source,
-        fingerprint,
+        lambda: _action_source_fingerprint(source),
     )
 
 
 def is_verified_journal_window_source(source: object) -> bool:
     """Return whether Journal issued this exact complete cursor window."""
-    if not isinstance(source, JournalAccountCheckWindowSource):
-        return False
-    try:
-        fingerprint = _window_source_fingerprint(source)
-    except Exception:
+    if type(source) is not JournalAccountCheckWindowSource:
         return False
     return _has_current_journal_source_authority(
         _WINDOW_SOURCE_AUTHORITIES,
         source,
-        fingerprint,
+        lambda: _window_source_fingerprint(source),
     )
 
 
 def is_verified_journal_replay_source(source: object) -> bool:
     """Return whether Journal issued this exact replay snapshot."""
-    if not isinstance(source, JournalActualReplaySource):
-        return False
-    try:
-        fingerprint = _replay_source_fingerprint(source)
-    except Exception:
+    if type(source) is not JournalActualReplaySource:
         return False
     return _has_current_journal_source_authority(
         _REPLAY_SOURCE_AUTHORITIES,
         source,
-        fingerprint,
+        lambda: _replay_source_fingerprint(source),
     )
 
 
@@ -3592,26 +6197,100 @@ def _is_verified_phase1_source(
     expected_type: type[object],
     registry: _JournalSourceRegistry,
 ) -> bool:
-    if not isinstance(source, expected_type):
-        return False
-    owner, read_cache = _phase1_registered_owner_and_read_cache(
-        registry,
-        source,
-    )
-    if owner is None:
-        return False
-    try:
-        fingerprint = _phase1_source_fingerprint(
-            source,
-            read_cache=read_cache,
-        )
-    except Exception:
+    if type(source) is not expected_type:
         return False
     return _has_current_journal_source_authority(
         registry,
         source,
-        fingerprint,
+        lambda: _phase1_source_fingerprint(source),
     )
+
+
+def _is_verified_phase2_source(
+    source: object,
+    expected_type: type[object],
+) -> bool:
+    return type(source) is expected_type and _phase2_source_owner(source) is not None
+
+
+def is_verified_phase2_window_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2WindowSource)
+
+
+def is_verified_phase2_authorization_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2AuthorizationSource)
+
+
+def is_verified_phase2_fee_schedule_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2FeeScheduleSource)
+
+
+def is_verified_phase2_event_exclusion_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2EventExclusionSource)
+
+
+def is_verified_phase2_option_chain_page_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2OptionChainPageSource)
+
+
+def is_verified_phase2_option_chain_fact_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2OptionChainFactSource)
+
+
+def is_verified_phase2_option_chain_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2OptionChainSource)
+
+
+def is_verified_phase2_manual_option_review_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2ManualOptionReviewSource)
+
+
+def is_verified_phase2_selection_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2SelectionSource)
+
+
+def is_verified_phase2_option_open_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2OptionOpenSource)
+
+
+def is_verified_phase2_open_position_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2OpenPositionSource)
+
+
+def is_verified_phase2_settlement_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2SettlementSource)
+
+
+def is_verified_phase2_portfolio_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2PortfolioSource)
+
+
+def is_verified_phase2_underlying_review_page_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2UnderlyingReviewPageSource)
+
+
+def is_verified_phase2_underlying_review_fact_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2UnderlyingReviewFactSource)
+
+
+def is_verified_phase2_underlying_review_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2UnderlyingReviewSource)
+
+
+def is_verified_phase2_exit_review_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, Phase2ExitReviewSource)
+
+
+def is_verified_historical_replay_evidence_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, HistoricalReplayEvidenceSource)
+
+
+def is_verified_historical_replay_date_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, HistoricalReplayDateSource)
+
+
+def is_verified_historical_replay_source(source: object) -> bool:
+    return _is_verified_phase2_source(source, HistoricalReplaySource)
 
 
 def is_verified_phase1_publication_source(source: object) -> bool:
@@ -3720,23 +6399,18 @@ def _phase1_exit_cohort_matches_source(
 
 
 def is_verified_phase1_exit_review_market_source(source: object) -> bool:
-    if not _is_verified_phase1_source(
-        source,
-        Phase1ExitReviewMarketSource,
-        _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES,
-    ):
+    if type(source) is not Phase1ExitReviewMarketSource:
         return False
-    assert isinstance(source, Phase1ExitReviewMarketSource)
     try:
         from .providers.alpaca import provider_fetch_cohorts_share_owner
 
+        evidence_source = source.signal_evidence_source
         return (
             provider_fetch_cohorts_share_owner(
                 source.daily_bar_cohort,
                 source.execution_bar_cohort,
                 source.quote_cohort,
             )
-            and phase1_sources_share_owner(source, source.signal_source)
             and _phase1_exit_cohort_matches_source(
                 source,
                 source.daily_bar_cohort,
@@ -3757,18 +6431,19 @@ def is_verified_phase1_exit_review_market_source(source: object) -> bool:
             and source.fee_schedule_digest == _PHASE1_EXIT_FEE_SCHEDULE_DIGEST
             and source.fee_micros == _PHASE1_EXIT_FEE_MICROS
             and (
-                source.signal_evidence_source is None
+                evidence_source is None
                 or (
                     is_verified_phase1_signal_evidence_source(
-                        source.signal_evidence_source
+                        evidence_source
                     )
-                    and phase1_sources_share_owner(
-                        source,
-                        source.signal_evidence_source,
-                    )
-                    and source.signal_evidence_source.signal_source.signal_id
+                    and evidence_source.signal_source.signal_id
                     == source.signal_id
                 )
+            )
+            and phase1_sources_share_owner(
+                source,
+                source.signal_source,
+                *((evidence_source,) if evidence_source is not None else ()),
             )
         )
     except Exception:
@@ -3776,13 +6451,8 @@ def is_verified_phase1_exit_review_market_source(source: object) -> bool:
 
 
 def is_verified_phase1_exit_review_source(source: object) -> bool:
-    if not _is_verified_phase1_source(
-        source,
-        Phase1ExitReviewSource,
-        _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES,
-    ):
+    if type(source) is not Phase1ExitReviewSource:
         return False
-    assert isinstance(source, Phase1ExitReviewSource)
     try:
         from .providers.alpaca import (
             Bar,
@@ -3850,7 +6520,6 @@ def is_verified_phase1_exit_review_source(source: object) -> bool:
         )
         return (
             is_verified_phase1_exit_review_market_source(source.market_source)
-            and phase1_sources_share_owner(source, source.market_source)
             and source.signal_source is source.market_source.signal_source
             and source.daily_bar_cohort is source.market_source.daily_bar_cohort
             and source.execution_bar_cohort
@@ -3873,14 +6542,6 @@ def is_verified_phase1_exit_review_source(source: object) -> bool:
                 source.daily_bar_cohort,
                 source.execution_bar_cohort,
                 source.quote_cohort,
-            )
-            and phase1_sources_share_owner(
-                source,
-                source.signal_source,
-            )
-            and phase1_sources_share_owner(
-                source,
-                source.canonical_replay_source,
             )
             and cohort_matches(
                 source.daily_bar_cohort,
@@ -3906,12 +6567,19 @@ def is_verified_phase1_exit_review_source(source: object) -> bool:
                         source.position_evidence
                     )
                     and isinstance(nested_signal_source, Phase1SignalSource)
-                    and phase1_sources_share_owner(
-                        source,
-                        nested_signal_source,
-                    )
                     and nested_signal_source.signal_id == source.signal_id
                 )
+            )
+            and phase1_sources_share_owner(
+                source,
+                source.market_source,
+                source.signal_source,
+                source.canonical_replay_source,
+                *(
+                    (nested_signal_source,)
+                    if nested_signal_source is not None
+                    else ()
+                ),
             )
         )
     except Exception:
@@ -3928,15 +6596,13 @@ def is_verified_phase1_canonical_replay_source(source: object) -> bool:
 
 def is_verified_phase1_equity_mark_source(source: object) -> bool:
     """Return whether this exact current Journal source still proves its inputs."""
-    if not _is_verified_phase1_source(
-        source,
-        Phase1EquityMarkSource,
-        _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
-    ):
+    if type(source) is not Phase1EquityMarkSource:
         return False
-    assert isinstance(source, Phase1EquityMarkSource)
     try:
-        from .ledger import Phase1CanonicalLedgerReplay
+        from .ledger import (
+            Phase1CanonicalLedgerReplay,
+            is_verified_phase1_canonical_ledger_replay_for_source,
+        )
         from .providers.alpaca import (
             _normalized_market_fact_source,
             is_issued_normalized_market_fact,
@@ -3957,17 +6623,13 @@ def is_verified_phase1_equity_mark_source(source: object) -> bool:
         ):
             return False
         if (
-            not phase1_sources_share_owner(
-                source,
+            type(source.canonical_replay) is not Phase1CanonicalLedgerReplay
+            or not is_verified_phase1_canonical_ledger_replay_for_source(
+                source.canonical_replay,
                 source.canonical_replay_source,
             )
-            or _journal_replay_source_owner(source.actual_replay_source)
-            is not _phase1_source_owner(source)
-            or not isinstance(source.canonical_replay, Phase1CanonicalLedgerReplay)
-            or not source.canonical_replay.source_verified
             or source.canonical_replay.source_digest
             != source.canonical_replay_source.source_digest
-            or not is_verified_journal_replay_source(source.actual_replay_source)
             or not is_verified_actual_ledger_state_for_source(
                 source.actual_replay,
                 source.actual_replay_source,
@@ -4031,7 +6693,11 @@ def is_verified_phase1_equity_mark_source(source: object) -> bool:
                 }
             ):
                 return False
-        return True
+        return phase1_sources_share_owner(
+            source,
+            source.canonical_replay_source,
+            source.actual_replay_source,
+        )
     except Exception:
         return False
 
@@ -4211,7 +6877,7 @@ class JournalTransaction:
             execution_event_id=execution_event_id,
         )
         owner = ref(self._journal)
-        generation = self._journal._source_generation
+        total_changes = _journal_source_authority_total_changes(self._journal)
         data_version = self._journal._source_authority_data_version()
         identity = id(source)
 
@@ -4226,7 +6892,7 @@ class JournalTransaction:
                 ref(source, discard),
                 _action_source_fingerprint(source),
                 owner,
-                generation,
+                total_changes,
                 data_version,
             )
         return source
@@ -4243,7 +6909,7 @@ class JournalTransaction:
             terminal_event_id=terminal_event_id,
         )
         owner = ref(self._journal)
-        generation = self._journal._source_generation
+        total_changes = _journal_source_authority_total_changes(self._journal)
         data_version = self._journal._source_authority_data_version()
         for action in (
             source.account_check_action,
@@ -4267,7 +6933,7 @@ class JournalTransaction:
                     ref(action, discard_action),
                     _action_source_fingerprint(action),
                     owner,
-                    generation,
+                    total_changes,
                     data_version,
                 )
         identity = id(source)
@@ -4283,7 +6949,7 @@ class JournalTransaction:
                 ref(source, discard_window),
                 _window_source_fingerprint(source),
                 owner,
-                generation,
+                total_changes,
                 data_version,
             )
         return source
@@ -4320,7 +6986,7 @@ class JournalTransaction:
         source: JournalActualReplaySource,
     ) -> JournalActualReplaySource:
         owner = ref(self._journal)
-        generation = self._journal._source_generation
+        total_changes = _journal_source_authority_total_changes(self._journal)
         data_version = self._journal._source_authority_data_version()
         for action in source.actions:
             identity = id(action)
@@ -4340,7 +7006,7 @@ class JournalTransaction:
                     ref(action, discard_action),
                     _action_source_fingerprint(action),
                     owner,
-                    generation,
+                    total_changes,
                     data_version,
                 )
         identity = id(source)
@@ -4356,7 +7022,7 @@ class JournalTransaction:
                 ref(source, discard_replay),
                 _replay_source_fingerprint(source),
                 owner,
-                generation,
+                total_changes,
                 data_version,
             )
         return source
@@ -4621,6 +7287,7 @@ class JournalTransaction:
         finished_at: datetime,
         market_session_decision: str,
         outcome: str,
+        result_envelope: ScheduledRunResultEnvelope,
         report_id: int | None = None,
         report_path: str | None = None,
         error_class: str | None = None,
@@ -4632,6 +7299,7 @@ class JournalTransaction:
             finished_at=finished_at,
             market_session_decision=market_session_decision,
             outcome=outcome,
+            result_envelope=result_envelope,
             report_id=report_id,
             report_path=report_path,
             error_class=error_class,
@@ -4795,6 +7463,20 @@ class JournalTransaction:
             details=details,
         )
 
+    def archive_phase2_fee_schedule(
+        self,
+        schedule: object,
+        *,
+        archived_at: datetime,
+    ) -> None:
+        """Archive one exact reviewed fee schedule inside this transaction."""
+        self._ensure_active()
+        self._mark_dirty()
+        self._journal._archive_phase2_fee_schedule(
+            schedule,
+            archived_at=archived_at,
+        )
+
 
 class Journal:
     """One configured SQLite connection and its durable audit API."""
@@ -4812,6 +7494,7 @@ class Journal:
         self._transaction_dirty = False
         self._projection_write_allowed = False
         self._report_claim_write_allowed = False
+        self._phase2_adherence_write_allowed = False
         self._source_generation = 0
         self._phase1_publication_read_cache: (
             dict[str, Phase1PublicationSource] | None
@@ -4828,6 +7511,9 @@ class Journal:
         self._phase1_exit_material_read_cache: (
             dict[tuple[object, ...], object] | None
         ) = None
+        self._historical_replay_date_contexts: dict[
+            int, tuple[ReferenceType[object], object, object]
+        ] = {}
         self.__phase1_observation_ingest_token = object()
         self._closed = False
 
@@ -4835,6 +7521,8 @@ class Journal:
     def open(
         cls, path: Path, *, migration_directory: Path | None = None
     ) -> Self:
+        if cls is not Journal:
+            raise JournalError("Journal subclasses cannot issue source authority")
         if not isinstance(path, Path):
             raise InvalidJournalValue("journal path must be a pathlib.Path")
         if migration_directory is not None:
@@ -5073,6 +7761,1549 @@ class Journal:
                 health_result=health_result,
                 details=details,
             )
+
+    def start_phase2_window(
+        self,
+        *,
+        promotion_decision: object,
+        start_action: object,
+        calendar_resolver: object,
+    ) -> Phase2WindowSource:
+        """Persist one exact PASSED-promotion OPTION_WINDOW_START boundary."""
+        from zoneinfo import ZoneInfo
+
+        from .risk import SessionCalendarResolver, _calendar_digest
+        from .validation import PromotionDecision, PromotionStatus
+
+        self._ensure_open()
+        registered_promotion = _registered_promotion_decision_source(
+            promotion_decision
+        )
+        if (
+            registered_promotion is None
+            or registered_promotion[1] is not self
+            or type(promotion_decision) is not PromotionDecision
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window promotion identity is unverified"
+            )
+        historical_promotion_source = registered_promotion[0]
+        if (
+            type(historical_promotion_source)
+            is not Phase1ValidationWindowSource
+            or _journal_registered_action_source_owner(start_action) is not self
+            or type(start_action) is not JournalActionSource
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window start action identity is unverified"
+            )
+        if (
+            not isinstance(calendar_resolver, SessionCalendarResolver)
+            or not calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue("Phase 2 window calendar is unverified")
+        calendar_digest = _calendar_digest(calendar_resolver)
+        if historical_promotion_source.calendar_digest != calendar_digest:
+            raise InvalidJournalValue("Phase 2 window calendar is inconsistent")
+
+        current_promotion = self.read_phase1_promotion_decision(
+            historical_promotion_source.validation_window_id,
+            through_session=historical_promotion_source.through_session,
+            query_cutoff=historical_promotion_source.query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        current_promotion_source = current_promotion._phase1_source
+        if (
+            type(current_promotion) is not PromotionDecision
+            or current_promotion != promotion_decision
+            or not current_promotion.passed
+            or current_promotion.status is not PromotionStatus.PASSED
+            or type(current_promotion_source)
+            is not Phase1ValidationWindowSource
+            or current_promotion_source.source_digest
+            != historical_promotion_source.source_digest
+            or current_promotion.authority_digest
+            != promotion_decision.authority_digest
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window promotion cannot be rederived"
+            )
+        current_action = self._read_action_source(
+            execution_event_id=start_action.execution_event_id,
+        )
+        if current_action != start_action:
+            raise InvalidJournalValue(
+                "Phase 2 window start action cannot be rederived"
+            )
+        if current_action.domain_kind != "OPTION_PAPER_WINDOW_START":
+            raise InvalidJournalValue(
+                "Phase 2 window requires OPTION_PAPER_WINDOW_START"
+            )
+        started_at = current_action.event_time
+        received_at = current_action.received_at
+        promotion_cutoff = current_promotion_source.query_cutoff
+        if (
+            started_at <= promotion_cutoff
+            or received_at <= promotion_cutoff
+            or started_at > received_at
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window start must be strictly after promotion"
+            )
+        started_session = started_at.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        if not calendar_resolver.is_open(started_session):
+            raise InvalidJournalValue(
+                "Phase 2 window must start on an open session"
+            )
+        promotion_signal_ids = tuple(
+            source.signal_id
+            for source in current_promotion_source.signal_sources
+        )
+        if (
+            not promotion_signal_ids
+            or len(set(promotion_signal_ids)) != len(promotion_signal_ids)
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 promotion signal cohort is incomplete"
+            )
+        promotion_signal_ids_json = _canonical_audit_json(
+            list(promotion_signal_ids)
+        )
+        window_id = _phase2_stable_id(
+            "stock-monitor/phase2-window/v1",
+            current_promotion_source.validation_window_id,
+            current_promotion_source.source_digest,
+            str(current_promotion.authority_digest),
+            current_action.source_digest,
+            str(current_action.execution_event_id),
+        )
+        source_references = _phase2_row_references(
+            current_promotion_source.row_references,
+            current_action.row_references,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-window-source/v1",
+            source_references,
+            {
+                "window_id": window_id,
+                "validation_window_id": (
+                    current_promotion_source.validation_window_id
+                ),
+                "promotion_source_digest": (
+                    current_promotion_source.source_digest
+                ),
+                "promotion_decision_digest": (
+                    current_promotion.authority_digest
+                ),
+                "promotion_signal_ids": list(promotion_signal_ids),
+                "promotion_through_session": (
+                    current_promotion_source.through_session.isoformat()
+                ),
+                "promotion_query_cutoff": _canonical_timestamp(
+                    promotion_cutoff
+                ),
+                "start_execution_event_id": (
+                    current_action.execution_event_id
+                ),
+                "start_raw_message_id": current_action.raw_message_id,
+                "started_session": started_session.isoformat(),
+                "started_at": _canonical_timestamp(started_at),
+                "received_at": _canonical_timestamp(received_at),
+                "starting_capital_micros": 5_000_000_000,
+                "calendar_digest": calendar_digest,
+            },
+        )
+        values_without_hash = (
+            window_id,
+            current_promotion_source.validation_window_id,
+            current_promotion_source.source_digest,
+            current_promotion.authority_digest,
+            promotion_signal_ids_json,
+            current_promotion_source.through_session.isoformat(),
+            _canonical_timestamp(promotion_cutoff),
+            current_action.execution_event_id,
+            current_action.raw_message_id,
+            started_session.isoformat(),
+            _canonical_timestamp(started_at),
+            _canonical_timestamp(received_at),
+            5_000_000_000,
+            calendar_digest,
+            source_digest,
+        )
+        record_sha256 = _phase2_plain_record_digest(
+            _PHASE2_WINDOW_COLUMNS,
+            values_without_hash,
+        )
+        phase2_write_plan = frozenset(
+            {
+                (
+                    "phase2_windows",
+                    record_sha256,
+                    tuple(values_without_hash),
+                )
+            }
+        )
+        with self.transaction() as transaction:
+            existing = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_PHASE2_WINDOW_COLUMNS)
+                + " FROM phase2_windows WHERE window_id = ? COLLATE BINARY "
+                "OR start_execution_event_id = ?",
+                (window_id, current_action.execution_event_id),
+            ).fetchone()
+            expected_window_row = (*values_without_hash, record_sha256)
+            inserted_window = existing is None
+            if existing is not None:
+                if tuple(existing[1:]) != expected_window_row:
+                    raise IdempotencyConflict(
+                        "Phase 2 window identity conflicts with stored content"
+                    )
+            else:
+                transaction._mark_dirty()
+                try:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase2_windows("
+                        + ", ".join(_PHASE2_WINDOW_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in expected_window_row)
+                        + ")",
+                        expected_window_row,
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise IdempotencyConflict(
+                        "Phase 2 window identity conflicts with stored content"
+                    ) from error
+            stored_window = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_PHASE2_WINDOW_COLUMNS)
+                + " FROM phase2_windows WHERE window_id = ? COLLATE BINARY",
+                (window_id,),
+            ).fetchone()
+            if (
+                stored_window is None
+                or tuple(stored_window[1:]) != expected_window_row
+            ):
+                raise IdempotencyConflict(
+                    "Phase 2 window identity conflicts with stored content"
+                )
+            window_reference = _journal_row_reference(
+                "phase2_windows",
+                _PHASE2_WINDOW_COLUMNS,
+                stored_window,
+            )
+            genesis_record = _phase2_window_genesis_record(
+                window_reference,
+                window_id=window_id,
+                window_source_digest=source_digest,
+                started_session=started_session,
+                started_at=started_at,
+                received_at=received_at,
+            )
+            phase2_write_plan = frozenset(
+                {
+                    (
+                        "phase2_windows",
+                        record_sha256,
+                        tuple(values_without_hash),
+                    ),
+                    (
+                        "phase2_equity_points",
+                        str(genesis_record[-1]),
+                        tuple(genesis_record[:-1]),
+                    ),
+                }
+            )
+            existing_genesis = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_PHASE2_EQUITY_POINT_COLUMNS)
+                + " FROM phase2_equity_points "
+                "WHERE point_id = ? COLLATE BINARY "
+                "OR (window_id = ? COLLATE BINARY AND point_kind = 'START')",
+                (str(genesis_record[0]), window_id),
+            ).fetchall()
+            if inserted_window:
+                if existing_genesis:
+                    raise IdempotencyConflict(
+                        "Phase 2 window genesis conflicts with stored content"
+                    )
+                try:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase2_equity_points("
+                        + ", ".join(_PHASE2_EQUITY_POINT_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in genesis_record)
+                        + ")",
+                        genesis_record,
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise IdempotencyConflict(
+                        "Phase 2 window genesis conflicts with stored content"
+                    ) from error
+            elif (
+                len(existing_genesis) != 1
+                or tuple(existing_genesis[0][1:]) != genesis_record
+            ):
+                raise IdempotencyConflict(
+                    "Phase 2 window genesis conflicts with stored content"
+                )
+        source = self.read_phase2_window_source(
+            window_id,
+            query_cutoff=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+        if source is None:
+            raise JournalError("Phase 2 window was not readable after write")
+        return source
+
+    def read_phase2_window_source(
+        self,
+        window_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase2WindowSource | None:
+        """Reissue one exact persisted Phase 2 window at a bounded cutoff."""
+        self._ensure_open()
+        canonical_window_id = _require_sha256(window_id, "Phase 2 window ID")
+        cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE2_WINDOW_COLUMNS)
+            + " FROM phase2_windows WHERE window_id = ? COLLATE BINARY",
+            (canonical_window_id,),
+        ).fetchone()
+        if row is None or _parse_canonical_timestamp(str(row[12])) > cutoff:
+            return None
+        source = self._phase2_window_source_from_row(
+            row,
+            query_cutoff=cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        source_identity = id(source)
+        owner_reference = ref(self)
+        source_total_changes = _journal_source_authority_total_changes(self)
+        source_data_version = self._source_authority_data_version()
+        source_fingerprint = _phase2_source_fingerprint(source)
+
+        def discard_phase2_window_source(dead: ReferenceType[object]) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                if current is not None and current[0] is dead:
+                    _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE2_SOURCE_AUTHORITIES[source_identity] = (
+                ref(source, discard_phase2_window_source),
+                source_fingerprint,
+                owner_reference,
+                source_total_changes,
+                source_data_version,
+            )
+        return source
+
+    def authorize_phase2_signal(
+        self,
+        *,
+        window_source: object,
+        signal_source: object,
+        calendar_resolver: object,
+    ) -> Phase2AuthorizationSource:
+        """Persist authorization for one exact new post-window PRIMARY."""
+        from .options_paper import OptionPaperError, _issue_phase2_authorization
+        from .validation import _issue_phase1_promotion_from_journal_source
+
+        self._ensure_open()
+        if (
+            type(window_source) is not Phase2WindowSource
+            or _phase2_registered_source_owner(window_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window source identity is unverified"
+            )
+        if (
+            type(signal_source) is not Phase1SignalSource
+            or _phase1_registered_source_owner(signal_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 signal source identity is unverified"
+            )
+        authorization_time = max(
+            window_source.query_cutoff,
+            signal_source.query_cutoff,
+        )
+        current_window = self.read_phase2_window_source(
+            window_source.window_id,
+            query_cutoff=authorization_time,
+            calendar_resolver=calendar_resolver,
+        )
+        if (
+            current_window is None
+            or current_window != window_source
+            or current_window.source_digest != window_source.source_digest
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window source cannot be rederived"
+            )
+        current_signal = self._read_phase1_signal_source(
+            signal_source.signal_id,
+            query_cutoff=signal_source.query_cutoff,
+        )
+        if (
+            current_signal != signal_source
+            or current_signal.source_digest != signal_source.source_digest
+            or not phase2_sources_share_owner(current_window, current_signal)
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 signal source cannot be rederived"
+            )
+        promotion = _issue_phase1_promotion_from_journal_source(
+            current_window.promotion_source,
+            calendar_resolver=calendar_resolver,
+        )
+        try:
+            domain_authorization = _issue_phase2_authorization(
+                promotion_decision=promotion,
+                window_source=current_window,
+                signal_source=current_signal,
+                issued_at=authorization_time,
+            )
+        except OptionPaperError as error:
+            raise InvalidJournalValue(
+                f"Phase 2 signal authorization is invalid: {error}"
+            ) from error
+        authorization_digest = domain_authorization.source_digest
+        authorization_id = _phase2_stable_id(
+            "stock-monitor/phase2-authorization/v1",
+            current_window.window_id,
+            current_signal.signal_id,
+            authorization_digest,
+        )
+        source_references = _phase2_row_references(
+            current_window.row_references,
+            current_signal.row_references,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-authorization-source/v1",
+            source_references,
+            {
+                "authorization_id": authorization_id,
+                "window_id": current_window.window_id,
+                "signal_id": current_signal.signal_id,
+                "signal_source_digest": current_signal.source_digest,
+                "authorization_digest": authorization_digest,
+                "authorized_at": _canonical_timestamp(authorization_time),
+                "received_at": _canonical_timestamp(authorization_time),
+            },
+        )
+        values_without_hash = (
+            authorization_id,
+            current_window.window_id,
+            current_signal.signal_id,
+            current_signal.source_digest,
+            authorization_digest,
+            _canonical_timestamp(authorization_time),
+            _canonical_timestamp(authorization_time),
+            source_digest,
+        )
+        record_sha256 = _phase2_plain_record_digest(
+            _PHASE2_AUTHORIZATION_COLUMNS,
+            values_without_hash,
+        )
+        phase2_write_plan = frozenset(
+            {
+                (
+                    "phase2_authorizations",
+                    record_sha256,
+                    tuple(values_without_hash),
+                )
+            }
+        )
+        with self.transaction() as transaction:
+            existing = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_PHASE2_AUTHORIZATION_COLUMNS)
+                + " FROM phase2_authorizations "
+                "WHERE authorization_id = ? COLLATE BINARY "
+                "OR (window_id = ? COLLATE BINARY "
+                "AND signal_id = ? COLLATE BINARY)",
+                (
+                    authorization_id,
+                    current_window.window_id,
+                    current_signal.signal_id,
+                ),
+            ).fetchone()
+            expected_row = (*values_without_hash, record_sha256)
+            if existing is not None:
+                if tuple(existing[1:]) != expected_row:
+                    raise IdempotencyConflict(
+                        "Phase 2 authorization conflicts with stored content"
+                    )
+            else:
+                transaction._mark_dirty()
+                try:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO phase2_authorizations("
+                        + ", ".join(_PHASE2_AUTHORIZATION_COLUMNS[1:])
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in expected_row)
+                        + ")",
+                        expected_row,
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise IdempotencyConflict(
+                        "Phase 2 authorization conflicts with stored content"
+                    ) from error
+        source = self.read_phase2_authorization_source(
+            authorization_id,
+            query_cutoff=authorization_time,
+            calendar_resolver=calendar_resolver,
+        )
+        if source is None:
+            raise JournalError(
+                "Phase 2 authorization was not readable after write"
+            )
+        return source
+
+    def read_phase2_authorization_source(
+        self,
+        authorization_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase2AuthorizationSource | None:
+        """Reissue one exact persisted post-promotion signal authority."""
+        self._ensure_open()
+        canonical_authorization_id = _require_sha256(
+            authorization_id,
+            "Phase 2 authorization ID",
+        )
+        cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE2_AUTHORIZATION_COLUMNS)
+            + " FROM phase2_authorizations "
+            "WHERE authorization_id = ? COLLATE BINARY",
+            (canonical_authorization_id,),
+        ).fetchone()
+        if row is None or _parse_canonical_timestamp(str(row[7])) > cutoff:
+            return None
+        source = self._phase2_authorization_source_from_row(
+            row,
+            query_cutoff=cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        source_identity = id(source)
+        owner_reference = ref(self)
+        source_total_changes = _journal_source_authority_total_changes(self)
+        source_data_version = self._source_authority_data_version()
+        source_fingerprint = _phase2_source_fingerprint(source)
+
+        def discard_phase2_authorization_source(
+            dead: ReferenceType[object],
+        ) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                if current is not None and current[0] is dead:
+                    _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE2_SOURCE_AUTHORITIES[source_identity] = (
+                ref(source, discard_phase2_authorization_source),
+                source_fingerprint,
+                owner_reference,
+                source_total_changes,
+                source_data_version,
+            )
+        return source
+
+    def read_phase2_event_exclusion_source(
+        self,
+        signal_source: object,
+        *,
+        calendar_resolver: object,
+        query_cutoff: datetime,
+    ) -> Phase2EventExclusionSource:
+        """Issue the latest persisted ten-session event truth for one signal."""
+        from .evidence import EvidenceDecision, ReviewedEvidenceBundle
+        from .risk import (
+            Phase1SignalEvidenceAuthority,
+            RiskBlock,
+            SessionCalendarResolver,
+            _calendar_digest,
+            _issue_phase1_signal_evidence_authority_from_source,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 2 event exclusion source requires a post-commit read"
+            )
+        cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion calendar is unverified"
+            )
+        try:
+            base_calendars = SessionCalendarResolver.calendars.__get__(
+                calendar_resolver,
+                SessionCalendarResolver,
+            )
+        except Exception as error:
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion calendar is unverified"
+            ) from error
+        if type(base_calendars) is not tuple:
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion calendar is unverified"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        if (
+            type(signal_source) is not Phase1SignalSource
+            or signal_source.calendar_digest != calendar_digest
+            or signal_source.query_cutoff < cutoff
+            or _phase1_source_owner(signal_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion signal identity is unverified"
+            )
+
+        initial_data_version = self._source_authority_data_version()
+        initial_total_changes = _journal_source_authority_total_changes(self)
+        review_rows = _sql(
+            self._connection,
+            "SELECT id, review_at FROM phase1_signal_evidence_reviews "
+            "WHERE signal_id = ? COLLATE BINARY AND recorded_at <= ? "
+            "ORDER BY review_at DESC, id DESC",
+            (signal_source.signal_id, _canonical_timestamp(cutoff)),
+        ).fetchall()
+        if not review_rows:
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion evidence is unavailable"
+            )
+        if (
+            len(review_rows) > 1
+            and str(review_rows[0][1]) == str(review_rows[1][1])
+        ):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion latest review is ambiguous"
+            )
+        reviewed_at = _parse_canonical_timestamp(str(review_rows[0][1]))
+        evidence_source = self._read_phase1_signal_evidence_source(
+            signal_source.signal_id,
+            review_at=reviewed_at,
+            query_cutoff=cutoff,
+            calendar_resolver=calendar_resolver,
+            exact_signal_source=signal_source,
+        )
+        try:
+            evidence_authority = (
+                _issue_phase1_signal_evidence_authority_from_source(
+                    evidence_source,
+                    calendar_resolver=calendar_resolver,
+                )
+            )
+        except RiskBlock as error:
+            raise MigrationCorruption(
+                "Phase 2 event exclusion evidence cannot be reissued"
+            ) from error
+        decision = evidence_source.evidence_decision
+        reviewed_bundle = evidence_source.reviewed_bundle
+        if (
+            type(evidence_authority) is not Phase1SignalEvidenceAuthority
+            or type(decision) is not EvidenceDecision
+            or type(reviewed_bundle) is not ReviewedEvidenceBundle
+            or evidence_source.signal_source is not signal_source
+            or evidence_authority.signal_source is not signal_source
+            or evidence_authority.evidence_decision is not decision
+            or evidence_authority.reviewed_bundle is not reviewed_bundle
+            or evidence_authority.review_at != reviewed_at
+            or evidence_source.review_at != reviewed_at
+            or evidence_source.query_cutoff != cutoff
+            or evidence_source.calendar_digest != calendar_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion evidence lineage is inconsistent"
+            )
+
+        covered_sessions = tuple(
+            calendar_resolver.add_sessions(
+                signal_source.publication_session,
+                offset,
+            )
+            for offset in range(10)
+        )
+        if (
+            len(covered_sessions) != 10
+            or covered_sessions != tuple(sorted(set(covered_sessions)))
+            or covered_sessions[0] != signal_source.publication_session
+            or any(
+                type(session) is not date
+                or not calendar_resolver.is_open(session)
+                for session in covered_sessions
+            )
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion session coverage is incomplete"
+            )
+        try:
+            exact_calendar = SessionCalendarResolver(base_calendars)
+            exact_calendar_digest = _calendar_digest(exact_calendar)
+            exact_covered_sessions = tuple(
+                exact_calendar.add_sessions(
+                    signal_source.publication_session,
+                    offset,
+                )
+                for offset in range(10)
+            )
+        except Exception as error:
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion session coverage is unverified"
+            ) from error
+        if (
+            exact_calendar_digest != calendar_digest
+            or exact_covered_sessions != covered_sessions
+            or any(
+                not exact_calendar.is_open(session)
+                for session in exact_covered_sessions
+            )
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion session coverage is unverified"
+            )
+        relevant_event_values = (
+            decision.binary_events
+            if signal_source.subject_kind == "STOCK"
+            else decision.etf_actions
+        )
+        relevant_coverage = (
+            decision.binary_event_coverage
+            if signal_source.subject_kind == "STOCK"
+            else decision.etf_action_coverage
+        )
+        if (
+            evidence_authority.status == "UNRESOLVED"
+            or decision.health != "HEALTHY"
+            or decision.ambiguities
+            or decision.conflicts
+            or relevant_coverage not in {"CONFIRMED_CLEAR", "OVERLAP"}
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 event exclusion evidence is unresolved"
+            )
+        covered_set = set(covered_sessions)
+        if any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not date
+            or (item[1] is not None and type(item[1]) is not str)
+            for item in relevant_event_values
+        ):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion dated events are malformed"
+            )
+        event_sessions = tuple(
+            sorted(
+                {
+                    item[0]
+                    for item in relevant_event_values
+                    if item[0] in covered_set
+                }
+            )
+        )
+        adverse_records = tuple(
+            record for record in reviewed_bundle.records if record.adverse_tags
+        )
+        expected_event_kind = (
+            "BINARY_EVENT"
+            if signal_source.subject_kind == "STOCK"
+            else "ETF_ACTION"
+        )
+        if bool(evidence_authority.adverse_tags) != bool(adverse_records):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion adverse truth is inconsistent"
+            )
+        if evidence_authority.adverse_tags and (
+            not event_sessions
+            or any(
+                record.event_kind != expected_event_kind
+                or record.event_date not in covered_set
+                or record.event_date not in event_sessions
+                for record in adverse_records
+            )
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 adverse evidence lacks a dated event overlap"
+            )
+        if (relevant_coverage == "OVERLAP") != bool(event_sessions):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion coverage conflicts with dated events"
+            )
+
+        evidence_source_row_ids = tuple(
+            evidence_source.source_observation_row_ids
+        )
+        evidence_source_highwater = evidence_source.source_observation_highwater
+        expected_evidence_source_count = (
+            evidence_source.expected_source_observation_count
+        )
+        if (
+            not evidence_source_row_ids
+            or len(set(evidence_source_row_ids))
+            != len(evidence_source_row_ids)
+            or any(
+                type(row_id) is not int or row_id <= 0
+                for row_id in evidence_source_row_ids
+            )
+            or expected_evidence_source_count != len(evidence_source_row_ids)
+            or evidence_source_highwater
+            != max(
+                evidence_source.registry_source_row_id,
+                *evidence_source_row_ids,
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 2 event exclusion evidence cohort is incomplete"
+            )
+        references = _phase2_row_references(
+            signal_source.row_references,
+            evidence_source.row_references,
+        )
+        digest_material = {
+            "signal_id": signal_source.signal_id,
+            "signal_source_digest": signal_source.source_digest,
+            "evidence_id": evidence_source.evidence_id,
+            "evidence_source_digest": evidence_source.source_digest,
+            "evidence_authority_digest": evidence_authority.source_digest,
+            "decision_digest": evidence_source.decision_digest,
+            "covered_sessions": [
+                session.isoformat() for session in covered_sessions
+            ],
+            "event_sessions": [session.isoformat() for session in event_sessions],
+            "reviewed_at": _canonical_timestamp(reviewed_at),
+            "query_cutoff": _canonical_timestamp(cutoff),
+            "calendar_digest": calendar_digest,
+            "evidence_source_row_ids": list(evidence_source_row_ids),
+            "evidence_source_highwater": evidence_source_highwater,
+            "expected_evidence_source_count": expected_evidence_source_count,
+        }
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-event-exclusion-source/v1",
+            references,
+            digest_material,
+        )
+        authority_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-event-exclusion-authority/v1",
+            references,
+            {**digest_material, "source_digest": source_digest},
+        )
+        source = Phase2EventExclusionSource(
+            signal_source=signal_source,
+            signal_evidence_source=evidence_source,
+            covered_sessions=covered_sessions,
+            event_sessions=event_sessions,
+            reviewed_at=reviewed_at,
+            query_cutoff=cutoff,
+            calendar_digest=calendar_digest,
+            evidence_source_row_ids=evidence_source_row_ids,
+            evidence_source_highwater=evidence_source_highwater,
+            expected_evidence_source_count=expected_evidence_source_count,
+            row_references=references,
+            source_digest=source_digest,
+            authority_digest=authority_digest,
+        )
+        before_fingerprint = _phase2_source_fingerprint(source)
+
+        current_data_version = self._source_authority_data_version()
+        current_total_changes = _journal_source_authority_total_changes(self)
+        if (
+            current_data_version != initial_data_version
+            or current_total_changes != initial_total_changes
+        ):
+            raise JournalError(
+                "Phase 2 event exclusion source changed during reconstruction"
+            )
+        signal_candidate = _phase1_source_authority_candidate(signal_source)
+        evidence_candidate = _phase1_source_authority_candidate(evidence_source)
+        if signal_candidate is None or evidence_candidate is None:
+            raise JournalError(
+                "Phase 2 event exclusion nested authority is unavailable"
+            )
+        nested_candidates = (signal_candidate, evidence_candidate)
+        if (
+            _current_journal_source_authority_owner(nested_candidates)
+            is not self
+        ):
+            raise JournalError(
+                "Phase 2 event exclusion nested authority changed"
+            )
+        source_fingerprint = _phase2_source_fingerprint(source)
+        if not _fingerprints_equal(before_fingerprint, source_fingerprint):
+            raise JournalError(
+                "Phase 2 event exclusion source changed during reconstruction"
+            )
+
+        source_identity = id(source)
+        owner_reference = ref(self)
+
+        def discard_phase2_event_exclusion_source(
+            dead: ReferenceType[object],
+        ) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                if current is not None and current[0] is dead:
+                    _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+
+        source_reference = ref(
+            source,
+            discard_phase2_event_exclusion_source,
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            for candidate in nested_candidates:
+                registry, nested_source = candidate[0], candidate[1]
+                issued = registry.get(id(nested_source))
+                if (
+                    issued is not candidate[7]
+                    or issued[0]() is not nested_source
+                    or issued[2]() is not self
+                    or issued[3] != initial_total_changes
+                    or issued[4] != initial_data_version
+                    or issued[1] is not candidate[5]
+                ):
+                    raise JournalError(
+                        "Phase 2 event exclusion nested authority changed"
+                    )
+            _PHASE2_SOURCE_AUTHORITIES[source_identity] = (
+                source_reference,
+                source_fingerprint,
+                owner_reference,
+                initial_total_changes,
+                initial_data_version,
+            )
+        return source
+
+    def read_phase2_portfolio_source(
+        self,
+        window_source: object,
+        *,
+        calendar_resolver: object,
+        query_cutoff: datetime,
+    ) -> Phase2PortfolioSource:
+        """Issue the account-wide flat portfolio for one sole window genesis."""
+        from .risk import SessionCalendarResolver, _calendar_digest
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 2 portfolio source requires a post-commit read"
+            )
+        cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 portfolio calendar is unverified"
+            )
+        try:
+            base_calendars = SessionCalendarResolver.calendars.__get__(
+                calendar_resolver,
+                SessionCalendarResolver,
+            )
+            calendar_digest = _calendar_digest(calendar_resolver)
+            exact_calendar = SessionCalendarResolver(base_calendars)
+            exact_calendar_digest = _calendar_digest(exact_calendar)
+        except Exception as error:
+            raise InvalidJournalValue(
+                "Phase 2 portfolio calendar is unverified"
+            ) from error
+        if (
+            type(base_calendars) is not tuple
+            or calendar_digest != exact_calendar_digest
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 portfolio calendar is unverified"
+            )
+        if (
+            type(window_source) is not Phase2WindowSource
+            or window_source.calendar_digest != calendar_digest
+            or window_source.received_at > cutoff
+            or _phase2_source_owner(window_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 portfolio window identity is unverified"
+            )
+
+        initial_data_version = self._source_authority_data_version()
+        initial_total_changes = _journal_source_authority_total_changes(self)
+        cutoff_text = _canonical_timestamp(cutoff)
+        summary_rows = _sql(
+            self._connection,
+            "SELECT 'phase2_windows', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_windows WHERE received_at <= ? "
+            "UNION ALL "
+            "SELECT 'phase2_entries', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_entries WHERE received_at <= ? "
+            "UNION ALL "
+            "SELECT 'phase2_marks', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_marks WHERE received_at <= ? "
+            "UNION ALL "
+            "SELECT 'phase2_exits', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_exits WHERE received_at <= ? "
+            "UNION ALL "
+            "SELECT 'phase2_fee_records', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_fee_records WHERE recorded_at <= ? "
+            "UNION ALL "
+            "SELECT 'phase2_equity_points', COUNT(*), COALESCE(MAX(id), 0) "
+            "FROM phase2_equity_points WHERE received_at <= ?",
+            (cutoff_text,) * 6,
+        ).fetchall()
+        expected_summary_names = (
+            "phase2_windows",
+            "phase2_entries",
+            "phase2_marks",
+            "phase2_exits",
+            "phase2_fee_records",
+            "phase2_equity_points",
+        )
+        if (
+            len(summary_rows) != len(expected_summary_names)
+            or any(
+                len(row) != 3
+                or type(row[0]) is not str
+                or row[0] != expected_name
+                or type(row[1]) is not int
+                or int(row[1]) < 0
+                or type(row[2]) is not int
+                or int(row[2]) < 0
+                for row, expected_name in zip(
+                    summary_rows,
+                    expected_summary_names,
+                    strict=True,
+                )
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 2 portfolio stream summary is malformed"
+            )
+        stream_summaries = tuple(
+            (str(row[0]), int(row[1]), int(row[2]))
+            for row in summary_rows
+        )
+        summary_by_name = {
+            name: (count, highwater)
+            for name, count, highwater in stream_summaries
+        }
+        if tuple(count for _name, count, _highwater in stream_summaries) != (
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 portfolio requires a sole genesis ledger"
+            )
+
+        window_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE2_WINDOW_COLUMNS)
+            + " FROM phase2_windows WHERE received_at <= ? ORDER BY id",
+            (cutoff_text,),
+        ).fetchall()
+        equity_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE2_EQUITY_POINT_COLUMNS)
+            + " FROM phase2_equity_points WHERE received_at <= ? ORDER BY id",
+            (cutoff_text,),
+        ).fetchall()
+        if len(window_rows) != 1 or len(equity_rows) != 1:
+            raise MigrationCorruption(
+                "Phase 2 portfolio genesis cohort is incomplete"
+            )
+        window_row = window_rows[0]
+        equity_row = equity_rows[0]
+        if (
+            len(window_row) != len(_PHASE2_WINDOW_COLUMNS)
+            or type(window_row[0]) is not int
+            or int(window_row[0]) <= 0
+            or str(window_row[-1])
+            != _phase2_plain_record_digest(
+                _PHASE2_WINDOW_COLUMNS,
+                tuple(window_row[1:-1]),
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 2 portfolio window row is malformed"
+            )
+        try:
+            promotion_signal_ids = tuple(json.loads(str(window_row[5])))
+            promotion_through_session = date.fromisoformat(str(window_row[6]))
+            promotion_cutoff = _parse_canonical_timestamp(str(window_row[7]))
+            started_session = date.fromisoformat(str(window_row[10]))
+            started_at = _parse_canonical_timestamp(str(window_row[11]))
+            received_at = _parse_canonical_timestamp(str(window_row[12]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise MigrationCorruption(
+                "Phase 2 portfolio window fields are malformed"
+            ) from error
+        window_reference = _journal_row_reference(
+            "phase2_windows",
+            _PHASE2_WINDOW_COLUMNS,
+            window_row,
+        )
+        if (
+            int(window_row[0])
+            != summary_by_name["phase2_windows"][1]
+            or int(window_row[0]) != window_source.row_id
+            or str(window_row[1]) != window_source.window_id
+            or str(window_row[2]) != window_source.validation_window_id
+            or str(window_row[3]) != window_source.promotion_source.source_digest
+            or str(window_row[4]) != window_source.promotion_decision_digest
+            or promotion_signal_ids != window_source.promotion_signal_ids
+            or promotion_through_session
+            != window_source.promotion_source.through_session
+            or promotion_cutoff != window_source.promotion_query_cutoff
+            or int(window_row[8])
+            != window_source.start_action.execution_event_id
+            or int(window_row[9]) != window_source.start_action.raw_message_id
+            or started_session != window_source.started_session
+            or started_at != window_source.started_at
+            or received_at != window_source.received_at
+            or received_at > cutoff
+            or int(window_row[13]) != 5_000_000_000
+            or window_source.starting_capital_micros != 5_000_000_000
+            or str(window_row[14]) != calendar_digest
+            or str(window_row[15]) != window_source.source_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 2 portfolio window identity is inconsistent"
+            )
+
+        expected_genesis = _phase2_window_genesis_record(
+            window_reference,
+            window_id=str(window_row[1]),
+            window_source_digest=str(window_row[15]),
+            started_session=started_session,
+            started_at=started_at,
+            received_at=received_at,
+        )
+        if (
+            len(equity_row) != len(_PHASE2_EQUITY_POINT_COLUMNS)
+            or type(equity_row[0]) is not int
+            or int(equity_row[0]) <= 0
+            or int(equity_row[0])
+            != summary_by_name["phase2_equity_points"][1]
+            or tuple(equity_row[1:]) != expected_genesis
+        ):
+            raise MigrationCorruption(
+                "Phase 2 portfolio START equity is inconsistent"
+            )
+        genesis_reference = _journal_row_reference(
+            "phase2_equity_points",
+            _PHASE2_EQUITY_POINT_COLUMNS,
+            equity_row,
+        )
+        ledger_references = (genesis_reference,)
+        references = _phase2_row_references(
+            (window_reference,),
+            ledger_references,
+        )
+        ledger_terminal_cursor = int(equity_row[0])
+        ledger_source_highwater = summary_by_name[
+            "phase2_equity_points"
+        ][1]
+        digest_material = {
+            "window_id": str(window_row[1]),
+            "window_source_digest": str(window_row[15]),
+            "as_of": cutoff_text,
+            "query_cutoff": cutoff_text,
+            "settled_cash_micros": 5_000_000_000,
+            "economic_cash_micros": 5_000_000_000,
+            "equity_micros": 5_000_000_000,
+            "open_position_source_digest": None,
+            "settlement_source_digests": [],
+            "unsettled_proceeds_micros": 0,
+            "calendar_digest": calendar_digest,
+            "ledger_terminal_cursor": ledger_terminal_cursor,
+            "ledger_source_highwater": ledger_source_highwater,
+            "expected_entry_count": 0,
+            "expected_exit_count": 0,
+            "expected_fee_count": 0,
+            "expected_equity_count": 1,
+            "stream_summaries": [
+                {
+                    "table": name,
+                    "count": count,
+                    "source_highwater": highwater,
+                }
+                for name, count, highwater in stream_summaries
+            ],
+        }
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-portfolio-source/v1",
+            references,
+            digest_material,
+        )
+        authority_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-portfolio-authority/v1",
+            references,
+            {**digest_material, "source_digest": source_digest},
+        )
+        source = Phase2PortfolioSource(
+            window_id=str(window_row[1]),
+            as_of=cutoff,
+            query_cutoff=cutoff,
+            settled_cash_micros=5_000_000_000,
+            economic_cash_micros=5_000_000_000,
+            equity_micros=5_000_000_000,
+            open_position_source=None,
+            settlement_sources=(),
+            unsettled_proceeds_micros=0,
+            calendar_digest=calendar_digest,
+            ledger_row_references=ledger_references,
+            ledger_terminal_cursor=ledger_terminal_cursor,
+            ledger_source_highwater=ledger_source_highwater,
+            expected_entry_count=0,
+            expected_exit_count=0,
+            expected_fee_count=0,
+            expected_equity_count=1,
+            row_references=references,
+            source_digest=source_digest,
+            authority_digest=authority_digest,
+        )
+        before_fingerprint = _phase2_source_fingerprint(source)
+
+        current_data_version = self._source_authority_data_version()
+        current_total_changes = _journal_source_authority_total_changes(self)
+        if (
+            current_data_version != initial_data_version
+            or current_total_changes != initial_total_changes
+        ):
+            raise JournalError(
+                "Phase 2 portfolio source changed during reconstruction"
+            )
+        window_candidate = _phase2_source_authority_candidate(window_source)
+        if window_candidate is None or (
+            _current_journal_source_authority_owner((window_candidate,))
+            is not self
+        ):
+            raise JournalError(
+                "Phase 2 portfolio window authority changed"
+            )
+        source_fingerprint = _phase2_source_fingerprint(source)
+        if not _fingerprints_equal(before_fingerprint, source_fingerprint):
+            raise JournalError(
+                "Phase 2 portfolio source changed during reconstruction"
+            )
+
+        source_identity = id(source)
+        owner_reference = ref(self)
+
+        def discard_phase2_portfolio_source(
+            dead: ReferenceType[object],
+        ) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                if current is not None and current[0] is dead:
+                    _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+                binding = _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(
+                    source_identity
+                )
+                if (
+                    binding is not None
+                    and binding.portfolio_reference is dead
+                ):
+                    _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.pop(
+                        source_identity,
+                        None,
+                    )
+
+        source_reference = ref(source, discard_phase2_portfolio_source)
+        source_issued = (
+            source_reference,
+            source_fingerprint,
+            owner_reference,
+            initial_total_changes,
+            initial_data_version,
+        )
+        window_binding = _Phase2PortfolioWindowAuthority(
+            portfolio_reference=source_reference,
+            window_source=window_source,
+            portfolio_issued=source_issued,
+            window_issued=window_candidate[7],
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            registry, nested_source = (
+                window_candidate[0],
+                window_candidate[1],
+            )
+            issued = registry.get(id(nested_source))
+            if (
+                issued is not window_candidate[7]
+                or issued[0]() is not nested_source
+                or issued[2]() is not self
+                or issued[3] != initial_total_changes
+                or issued[4] != initial_data_version
+                or issued[1] is not window_candidate[5]
+            ):
+                raise JournalError(
+                    "Phase 2 portfolio window authority changed"
+                )
+            _PHASE2_SOURCE_AUTHORITIES[source_identity] = source_issued
+            _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES[
+                source_identity
+            ] = window_binding
+        return source
+
+    def archive_phase2_fee_schedule(
+        self,
+        schedule: object,
+        *,
+        archived_at: datetime,
+    ) -> Phase2FeeScheduleSource:
+        """Archive and issue one exact reviewed Phase 2 fee schedule."""
+        with self.transaction() as transaction:
+            transaction.archive_phase2_fee_schedule(
+                schedule,
+                archived_at=archived_at,
+            )
+        source = self.read_phase2_fee_schedule_source(
+            getattr(schedule, "schedule_id", ""),
+            query_cutoff=archived_at,
+        )
+        if source is None:
+            raise JournalError("Phase 2 fee schedule archive was not readable")
+        return source
+
+    def read_phase2_fee_schedule_source(
+        self,
+        schedule_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> Phase2FeeScheduleSource | None:
+        """Reissue one archived schedule no later than the exact cutoff."""
+        self._ensure_open()
+        if not isinstance(schedule_id, str) or not schedule_id:
+            raise InvalidJournalValue("Phase 2 fee schedule ID is invalid")
+        cutoff = _canonical_timestamp(query_cutoff)
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE2_FEE_SCHEDULE_COLUMNS)
+            + " FROM phase2_fee_schedules "
+            "WHERE schedule_id = ? COLLATE BINARY AND archived_at <= ?",
+            (schedule_id, cutoff),
+        ).fetchone()
+        if row is None:
+            return None
+        source = self._phase2_fee_schedule_source_from_row(row)
+        source_identity = id(source)
+        owner_reference = ref(self)
+        source_total_changes = _journal_source_authority_total_changes(self)
+        source_data_version = self._source_authority_data_version()
+        source_fingerprint = _phase2_source_fingerprint(source)
+
+        def discard_phase2_fee_source(dead: ReferenceType[object]) -> None:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                if current is not None and current[0] is dead:
+                    _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE2_SOURCE_AUTHORITIES[source_identity] = (
+                ref(source, discard_phase2_fee_source),
+                source_fingerprint,
+                owner_reference,
+                source_total_changes,
+                source_data_version,
+            )
+        return source
+
+    def archive_historical_replay_source(
+        self,
+        *,
+        run_id: str,
+        session_dates: Sequence[date],
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> HistoricalReplaySource:
+        """Seal one exact point-in-time replay snapshot and issue its source."""
+        self._ensure_open()
+        canonical_run_id = _require_sha256(run_id, "historical replay run ID")
+        (
+            canonical_sessions,
+            normalized_cutoff,
+            calendar_digest,
+            policy_digest,
+            report_cutoffs,
+        ) = self._historical_replay_request_configuration(
+            session_dates=session_dates,
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT 1 FROM historical_replay_runs "
+            "WHERE replay_run_id = ? COLLATE BINARY",
+            (canonical_run_id,),
+        ).fetchone()
+        if existing is not None:
+            if not self._historical_replay_request_matches(
+                run_id=canonical_run_id,
+                session_dates=canonical_sessions,
+                query_cutoff=normalized_cutoff,
+                calendar_digest=calendar_digest,
+                policy_digest=policy_digest,
+                report_cutoffs=report_cutoffs,
+            ):
+                raise IdempotencyConflict(
+                    "historical replay run identity conflicts with stored content"
+                )
+            source = self.read_historical_replay_source(
+                canonical_run_id,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            if source is None:
+                raise MigrationCorruption(
+                    "historical replay retry could not read its sealed source"
+                )
+            return source
+
+        date_plans = tuple(
+            self._prepare_historical_replay_date(
+                session_date=session_date,
+                report_cutoff=report_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+            for session_date, report_cutoff in zip(
+                canonical_sessions, report_cutoffs, strict=True
+            )
+        )
+        recorded_at = _parse_canonical_timestamp(_canonical_timestamp(_utc_now()))
+        if recorded_at < normalized_cutoff:
+            raise InvalidJournalValue(
+                "historical replay cannot be recorded before its cutoff"
+            )
+        with self.transaction() as transaction:
+            transaction._mark_dirty()
+            self._archive_historical_replay_source(
+                run_id=canonical_run_id,
+                session_dates=canonical_sessions,
+                query_cutoff=normalized_cutoff,
+                calendar_digest=calendar_digest,
+                policy_digest=policy_digest,
+                date_plans=date_plans,
+                recorded_at=recorded_at,
+            )
+        source = self.read_historical_replay_source(
+            canonical_run_id,
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        if source is None:
+            raise JournalError("historical replay archive was not readable")
+        return source
+
+    def read_historical_replay_source(
+        self,
+        run_id: str,
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> HistoricalReplaySource | None:
+        """Reissue one exact sealed historical replay source from storage."""
+        self._ensure_open()
+        canonical_run_id = _require_sha256(run_id, "historical replay run ID")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_RUN_COLUMNS)
+            + " FROM historical_replay_runs "
+            "WHERE replay_run_id = ? COLLATE BINARY",
+            (canonical_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        source = self._historical_replay_source_from_rows(
+            row,
+            query_cutoff=normalized_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        issued_sources: tuple[object, ...] = (
+            *(
+                evidence_source
+                for date_source in source.date_sources
+                for evidence_source in date_source.evidence_sources
+            ),
+            *source.date_sources,
+            source,
+        )
+        owner_reference = ref(self)
+        source_total_changes = _journal_source_authority_total_changes(self)
+        source_data_version = self._source_authority_data_version()
+
+        def discard_phase2_replay_source(
+            source_identity: int,
+        ):
+            def discard(dead: ReferenceType[object]) -> None:
+                with _JOURNAL_SOURCE_LOCK:
+                    current = _PHASE2_SOURCE_AUTHORITIES.get(source_identity)
+                    if current is not None and current[0] is dead:
+                        _PHASE2_SOURCE_AUTHORITIES.pop(source_identity, None)
+
+            return discard
+
+        with _JOURNAL_SOURCE_LOCK:
+            for issued_source in issued_sources:
+                source_identity = id(issued_source)
+                _PHASE2_SOURCE_AUTHORITIES[source_identity] = (
+                    ref(
+                        issued_source,
+                        discard_phase2_replay_source(source_identity),
+                    ),
+                    _phase2_source_fingerprint(issued_source),
+                    owner_reference,
+                    source_total_changes,
+                    source_data_version,
+                )
+        for date_source in source.date_sources:
+            self._historical_replay_date_contexts[id(date_source)] = (
+                ref(date_source),
+                calendar_resolver,
+                policy,
+            )
+        from .replay import _register_historical_replay_source
+
+        _register_historical_replay_source(source)
+        return source
 
     def ingest_phase1_session_cohorts(
         self,
@@ -5686,11 +9917,17 @@ class Journal:
                 },
             ),
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
             replay_source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EXIT_PROVIDER_REPLAY_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         try:
             daily_cohort, execution_cohort, quote_cohort = (
                 _phase1_reissue_exit_provider_cohorts(replay_source)
@@ -6167,11 +10404,17 @@ class Journal:
             row_references=tuple(market_references),
             source_digest=market_source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES,
             market_source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EXIT_REVIEW_MARKET_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         if market_read_cache is not None:
             market_read_cache[market_cache_key] = market_source
         if market_only:
@@ -6293,11 +10536,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EXIT_REVIEW_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def _read_phase1_equity_mark_source(
@@ -6463,11 +10712,17 @@ class Journal:
                 row_references=replay_references,
                 source_digest=source_digest,
             )
-            _register_journal_source_authority(
+            _reader_source_identity, _reader_source_authority = (
+                _phase1_reader_source_registration_material(
                 _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
                 source,
                 self,
+                )
             )
+            with _JOURNAL_SOURCE_LOCK:
+                _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES[
+                    _reader_source_identity
+                ] = _reader_source_authority
             return source
 
         set_row = _sql(
@@ -6960,11 +11215,17 @@ class Journal:
                 },
             ),
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES,
             replay_source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EQUITY_PROVIDER_REPLAY_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         quote_cohort, daily_cohort = _phase1_reissue_equity_provider_cohorts(
             replay_source
         )
@@ -7289,11 +11550,17 @@ class Journal:
             row_references=references,
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EQUITY_MARK_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def _record_phase1_session_mark_public(
@@ -8191,11 +12458,17 @@ class Journal:
             row_references=tuple(row_references),
             source_digest=expected_source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
             raw_source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         from .evidence import _issue_reviewed_bundle_from_phase1_source
 
         reviewed_bundle = _issue_reviewed_bundle_from_phase1_source(raw_source)
@@ -8237,11 +12510,17 @@ class Journal:
             reviewed_bundle=reviewed_bundle,
             evidence_decision=decision,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def read_phase1_signal_evidence_source(
@@ -8534,11 +12813,17 @@ class Journal:
             row_references=signal_source.row_references,
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_EXPIRY_DEADLINE_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def read_phase1_expiry_deadline_source(
@@ -8619,26 +12904,8 @@ class Journal:
 
     def _persist_phase1_expiry_deadline(
         self,
-        source: Phase1ExpiryDeadlineSource,
+        values_without_hash: tuple[object, ...],
     ) -> Sequence[object]:
-        manifest_json = _canonical_audit_json(
-            dict(source.deadline_session_manifest)
-        )
-        values_without_hash = (
-            getattr(source.expiry_evidence, "source_id"),
-            source.signal_id,
-            source.deadline_session.isoformat(),
-            _canonical_timestamp(source.deadline_at),
-            _canonical_timestamp(source.observed_at),
-            source.calendar_digest,
-            manifest_json,
-            source.completion_terminal_cursor,
-            source.completion_source_highwater,
-            source.expected_completion_count,
-            source.evidence_review_highwater,
-            source.expected_positive_evidence_count,
-            source.source_digest,
-        )
         record_sha256 = hashlib.sha256(
             _canonical_audit_json(
                 dict(
@@ -9025,7 +13292,43 @@ class Journal:
                     "reason_codes": list(getattr(simulated, "reason_codes", ())),
                 }
             elif expiry_source is not None:
-                expiry_row = self._persist_phase1_expiry_deadline(expiry_source)
+                if not is_verified_phase1_expiry_deadline_source(
+                    expiry_source
+                ):
+                    raise IdempotencyConflict(
+                        "Phase 1 expiry deadline changed before persistence"
+                    )
+                expiry_source_id_snapshot = getattr(
+                    expiry_source.expiry_evidence,
+                    "source_id",
+                )
+                expiry_source_digest_snapshot = expiry_source.source_digest
+                expiry_source_references_snapshot = tuple(
+                    expiry_source.row_references
+                )
+                expiry_deadline_at_snapshot = _canonical_timestamp(
+                    expiry_source.deadline_at
+                )
+                expiry_values_without_hash = (
+                    expiry_source_id_snapshot,
+                    expiry_source.signal_id,
+                    expiry_source.deadline_session.isoformat(),
+                    expiry_deadline_at_snapshot,
+                    _canonical_timestamp(expiry_source.observed_at),
+                    expiry_source.calendar_digest,
+                    _canonical_audit_json(
+                        dict(expiry_source.deadline_session_manifest)
+                    ),
+                    expiry_source.completion_terminal_cursor,
+                    expiry_source.completion_source_highwater,
+                    expiry_source.expected_completion_count,
+                    expiry_source.evidence_review_highwater,
+                    expiry_source.expected_positive_evidence_count,
+                    expiry_source_digest_snapshot,
+                )
+                expiry_row = self._persist_phase1_expiry_deadline(
+                    expiry_values_without_hash
+                )
                 expiry_reference = _journal_row_reference(
                     "phase1_expiry_deadlines",
                     _PHASE1_EXPIRY_DEADLINE_COLUMNS,
@@ -9035,21 +13338,18 @@ class Journal:
                 to_status = "EXPIRED"
                 session_completion_id = None
                 signal_evidence_id = None
-                expiry_source_id = getattr(
-                    expiry_source.expiry_evidence,
-                    "source_id",
-                )
+                expiry_source_id = str(expiry_row[1])
                 terminal_source_id = expiry_source_id
-                terminal_source_digest = expiry_source.source_digest
+                terminal_source_digest = expiry_source_digest_snapshot
                 source_references = (
-                    *expiry_source.row_references,
+                    *expiry_source_references_snapshot,
                     expiry_reference,
                 )
                 terminal_details = {
                     "terminal_evidence_kind": "EXPIRY_DEADLINE",
-                    "terminal_evidence_digest": expiry_source.source_digest,
+                    "terminal_evidence_digest": expiry_source_digest_snapshot,
                     "terminal_source_id": expiry_source_id,
-                    "deadline_at": _canonical_timestamp(expiry_source.deadline_at),
+                    "deadline_at": str(expiry_row[4]),
                 }
             else:
                 raise JournalError("Phase 1 terminal derivation was incomplete")
@@ -10231,11 +14531,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_PUBLICATION_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         if read_cache is not None:
             read_cache[report_id] = source
         return source
@@ -10358,11 +14664,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
-            _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
-            source,
-            self,
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_SIGNAL_SOURCE_AUTHORITIES[
+                source_identity
+            ] = source_authority
         return source
 
     def read_phase1_signal(
@@ -11658,17 +15970,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        for signal_source in signal_sources:
-            _register_journal_source_authority(
-                _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
-                signal_source,
-                self,
-            )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_CANONICAL_REPLAY_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         if replay_read_cache is not None and replay_cache_key is not None:
             replay_read_cache[replay_cache_key] = source
         return source
@@ -11762,6 +16074,236 @@ class Journal:
             phase1_canonical_replay=replay,
         )
 
+    def _read_phase1_cached_promotion_equity_mark_source(
+        self,
+        *,
+        cache: _Phase1PromotionMarkCacheCapability,
+        validation_window_id: str,
+        ledger_name: str,
+        session_date: date,
+        point_query_cutoff: datetime,
+        final_query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+        calendar_digest: str,
+        policy_digest: str,
+    ) -> tuple[Phase1EquityMarkSource, object]:
+        """Build and issue once, then freshly verify one exact cached pair."""
+        from .policy import Policy
+        from .risk import (
+            Phase1EquityPointAuthority,
+            SessionCalendarResolver,
+            _is_current_phase1_equity_point_authority_without_callbacks,
+            _issue_phase1_equity_point_from_source,
+            _calendar_digest,
+            _policy_digest,
+        )
+
+        if type(cache) is not _Phase1PromotionMarkCacheCapability:
+            raise JournalError("Phase 1 promotion mark cache is unverified")
+        validation_window_id = _require_nonempty_text(
+            validation_window_id,
+            "Phase 1 validation window ID",
+        )
+        ledger_name = _canonical_token(ledger_name, "Phase 1 ledger name")
+        if ledger_name not in {"CANONICAL", "ACTUAL"}:
+            raise InvalidJournalValue("Phase 1 ledger name is unsupported")
+        if type(session_date) is not date:
+            raise InvalidJournalValue(
+                "Phase 1 promotion mark session must be a date"
+            )
+        normalized_point_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(point_query_cutoff)
+        )
+        normalized_final_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(final_query_cutoff)
+        )
+        if normalized_final_cutoff < normalized_point_cutoff:
+            raise InvalidJournalValue(
+                "Phase 1 promotion cutoff precedes an equity point"
+            )
+        key: _Phase1PromotionMarkCacheKey = (
+            validation_window_id,
+            ledger_name,
+            session_date,
+            normalized_point_cutoff,
+            normalized_final_cutoff,
+            calendar_digest,
+            policy_digest,
+        )
+        if (
+            not isinstance(calendar_resolver, SessionCalendarResolver)
+            or not calendar_resolver.release_verified
+            or not isinstance(policy, Policy)
+        ):
+            raise JournalError("Phase 1 promotion mark cache context is invalid")
+        try:
+            policy.validate()
+        except Exception as error:
+            raise JournalError(
+                "Phase 1 promotion mark cache context is invalid"
+            ) from error
+        if (
+            _calendar_digest(calendar_resolver) != calendar_digest
+            or _policy_digest(policy) != policy_digest
+        ):
+            raise JournalError("Phase 1 promotion mark cache context is invalid")
+
+        cache_identity = id(cache)
+        with _JOURNAL_SOURCE_LOCK:
+            authority = _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES.get(
+                cache_identity
+            )
+            if (
+                authority is None
+                or authority.capability_reference() is not cache
+                or authority.owner_reference() is not self
+                or authority.validation_window_id != validation_window_id
+                or authority.final_query_cutoff != normalized_final_cutoff
+                or authority.calendar_digest != calendar_digest
+                or authority.policy_digest != policy_digest
+            ):
+                raise JournalError(
+                    "Phase 1 promotion mark cache is unverified"
+                )
+            captured_entries = authority.entries
+            matching_entries = tuple(
+                entry for entry in captured_entries if entry.key == key
+            )
+            if len(matching_entries) > 1:
+                raise MigrationCorruption(
+                    "Phase 1 promotion equity mark cache is ambiguous"
+                )
+            entry = None if not matching_entries else matching_entries[0]
+            source = None if entry is None else entry.source
+            issued_authority = None if entry is None else entry.authority
+            cache_miss = entry is None
+
+        current_data_version = self._source_authority_data_version()
+        current_total_changes = _journal_source_authority_total_changes(self)
+        if (
+            authority.data_version != current_data_version
+            or authority.total_changes != current_total_changes
+        ):
+            raise JournalError(
+                "Phase 1 promotion mark cache changed during reconstruction"
+            )
+
+        if source is None:
+            source = self._read_phase1_equity_mark_source(
+                ledger_name=ledger_name,
+                session_date=session_date,
+                query_cutoff=normalized_point_cutoff,
+                current_query_cutoff=normalized_final_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+
+            current_data_version = self._source_authority_data_version()
+            current_total_changes = _journal_source_authority_total_changes(
+                self
+            )
+            if (
+                authority.data_version != current_data_version
+                or authority.total_changes != current_total_changes
+            ):
+                raise JournalError(
+                    "Phase 1 promotion mark cache changed during reconstruction"
+                )
+
+        if type(source) is not Phase1EquityMarkSource:
+            raise MigrationCorruption(
+                "Phase 1 promotion equity mark cache is stale or inconsistent"
+            )
+        canonical_replay_source = object.__getattribute__(
+            source,
+            "canonical_replay_source",
+        )
+        signal_sources = object.__getattribute__(
+            canonical_replay_source,
+            "signal_sources",
+        )
+        if (
+            source.validation_window_id != validation_window_id
+            or source.ledger_name != ledger_name
+            or source.session_date != session_date
+            or source.query_cutoff != normalized_point_cutoff
+            or source.calendar_digest != calendar_digest
+            or type(signal_sources) is not tuple
+            or not signal_sources
+            or any(
+                type(signal) is not Phase1SignalSource
+                or signal.policy_digest != policy_digest
+                for signal in signal_sources
+            )
+            # This owner check is intentionally last.  It performs all
+            # callback-bearing currentness work before its final fresh seal;
+            # no cache verdict or fingerprint is retained between uses.
+            or _phase1_source_owner(source) is not self
+        ):
+            raise MigrationCorruption(
+                "Phase 1 promotion equity mark cache is stale or inconsistent"
+            )
+
+        if cache_miss:
+            issued_authority = _issue_phase1_equity_point_from_source(
+                source,
+                calendar_resolver=calendar_resolver,
+            )
+            if type(issued_authority) is not Phase1EquityPointAuthority:
+                raise MigrationCorruption(
+                    "Phase 1 promotion equity authority is unverified"
+                )
+        elif (
+            type(issued_authority) is not Phase1EquityPointAuthority
+            or not _is_current_phase1_equity_point_authority_without_callbacks(
+                issued_authority,
+                source,
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 1 promotion equity authority is unverified"
+            )
+
+        with _JOURNAL_SOURCE_LOCK:
+            current_authority = (
+                _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES.get(cache_identity)
+            )
+            if (
+                current_authority is not authority
+                or authority.capability_reference() is not cache
+                or authority.owner_reference() is not self
+                or authority.entries is not captured_entries
+                or authority.total_changes != current_total_changes
+                or authority.data_version != current_data_version
+            ):
+                raise JournalError(
+                    "Phase 1 promotion mark cache changed during reconstruction"
+                )
+            if cache_miss:
+                replacement = authority._replace(
+                    entries=(
+                        *captured_entries,
+                        _Phase1PromotionMarkCacheEntry(
+                            key,
+                            source,
+                            issued_authority,
+                        ),
+                    )
+                )
+                _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                    cache_identity
+                ] = replacement
+            elif (
+                entry is None
+                or entry.source is not source
+                or entry.authority is not issued_authority
+            ):
+                raise MigrationCorruption(
+                    "Phase 1 promotion equity mark cache changed during verification"
+                )
+        return source, issued_authority
+
     def _read_phase1_breaker_history_source(
         self,
         *,
@@ -11770,6 +16312,10 @@ class Journal:
         query_cutoff: datetime,
         calendar_resolver: object | None = None,
         policy: object | None = None,
+        _promotion_mark_cache: (
+            _Phase1PromotionMarkCacheCapability | None
+        ) = None,
+        _promotion_query_cutoff: datetime | None = None,
     ) -> Phase1BreakerHistorySource:
         with self._phase1_publication_read_scope():
             return self._read_phase1_breaker_history_source_uncached(
@@ -11778,6 +16324,8 @@ class Journal:
                 query_cutoff=query_cutoff,
                 calendar_resolver=calendar_resolver,
                 policy=policy,
+                _promotion_mark_cache=_promotion_mark_cache,
+                _promotion_query_cutoff=_promotion_query_cutoff,
             )
 
     def _read_phase1_breaker_history_source_uncached(
@@ -11788,6 +16336,10 @@ class Journal:
         query_cutoff: datetime,
         calendar_resolver: object | None = None,
         policy: object | None = None,
+        _promotion_mark_cache: (
+            _Phase1PromotionMarkCacheCapability | None
+        ) = None,
+        _promotion_query_cutoff: datetime | None = None,
     ) -> Phase1BreakerHistorySource:
         """Read the complete immutable Phase 1 curve/close streams."""
         self._ensure_open()
@@ -11800,6 +16352,12 @@ class Journal:
         normalized_cutoff = _parse_canonical_timestamp(
             _canonical_timestamp(query_cutoff)
         )
+        if (_promotion_mark_cache is None) != (
+            _promotion_query_cutoff is None
+        ):
+            raise JournalError(
+                "Phase 1 promotion mark cache context is incomplete"
+            )
         stored_cutoff = _canonical_timestamp(normalized_cutoff)
         windows = _sql(
             self._connection,
@@ -11939,18 +16497,36 @@ class Journal:
                 equity_rows[1:],
                 strict=True,
             ):
-                mark_source = self._read_phase1_equity_mark_source(
-                    ledger_name=ledger_name,
-                    session_date=point.session_date,
-                    query_cutoff=point.received_at,
-                    current_query_cutoff=normalized_cutoff,
-                    calendar_resolver=calendar_resolver,
-                    policy=policy,
-                )
-                authority = _issue_phase1_equity_point_from_source(
-                    mark_source,
-                    calendar_resolver=calendar_resolver,
-                )
+                if _promotion_mark_cache is None:
+                    mark_source = self._read_phase1_equity_mark_source(
+                        ledger_name=ledger_name,
+                        session_date=point.session_date,
+                        query_cutoff=point.received_at,
+                        current_query_cutoff=normalized_cutoff,
+                        calendar_resolver=calendar_resolver,
+                        policy=policy,
+                    )
+                    authority = _issue_phase1_equity_point_from_source(
+                        mark_source,
+                        calendar_resolver=calendar_resolver,
+                    )
+                else:
+                    assert _promotion_query_cutoff is not None
+                    assert policy_digest is not None
+                    mark_source, authority = (
+                        self._read_phase1_cached_promotion_equity_mark_source(
+                            cache=_promotion_mark_cache,
+                            validation_window_id=window_id,
+                            ledger_name=ledger_name,
+                            session_date=point.session_date,
+                            point_query_cutoff=point.received_at,
+                            final_query_cutoff=_promotion_query_cutoff,
+                            calendar_resolver=calendar_resolver,
+                            policy=policy,
+                            calendar_digest=str(window_row[6]),
+                            policy_digest=policy_digest,
+                        )
+                    )
                 expected_point_id = hashlib.sha256(
                     (
                         "stock-monitor/phase1-session-equity-point/v1\x00"
@@ -12229,11 +16805,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_BREAKER_HISTORY_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def read_phase1_breaker_history(
@@ -12706,11 +17288,17 @@ class Journal:
             row_references=references,
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_SIGNAL_DISPOSITION_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def read_phase1_published_signal_disposition_source(
@@ -12761,6 +17349,10 @@ class Journal:
         canonical_replay_source: Phase1CanonicalReplaySource | None = None,
         breaker_history_source: Phase1BreakerHistorySource | None = None,
         actual_replay_source: JournalActualReplaySource | None = None,
+        _promotion_mark_cache: (
+            _Phase1PromotionMarkCacheCapability | None
+        ) = None,
+        _promotion_query_cutoff: datetime | None = None,
     ) -> Phase1AdherenceReviewSource:
         """Build every fixed-check input from exact current Journal sources."""
         from .policy import Policy
@@ -12891,9 +17483,7 @@ class Journal:
                 )
             )
         elif not (
-            is_verified_phase1_canonical_replay_source(
-                canonical_replay_source
-            )
+            type(canonical_replay_source) is Phase1CanonicalReplaySource
             and _phase1_source_owner(canonical_replay_source) is self
             and canonical_replay_source.query_cutoff == normalized_cutoff
             and canonical_replay_source.validation_window_id
@@ -12914,12 +17504,12 @@ class Journal:
                     query_cutoff=normalized_cutoff,
                     calendar_resolver=calendar_resolver,
                     policy=policy,
+                    _promotion_mark_cache=_promotion_mark_cache,
+                    _promotion_query_cutoff=_promotion_query_cutoff,
                 )
             )
         elif not (
-            is_verified_phase1_breaker_history_source(
-                breaker_history_source
-            )
+            type(breaker_history_source) is Phase1BreakerHistorySource
             and _phase1_source_owner(breaker_history_source) is self
             and breaker_history_source.validation_window_id
             == signal_source.validation_window_id
@@ -12937,7 +17527,7 @@ class Journal:
                     query_cutoff=normalized_cutoff,
                 )
         elif not (
-            is_verified_journal_replay_source(actual_replay_source)
+            type(actual_replay_source) is JournalActualReplaySource
             and _journal_replay_source_owner(actual_replay_source) is self
             and actual_replay_source.query_cutoff == normalized_cutoff
         ):
@@ -13201,11 +17791,17 @@ class Journal:
                 row_references=references,
                 source_digest=source_digest,
             )
-            _register_journal_source_authority(
+            _reader_source_identity, _reader_source_authority = (
+                _phase1_reader_source_registration_material(
                 _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES,
                 evidence,
                 self,
+                )
             )
+            with _JOURNAL_SOURCE_LOCK:
+                _PHASE1_ADHERENCE_CHECK_EVIDENCE_SOURCE_AUTHORITIES[
+                    _reader_source_identity
+                ] = _reader_source_authority
             evidence_sources.append(evidence)
 
         references = tuple(
@@ -13274,11 +17870,17 @@ class Journal:
             row_references=references,
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_ADHERENCE_REVIEW_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def read_phase1_adherence_review_source(
@@ -13483,6 +18085,10 @@ class Journal:
         query_cutoff: datetime,
         calendar_resolver: object,
         policy: object,
+        _promotion_mark_cache: (
+            _Phase1PromotionMarkCacheCapability | None
+        ) = None,
+        _promotion_query_cutoff: datetime | None = None,
     ) -> tuple[Phase1AdherenceCheckSource, ...]:
         """Reissue and authenticate one persisted fixed ten-check cohort."""
         from .validation import (
@@ -13562,6 +18168,8 @@ class Journal:
             query_cutoff=evaluated_at,
             calendar_resolver=calendar_resolver,
             policy=policy,
+            _promotion_mark_cache=_promotion_mark_cache,
+            _promotion_query_cutoff=_promotion_query_cutoff,
         )
         authority = _issue_phase1_adherence_from_journal_source(
             review_source,
@@ -13727,6 +18335,122 @@ class Journal:
         query_cutoff: datetime,
         calendar_resolver: object,
     ) -> Phase1ValidationWindowSource:
+        """Run one validation rebuild with a non-exportable mark cache."""
+        from .risk import SessionCalendarResolver, _calendar_digest
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 validation source requires a post-commit read"
+            )
+        normalized_window_id = _require_nonempty_text(
+            validation_window_id,
+            "Phase 1 validation window ID",
+        )
+        if type(through_session) is not date:
+            raise InvalidJournalValue(
+                "Phase 1 validation through-session must be a date"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
+            calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "Phase 1 validation calendar is unverified"
+            )
+        calendar_digest = _calendar_digest(calendar_resolver)
+        initial_data_version = self._source_authority_data_version()
+        initial_total_changes = _journal_source_authority_total_changes(self)
+        policy_rows = _sql(
+            self._connection,
+            "SELECT DISTINCT signal.policy_digest FROM phase1_signals AS signal "
+            "JOIN phase1_validation_windows AS window "
+            "ON window.window_id = signal.validation_window_id COLLATE BINARY "
+            "WHERE signal.validation_window_id = ? COLLATE BINARY "
+            "AND signal.publication_session >= window.started_session "
+            "AND signal.publication_session <= ? AND signal.received_at <= ?",
+            (
+                normalized_window_id,
+                through_session.isoformat(),
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        current_data_version = self._source_authority_data_version()
+        current_total_changes = _journal_source_authority_total_changes(self)
+        if (
+            current_data_version != initial_data_version
+            or current_total_changes != initial_total_changes
+        ):
+            raise JournalError(
+                "Phase 1 validation source changed during reconstruction"
+            )
+
+        capability = _Phase1PromotionMarkCacheCapability()
+        if len(policy_rows) != 1:
+            return self._read_phase1_validation_window_source_with_mark_cache(
+                normalized_window_id,
+                through_session=through_session,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                _promotion_mark_cache=capability,
+                _promotion_initial_data_version=initial_data_version,
+                _promotion_initial_total_changes=initial_total_changes,
+            )
+
+        authority = _Phase1PromotionMarkCacheAuthority(
+            capability_reference=ref(capability),
+            owner_reference=ref(self),
+            validation_window_id=normalized_window_id,
+            final_query_cutoff=normalized_cutoff,
+            calendar_digest=calendar_digest,
+            policy_digest=str(policy_rows[0][0]),
+            total_changes=initial_total_changes,
+            data_version=initial_data_version,
+            entries=(),
+        )
+        capability_identity = id(capability)
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                capability_identity
+            ] = authority
+        try:
+            return self._read_phase1_validation_window_source_with_mark_cache(
+                normalized_window_id,
+                through_session=through_session,
+                query_cutoff=normalized_cutoff,
+                calendar_resolver=calendar_resolver,
+                _promotion_mark_cache=capability,
+                _promotion_initial_data_version=initial_data_version,
+                _promotion_initial_total_changes=initial_total_changes,
+            )
+        finally:
+            with _JOURNAL_SOURCE_LOCK:
+                current = _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES.get(
+                    capability_identity
+                )
+                if (
+                    current is not None
+                    and current.capability_reference() is capability
+                    and current.owner_reference() is self
+                ):
+                    _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES.pop(
+                        capability_identity,
+                        None,
+                    )
+
+    def _read_phase1_validation_window_source_with_mark_cache(
+        self,
+        validation_window_id: str,
+        *,
+        through_session: date,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        _promotion_mark_cache: _Phase1PromotionMarkCacheCapability,
+        _promotion_initial_data_version: int,
+        _promotion_initial_total_changes: int,
+    ) -> Phase1ValidationWindowSource:
         """Rebuild one complete promotion window from typed durable sources."""
         from .risk import (
             SessionCalendarResolver,
@@ -13749,6 +18473,8 @@ class Journal:
         normalized_cutoff = _parse_canonical_timestamp(
             _canonical_timestamp(query_cutoff)
         )
+        initial_data_version = _promotion_initial_data_version
+        initial_total_changes = _promotion_initial_total_changes
         if not isinstance(calendar_resolver, SessionCalendarResolver) or not (
             calendar_resolver.release_verified
         ):
@@ -13906,6 +18632,8 @@ class Journal:
                 query_cutoff=normalized_cutoff,
                 calendar_resolver=calendar_resolver,
                 policy=policy,
+                _promotion_mark_cache=_promotion_mark_cache,
+                _promotion_query_cutoff=normalized_cutoff,
             )
         )
         canonical_replay_source = self._read_phase1_canonical_replay_source(
@@ -13919,6 +18647,8 @@ class Journal:
             query_cutoff=normalized_cutoff,
             calendar_resolver=calendar_resolver,
             policy=policy,
+            _promotion_mark_cache=_promotion_mark_cache,
+            _promotion_query_cutoff=normalized_cutoff,
         )
         actual_history = self._read_phase1_breaker_history_source(
             ledger_name="ACTUAL",
@@ -13926,6 +18656,8 @@ class Journal:
             query_cutoff=normalized_cutoff,
             calendar_resolver=calendar_resolver,
             policy=policy,
+            _promotion_mark_cache=_promotion_mark_cache,
+            _promotion_query_cutoff=normalized_cutoff,
         )
         with self.transaction() as transaction:
             actual_replay_source = transaction.read_actual_replay(
@@ -13941,6 +18673,8 @@ class Journal:
                 canonical_replay_source=canonical_replay_source,
                 breaker_history_source=canonical_history,
                 actual_replay_source=actual_replay_source,
+                _promotion_mark_cache=_promotion_mark_cache,
+                _promotion_query_cutoff=normalized_cutoff,
             )
             for disposition in disposition_sources
         )
@@ -14126,11 +18860,25 @@ class Journal:
             row_references=references,
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
-            _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES,
-            source,
-            self,
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
         )
+        if (
+            source_authority[3] != initial_total_changes
+            or source_authority[4] != initial_data_version
+        ):
+            raise JournalError(
+                "Phase 1 validation source changed during reconstruction"
+            )
+
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_VALIDATION_WINDOW_SOURCE_AUTHORITIES[
+                source_identity
+            ] = source_authority
         return source
 
     def read_phase1_promotion_decision(
@@ -14310,6 +19058,118 @@ class Journal:
                 started_at=started_at,
             )
 
+    def read_scheduled_run_status(
+        self,
+        *,
+        run_key: str,
+        run_kind: str,
+        session_date: date,
+    ) -> str:
+        """Read the durable scheduler/report state without exposing SQLite."""
+        self._ensure_open()
+        run_key = _require_nonempty_text(run_key, "scheduled run key")
+        run_kind = _canonical_token(run_kind, "scheduled run kind")
+        stored_date = _canonical_date(session_date)
+        row = _sql(
+            self._connection,
+            "SELECT run.run_kind, run.session_date, run.finished_at, run.outcome, "
+            "run.report_id, run.report_path, claim.status, claim.report_id "
+            "FROM scheduled_runs AS run LEFT JOIN report_claims AS claim "
+            "ON claim.session_date = run.session_date "
+            "AND claim.report_kind = run.run_kind "
+            "WHERE run.run_key = ? COLLATE BINARY",
+            (run_key,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("scheduled run does not exist")
+        if (str(row[0]), str(row[1])) != (run_kind, stored_date):
+            raise IdempotencyConflict(
+                "scheduled run identity conflicts with stored content"
+            )
+        if row[2] is None:
+            if row[6] == "FINALIZED" and row[7] is not None:
+                return "REPORT_FINALIZED"
+            return "IN_PROGRESS"
+        if row[3] == "REPORT_EMITTED" and row[4] is not None and row[5] is not None:
+            return "REPORT_EMITTED"
+        return "COMPLETED_NO_REPORT"
+
+    def read_scheduled_run_result_envelope(
+        self,
+        *,
+        run_key: str,
+        run_kind: str,
+        session_date: date,
+    ) -> ScheduledRunResultEnvelope | None:
+        """Read exact terminal workflow truth, or ``None`` for a legacy row."""
+        self._ensure_open()
+        run_key = _require_nonempty_text(run_key, "scheduled run key")
+        run_kind = _canonical_token(run_kind, "scheduled run kind")
+        stored_date = _canonical_date(session_date)
+        row = _sql(
+            self._connection,
+            "SELECT run.run_kind, run.session_date, run.finished_at, run.outcome, "
+            "run.report_id, run.report_path, run.result_envelope_json, "
+            "run.result_envelope_sha256, report.report_id, "
+            "report.archive_relative_path "
+            "FROM scheduled_runs AS run LEFT JOIN reports AS report "
+            "ON report.id = run.report_id "
+            "WHERE run.run_key = ? COLLATE BINARY",
+            (run_key,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("scheduled run does not exist")
+        if (str(row[0]), str(row[1])) != (run_kind, stored_date):
+            raise IdempotencyConflict(
+                "scheduled run identity conflicts with stored content"
+            )
+        if row[2] is None:
+            raise InvalidJournalValue("scheduled run is not complete")
+        if row[6] is None and row[7] is None:
+            return None
+        if (row[6] is None) != (row[7] is None):
+            raise MigrationCorruption(
+                "scheduled result envelope storage is incomplete"
+            )
+        envelope = _decode_scheduled_result_envelope(row[6], row[7])
+        stored_report_identity = (row[8], row[4], row[5])
+        envelope_report_identity = (
+            envelope.report_id,
+            envelope.report_row_id,
+            envelope.report_path,
+        )
+        if stored_report_identity != envelope_report_identity:
+            raise MigrationCorruption(
+                "scheduled result envelope report identity is inconsistent"
+            )
+        if (str(row[3]) == "REPORT_EMITTED") != (
+            envelope.report_row_id is not None
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope conflicts with completion outcome"
+            )
+        if row[9] != envelope.report_path:
+            raise MigrationCorruption(
+                "scheduled result envelope report path is inconsistent"
+            )
+        if envelope.report_id is not None:
+            material = journal.read_report(envelope.report_id)
+            if (
+                material.report_row_id != envelope.report_row_id
+                or material.archive_relative_path != envelope.report_path
+                or material.body != envelope.report_body
+                or material.content_sha256 != envelope.report_content_sha256
+                or material.state_sha256 != envelope.report_state_sha256
+                or material.observation_ids
+                != envelope.report_observation_row_ids
+                or material.observation_sha256s
+                != envelope.report_observation_sha256s
+            ):
+                raise MigrationCorruption(
+                    "scheduled result envelope report material is inconsistent"
+                )
+        return envelope
+
     def complete_scheduled_run(
         self,
         *,
@@ -14317,6 +19177,7 @@ class Journal:
         finished_at: datetime,
         market_session_decision: str,
         outcome: str,
+        result_envelope: ScheduledRunResultEnvelope,
         report_id: int | None = None,
         report_path: str | None = None,
         error_class: str | None = None,
@@ -14328,6 +19189,7 @@ class Journal:
                 finished_at=finished_at,
                 market_session_decision=market_session_decision,
                 outcome=outcome,
+                result_envelope=result_envelope,
                 report_id=report_id,
                 report_path=report_path,
                 error_class=error_class,
@@ -22172,11 +27034,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_ENTRY_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_ENTRY_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def _read_phase1_shadow_fill_source(
@@ -22301,11 +27169,17 @@ class Journal:
             row_references=tuple(references),
             source_digest=source_digest,
         )
-        _register_journal_source_authority(
+        _reader_source_identity, _reader_source_authority = (
+            _phase1_reader_source_registration_material(
             _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
             source,
             self,
+            )
         )
+        with _JOURNAL_SOURCE_LOCK:
+            _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES[
+                _reader_source_identity
+            ] = _reader_source_authority
         return source
 
     def _phase1_late_evidence_references(
@@ -24058,6 +28932,7 @@ class Journal:
         finished_at: datetime,
         market_session_decision: str,
         outcome: str,
+        result_envelope: ScheduledRunResultEnvelope,
         report_id: int | None,
         report_path: str | None,
         error_class: str | None,
@@ -24072,6 +28947,14 @@ class Journal:
         if report_path is not None:
             report_path = _canonical_archive_path(report_path)
         error_class = _optional_text(error_class, "scheduled run error class")
+        result_envelope_json, result_envelope_sha256 = (
+            _scheduled_result_envelope_storage(result_envelope)
+        )
+        envelope_report_identity = (
+            result_envelope.report_id,
+            result_envelope.report_row_id,
+            result_envelope.report_path,
+        )
         completion = (
             stored_finished_at,
             market_session_decision,
@@ -24079,10 +28962,13 @@ class Journal:
             report_path,
             outcome,
             error_class,
+            result_envelope_json,
+            result_envelope_sha256,
         )
         row = _sql(self._connection,
             "SELECT run_kind, session_date, started_at, finished_at, "
-            "market_session_decision, report_id, report_path, outcome, error_class "
+            "market_session_decision, report_id, report_path, outcome, error_class, "
+            "result_envelope_json, result_envelope_sha256 "
             "FROM scheduled_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -24104,11 +28990,17 @@ class Journal:
             raise InvalidJournalValue(
                 "scheduled report outcome conflicts with its report identity"
             )
+        if (report_id, report_path) != envelope_report_identity[1:]:
+            raise InvalidJournalValue(
+                "scheduled result envelope conflicts with its stored report identity"
+            )
         if report_id is not None:
             report = _sql(self._connection,
                 "SELECT report.session_date, report.report_kind, "
                 "report.archive_relative_path, claim.status, claim.report_id, "
-                "claim.finalized_at FROM reports AS report "
+                "claim.finalized_at, report.report_id, report.body_text, "
+                "report.content_sha256, report.state_sha256 "
+                "FROM reports AS report "
                 "JOIN report_claims AS claim ON claim.id = report.claim_id "
                 "WHERE report.id = ?",
                 (report_id,),
@@ -24125,6 +29017,35 @@ class Journal:
                 )
             if report[3] != "FINALIZED" or report[4] != report_id:
                 raise InvalidJournalValue("scheduled report is not finalized")
+            if str(report[0]) != str(row[1]) or str(report[1]) != str(row[0]):
+                raise InvalidJournalValue(
+                    "scheduled report does not match the run identity"
+                )
+            if report[6] != envelope_report_identity[0]:
+                raise InvalidJournalValue(
+                    "scheduled result envelope conflicts with the report ID"
+                )
+            pins = _sql(
+                self._connection,
+                "SELECT pin.source_observation_id, observation.observation_sha256 "
+                "FROM report_observations AS pin "
+                "JOIN source_observations AS observation "
+                "ON observation.id = pin.source_observation_id "
+                "WHERE pin.report_id = ? ORDER BY pin.observation_ordinal",
+                (report_id,),
+            ).fetchall()
+            if (
+                str(report[7]) != result_envelope.report_body
+                or str(report[8]) != result_envelope.report_content_sha256
+                or str(report[9]) != result_envelope.report_state_sha256
+                or tuple(int(pin[0]) for pin in pins)
+                != result_envelope.report_observation_row_ids
+                or tuple(str(pin[1]) for pin in pins)
+                != result_envelope.report_observation_sha256s
+            ):
+                raise InvalidJournalValue(
+                    "scheduled result envelope conflicts with report material"
+                )
             report_finalized_at = report[5]
             if (
                 report_finalized_at is None
@@ -24136,7 +29057,8 @@ class Journal:
                 )
         cursor = _sql(self._connection,
             "UPDATE scheduled_runs SET finished_at = ?, market_session_decision = ?, "
-            "report_id = ?, report_path = ?, outcome = ?, error_class = ? "
+            "report_id = ?, report_path = ?, outcome = ?, error_class = ?, "
+            "result_envelope_json = ?, result_envelope_sha256 = ? "
             "WHERE id = ? AND finished_at IS NULL",
             (*completion, run_id),
         )
@@ -24731,6 +29653,2081 @@ class Journal:
             )
         return int(row[0]), not inserted
 
+    def _historical_replay_request_configuration(
+        self,
+        *,
+        session_dates: Sequence[date],
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> tuple[
+        tuple[date, ...],
+        datetime,
+        str,
+        str,
+        tuple[datetime, ...],
+    ]:
+        from .policy import Policy
+        from .risk import SessionCalendarResolver, _calendar_digest, _policy_digest
+
+        if isinstance(session_dates, (str, bytes)) or not isinstance(
+            session_dates, Sequence
+        ):
+            raise InvalidJournalValue(
+                "historical replay sessions must be a sequence"
+            )
+        sessions = tuple(session_dates)
+        if (
+            not sessions
+            or any(type(item) is not date for item in sessions)
+            or len(set(sessions)) != len(sessions)
+        ):
+            raise InvalidJournalValue(
+                "historical replay sessions must be unique dates"
+            )
+        sessions = tuple(sorted(sessions))
+        if (
+            type(calendar_resolver) is not SessionCalendarResolver
+            or not calendar_resolver.release_verified
+        ):
+            raise InvalidJournalValue(
+                "historical replay calendar authority is unverified"
+            )
+        if type(policy) is not Policy:
+            raise InvalidJournalValue(
+                "historical replay policy authority is invalid"
+            )
+        try:
+            policy.validate()
+            calendar_digest = _calendar_digest(calendar_resolver)
+            policy_digest = _policy_digest(policy)
+        except Exception as error:
+            raise InvalidJournalValue(
+                "historical replay configuration is invalid"
+            ) from error
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        report_cutoffs: list[datetime] = []
+        for session_date in sessions:
+            try:
+                if not calendar_resolver.is_open(session_date):
+                    raise InvalidJournalValue(
+                        "historical replay sessions must be open sessions"
+                    )
+                schedule = calendar_resolver.session(session_date)
+                report_cutoff = datetime.combine(
+                    session_date,
+                    schedule.close_time,
+                    tzinfo=schedule.timezone,
+                ) + timedelta(minutes=30)
+                report_cutoff = _parse_canonical_timestamp(
+                    _canonical_timestamp(report_cutoff)
+                )
+            except InvalidJournalValue:
+                raise
+            except Exception as error:
+                raise InvalidJournalValue(
+                    "historical replay session calendar is incomplete"
+                ) from error
+            if report_cutoff > normalized_cutoff:
+                raise InvalidJournalValue(
+                    "historical replay cutoff precedes a requested report"
+                )
+            report_cutoffs.append(report_cutoff)
+        return (
+            sessions,
+            normalized_cutoff,
+            calendar_digest,
+            policy_digest,
+            tuple(report_cutoffs),
+        )
+
+    def _historical_replay_request_matches(
+        self,
+        *,
+        run_id: str,
+        session_dates: tuple[date, ...],
+        query_cutoff: datetime,
+        calendar_digest: str,
+        policy_digest: str,
+        report_cutoffs: tuple[datetime, ...],
+    ) -> bool:
+        run = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_RUN_COLUMNS)
+            + " FROM historical_replay_runs "
+            "WHERE replay_run_id = ? COLLATE BINARY",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            return False
+        date_rows = _sql(
+            self._connection,
+            "SELECT session_date, report_cutoff FROM historical_replay_dates "
+            "WHERE replay_run_id = ? COLLATE BINARY ORDER BY session_date, id",
+            (run_id,),
+        ).fetchall()
+        seal = _sql(
+            self._connection,
+            "SELECT 1 FROM historical_replay_run_seals "
+            "WHERE replay_run_id = ? COLLATE BINARY",
+            (run_id,),
+        ).fetchone()
+        return (
+            seal is not None
+            and str(run[2]) == "STRICT_POINT_IN_TIME"
+            and str(run[3]) == session_dates[0].isoformat()
+            and str(run[4]) == session_dates[-1].isoformat()
+            and str(run[5]) == _canonical_timestamp(query_cutoff)
+            and str(run[6]) == calendar_digest
+            and str(run[7]) == policy_digest
+            and int(run[8]) == len(session_dates)
+            and tuple(str(row[0]) for row in date_rows)
+            == tuple(item.isoformat() for item in session_dates)
+            and tuple(str(row[1]) for row in date_rows)
+            == tuple(_canonical_timestamp(item) for item in report_cutoffs)
+        )
+
+    def _prepare_historical_replay_date(
+        self,
+        *,
+        session_date: date,
+        report_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> _HistoricalReplayDatePlan:
+        canonical_source: Phase1CanonicalReplaySource | None
+        try:
+            canonical_source = self._read_phase1_canonical_replay_source(
+                query_cutoff=report_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+        except InvalidJournalValue:
+            canonical_source = None
+        replay_case = (
+            None
+            if canonical_source is None
+            else self._historical_replay_case_from_phase1(
+                canonical_source,
+                session_date=session_date,
+            )
+        )
+        if replay_case is None or canonical_source is None:
+            evidence: tuple[_HistoricalReplayEvidencePlan, ...] = ()
+            references: tuple[JournalRowReference, ...] = ()
+            case_digest, domain_input_digest, mechanics_digest = (
+                _historical_replay_missing_case_digests(
+                    session_date=session_date,
+                    report_cutoff=report_cutoff,
+                )
+            )
+        else:
+            evidence = self._historical_replay_evidence_from_phase1(
+                canonical_source,
+                session_date=session_date,
+                report_cutoff=report_cutoff,
+                calendar_resolver=calendar_resolver,
+            )
+            references = tuple(canonical_source.row_references)
+            case_digest, domain_input_digest, mechanics_digest = (
+                _historical_replay_case_digests(
+                    replay_case,
+                    phase1_source_digest=canonical_source.source_digest,
+                )
+            )
+        completion_digest = _historical_replay_completion_digest(
+            session_date=session_date,
+            report_cutoff=report_cutoff,
+            evidence=evidence,
+            case_digest=case_digest,
+            domain_input_digest=domain_input_digest,
+            mechanics_digest=mechanics_digest,
+        )
+        return _HistoricalReplayDatePlan(
+            session_date=session_date,
+            report_cutoff=report_cutoff,
+            replay_case=replay_case,
+            evidence=evidence,
+            row_references=references,
+            case_digest=case_digest,
+            domain_input_digest=domain_input_digest,
+            mechanics_digest=mechanics_digest,
+            completion_digest=completion_digest,
+        )
+
+    @staticmethod
+    def _historical_replay_case_from_phase1(
+        source: Phase1CanonicalReplaySource,
+        *,
+        session_date: date,
+    ) -> object | None:
+        from .replay import (
+            ReplayCase,
+            ReplayDomainComponent,
+            ReplayDomainResult,
+            ReplayDomainStatus,
+            ReplayMechanicsResult,
+            ReplayMechanicsStatus,
+        )
+
+        signals = tuple(
+            signal
+            for signal in source.signal_sources
+            if signal.publication_session == session_date
+            and signal.role == "PRIMARY"
+        )
+        if len(signals) != 1:
+            return None
+        signal = signals[0]
+        entries = tuple(
+            entry
+            for entry in source.entry_sources
+            if entry.signal_source.signal_id == signal.signal_id
+            and entry.completion.session_date == session_date
+        )
+        if len(entries) != 1:
+            return None
+        entry = entries[0]
+        lifecycle = entry.lifecycle_event
+        if (
+            lifecycle.event_kind != "PAPER_FILL"
+            or lifecycle.to_status != "TRIGGERED_PAPER"
+            or lifecycle.price_micros is None
+            or lifecycle.trigger_observation_id is None
+            or lifecycle.quote_observation_id is None
+            or entry.buy_posting.unit_price_micros != lifecycle.price_micros
+            or entry.buy_posting.shares_delta != signal.planned_shares
+        ):
+            return None
+        mechanics = ReplayMechanicsResult(
+            ReplayMechanicsStatus.RESOLVED,
+            exit_reason="ENTRY_ONLY",
+            observation_ids=(
+                lifecycle.trigger_observation_id,
+                lifecycle.quote_observation_id,
+            ),
+            entry_fill_price=money_from_micros(lifecycle.price_micros),
+            entry_status=lifecycle.to_status,
+        )
+        return ReplayCase(
+            session_date=session_date,
+            domain_results=tuple(
+                ReplayDomainResult(
+                    component,
+                    ReplayDomainStatus.PASSED,
+                )
+                for component in ReplayDomainComponent
+            ),
+            mechanics=mechanics,
+        )
+
+    def _historical_replay_evidence_from_phase1(
+        self,
+        source: Phase1CanonicalReplaySource,
+        *,
+        session_date: date,
+        report_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> tuple[_HistoricalReplayEvidencePlan, ...]:
+        signal = next(
+            (
+                item
+                for item in source.signal_sources
+                if item.publication_session == session_date
+                and item.role == "PRIMARY"
+            ),
+            None,
+        )
+        entry = next(
+            (
+                item
+                for item in source.entry_sources
+                if signal is not None
+                and item.signal_source.signal_id == signal.signal_id
+                and item.completion.session_date == session_date
+            ),
+            None,
+        )
+        if signal is None or entry is None:
+            return ()
+        if not entry.observations:
+            return ()
+
+        plans: list[_HistoricalReplayEvidencePlan] = []
+        provider = entry.observations[0]
+        source_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_SOURCE_OBSERVATION_COLUMNS)
+            + " FROM source_observations WHERE id = ?",
+            (provider.source_observation_id,),
+        ).fetchone()
+        payload_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SOURCE_PAYLOAD_COLUMNS)
+            + " FROM phase1_source_payloads WHERE source_observation_id = ?",
+            (provider.source_observation_id,),
+        ).fetchone()
+        if source_row is None or payload_row is None:
+            return tuple(plans)
+        try:
+            details = _canonical_stored_details(
+                source_row[12], label="historical replay provider source"
+            )
+            external_id = _require_nonempty_text(
+                details.get("source_observation_id"),
+                "historical replay provider source observation ID",
+            )
+        except (InvalidJournalValue, MigrationCorruption):
+            return tuple(plans)
+        if (
+            str(source_row[2]) != provider.source_payload_sha256
+            or str(payload_row[2]) != provider.source_payload_sha256
+            or bytes(payload_row[3]) != provider.source_payload
+            or _parse_canonical_timestamp(str(source_row[8])) > report_cutoff
+        ):
+            return tuple(plans)
+        source_reference = _journal_row_reference(
+            "source_observations", _SOURCE_OBSERVATION_COLUMNS, source_row
+        )
+        payload_reference = _journal_row_reference(
+            "phase1_source_payloads", _PHASE1_SOURCE_PAYLOAD_COLUMNS, payload_row
+        )
+        if source_reference not in provider.row_references or (
+            payload_reference not in provider.row_references
+        ):
+            return tuple(plans)
+        plans.append(
+            _HistoricalReplayEvidencePlan(
+                role="SOURCE_EVIDENCE",
+                evidence_ordinal=3,
+                subject=signal.symbol,
+                source_kind="PROVIDER_FACT",
+                source_observation_row_id=provider.source_observation_id,
+                external_source_observation_id=external_id,
+                source_item_ordinal=provider.source_item_ordinal,
+                source_item_path=provider.source_item_path,
+                payload_sha256=provider.source_payload_sha256,
+                content_sha256=provider.source_observation_sha256,
+                authority_digest=entry.source_digest,
+                effective_at=provider.source_time,
+                published_at=provider.source_time,
+                retrieved_at=provider.received_at,
+                row_references=(source_reference, payload_reference),
+            )
+        )
+        return tuple(plans)
+
+    def _archive_historical_replay_source(
+        self,
+        *,
+        run_id: str,
+        session_dates: tuple[date, ...],
+        query_cutoff: datetime,
+        calendar_digest: str,
+        policy_digest: str,
+        date_plans: tuple[_HistoricalReplayDatePlan, ...],
+        recorded_at: datetime,
+    ) -> None:
+        if not self._transaction_active or not self._transaction_dirty:
+            raise JournalError(
+                "historical replay archive requires an active write transaction"
+            )
+        if tuple(item.session_date for item in date_plans) != session_dates:
+            raise JournalError("historical replay date plans are inconsistent")
+        stored_cutoff = _canonical_timestamp(query_cutoff)
+        stored_recorded_at = _canonical_timestamp(recorded_at)
+        date_highwater = int(
+            _sql(
+                self._connection,
+                "SELECT COALESCE(max(id), 0) FROM historical_replay_dates",
+            ).fetchone()[0]
+        )
+        evidence_highwater = int(
+            _sql(
+                self._connection,
+                "SELECT COALESCE(max(id), 0) FROM historical_replay_evidence",
+            ).fetchone()[0]
+        )
+        total_evidence = sum(len(item.evidence) for item in date_plans)
+        predicted_date_terminal = date_highwater + len(date_plans)
+        predicted_evidence_terminal = (
+            None
+            if total_evidence == 0
+            else evidence_highwater + total_evidence
+        )
+        source_observation_highwater = max(
+            (
+                evidence.source_observation_row_id
+                for item in date_plans
+                for evidence in item.evidence
+            ),
+            default=0,
+        )
+        cursors_json = _canonical_audit_json(
+            {
+                "date_terminal_cursor": predicted_date_terminal,
+                "evidence_terminal_cursor": predicted_evidence_terminal,
+            }
+        )
+        highwaters_json = _canonical_audit_json(
+            {
+                "source_observation_highwater": (
+                    source_observation_highwater
+                )
+            }
+        )
+        run_references = tuple(
+            reference
+            for item in date_plans
+            for reference in (
+                *item.row_references,
+                *(
+                    nested
+                    for evidence in item.evidence
+                    for nested in evidence.row_references
+                ),
+            )
+        )
+        run_references_json = _historical_replay_references_json(run_references)
+
+        prepared_dates: list[
+            tuple[
+                tuple[object, ...],
+                tuple[tuple[object, ...], ...],
+            ]
+        ] = []
+        date_source_digests: list[str] = []
+        for plan in date_plans:
+            replay_date_id = _historical_replay_stable_id(
+                "stock-monitor/historical-replay-date/v1",
+                run_id,
+                plan.session_date.isoformat(),
+            )
+            prepared_evidence: list[tuple[object, ...]] = []
+            evidence_source_digests: list[str] = []
+            for evidence in plan.evidence:
+                replay_evidence_id = _historical_replay_stable_id(
+                    "stock-monitor/historical-replay-evidence/v1",
+                    replay_date_id,
+                    evidence.role,
+                )
+                evidence_source_digest = _journal_bundle_digest(
+                    "stock-monitor/historical-replay-evidence-source/v1",
+                    evidence.row_references,
+                    {
+                        "replay_evidence_id": replay_evidence_id,
+                        "replay_date_id": replay_date_id,
+                        "role": evidence.role,
+                        "evidence_ordinal": evidence.evidence_ordinal,
+                        "subject": evidence.subject,
+                        "source_kind": evidence.source_kind,
+                        "source_observation_id": (
+                            evidence.source_observation_row_id
+                        ),
+                        "external_source_observation_id": (
+                            evidence.external_source_observation_id
+                        ),
+                        "source_item_ordinal": evidence.source_item_ordinal,
+                        "source_item_path": evidence.source_item_path,
+                        "payload_sha256": evidence.payload_sha256,
+                        "content_sha256": evidence.content_sha256,
+                        "authority_digest": evidence.authority_digest,
+                        "effective_at": _canonical_timestamp(
+                            evidence.effective_at
+                        ),
+                        "published_at": _canonical_timestamp(
+                            evidence.published_at
+                        ),
+                        "retrieved_at": _canonical_timestamp(
+                            evidence.retrieved_at
+                        ),
+                        "recorded_at": stored_recorded_at,
+                    },
+                )
+                values_without_hash = (
+                    replay_evidence_id,
+                    replay_date_id,
+                    evidence.role,
+                    evidence.evidence_ordinal,
+                    evidence.subject,
+                    evidence.source_kind,
+                    evidence.source_observation_row_id,
+                    evidence.external_source_observation_id,
+                    evidence.source_item_ordinal,
+                    evidence.source_item_path,
+                    evidence.payload_sha256,
+                    evidence.content_sha256,
+                    evidence.authority_digest,
+                    _canonical_timestamp(evidence.effective_at),
+                    _canonical_timestamp(evidence.published_at),
+                    _canonical_timestamp(evidence.retrieved_at),
+                    stored_recorded_at,
+                    evidence_source_digest,
+                )
+                record_sha256 = _historical_replay_record_digest(
+                    _HISTORICAL_REPLAY_EVIDENCE_COLUMNS,
+                    values_without_hash,
+                )
+                prepared_evidence.append(
+                    (*values_without_hash, record_sha256)
+                )
+                evidence_source_digests.append(evidence_source_digest)
+            date_source_digest = _journal_bundle_digest(
+                "stock-monitor/historical-replay-date-source/v1",
+                (
+                    *plan.row_references,
+                    *(
+                        reference
+                        for evidence in plan.evidence
+                        for reference in evidence.row_references
+                    ),
+                ),
+                {
+                    "replay_date_id": replay_date_id,
+                    "run_id": run_id,
+                    "session_date": plan.session_date.isoformat(),
+                    "report_cutoff": _canonical_timestamp(
+                        plan.report_cutoff
+                    ),
+                    "expected_role_count": 3,
+                    "expected_evidence_count": 3,
+                    "case_digest": plan.case_digest,
+                    "domain_input_digest": plan.domain_input_digest,
+                    "mechanics_digest": plan.mechanics_digest,
+                    "completion_digest": plan.completion_digest,
+                    "evidence_source_digests": evidence_source_digests,
+                    "completed_at": stored_recorded_at,
+                },
+            )
+            date_values_without_hash = (
+                replay_date_id,
+                run_id,
+                plan.session_date.isoformat(),
+                _canonical_timestamp(plan.report_cutoff),
+                3,
+                3,
+                plan.case_digest,
+                plan.domain_input_digest,
+                plan.mechanics_digest,
+                plan.completion_digest,
+                _historical_replay_references_json(plan.row_references),
+                stored_recorded_at,
+                stored_recorded_at,
+                date_source_digest,
+            )
+            date_record_sha256 = _historical_replay_record_digest(
+                _HISTORICAL_REPLAY_DATE_COLUMNS,
+                date_values_without_hash,
+            )
+            prepared_dates.append(
+                (
+                    (*date_values_without_hash, date_record_sha256),
+                    tuple(prepared_evidence),
+                )
+            )
+            date_source_digests.append(date_source_digest)
+
+        run_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-source/v1",
+            run_references,
+            {
+                "run_id": run_id,
+                "tier": "STRICT_POINT_IN_TIME",
+                "started_session": session_dates[0].isoformat(),
+                "ended_session": session_dates[-1].isoformat(),
+                "query_cutoff": stored_cutoff,
+                "calendar_digest": calendar_digest,
+                "policy_digest": policy_digest,
+                "expected_date_count": len(session_dates),
+                "cursors_json": cursors_json,
+                "highwaters_json": highwaters_json,
+                "date_source_digests": date_source_digests,
+                "recorded_at": stored_recorded_at,
+            },
+        )
+        run_values_without_hash = (
+            run_id,
+            "STRICT_POINT_IN_TIME",
+            session_dates[0].isoformat(),
+            session_dates[-1].isoformat(),
+            stored_cutoff,
+            calendar_digest,
+            policy_digest,
+            len(session_dates),
+            cursors_json,
+            highwaters_json,
+            run_references_json,
+            stored_recorded_at,
+            run_source_digest,
+        )
+        run_record_sha256 = _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_RUN_COLUMNS,
+            run_values_without_hash,
+        )
+        seal_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-seal/v1",
+            run_references,
+            {
+                "run_id": run_id,
+                "expected_date_count": len(session_dates),
+                "actual_date_count": len(date_plans),
+                "actual_evidence_count": total_evidence,
+                "date_terminal_cursor": predicted_date_terminal,
+                "evidence_terminal_cursor": predicted_evidence_terminal,
+                "source_observation_highwater": (
+                    source_observation_highwater
+                ),
+                "sealed_at": stored_recorded_at,
+                "run_source_digest": run_source_digest,
+            },
+        )
+        seal_values_without_hash = (
+            run_id,
+            len(session_dates),
+            len(date_plans),
+            total_evidence,
+            predicted_date_terminal,
+            predicted_evidence_terminal,
+            source_observation_highwater,
+            stored_recorded_at,
+            seal_source_digest,
+        )
+        seal_record_sha256 = _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_SEAL_COLUMNS,
+            seal_values_without_hash,
+        )
+        phase2_write_plan = frozenset(
+            {
+                (
+                    "historical_replay_runs",
+                    run_record_sha256,
+                    tuple(run_values_without_hash),
+                ),
+                (
+                    "historical_replay_run_seals",
+                    seal_record_sha256,
+                    tuple(seal_values_without_hash),
+                ),
+                *(
+                    (
+                        "historical_replay_dates",
+                        str(date_row[-1]),
+                        tuple(date_row[:-1]),
+                    )
+                    for date_row, _evidence_rows in prepared_dates
+                ),
+                *(
+                    (
+                        "historical_replay_evidence",
+                        str(evidence_row[-1]),
+                        tuple(evidence_row[:-1]),
+                    )
+                    for _date_row, evidence_rows in prepared_dates
+                    for evidence_row in evidence_rows
+                ),
+            }
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO historical_replay_runs("
+                + ", ".join(_HISTORICAL_REPLAY_RUN_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join(
+                    "?" for _ in (*run_values_without_hash, run_record_sha256)
+                )
+                + ")",
+                (*run_values_without_hash, run_record_sha256),
+            )
+            for date_row, evidence_rows in prepared_dates:
+                _sql(
+                    self._connection,
+                    "INSERT INTO historical_replay_dates("
+                    + ", ".join(_HISTORICAL_REPLAY_DATE_COLUMNS[1:])
+                    + ") VALUES ("
+                    + ", ".join(
+                        "?" for _ in date_row
+                    )
+                    + ")",
+                    date_row,
+                )
+                for evidence_row in evidence_rows:
+                    _sql(
+                        self._connection,
+                        "INSERT INTO historical_replay_evidence("
+                        + ", ".join(
+                            _HISTORICAL_REPLAY_EVIDENCE_COLUMNS[1:]
+                        )
+                        + ") VALUES ("
+                        + ", ".join("?" for _ in evidence_row)
+                        + ")",
+                        evidence_row,
+                    )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "historical replay archive conflicts with stored content"
+            ) from error
+
+        actual_date_terminal = int(
+            _sql(
+                self._connection,
+                "SELECT max(id) FROM historical_replay_dates "
+                "WHERE replay_run_id = ? COLLATE BINARY",
+                (run_id,),
+            ).fetchone()[0]
+        )
+        evidence_cursor_row = _sql(
+            self._connection,
+            "SELECT max(evidence.id) FROM historical_replay_evidence AS evidence "
+            "JOIN historical_replay_dates AS replay_date "
+            "ON replay_date.replay_date_id = evidence.replay_date_id "
+            "WHERE replay_date.replay_run_id = ? COLLATE BINARY",
+            (run_id,),
+        ).fetchone()
+        actual_evidence_terminal = (
+            None
+            if evidence_cursor_row is None or evidence_cursor_row[0] is None
+            else int(evidence_cursor_row[0])
+        )
+        if (
+            actual_date_terminal != predicted_date_terminal
+            or actual_evidence_terminal != predicted_evidence_terminal
+        ):
+            raise JournalError("historical replay cursor allocation changed")
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO historical_replay_run_seals("
+                + ", ".join(_HISTORICAL_REPLAY_SEAL_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join(
+                    "?" for _ in (*seal_values_without_hash, seal_record_sha256)
+                )
+                + ")",
+                (*seal_values_without_hash, seal_record_sha256),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "historical replay seal conflicts with stored content"
+            ) from error
+
+    def _historical_replay_references_from_json(
+        self,
+        value: object,
+        *,
+        label: str,
+    ) -> tuple[JournalRowReference, ...]:
+        if type(value) is not str:
+            raise MigrationCorruption(f"{label} row references are malformed")
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                f"{label} row references are malformed"
+            ) from error
+        if (
+            type(decoded) is not list
+            or _canonical_audit_json(decoded) != value
+        ):
+            raise MigrationCorruption(
+                f"{label} row references are not canonical"
+            )
+        references: list[JournalRowReference] = []
+        seen: set[tuple[str, int]] = set()
+        for item in decoded:
+            if (
+                type(item) is not list
+                or len(item) != 3
+                or type(item[0]) is not str
+                or type(item[1]) is not int
+                or item[1] <= 0
+                or type(item[2]) is not str
+            ):
+                raise MigrationCorruption(
+                    f"{label} row reference is malformed"
+                )
+            try:
+                table = _whitelisted_table(item[0])
+                digest = _require_sha256(item[2], f"{label} row digest")
+            except InvalidJournalValue as error:
+                raise MigrationCorruption(
+                    f"{label} row reference is malformed"
+                ) from error
+            key = (table, item[1])
+            if key in seen:
+                raise MigrationCorruption(
+                    f"{label} row references contain duplicates"
+                )
+            seen.add(key)
+            reference = JournalRowReference(table, item[1], digest)
+            if self._historical_replay_current_reference(reference) != reference:
+                raise MigrationCorruption(
+                    f"{label} referenced source row changed"
+                )
+            references.append(reference)
+        if references != sorted(
+            references, key=lambda item: (item.table, item.row_id)
+        ):
+            raise MigrationCorruption(
+                f"{label} row references are not ordered"
+            )
+        return tuple(references)
+
+    def _historical_replay_current_reference(
+        self,
+        reference: JournalRowReference,
+    ) -> JournalRowReference:
+        table = _whitelisted_table(reference.table)
+        column_rows = _sql(
+            self._connection,
+            f"PRAGMA table_info({table})",
+        ).fetchall()
+        columns = tuple(str(row[1]) for row in column_rows)
+        if not columns or columns[0] != "id":
+            raise MigrationCorruption(
+                "historical replay referenced table is malformed"
+            )
+        row = _sql(
+            self._connection,
+            f"SELECT * FROM {table} WHERE id = ?",
+            (reference.row_id,),
+        ).fetchone()
+        if row is None:
+            raise MigrationCorruption(
+                "historical replay referenced row is missing"
+            )
+        return _journal_row_reference(table, columns, row)
+
+    def _historical_replay_source_from_rows(
+        self,
+        run_row: Sequence[object],
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+        policy: object,
+    ) -> HistoricalReplaySource:
+        from .risk import _calendar_digest, _policy_digest
+
+        if len(run_row) != len(_HISTORICAL_REPLAY_RUN_COLUMNS):
+            raise MigrationCorruption("historical replay run row is malformed")
+        if str(run_row[-1]) != _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_RUN_COLUMNS,
+            tuple(run_row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "historical replay run record digest is inconsistent"
+            )
+        try:
+            stored_cutoff = _parse_canonical_timestamp(str(run_row[5]))
+            recorded_at = _parse_canonical_timestamp(str(run_row[12]))
+            started_session = date.fromisoformat(str(run_row[3]))
+            ended_session = date.fromisoformat(str(run_row[4]))
+            calendar_digest = _calendar_digest(calendar_resolver)
+            policy.validate()
+            policy_digest = _policy_digest(policy)
+        except Exception as error:
+            raise InvalidJournalValue(
+                "historical replay read configuration is invalid"
+            ) from error
+        if (
+            query_cutoff != stored_cutoff
+            or str(run_row[2]) != "STRICT_POINT_IN_TIME"
+            or str(run_row[6]) != calendar_digest
+            or str(run_row[7]) != policy_digest
+            or recorded_at < stored_cutoff
+            or started_session > ended_session
+            or type(run_row[0]) is not int
+            or int(run_row[0]) <= 0
+        ):
+            raise InvalidJournalValue(
+                "historical replay read does not match the sealed request"
+            )
+        run_id = str(run_row[1])
+        date_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_DATE_COLUMNS)
+            + " FROM historical_replay_dates "
+            "WHERE replay_run_id = ? COLLATE BINARY ORDER BY session_date, id",
+            (run_id,),
+        ).fetchall()
+        if len(date_rows) != int(run_row[8]):
+            raise MigrationCorruption(
+                "historical replay run date count is inconsistent"
+            )
+        sessions = tuple(date.fromisoformat(str(row[3])) for row in date_rows)
+        report_cutoffs = tuple(
+            _parse_canonical_timestamp(str(row[4])) for row in date_rows
+        )
+        (
+            expected_sessions,
+            _expected_cutoff,
+            _expected_calendar_digest,
+            _expected_policy_digest,
+            expected_report_cutoffs,
+        ) = self._historical_replay_request_configuration(
+            session_dates=sessions,
+            query_cutoff=stored_cutoff,
+            calendar_resolver=calendar_resolver,
+            policy=policy,
+        )
+        if (
+            sessions != expected_sessions
+            or report_cutoffs != expected_report_cutoffs
+            or sessions[0] != started_session
+            or sessions[-1] != ended_session
+        ):
+            raise MigrationCorruption(
+                "historical replay date coverage is inconsistent"
+            )
+        seal_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_SEAL_COLUMNS)
+            + " FROM historical_replay_run_seals "
+            "WHERE replay_run_id = ? COLLATE BINARY",
+            (run_id,),
+        ).fetchone()
+        if seal_row is None or len(seal_row) != len(
+            _HISTORICAL_REPLAY_SEAL_COLUMNS
+        ):
+            raise MigrationCorruption("historical replay run is not sealed")
+        if str(seal_row[-1]) != _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_SEAL_COLUMNS,
+            tuple(seal_row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "historical replay seal record digest is inconsistent"
+            )
+
+        date_sources: list[HistoricalReplayDateSource] = []
+        all_evidence_sources: list[HistoricalReplayEvidenceSource] = []
+        date_source_digests: list[str] = []
+        for date_row in date_rows:
+            date_source, evidence_sources = (
+                self._historical_replay_date_source_from_row(
+                    date_row,
+                    calendar_resolver=calendar_resolver,
+                    policy=policy,
+                )
+            )
+            date_sources.append(date_source)
+            all_evidence_sources.extend(evidence_sources)
+            date_source_digests.append(date_source.source_digest)
+
+        actual_date_terminal = max(item.row_id for item in date_sources)
+        actual_evidence_terminal = (
+            None
+            if not all_evidence_sources
+            else max(item.row_id for item in all_evidence_sources)
+        )
+        source_observation_highwater = max(
+            (
+                item.source_observation_row_id
+                for item in all_evidence_sources
+            ),
+            default=0,
+        )
+        try:
+            cursors = json.loads(str(run_row[9]))
+            highwaters = json.loads(str(run_row[10]))
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                "historical replay run cursors are malformed"
+            ) from error
+        expected_cursors = {
+            "date_terminal_cursor": actual_date_terminal,
+            "evidence_terminal_cursor": actual_evidence_terminal,
+        }
+        expected_highwaters = {
+            "source_observation_highwater": source_observation_highwater,
+        }
+        if (
+            type(cursors) is not dict
+            or type(highwaters) is not dict
+            or cursors != expected_cursors
+            or highwaters != expected_highwaters
+            or _canonical_audit_json(cursors) != str(run_row[9])
+            or _canonical_audit_json(highwaters) != str(run_row[10])
+            or int(seal_row[2]) != len(date_sources)
+            or int(seal_row[3]) != len(date_sources)
+            or int(seal_row[4]) != len(all_evidence_sources)
+            or int(seal_row[5]) != actual_date_terminal
+            or (
+                None if seal_row[6] is None else int(seal_row[6])
+            )
+            != actual_evidence_terminal
+            or int(seal_row[7]) != source_observation_highwater
+            or _parse_canonical_timestamp(str(seal_row[8])) < recorded_at
+        ):
+            raise MigrationCorruption(
+                "historical replay seal cursors are inconsistent"
+            )
+        run_references = self._historical_replay_references_from_json(
+            run_row[11], label="historical replay run"
+        )
+        expected_run_references = tuple(
+            sorted(
+                {
+                    (reference.table, reference.row_id): reference
+                    for date_source in date_sources
+                    for reference in date_source.row_references
+                    if reference.table
+                    not in {
+                        "historical_replay_dates",
+                        "historical_replay_evidence",
+                    }
+                }.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        if run_references != expected_run_references:
+            raise MigrationCorruption(
+                "historical replay run source references are inconsistent"
+            )
+        expected_run_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-source/v1",
+            run_references,
+            {
+                "run_id": run_id,
+                "tier": "STRICT_POINT_IN_TIME",
+                "started_session": started_session.isoformat(),
+                "ended_session": ended_session.isoformat(),
+                "query_cutoff": _canonical_timestamp(stored_cutoff),
+                "calendar_digest": calendar_digest,
+                "policy_digest": policy_digest,
+                "expected_date_count": len(date_sources),
+                "cursors_json": str(run_row[9]),
+                "highwaters_json": str(run_row[10]),
+                "date_source_digests": date_source_digests,
+                "recorded_at": _canonical_timestamp(recorded_at),
+            },
+        )
+        if str(run_row[13]) != expected_run_source_digest:
+            raise MigrationCorruption(
+                "historical replay run source digest is inconsistent"
+            )
+        expected_seal_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-seal/v1",
+            run_references,
+            {
+                "run_id": run_id,
+                "expected_date_count": len(date_sources),
+                "actual_date_count": len(date_sources),
+                "actual_evidence_count": len(all_evidence_sources),
+                "date_terminal_cursor": actual_date_terminal,
+                "evidence_terminal_cursor": actual_evidence_terminal,
+                "source_observation_highwater": source_observation_highwater,
+                "sealed_at": str(seal_row[8]),
+                "run_source_digest": expected_run_source_digest,
+            },
+        )
+        if str(seal_row[9]) != expected_seal_source_digest:
+            raise MigrationCorruption(
+                "historical replay seal source digest is inconsistent"
+            )
+        run_reference = _journal_row_reference(
+            "historical_replay_runs",
+            _HISTORICAL_REPLAY_RUN_COLUMNS,
+            run_row,
+        )
+        seal_reference = _journal_row_reference(
+            "historical_replay_run_seals",
+            _HISTORICAL_REPLAY_SEAL_COLUMNS,
+            seal_row,
+        )
+        source_references = tuple(
+            sorted(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in (
+                        *run_references,
+                        *(
+                            reference
+                            for date_source in date_sources
+                            for reference in date_source.row_references
+                        ),
+                        run_reference,
+                        seal_reference,
+                    )
+                }.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        source = HistoricalReplaySource(
+            row_id=int(run_row[0]),
+            run_id=run_id,
+            tier="STRICT_POINT_IN_TIME",
+            query_cutoff=stored_cutoff,
+            calendar_digest=calendar_digest,
+            policy_digest=policy_digest,
+            date_sources=tuple(date_sources),
+            expected_date_count=len(date_sources),
+            cursors=(
+                ("date_terminal_cursor", actual_date_terminal),
+                ("evidence_terminal_cursor", actual_evidence_terminal),
+            ),
+            highwaters=(
+                ("source_observation_highwater", source_observation_highwater),
+            ),
+            row_references=source_references,
+            source_digest=expected_run_source_digest,
+        )
+        return source
+
+    def _historical_replay_date_source_from_row(
+        self,
+        date_row: Sequence[object],
+        *,
+        calendar_resolver: object,
+        policy: object,
+    ) -> tuple[
+        HistoricalReplayDateSource,
+        tuple[HistoricalReplayEvidenceSource, ...],
+    ]:
+        if len(date_row) != len(_HISTORICAL_REPLAY_DATE_COLUMNS):
+            raise MigrationCorruption("historical replay date row is malformed")
+        if str(date_row[-1]) != _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_DATE_COLUMNS,
+            tuple(date_row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "historical replay date record digest is inconsistent"
+            )
+        replay_date_id = str(date_row[1])
+        session_date = date.fromisoformat(str(date_row[3]))
+        report_cutoff = _parse_canonical_timestamp(str(date_row[4]))
+        completed_at = _parse_canonical_timestamp(str(date_row[12]))
+        recorded_at = _parse_canonical_timestamp(str(date_row[13]))
+        if (
+            int(date_row[5]) != 3
+            or int(date_row[6]) != 3
+            or report_cutoff > completed_at
+            or completed_at > recorded_at
+        ):
+            raise MigrationCorruption(
+                "historical replay date boundary is inconsistent"
+            )
+        source_references = self._historical_replay_references_from_json(
+            date_row[11], label="historical replay date"
+        )
+        evidence_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_EVIDENCE_COLUMNS)
+            + " FROM historical_replay_evidence "
+            "WHERE replay_date_id = ? COLLATE BINARY ORDER BY evidence_ordinal, id",
+            (replay_date_id,),
+        ).fetchall()
+        evidence_sources = tuple(
+            self._historical_replay_evidence_source_from_row(
+                row,
+                report_cutoff=report_cutoff,
+            )
+            for row in evidence_rows
+        )
+        evidence_plans = tuple(
+            _HistoricalReplayEvidencePlan(
+                role=item.role,
+                evidence_ordinal=item.evidence_ordinal,
+                subject=item.subject,
+                source_kind=item.source_kind,
+                source_observation_row_id=item.source_observation_row_id,
+                external_source_observation_id=(
+                    item.external_source_observation_id
+                ),
+                source_item_ordinal=item.source_item_ordinal,
+                source_item_path=item.source_item_path,
+                payload_sha256=item.payload_sha256,
+                content_sha256=item.content_sha256,
+                authority_digest=item.authority_digest,
+                effective_at=item.effective_at,
+                published_at=item.published_at,
+                retrieved_at=item.retrieved_at,
+                row_references=tuple(
+                    reference
+                    for reference in item.row_references
+                    if reference.table != "historical_replay_evidence"
+                ),
+            )
+            for item in evidence_sources
+        )
+        expected_completion_digest = _historical_replay_completion_digest(
+            session_date=session_date,
+            report_cutoff=report_cutoff,
+            evidence=evidence_plans,
+            case_digest=str(date_row[7]),
+            domain_input_digest=str(date_row[8]),
+            mechanics_digest=str(date_row[9]),
+        )
+        if str(date_row[10]) != expected_completion_digest:
+            raise MigrationCorruption(
+                "historical replay date completion digest is inconsistent"
+            )
+        expected_date_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-date-source/v1",
+            (
+                *source_references,
+                *(
+                    reference
+                    for item in evidence_plans
+                    for reference in item.row_references
+                ),
+            ),
+            {
+                "replay_date_id": replay_date_id,
+                "run_id": str(date_row[2]),
+                "session_date": session_date.isoformat(),
+                "report_cutoff": _canonical_timestamp(report_cutoff),
+                "expected_role_count": 3,
+                "expected_evidence_count": 3,
+                "case_digest": str(date_row[7]),
+                "domain_input_digest": str(date_row[8]),
+                "mechanics_digest": str(date_row[9]),
+                "completion_digest": str(date_row[10]),
+                "evidence_source_digests": [
+                    item.source_digest for item in evidence_sources
+                ],
+                "completed_at": _canonical_timestamp(completed_at),
+            },
+        )
+        if str(date_row[14]) != expected_date_source_digest:
+            raise MigrationCorruption(
+                "historical replay date source digest is inconsistent"
+            )
+        date_reference = _journal_row_reference(
+            "historical_replay_dates",
+            _HISTORICAL_REPLAY_DATE_COLUMNS,
+            date_row,
+        )
+        row_references = tuple(
+            sorted(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in (
+                        *source_references,
+                        *(
+                            reference
+                            for item in evidence_sources
+                            for reference in item.row_references
+                        ),
+                        date_reference,
+                    )
+                }.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        source = HistoricalReplayDateSource(
+            row_id=int(date_row[0]),
+            replay_date_id=replay_date_id,
+            run_id=str(date_row[2]),
+            session_date=session_date,
+            report_cutoff=report_cutoff,
+            evidence_sources=evidence_sources,
+            expected_role_count=3,
+            expected_evidence_count=3,
+            case_digest=str(date_row[7]),
+            domain_input_digest=str(date_row[8]),
+            mechanics_digest=str(date_row[9]),
+            completion_digest=str(date_row[10]),
+            completed_at=completed_at,
+            row_references=row_references,
+            source_digest=expected_date_source_digest,
+        )
+        return source, evidence_sources
+
+    def _historical_replay_evidence_source_from_row(
+        self,
+        row: Sequence[object],
+        *,
+        report_cutoff: datetime,
+    ) -> HistoricalReplayEvidenceSource:
+        if len(row) != len(_HISTORICAL_REPLAY_EVIDENCE_COLUMNS):
+            raise MigrationCorruption(
+                "historical replay evidence row is malformed"
+            )
+        if str(row[-1]) != _historical_replay_record_digest(
+            _HISTORICAL_REPLAY_EVIDENCE_COLUMNS,
+            tuple(row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "historical replay evidence record digest is inconsistent"
+            )
+        source_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_SOURCE_OBSERVATION_COLUMNS)
+            + " FROM source_observations WHERE id = ?",
+            (int(row[7]),),
+        ).fetchone()
+        payload_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SOURCE_PAYLOAD_COLUMNS)
+            + " FROM phase1_source_payloads WHERE source_observation_id = ?",
+            (int(row[7]),),
+        ).fetchone()
+        if source_row is None or payload_row is None:
+            raise MigrationCorruption(
+                "historical replay evidence source is missing"
+            )
+        source_reference = _journal_row_reference(
+            "source_observations", _SOURCE_OBSERVATION_COLUMNS, source_row
+        )
+        payload_reference = _journal_row_reference(
+            "phase1_source_payloads", _PHASE1_SOURCE_PAYLOAD_COLUMNS, payload_row
+        )
+        effective_at = _parse_canonical_timestamp(str(row[14]))
+        published_at = _parse_canonical_timestamp(str(row[15]))
+        retrieved_at = _parse_canonical_timestamp(str(row[16]))
+        recorded_at = _parse_canonical_timestamp(str(row[17]))
+        expected_source_digest = _journal_bundle_digest(
+            "stock-monitor/historical-replay-evidence-source/v1",
+            (source_reference, payload_reference),
+            {
+                "replay_evidence_id": str(row[1]),
+                "replay_date_id": str(row[2]),
+                "role": str(row[3]),
+                "evidence_ordinal": int(row[4]),
+                "subject": str(row[5]),
+                "source_kind": str(row[6]),
+                "source_observation_id": int(row[7]),
+                "external_source_observation_id": str(row[8]),
+                "source_item_ordinal": int(row[9]),
+                "source_item_path": str(row[10]),
+                "payload_sha256": str(row[11]),
+                "content_sha256": str(row[12]),
+                "authority_digest": str(row[13]),
+                "effective_at": _canonical_timestamp(effective_at),
+                "published_at": _canonical_timestamp(published_at),
+                "retrieved_at": _canonical_timestamp(retrieved_at),
+                "recorded_at": _canonical_timestamp(recorded_at),
+            },
+        )
+        if (
+            str(row[18]) != expected_source_digest
+            or str(source_row[2]) != str(row[11])
+            or str(payload_row[2]) != str(row[11])
+            or str(source_row[7]) != str(row[15])
+            or str(source_row[8]) != str(row[16])
+            or retrieved_at > report_cutoff
+            or effective_at > retrieved_at
+            or published_at > retrieved_at
+            or retrieved_at > recorded_at
+        ):
+            raise MigrationCorruption(
+                "historical replay evidence source is inconsistent"
+            )
+        evidence_reference = _journal_row_reference(
+            "historical_replay_evidence",
+            _HISTORICAL_REPLAY_EVIDENCE_COLUMNS,
+            row,
+        )
+        source = HistoricalReplayEvidenceSource(
+            row_id=int(row[0]),
+            replay_evidence_id=str(row[1]),
+            replay_date_id=str(row[2]),
+            role=str(row[3]),
+            evidence_ordinal=int(row[4]),
+            subject=str(row[5]),
+            source_kind=str(row[6]),
+            source_observation_row_id=int(row[7]),
+            external_source_observation_id=str(row[8]),
+            source_item_ordinal=int(row[9]),
+            source_item_path=str(row[10]),
+            payload_sha256=str(row[11]),
+            content_sha256=str(row[12]),
+            authority_digest=str(row[13]),
+            effective_at=effective_at,
+            published_at=published_at,
+            retrieved_at=retrieved_at,
+            row_references=(
+                source_reference,
+                payload_reference,
+                evidence_reference,
+            ),
+            source_digest=expected_source_digest,
+        )
+        return source
+
+    def _rederive_historical_replay_case_source(
+        self,
+        source: HistoricalReplayDateSource,
+    ) -> object | None:
+        if (
+            type(source) is not HistoricalReplayDateSource
+            or _phase2_source_owner(source) is not self
+        ):
+            return None
+        context = self._historical_replay_date_contexts.get(id(source))
+        if context is None or context[0]() is not source:
+            return None
+        calendar_resolver, policy = context[1], context[2]
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_HISTORICAL_REPLAY_DATE_COLUMNS)
+            + " FROM historical_replay_dates WHERE id = ? "
+            "AND replay_date_id = ? COLLATE BINARY",
+            (source.row_id, source.replay_date_id),
+        ).fetchone()
+        if (
+            row is None
+            or str(row[-1])
+            != _historical_replay_record_digest(
+                _HISTORICAL_REPLAY_DATE_COLUMNS,
+                tuple(row[1:-1]),
+            )
+            or str(row[14]) != source.source_digest
+            or str(row[7]) != source.case_digest
+            or str(row[8]) != source.domain_input_digest
+            or str(row[9]) != source.mechanics_digest
+            or str(row[10]) != source.completion_digest
+        ):
+            return None
+        stored_references = self._historical_replay_references_from_json(
+            row[11], label="historical replay rederivation"
+        )
+        try:
+            canonical_source = self._read_phase1_canonical_replay_source(
+                query_cutoff=source.report_cutoff,
+                calendar_resolver=calendar_resolver,
+                policy=policy,
+            )
+        except (InvalidJournalValue, MigrationCorruption):
+            return None
+        current_references = tuple(
+            sorted(
+                {
+                    (reference.table, reference.row_id): reference
+                    for reference in canonical_source.row_references
+                }.values(),
+                key=lambda item: (item.table, item.row_id),
+            )
+        )
+        if current_references != stored_references:
+            return None
+        replay_case = self._historical_replay_case_from_phase1(
+            canonical_source,
+            session_date=source.session_date,
+        )
+        if replay_case is None:
+            return None
+        case_digest, domain_input_digest, mechanics_digest = (
+            _historical_replay_case_digests(
+                replay_case,
+                phase1_source_digest=canonical_source.source_digest,
+            )
+        )
+        if (
+            case_digest != source.case_digest
+            or domain_input_digest != source.domain_input_digest
+            or mechanics_digest != source.mechanics_digest
+        ):
+            return None
+        return replay_case
+
+    def _phase2_window_source_from_row(
+        self,
+        row: Sequence[object],
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase2WindowSource:
+        from zoneinfo import ZoneInfo
+
+        from .risk import SessionCalendarResolver, _calendar_digest
+        from .validation import PromotionDecision, PromotionStatus, ValidationError
+
+        if len(row) != len(_PHASE2_WINDOW_COLUMNS):
+            raise MigrationCorruption("Phase 2 window row shape is malformed")
+        if str(row[-1]) != _phase2_plain_record_digest(
+            _PHASE2_WINDOW_COLUMNS,
+            tuple(row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "Phase 2 window record digest is inconsistent"
+            )
+        if (
+            type(row[0]) is not int
+            or int(row[0]) <= 0
+            or not isinstance(calendar_resolver, SessionCalendarResolver)
+            or not calendar_resolver.release_verified
+        ):
+            raise MigrationCorruption("Phase 2 window authority is malformed")
+        try:
+            started_session = date.fromisoformat(str(row[10]))
+            promotion_through_session = date.fromisoformat(str(row[6]))
+            promotion_cutoff = _parse_canonical_timestamp(str(row[7]))
+            started_at = _parse_canonical_timestamp(str(row[11]))
+            received_at = _parse_canonical_timestamp(str(row[12]))
+            parsed_signal_ids = json.loads(str(row[5]))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise MigrationCorruption(
+                "Phase 2 window chronology is malformed"
+            ) from error
+        if (
+            started_session.isoformat() != str(row[10])
+            or promotion_through_session.isoformat() != str(row[6])
+            or type(parsed_signal_ids) is not list
+            or not parsed_signal_ids
+            or any(type(item) is not str or not item for item in parsed_signal_ids)
+            or len(set(parsed_signal_ids)) != len(parsed_signal_ids)
+            or _canonical_audit_json(parsed_signal_ids) != str(row[5])
+        ):
+            raise MigrationCorruption("Phase 2 window fields are malformed")
+        promotion_signal_ids = tuple(parsed_signal_ids)
+        calendar_digest = _calendar_digest(calendar_resolver)
+        if str(row[14]) != calendar_digest:
+            raise MigrationCorruption("Phase 2 window calendar is inconsistent")
+        promotion = self.read_phase1_promotion_decision(
+            str(row[2]),
+            through_session=promotion_through_session,
+            query_cutoff=promotion_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        promotion_source = promotion._phase1_source
+        if (
+            type(promotion) is not PromotionDecision
+            or not promotion.passed
+            or promotion.status is not PromotionStatus.PASSED
+            or type(promotion_source) is not Phase1ValidationWindowSource
+            or promotion_source.source_digest != str(row[3])
+            or promotion.authority_digest != str(row[4])
+            or promotion_source.validation_window_id != str(row[2])
+            or promotion_source.through_session != promotion_through_session
+            or promotion_source.query_cutoff != promotion_cutoff
+            or tuple(
+                source.signal_id for source in promotion_source.signal_sources
+            )
+            != promotion_signal_ids
+        ):
+            raise MigrationCorruption(
+                "Phase 2 window promotion lineage is inconsistent"
+            )
+        try:
+            current_promotion = self.read_phase1_promotion_decision(
+                str(row[2]),
+                through_session=promotion_through_session,
+                query_cutoff=query_cutoff,
+                calendar_resolver=calendar_resolver,
+            )
+        except ValidationError as error:
+            raise InvalidJournalValue(
+                "Phase 2 window promotion was revoked at the current cutoff"
+            ) from error
+        if (
+            not current_promotion.passed
+            or current_promotion.status is not PromotionStatus.PASSED
+            or _phase2_promotion_semantics(current_promotion)
+            != _phase2_promotion_semantics(promotion)
+        ):
+            raise InvalidJournalValue(
+                "Phase 2 window promotion was revoked at the current cutoff"
+            )
+        action = self._read_action_source(
+            execution_event_id=int(row[8]),
+        )
+        if (
+            action.domain_kind != "OPTION_PAPER_WINDOW_START"
+            or action.execution_event_id != int(row[8])
+            or action.raw_message_id != int(row[9])
+            or action.event_time != started_at
+            or action.received_at != received_at
+            or promotion_cutoff >= started_at
+            or promotion_cutoff >= received_at
+            or started_at > received_at
+            or started_at.astimezone(ZoneInfo("America/New_York")).date()
+            != started_session
+            or not calendar_resolver.is_open(started_session)
+            or int(row[13]) != 5_000_000_000
+        ):
+            raise MigrationCorruption(
+                "Phase 2 window start lineage is inconsistent"
+            )
+        expected_window_id = _phase2_stable_id(
+            "stock-monitor/phase2-window/v1",
+            promotion_source.validation_window_id,
+            promotion_source.source_digest,
+            str(promotion.authority_digest),
+            action.source_digest,
+            str(action.execution_event_id),
+        )
+        source_references = _phase2_row_references(
+            promotion_source.row_references,
+            action.row_references,
+        )
+        expected_source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-window-source/v1",
+            source_references,
+            {
+                "window_id": expected_window_id,
+                "validation_window_id": promotion_source.validation_window_id,
+                "promotion_source_digest": promotion_source.source_digest,
+                "promotion_decision_digest": promotion.authority_digest,
+                "promotion_signal_ids": list(promotion_signal_ids),
+                "promotion_through_session": (
+                    promotion_through_session.isoformat()
+                ),
+                "promotion_query_cutoff": _canonical_timestamp(
+                    promotion_cutoff
+                ),
+                "start_execution_event_id": action.execution_event_id,
+                "start_raw_message_id": action.raw_message_id,
+                "started_session": started_session.isoformat(),
+                "started_at": _canonical_timestamp(started_at),
+                "received_at": _canonical_timestamp(received_at),
+                "starting_capital_micros": 5_000_000_000,
+                "calendar_digest": calendar_digest,
+            },
+        )
+        if (
+            str(row[1]) != expected_window_id
+            or str(row[15]) != expected_source_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 2 window source digest is inconsistent"
+            )
+        row_reference = _journal_row_reference(
+            "phase2_windows",
+            _PHASE2_WINDOW_COLUMNS,
+            row,
+        )
+        expected_genesis = _phase2_window_genesis_record(
+            row_reference,
+            window_id=expected_window_id,
+            window_source_digest=expected_source_digest,
+            started_session=started_session,
+            started_at=started_at,
+            received_at=received_at,
+        )
+        genesis_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_PHASE2_EQUITY_POINT_COLUMNS)
+            + " FROM phase2_equity_points "
+            "WHERE window_id = ? COLLATE BINARY AND point_kind = 'START'",
+            (expected_window_id,),
+        ).fetchall()
+        if (
+            len(genesis_rows) != 1
+            or type(genesis_rows[0][0]) is not int
+            or int(genesis_rows[0][0]) <= 0
+            or tuple(genesis_rows[0][1:]) != expected_genesis
+        ):
+            raise MigrationCorruption(
+                "Phase 2 window genesis lineage is inconsistent"
+            )
+        genesis_reference = _journal_row_reference(
+            "phase2_equity_points",
+            _PHASE2_EQUITY_POINT_COLUMNS,
+            genesis_rows[0],
+        )
+        references = _phase2_row_references(
+            (row_reference, genesis_reference),
+            source_references,
+        )
+        return Phase2WindowSource(
+            row_id=int(row[0]),
+            window_id=expected_window_id,
+            validation_window_id=promotion_source.validation_window_id,
+            promotion_source=promotion_source,
+            promotion_decision_digest=str(promotion.authority_digest),
+            promotion_signal_ids=promotion_signal_ids,
+            promotion_query_cutoff=promotion_cutoff,
+            start_action=action,
+            started_session=started_session,
+            started_at=started_at,
+            received_at=received_at,
+            starting_capital_micros=5_000_000_000,
+            calendar_digest=calendar_digest,
+            query_cutoff=received_at,
+            row_references=references,
+            source_digest=expected_source_digest,
+        )
+
+    def _phase2_authorization_source_from_row(
+        self,
+        row: Sequence[object],
+        *,
+        query_cutoff: datetime,
+        calendar_resolver: object,
+    ) -> Phase2AuthorizationSource:
+        from .options_paper import OptionPaperError, _issue_phase2_authorization
+        from .validation import _issue_phase1_promotion_from_journal_source
+
+        if len(row) != len(_PHASE2_AUTHORIZATION_COLUMNS):
+            raise MigrationCorruption(
+                "Phase 2 authorization row shape is malformed"
+            )
+        if str(row[-1]) != _phase2_plain_record_digest(
+            _PHASE2_AUTHORIZATION_COLUMNS,
+            tuple(row[1:-1]),
+        ):
+            raise MigrationCorruption(
+                "Phase 2 authorization record digest is inconsistent"
+            )
+        try:
+            authorized_at = _parse_canonical_timestamp(str(row[6]))
+            received_at = _parse_canonical_timestamp(str(row[7]))
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                "Phase 2 authorization chronology is malformed"
+            ) from error
+        if (
+            type(row[0]) is not int
+            or int(row[0]) <= 0
+            or authorized_at != received_at
+            or received_at > query_cutoff
+        ):
+            raise MigrationCorruption(
+                "Phase 2 authorization fields are malformed"
+            )
+        window = self.read_phase2_window_source(
+            str(row[2]),
+            query_cutoff=query_cutoff,
+            calendar_resolver=calendar_resolver,
+        )
+        if window is None:
+            raise MigrationCorruption(
+                "Phase 2 authorization window is unavailable"
+            )
+        signal = self._read_phase1_signal_source(
+            str(row[3]),
+            query_cutoff=received_at,
+        )
+        if (
+            signal.source_digest != str(row[4])
+            or not phase2_sources_share_owner(window, signal)
+            or authorized_at != max(window.query_cutoff, signal.query_cutoff)
+        ):
+            raise MigrationCorruption(
+                "Phase 2 authorization signal lineage is inconsistent"
+            )
+        promotion = _issue_phase1_promotion_from_journal_source(
+            window.promotion_source,
+            calendar_resolver=calendar_resolver,
+        )
+        try:
+            domain_authorization = _issue_phase2_authorization(
+                promotion_decision=promotion,
+                window_source=window,
+                signal_source=signal,
+                issued_at=authorized_at,
+            )
+        except OptionPaperError as error:
+            raise MigrationCorruption(
+                "Phase 2 authorization cannot be reissued"
+            ) from error
+        authorization_digest = domain_authorization.source_digest
+        expected_authorization_id = _phase2_stable_id(
+            "stock-monitor/phase2-authorization/v1",
+            window.window_id,
+            signal.signal_id,
+            authorization_digest,
+        )
+        source_references = _phase2_row_references(
+            window.row_references,
+            signal.row_references,
+        )
+        expected_source_digest = _journal_bundle_digest(
+            "stock-monitor/phase2-authorization-source/v1",
+            source_references,
+            {
+                "authorization_id": expected_authorization_id,
+                "window_id": window.window_id,
+                "signal_id": signal.signal_id,
+                "signal_source_digest": signal.source_digest,
+                "authorization_digest": authorization_digest,
+                "authorized_at": _canonical_timestamp(authorized_at),
+                "received_at": _canonical_timestamp(received_at),
+            },
+        )
+        if (
+            str(row[1]) != expected_authorization_id
+            or str(row[5]) != authorization_digest
+            or str(row[8]) != expected_source_digest
+        ):
+            raise MigrationCorruption(
+                "Phase 2 authorization digest is inconsistent"
+            )
+        row_reference = _journal_row_reference(
+            "phase2_authorizations",
+            _PHASE2_AUTHORIZATION_COLUMNS,
+            row,
+        )
+        references = _phase2_row_references(
+            (row_reference,),
+            source_references,
+        )
+        return Phase2AuthorizationSource(
+            row_id=int(row[0]),
+            authorization_id=expected_authorization_id,
+            window_source=window,
+            signal_source=signal,
+            authorized_at=authorized_at,
+            received_at=received_at,
+            authorization_digest=authorization_digest,
+            row_references=references,
+            source_digest=expected_source_digest,
+        )
+
+    def _archive_phase2_fee_schedule(
+        self,
+        schedule: object,
+        *,
+        archived_at: datetime,
+    ) -> None:
+        from .config import (
+            FeeSchedule,
+            _read_reviewed_fee_schedule_bytes,
+            is_reviewed_fee_schedule,
+        )
+
+        if not self._transaction_active or not self._transaction_dirty:
+            raise JournalError(
+                "Phase 2 fee archive requires an active source-specific transaction"
+            )
+        if type(schedule) is not FeeSchedule or not is_reviewed_fee_schedule(
+            schedule
+        ):
+            raise InvalidJournalValue("Phase 2 fee schedule authority is unverified")
+        reviewed_bytes = _read_reviewed_fee_schedule_bytes(schedule)
+        if (
+            type(reviewed_bytes) is not bytes
+            or not reviewed_bytes
+            or hashlib.sha256(reviewed_bytes).hexdigest() != schedule.digest
+        ):
+            raise InvalidJournalValue("Phase 2 fee schedule bytes are inconsistent")
+        effective_session = _canonical_date(schedule.effective_session)
+        reviewed_at = _canonical_timestamp(schedule.reviewed_at)
+        archived = _canonical_timestamp(archived_at)
+        if reviewed_at > archived:
+            raise InvalidJournalValue(
+                "Phase 2 fee schedule cannot be archived before review"
+            )
+        if (
+            schedule.currency != "USD"
+            or type(schedule.contract_multiplier) is not int
+            or schedule.contract_multiplier != 100
+            or type(schedule.entry_fee_per_contract_micros) is not int
+            or schedule.entry_fee_per_contract_micros < 0
+            or type(schedule.exit_fee_per_contract_micros) is not int
+            or schedule.exit_fee_per_contract_micros <= 0
+            or type(schedule.close_fee_reserve_per_contract_micros) is not int
+            or schedule.close_fee_reserve_per_contract_micros
+            < schedule.exit_fee_per_contract_micros
+        ):
+            raise InvalidJournalValue("Phase 2 fee schedule fields are invalid")
+        _require_sha256(schedule.source_sha256, "Phase 2 fee source digest")
+        _require_sha256(schedule.digest, "Phase 2 fee schedule digest")
+        source_digest = _phase2_fee_schedule_source_digest(
+            schedule_id=schedule.schedule_id,
+            effective_session=effective_session,
+            reviewed_at=reviewed_at,
+            currency=schedule.currency,
+            contract_multiplier=schedule.contract_multiplier,
+            entry_fee_per_contract_micros=(
+                schedule.entry_fee_per_contract_micros
+            ),
+            exit_fee_per_contract_micros=(
+                schedule.exit_fee_per_contract_micros
+            ),
+            close_fee_reserve_per_contract_micros=(
+                schedule.close_fee_reserve_per_contract_micros
+            ),
+            source_sha256=schedule.source_sha256,
+            schedule_digest=schedule.digest,
+            archived_at=archived,
+        )
+        values_without_hash = (
+            schedule.schedule_id,
+            effective_session,
+            reviewed_at,
+            schedule.currency,
+            schedule.contract_multiplier,
+            schedule.entry_fee_per_contract_micros,
+            schedule.exit_fee_per_contract_micros,
+            schedule.close_fee_reserve_per_contract_micros,
+            schedule.source_sha256,
+            schedule.digest,
+            reviewed_bytes,
+            archived,
+            source_digest,
+        )
+        record_sha256 = _phase2_fee_schedule_record_digest(values_without_hash)
+        existing = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE2_FEE_SCHEDULE_COLUMNS)
+            + " FROM phase2_fee_schedules "
+            "WHERE schedule_id = ? COLLATE BINARY "
+            "OR schedule_digest = ? COLLATE BINARY",
+            (schedule.schedule_id, schedule.digest),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[1:-1]) != values_without_hash or str(
+                existing[-1]
+            ) != record_sha256:
+                raise IdempotencyConflict(
+                    "Phase 2 fee schedule identity conflicts with stored content"
+                )
+            return
+        phase2_write_plan = frozenset(
+            {
+                (
+                    "phase2_fee_schedules",
+                    record_sha256,
+                    tuple(values_without_hash),
+                )
+            }
+        )
+        try:
+            _sql(
+                self._connection,
+                "INSERT INTO phase2_fee_schedules("
+                + ", ".join(_PHASE2_FEE_SCHEDULE_COLUMNS[1:])
+                + ") VALUES ("
+                + ", ".join(
+                    "?" for _ in (*values_without_hash, record_sha256)
+                )
+                + ")",
+                (*values_without_hash, record_sha256),
+            )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "Phase 2 fee schedule identity conflicts with stored content"
+            ) from error
+
+    def _phase2_fee_schedule_source_from_row(
+        self,
+        row: Sequence[object],
+    ) -> Phase2FeeScheduleSource:
+        from .config import (
+            _canonical_reviewed_fee_bytes,
+            _parse_reviewed_fee_schedule,
+        )
+
+        if len(row) != len(_PHASE2_FEE_SCHEDULE_COLUMNS):
+            raise MigrationCorruption("Phase 2 fee schedule row shape is malformed")
+        if str(row[-1]) != _phase2_fee_schedule_record_digest(tuple(row[1:-1])):
+            raise MigrationCorruption(
+                "Phase 2 fee schedule record digest is inconsistent"
+            )
+        reviewed_bytes = row[11]
+        if type(reviewed_bytes) is not bytes or not reviewed_bytes:
+            raise MigrationCorruption("Phase 2 fee schedule bytes are malformed")
+        try:
+            document = json.loads(reviewed_bytes.decode("utf-8"))
+            if (
+                not isinstance(document, dict)
+                or _canonical_reviewed_fee_bytes(document) != reviewed_bytes
+            ):
+                raise ValueError
+            parsed = _parse_reviewed_fee_schedule(document)
+        except Exception as error:
+            raise MigrationCorruption(
+                "Phase 2 archived fee schedule cannot be reparsed"
+            ) from error
+        try:
+            effective_session = date.fromisoformat(str(row[2]))
+            reviewed_at = _parse_canonical_timestamp(str(row[3]))
+            archived_at = _parse_canonical_timestamp(str(row[12]))
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                "Phase 2 fee schedule chronology is malformed"
+            ) from error
+        if (
+            _canonical_date(effective_session) != row[2]
+            or reviewed_at > archived_at
+            or type(row[0]) is not int
+            or int(row[0]) <= 0
+            or type(row[5]) is not int
+            or type(row[6]) is not int
+            or type(row[7]) is not int
+            or type(row[8]) is not int
+            or hashlib.sha256(reviewed_bytes).hexdigest() != str(row[10])
+            or (
+                parsed.schedule_id,
+                parsed.effective_session,
+                parsed.reviewed_at,
+                parsed.currency,
+                parsed.contract_multiplier,
+                parsed.entry_fee_per_contract_micros,
+                parsed.exit_fee_per_contract_micros,
+                parsed.close_fee_reserve_per_contract_micros,
+                parsed.source_sha256,
+                parsed.digest,
+            )
+            != (
+                row[1],
+                effective_session,
+                reviewed_at,
+                row[4],
+                row[5],
+                row[6],
+                row[7],
+                row[8],
+                row[9],
+                row[10],
+            )
+        ):
+            raise MigrationCorruption(
+                "Phase 2 archived fee schedule fields are inconsistent"
+            )
+        expected_source_digest = _phase2_fee_schedule_source_digest(
+            schedule_id=parsed.schedule_id,
+            effective_session=_canonical_date(parsed.effective_session),
+            reviewed_at=_canonical_timestamp(parsed.reviewed_at),
+            currency=parsed.currency,
+            contract_multiplier=parsed.contract_multiplier,
+            entry_fee_per_contract_micros=(
+                parsed.entry_fee_per_contract_micros
+            ),
+            exit_fee_per_contract_micros=parsed.exit_fee_per_contract_micros,
+            close_fee_reserve_per_contract_micros=(
+                parsed.close_fee_reserve_per_contract_micros
+            ),
+            source_sha256=parsed.source_sha256,
+            schedule_digest=parsed.digest,
+            archived_at=_canonical_timestamp(archived_at),
+        )
+        if str(row[13]) != expected_source_digest:
+            raise MigrationCorruption(
+                "Phase 2 fee schedule source digest is inconsistent"
+            )
+        row_reference = _journal_row_reference(
+            "phase2_fee_schedules",
+            _PHASE2_FEE_SCHEDULE_COLUMNS,
+            row,
+        )
+        source = Phase2FeeScheduleSource(
+            row_id=int(row[0]),
+            schedule_id=parsed.schedule_id,
+            effective_session=parsed.effective_session,
+            reviewed_at=parsed.reviewed_at,
+            currency=parsed.currency,
+            contract_multiplier=parsed.contract_multiplier,
+            entry_fee_per_contract_micros=(
+                parsed.entry_fee_per_contract_micros
+            ),
+            exit_fee_per_contract_micros=parsed.exit_fee_per_contract_micros,
+            close_fee_reserve_per_contract_micros=(
+                parsed.close_fee_reserve_per_contract_micros
+            ),
+            source_sha256=parsed.source_sha256,
+            schedule_digest=parsed.digest,
+            reviewed_bytes=reviewed_bytes,
+            archived_at=archived_at,
+            row_references=(row_reference,),
+            source_digest=expected_source_digest,
+        )
+        return source
+
     @contextmanager
     def _projection_write(self) -> Iterator[None]:
         if not self._transaction_active or self._projection_write_allowed:
@@ -24752,6 +31749,19 @@ class Journal:
             yield
         finally:
             self._report_claim_write_allowed = False
+
+    @contextmanager
+    def _phase2_adherence_write(self) -> Iterator[None]:
+        if not self._transaction_active or self._phase2_adherence_write_allowed:
+            raise JournalError(
+                "Phase 2 adherence writes require an active journal transaction"
+            )
+        self._transaction_dirty = True
+        self._phase2_adherence_write_allowed = True
+        try:
+            yield
+        finally:
+            self._phase2_adherence_write_allowed = False
 
     @contextmanager
     def _immediate_connection(self) -> Iterator[sqlite3.Connection]:
@@ -24789,6 +31799,50 @@ class Journal:
                 self._source_generation += 1
 
     def _configure_connection(self) -> None:
+        phase2_source_writer_codes = frozenset(
+            {
+                Journal.start_phase2_window.__code__,
+                Journal.authorize_phase2_signal.__code__,
+                Journal._archive_phase2_fee_schedule.__code__,
+                Journal._archive_historical_replay_source.__code__,
+            }
+        )
+
+        def phase2_write_allowed(*arguments: object) -> int:
+            if len(arguments) < 3:
+                return 0
+            table, record_sha256, *stored_values = arguments
+            if (
+                type(self) is not Journal
+                or not self._transaction_active
+                or not self._transaction_dirty
+                or type(table) is not str
+                or type(record_sha256) is not str
+            ):
+                return 0
+            frame = inspect.currentframe()
+            try:
+                candidate = None if frame is None else frame.f_back
+                while candidate is not None:
+                    if (
+                        candidate.f_code in phase2_source_writer_codes
+                        and candidate.f_locals.get("self") is self
+                    ):
+                        plan = candidate.f_locals.get("phase2_write_plan")
+                        return int(
+                            type(plan) is frozenset
+                            and (
+                                table,
+                                record_sha256,
+                                tuple(stored_values),
+                            )
+                            in plan
+                        )
+                    candidate = candidate.f_back
+                return 0
+            finally:
+                del frame
+
         try:
             self._connection.create_function(
                 "journal_projection_write_allowed",
@@ -24799,6 +31853,16 @@ class Journal:
                 "journal_report_claim_write_allowed",
                 0,
                 lambda: int(self._report_claim_write_allowed),
+            )
+            self._connection.create_function(
+                "journal_phase2_write_allowed",
+                -1,
+                phase2_write_allowed,
+            )
+            self._connection.create_function(
+                "journal_phase2_adherence_write_allowed",
+                0,
+                lambda: int(self._phase2_adherence_write_allowed),
             )
             _sql(self._connection,
                 f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MILLISECONDS}"
@@ -25507,6 +32571,261 @@ def _canonical_archive_path(value: object) -> str:
     return value
 
 
+def _scheduled_result_envelope_payload(
+    envelope: object,
+) -> dict[str, object]:
+    if type(envelope) is not ScheduledRunResultEnvelope:
+        raise InvalidJournalValue(
+            "scheduled result envelope must have its exact typed representation"
+        )
+    if (
+        type(envelope.outcome) is not str
+        or _canonical_token(envelope.outcome, "scheduled result outcome")
+        != envelope.outcome
+    ):
+        raise InvalidJournalValue("scheduled result outcome is not canonical")
+    if type(envelope.message) is not str or "\x00" in envelope.message:
+        raise InvalidJournalValue("scheduled result message is invalid")
+    if (
+        type(envelope.exit_code) is not int
+        or envelope.exit_code not in _SCHEDULED_RESULT_EXIT_CODES
+    ):
+        raise InvalidJournalValue("scheduled result exit code is unsupported")
+    if type(envelope.reason_codes) is not tuple or any(
+        type(code) is not str
+        or _canonical_token(code, "scheduled result reason code") != code
+        for code in envelope.reason_codes
+    ):
+        raise InvalidJournalValue("scheduled result reason codes are invalid")
+    if (
+        type(envelope.execution_mode) is not str
+        or envelope.execution_mode not in {"CANONICAL", "FIXTURE"}
+    ):
+        raise InvalidJournalValue("scheduled result execution mode is unsupported")
+    if type(envelope.candidates) is not tuple:
+        raise InvalidJournalValue("scheduled result candidates must be a tuple")
+    candidate_payload: list[dict[str, str]] = []
+    for candidate in envelope.candidates:
+        if (
+            type(candidate) is not tuple
+            or len(candidate) != 2
+            or type(candidate[0]) is not str
+            or re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", candidate[0]) is None
+            or type(candidate[1]) is not str
+            or _canonical_token(candidate[1], "scheduled candidate role")
+            != candidate[1]
+        ):
+            raise InvalidJournalValue("scheduled result candidate is invalid")
+        candidate_payload.append({"symbol": candidate[0], "role": candidate[1]})
+    if envelope.exit_code != 0 and envelope.candidates:
+        raise InvalidJournalValue(
+            "nonzero scheduled results cannot contain candidates"
+        )
+    if envelope.outcome != "CANDIDATES" and envelope.candidates:
+        raise InvalidJournalValue(
+            "only candidate scheduled results may contain candidates"
+        )
+    report_values = (
+        envelope.report_id,
+        envelope.report_row_id,
+        envelope.report_path,
+    )
+    if any(value is not None for value in report_values) and not all(
+        value is not None for value in report_values
+    ):
+        raise InvalidJournalValue("scheduled result report identity is incomplete")
+    if envelope.report_id is not None:
+        _require_sha256(envelope.report_id, "scheduled result report ID")
+        _require_integer(
+            envelope.report_row_id,
+            "scheduled result report row ID",
+            minimum=1,
+        )
+        _canonical_archive_path(envelope.report_path)
+        if (
+            type(envelope.report_body) is not str
+            or envelope.report_body != envelope.message
+            or type(envelope.report_content_sha256) is not str
+            or type(envelope.report_state_sha256) is not str
+        ):
+            raise InvalidJournalValue(
+                "scheduled result report material is incomplete"
+            )
+        if hashlib.sha256(envelope.report_body.encode("utf-8")).hexdigest() != (
+            envelope.report_content_sha256
+        ):
+            raise InvalidJournalValue(
+                "scheduled result report body hash is inconsistent"
+            )
+        _require_sha256(
+            envelope.report_content_sha256,
+            "scheduled result report content hash",
+        )
+        _require_sha256(
+            envelope.report_state_sha256,
+            "scheduled result report state hash",
+        )
+        if (
+            type(envelope.report_observation_row_ids) is not tuple
+            or type(envelope.report_observation_sha256s) is not tuple
+            or len(envelope.report_observation_row_ids)
+            != len(envelope.report_observation_sha256s)
+            or any(
+                type(row_id) is not int or row_id < 1
+                for row_id in envelope.report_observation_row_ids
+            )
+            or len(set(envelope.report_observation_row_ids))
+            != len(envelope.report_observation_row_ids)
+            or any(
+                type(digest) is not str
+                or _require_sha256(
+                    digest,
+                    "scheduled result report observation hash",
+                )
+                != digest
+                for digest in envelope.report_observation_sha256s
+            )
+        ):
+            raise InvalidJournalValue(
+                "scheduled result report observation material is invalid"
+            )
+    elif (
+        envelope.report_body is not None
+        or envelope.report_content_sha256 is not None
+        or envelope.report_state_sha256 is not None
+        or envelope.report_observation_row_ids
+        or envelope.report_observation_sha256s
+    ):
+        raise InvalidJournalValue(
+            "scheduled result report material lacks its report identity"
+        )
+    return {
+        "schema": _SCHEDULED_RESULT_SCHEMA,
+        "outcome": envelope.outcome,
+        "message": envelope.message,
+        "exit_code": envelope.exit_code,
+        "reason_codes": list(envelope.reason_codes),
+        "execution_mode": envelope.execution_mode,
+        "candidates": candidate_payload,
+        "report_id": envelope.report_id,
+        "report_row_id": envelope.report_row_id,
+        "report_path": envelope.report_path,
+        "report_body": envelope.report_body,
+        "report_content_sha256": envelope.report_content_sha256,
+        "report_state_sha256": envelope.report_state_sha256,
+        "report_observation_row_ids": list(
+            envelope.report_observation_row_ids
+        ),
+        "report_observation_sha256s": list(
+            envelope.report_observation_sha256s
+        ),
+    }
+
+
+def _scheduled_result_envelope_storage(
+    envelope: object,
+) -> tuple[str, str]:
+    stored_json = _canonical_json(_scheduled_result_envelope_payload(envelope))
+    return stored_json, hashlib.sha256(stored_json.encode("utf-8")).hexdigest()
+
+
+def _decode_scheduled_result_envelope(
+    stored_json: object,
+    stored_sha256: object,
+    *,
+    _envelope_type: type[ScheduledRunResultEnvelope] = ScheduledRunResultEnvelope,
+    _storage: Callable[[object], tuple[str, str]] = (
+        _scheduled_result_envelope_storage
+    ),
+) -> ScheduledRunResultEnvelope:
+    if type(stored_json) is not str or type(stored_sha256) is not str:
+        raise MigrationCorruption("scheduled result envelope storage is malformed")
+    try:
+        canonical_sha256 = _require_sha256(
+            stored_sha256,
+            "scheduled result envelope hash",
+        )
+    except InvalidJournalValue as error:
+        raise MigrationCorruption(
+            "scheduled result envelope hash is malformed"
+        ) from error
+    actual_sha256 = hashlib.sha256(stored_json.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(actual_sha256, canonical_sha256):
+        raise MigrationCorruption("scheduled result envelope hash is inconsistent")
+    try:
+        payload = json.loads(stored_json)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise MigrationCorruption("scheduled result envelope is invalid JSON") from error
+    if type(payload) is not dict or frozenset(payload) not in {
+        _LEGACY_SCHEDULED_RESULT_KEYS,
+        _SCHEDULED_RESULT_KEYS,
+    }:
+        raise MigrationCorruption("scheduled result envelope fields are invalid")
+    legacy = frozenset(payload) == _LEGACY_SCHEDULED_RESULT_KEYS
+    if payload.get("schema") != _SCHEDULED_RESULT_SCHEMA:
+        raise MigrationCorruption("scheduled result envelope schema is unsupported")
+    reasons = payload.get("reason_codes")
+    candidates = payload.get("candidates")
+    if type(reasons) is not list or type(candidates) is not list:
+        raise MigrationCorruption("scheduled result envelope collections are invalid")
+    candidate_values: list[tuple[str, str]] = []
+    for candidate in candidates:
+        if (
+            type(candidate) is not dict
+            or frozenset(candidate) != {"symbol", "role"}
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope candidate fields are invalid"
+            )
+        candidate_values.append((candidate["symbol"], candidate["role"]))
+    observation_row_ids = [] if legacy else payload.get("report_observation_row_ids")
+    observation_sha256s = (
+        [] if legacy else payload.get("report_observation_sha256s")
+    )
+    if type(observation_row_ids) is not list or type(observation_sha256s) is not list:
+        raise MigrationCorruption(
+            "scheduled result envelope report observations are invalid"
+        )
+    try:
+        envelope = _envelope_type(
+            outcome=payload["outcome"],
+            message=payload["message"],
+            exit_code=payload["exit_code"],
+            reason_codes=tuple(reasons),
+            execution_mode=payload["execution_mode"],
+            candidates=tuple(candidate_values),
+            report_id=payload["report_id"],
+            report_row_id=payload["report_row_id"],
+            report_path=payload["report_path"],
+            report_body=None if legacy else payload["report_body"],
+            report_content_sha256=(
+                None if legacy else payload["report_content_sha256"]
+            ),
+            report_state_sha256=(
+                None if legacy else payload["report_state_sha256"]
+            ),
+            report_observation_row_ids=tuple(observation_row_ids),
+            report_observation_sha256s=tuple(observation_sha256s),
+        )
+        if legacy:
+            canonical_json = _canonical_json(payload)
+            canonical_digest = hashlib.sha256(
+                canonical_json.encode("utf-8")
+            ).hexdigest()
+        else:
+            canonical_json, canonical_digest = (
+                _storage(envelope)
+            )
+    except (InvalidJournalValue, TypeError, ValueError) as error:
+        raise MigrationCorruption("scheduled result envelope content is malformed") from error
+    if canonical_json != stored_json or not secrets.compare_digest(
+        canonical_digest,
+        canonical_sha256,
+    ):
+        raise MigrationCorruption("scheduled result envelope is not canonical")
+    return envelope
+
+
 def _canonical_integer_set(values: object, name: str) -> tuple[int, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise InvalidJournalValue(f"{name} must be a sequence of integers")
@@ -25645,3 +32964,1440 @@ def _translate_sqlite_error(error: sqlite3.Error) -> JournalError:
     if _is_busy_error(error):
         return JournalBusy("journal is busy")
     return JournalError("journal database operation failed")
+
+
+def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
+    """Seal scheduled writes behind a one-shot runner-owned capability."""
+    journal_type = Journal
+    envelope_type = ScheduledRunResultEnvelope
+    original_mark_dirty = JournalTransaction._mark_dirty
+    execute_sql = getattr(sqlite3.Connection, "execute")
+    canonical_timestamp = _canonical_timestamp
+    owners: dict[int, tuple[object, ...]] = {}
+    publisher_records: dict[int, tuple[object, Journal, Path, Path]] = {}
+    candidate_type: type[object] | None = None
+    workflow_result_type: type[object] | None = None
+    publisher_type: type[object] | None = None
+    published_type: type[object] | None = None
+    report_type: type[object] | None = None
+    archive_function: Callable[..., object] | None = None
+    archive_code: object | None = None
+    workflow_error_type: type[Exception] | None = None
+    runner_code: object | None = None
+    wrapper_code: object | None = None
+    runner_globals: dict[str, object] | None = None
+    runner_dependencies: tuple[tuple[str, object], ...] = ()
+    store_start_code: object | None = None
+    store_complete_code: object | None = None
+    path_type = type(Path())
+    path_is_file = path_type.is_file
+    path_is_symlink = path_type.is_symlink
+    path_joinpath = path_type.joinpath
+    path_read_bytes = path_type.read_bytes
+    path_resolve = path_type.resolve
+    sha256_function = hashlib.sha256
+    compare_digest = secrets.compare_digest
+    object_new = object.__new__
+    object_setattr = object.__setattr__
+    chr_function = chr
+    ord_function = ord
+    scheduled_schema = _SCHEDULED_RESULT_SCHEMA
+    legacy_result_keys = _LEGACY_SCHEDULED_RESULT_KEYS
+    result_keys = _SCHEDULED_RESULT_KEYS
+    exit_codes = _SCHEDULED_RESULT_EXIT_CODES
+
+    def decode_json(value: str) -> object:
+        """Decode the envelope grammar without dispatching through ``json``."""
+        position = 0
+        limit = len(value)
+
+        def skip_space(index: int) -> int:
+            while index < limit and value[index] in " \t\r\n":
+                index += 1
+            return index
+
+        def parse_string(index: int) -> tuple[str, int]:
+            if index >= limit or value[index] != '"':
+                raise ValueError("JSON string expected")
+            index += 1
+            characters: list[str] = []
+            while index < limit:
+                character = value[index]
+                index += 1
+                if character == '"':
+                    return "".join(characters), index
+                if character != "\\":
+                    if ord_function(character) < 32:
+                        raise ValueError("JSON string contains a control character")
+                    characters.append(character)
+                    continue
+                if index >= limit:
+                    raise ValueError("JSON string escape is incomplete")
+                escaped = value[index]
+                index += 1
+                if escaped == '"':
+                    characters.append('"')
+                elif escaped == "\\":
+                    characters.append("\\")
+                elif escaped == "/":
+                    characters.append("/")
+                elif escaped == "b":
+                    characters.append("\b")
+                elif escaped == "f":
+                    characters.append("\f")
+                elif escaped == "n":
+                    characters.append("\n")
+                elif escaped == "r":
+                    characters.append("\r")
+                elif escaped == "t":
+                    characters.append("\t")
+                elif escaped == "u":
+                    if index + 4 > limit:
+                        raise ValueError("JSON Unicode escape is incomplete")
+                    codepoint = 0
+                    for digit in value[index : index + 4]:
+                        if "0" <= digit <= "9":
+                            nibble = ord_function(digit) - 48
+                        elif "a" <= digit <= "f":
+                            nibble = ord_function(digit) - 87
+                        elif "A" <= digit <= "F":
+                            nibble = ord_function(digit) - 55
+                        else:
+                            raise ValueError("JSON Unicode escape is invalid")
+                        codepoint = codepoint * 16 + nibble
+                    index += 4
+                    if 0xD800 <= codepoint <= 0xDBFF:
+                        if (
+                            index + 6 > limit
+                            or value[index : index + 2] != "\\u"
+                        ):
+                            raise ValueError("JSON surrogate pair is incomplete")
+                        low = 0
+                        for digit in value[index + 2 : index + 6]:
+                            if "0" <= digit <= "9":
+                                nibble = ord_function(digit) - 48
+                            elif "a" <= digit <= "f":
+                                nibble = ord_function(digit) - 87
+                            elif "A" <= digit <= "F":
+                                nibble = ord_function(digit) - 55
+                            else:
+                                raise ValueError("JSON Unicode escape is invalid")
+                            low = low * 16 + nibble
+                        if not 0xDC00 <= low <= 0xDFFF:
+                            raise ValueError("JSON surrogate pair is invalid")
+                        codepoint = (
+                            0x10000
+                            + ((codepoint - 0xD800) << 10)
+                            + (low - 0xDC00)
+                        )
+                        index += 6
+                    elif 0xDC00 <= codepoint <= 0xDFFF:
+                        raise ValueError("JSON low surrogate has no high surrogate")
+                    characters.append(chr_function(codepoint))
+                else:
+                    raise ValueError("JSON string escape is invalid")
+            raise ValueError("JSON string is unterminated")
+
+        def parse_value(index: int) -> tuple[object, int]:
+            index = skip_space(index)
+            if index >= limit:
+                raise ValueError("JSON value is missing")
+            character = value[index]
+            if character == '"':
+                return parse_string(index)
+            if character == "[":
+                items: list[object] = []
+                index = skip_space(index + 1)
+                if index < limit and value[index] == "]":
+                    return items, index + 1
+                while True:
+                    item, index = parse_value(index)
+                    items.append(item)
+                    index = skip_space(index)
+                    if index < limit and value[index] == ",":
+                        index = skip_space(index + 1)
+                        continue
+                    if index < limit and value[index] == "]":
+                        return items, index + 1
+                    raise ValueError("JSON array separator is invalid")
+            if character == "{":
+                mapping: dict[str, object] = {}
+                index = skip_space(index + 1)
+                if index < limit and value[index] == "}":
+                    return mapping, index + 1
+                while True:
+                    key, index = parse_string(index)
+                    index = skip_space(index)
+                    if index >= limit or value[index] != ":":
+                        raise ValueError("JSON object separator is invalid")
+                    item, index = parse_value(index + 1)
+                    mapping[key] = item
+                    index = skip_space(index)
+                    if index < limit and value[index] == ",":
+                        index = skip_space(index + 1)
+                        continue
+                    if index < limit and value[index] == "}":
+                        return mapping, index + 1
+                    raise ValueError("JSON object terminator is invalid")
+            for literal, decoded in (
+                ("true", True),
+                ("false", False),
+                ("null", None),
+            ):
+                if value.startswith(literal, index):
+                    return decoded, index + len(literal)
+            negative = character == "-"
+            if negative:
+                index += 1
+                if index >= limit:
+                    raise ValueError("JSON number is incomplete")
+            if value[index] < "0" or value[index] > "9":
+                raise ValueError("JSON value is invalid")
+            if value[index] == "0" and index + 1 < limit and value[index + 1].isdigit():
+                raise ValueError("JSON number has a leading zero")
+            number = 0
+            while index < limit and "0" <= value[index] <= "9":
+                number = number * 10 + ord_function(value[index]) - 48
+                index += 1
+            if index < limit and value[index] in ".eE":
+                raise ValueError("scheduled JSON does not permit fractional numbers")
+            return (-number if negative else number), index
+
+        decoded, position = parse_value(position)
+        if skip_space(position) != limit:
+            raise ValueError("JSON has trailing material")
+        return decoded
+
+    def canonical_json(value: object) -> str:
+        """Encode exact envelope primitives without live encoder dispatch."""
+
+        def encode_string(text: str) -> str:
+            pieces = ['"']
+            for character in text:
+                if character == '"':
+                    pieces.append('\\"')
+                elif character == "\\":
+                    pieces.append("\\\\")
+                elif character == "\b":
+                    pieces.append("\\b")
+                elif character == "\f":
+                    pieces.append("\\f")
+                elif character == "\n":
+                    pieces.append("\\n")
+                elif character == "\r":
+                    pieces.append("\\r")
+                elif character == "\t":
+                    pieces.append("\\t")
+                else:
+                    codepoint = ord_function(character)
+                    if codepoint < 32:
+                        digits = "0123456789abcdef"
+                        pieces.append(
+                            "\\u00"
+                            + digits[(codepoint >> 4) & 15]
+                            + digits[codepoint & 15]
+                        )
+                    else:
+                        pieces.append(character)
+            pieces.append('"')
+            return "".join(pieces)
+
+        value_type = type(value)
+        if value is None:
+            return "null"
+        if value_type is bool:
+            return "true" if value else "false"
+        if value_type is int:
+            return str(value)
+        if value_type is str:
+            return encode_string(value)
+        if value_type is list:
+            return "[" + ",".join(canonical_json(item) for item in value) + "]"
+        if value_type is dict:
+            keys = list(value)
+            if any(type(key) is not str for key in keys):
+                raise MigrationCorruption(
+                    "scheduled result JSON object key is invalid"
+                )
+            keys.sort()
+            return "{" + ",".join(
+                encode_string(key) + ":" + canonical_json(value[key])
+                for key in keys
+            ) + "}"
+        raise MigrationCorruption("scheduled result JSON value is invalid")
+
+    def is_token(value: object) -> bool:
+        return (
+            type(value) is str
+            and bool(value)
+            and value[0] in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            and all(
+                character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+                for character in value
+            )
+        )
+
+    def is_symbol(value: object) -> bool:
+        return (
+            type(value) is str
+            and 1 <= len(value) <= 10
+            and value[0] in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            and all(
+                character in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789."
+                for character in value
+            )
+        )
+
+    def is_sha256(value: object) -> bool:
+        return (
+            type(value) is str
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def is_archive_path(value: object) -> bool:
+        if (
+            type(value) is not str
+            or not value
+            or value.startswith("/")
+            or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            return False
+        parts = value.split("/")
+        return (
+            all(part not in {"", ".", ".."} for part in parts)
+            and parts[-1].lower().endswith(".md")
+        )
+
+    def construct_envelope(
+        *,
+        outcome: str,
+        message: str,
+        exit_code: int,
+        reason_codes: tuple[str, ...],
+        execution_mode: str,
+        candidates: tuple[tuple[str, str], ...],
+        report_id: str | None,
+        report_row_id: int | None,
+        report_path: str | None,
+        report_body: str | None,
+        report_content_sha256: str | None,
+        report_state_sha256: str | None,
+        report_observation_row_ids: tuple[int, ...],
+        report_observation_sha256s: tuple[str, ...],
+    ) -> ScheduledRunResultEnvelope:
+        envelope = object_new(envelope_type)
+        for name, value in (
+            ("outcome", outcome),
+            ("message", message),
+            ("exit_code", exit_code),
+            ("reason_codes", reason_codes),
+            ("execution_mode", execution_mode),
+            ("candidates", candidates),
+            ("report_id", report_id),
+            ("report_row_id", report_row_id),
+            ("report_path", report_path),
+            ("report_body", report_body),
+            ("report_content_sha256", report_content_sha256),
+            ("report_state_sha256", report_state_sha256),
+            ("report_observation_row_ids", report_observation_row_ids),
+            ("report_observation_sha256s", report_observation_sha256s),
+        ):
+            object_setattr(envelope, name, value)
+        return envelope
+
+    def decode_envelope(
+        stored_json: object,
+        stored_sha256: object,
+    ) -> ScheduledRunResultEnvelope:
+        if type(stored_json) is not str or not is_sha256(stored_sha256):
+            raise MigrationCorruption("scheduled result envelope storage is malformed")
+        actual_sha256 = sha256_function(stored_json.encode("utf-8")).hexdigest()
+        if not compare_digest(actual_sha256, stored_sha256):
+            raise MigrationCorruption(
+                "scheduled result envelope hash is inconsistent"
+            )
+        try:
+            payload = decode_json(stored_json)
+        except (TypeError, ValueError) as error:
+            raise MigrationCorruption(
+                "scheduled result envelope is invalid JSON"
+            ) from error
+        if type(payload) is not dict:
+            raise MigrationCorruption(
+                "scheduled result envelope fields are invalid"
+            )
+        keys = frozenset(payload)
+        if keys not in {legacy_result_keys, result_keys}:
+            raise MigrationCorruption(
+                "scheduled result envelope fields are invalid"
+            )
+        legacy = keys == legacy_result_keys
+        if payload.get("schema") != scheduled_schema:
+            raise MigrationCorruption(
+                "scheduled result envelope schema is unsupported"
+            )
+        outcome = payload.get("outcome")
+        message = payload.get("message")
+        exit_code = payload.get("exit_code")
+        reasons = payload.get("reason_codes")
+        execution_mode = payload.get("execution_mode")
+        candidate_payload = payload.get("candidates")
+        if (
+            not is_token(outcome)
+            or type(message) is not str
+            or "\x00" in message
+            or type(exit_code) is not int
+            or exit_code not in exit_codes
+            or type(reasons) is not list
+            or any(not is_token(reason) for reason in reasons)
+            or execution_mode not in {"CANONICAL", "FIXTURE"}
+            or type(candidate_payload) is not list
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope content is malformed"
+            )
+        candidate_values: list[tuple[str, str]] = []
+        for candidate in candidate_payload:
+            if (
+                type(candidate) is not dict
+                or frozenset(candidate) != {"symbol", "role"}
+                or not is_symbol(candidate.get("symbol"))
+                or not is_token(candidate.get("role"))
+            ):
+                raise MigrationCorruption(
+                    "scheduled result envelope candidate fields are invalid"
+                )
+            candidate_values.append((candidate["symbol"], candidate["role"]))
+        candidates = tuple(candidate_values)
+        if (exit_code != 0 and candidates) or (
+            outcome != "CANDIDATES" and candidates
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope candidates conflict with its outcome"
+            )
+        report_id = payload.get("report_id")
+        report_row_id = payload.get("report_row_id")
+        report_path = payload.get("report_path")
+        report_values = (report_id, report_row_id, report_path)
+        if any(value is not None for value in report_values) and not all(
+            value is not None for value in report_values
+        ):
+            raise MigrationCorruption(
+                "scheduled result report identity is incomplete"
+            )
+        report_body = None if legacy else payload.get("report_body")
+        report_content_sha256 = (
+            None if legacy else payload.get("report_content_sha256")
+        )
+        report_state_sha256 = (
+            None if legacy else payload.get("report_state_sha256")
+        )
+        row_ids_value = [] if legacy else payload.get("report_observation_row_ids")
+        observation_sha256s_value = (
+            [] if legacy else payload.get("report_observation_sha256s")
+        )
+        if type(row_ids_value) is not list or type(observation_sha256s_value) is not list:
+            raise MigrationCorruption(
+                "scheduled result envelope report observations are invalid"
+            )
+        row_ids = tuple(row_ids_value)
+        observation_sha256s = tuple(observation_sha256s_value)
+        if report_id is not None:
+            if (
+                legacy
+                or not is_sha256(report_id)
+                or type(report_row_id) is not int
+                or report_row_id < 1
+                or not is_archive_path(report_path)
+                or type(report_body) is not str
+                or report_body != message
+                or not is_sha256(report_content_sha256)
+                or sha256_function(report_body.encode("utf-8")).hexdigest()
+                != report_content_sha256
+                or not is_sha256(report_state_sha256)
+                or any(type(row_id) is not int or row_id < 1 for row_id in row_ids)
+                or len(set(row_ids)) != len(row_ids)
+                or len(row_ids) != len(observation_sha256s)
+                or any(not is_sha256(value) for value in observation_sha256s)
+            ):
+                raise MigrationCorruption(
+                    "scheduled result report material is invalid"
+                )
+        elif (
+            report_body is not None
+            or report_content_sha256 is not None
+            or report_state_sha256 is not None
+            or row_ids
+            or observation_sha256s
+        ):
+            raise MigrationCorruption(
+                "scheduled result report material lacks its report identity"
+            )
+        if canonical_json(payload) != stored_json:
+            raise MigrationCorruption(
+                "scheduled result envelope is not canonical"
+            )
+        return construct_envelope(
+            outcome=outcome,
+            message=message,
+            exit_code=exit_code,
+            reason_codes=tuple(reasons),
+            execution_mode=execution_mode,
+            candidates=candidates,
+            report_id=report_id,
+            report_row_id=report_row_id,
+            report_path=report_path,
+            report_body=report_body,
+            report_content_sha256=report_content_sha256,
+            report_state_sha256=report_state_sha256,
+            report_observation_row_ids=row_ids,
+            report_observation_sha256s=observation_sha256s,
+        )
+
+    def configure(
+        *,
+        candidate: type[object],
+        workflow_result: type[object],
+        publisher: type[object],
+        published: type[object],
+        report: type[object],
+        archive: Callable[..., object],
+        workflow_error: type[Exception],
+        runner: Callable[..., object],
+        wrapper: Callable[..., object],
+        scheduled_globals: dict[str, object],
+        store_start: Callable[..., object],
+        store_complete: Callable[..., object],
+        dependencies: tuple[tuple[str, object], ...],
+    ) -> None:
+        nonlocal candidate_type, workflow_result_type, publisher_type
+        nonlocal published_type, report_type, archive_function, archive_code
+        nonlocal workflow_error_type
+        nonlocal runner_code, wrapper_code, runner_globals, runner_dependencies
+        nonlocal store_start_code, store_complete_code
+        if candidate_type is not None:
+            raise InvalidJournalValue("scheduled authority is already configured")
+        candidate_type = candidate
+        workflow_result_type = workflow_result
+        publisher_type = publisher
+        published_type = published
+        report_type = report
+        archive_function = archive
+        archive_code = archive.__code__
+        workflow_error_type = workflow_error
+        if (
+            type(scheduled_globals) is not dict
+            or runner.__globals__ is not scheduled_globals
+            or wrapper.__globals__ is not scheduled_globals
+            or type(dependencies) is not tuple
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                for item in dependencies
+            )
+        ):
+            raise InvalidJournalValue("scheduled runner authority is malformed")
+        runner_code = runner.__code__
+        wrapper_code = wrapper.__code__
+        runner_globals = scheduled_globals
+        runner_dependencies = dependencies
+        if (
+            store_start.__globals__ is not scheduled_globals
+            or store_complete.__globals__ is not scheduled_globals
+        ):
+            raise InvalidJournalValue("scheduled store authority is malformed")
+        store_start_code = store_start.__code__
+        store_complete_code = store_complete.__code__
+
+        def deny_raw_heal(self: object, **values: object) -> object:
+            del self, values
+            raise workflow_error(
+                "scheduled healing requires the exact run_scheduled authority"
+            )
+
+        publisher.heal_finalized = deny_raw_heal
+
+    def require_runner_stack(*, through_store: bool = True) -> None:
+        frame = inspect.currentframe()
+        caller = None if frame is None else frame.f_back
+        store = None if caller is None else caller.f_back
+        runner = (
+            None
+            if store is None
+            else store.f_back if through_store else store
+        )
+        wrapper = None if runner is None else runner.f_back
+        try:
+            if (
+                runner is None
+                or wrapper is None
+                or runner_code is None
+                or wrapper_code is None
+                or runner_globals is None
+                or (
+                    through_store
+                    and (
+                        store is None
+                        or store.f_code
+                        not in {store_start_code, store_complete_code}
+                        or store.f_globals is not runner_globals
+                    )
+                )
+                or runner.f_code is not runner_code
+                or wrapper.f_code is not wrapper_code
+                or runner.f_globals is not runner_globals
+                or wrapper.f_globals is not runner_globals
+                or any(
+                    runner.f_locals.get(name) is not expected
+                    for name, expected in runner_dependencies
+                )
+            ):
+                raise InvalidJournalValue(
+                    "scheduled writer requires the exact live runner stack"
+                )
+        finally:
+            del frame, caller, store, runner, wrapper
+
+    def publisher_record(
+        value: object,
+        journal: Journal,
+        *,
+        mint: bool,
+    ) -> tuple[object, Journal, Path, Path] | None:
+        if publisher_type is None or type(value) is not publisher_type:
+            return None
+        if getattr(value, "journal", None) is not journal:
+            return None
+        root = getattr(value, "report_archive_root", None)
+        if type(root) is not path_type:
+            return None
+        absolute = root.absolute()
+        if not root.is_absolute() or root.is_symlink():
+            return None
+        resolved = absolute.resolve(strict=False)
+        prior = publisher_records.get(id(value))
+        if prior is None:
+            if not mint:
+                return None
+            prior = (value, journal, root, resolved)
+            publisher_records[id(value)] = prior
+        if (
+            prior[0] is not value
+            or prior[1] is not journal
+            or prior[2] is not root
+            or prior[3] != resolved
+        ):
+            return None
+        return prior
+
+    def archive_is_current(
+        bound: tuple[object, Journal, Path, Path],
+        relative_path: object,
+        body: object,
+        content_sha256: object,
+    ) -> bool:
+        if (
+            type(relative_path) is not str
+            or not is_archive_path(relative_path)
+            or type(body) is not str
+            or not is_sha256(content_sha256)
+        ):
+            return False
+        current = bound[2]
+        for part in relative_path.split("/"):
+            current = path_joinpath(current, part)
+            if path_is_symlink(current):
+                return False
+        expected = path_joinpath(bound[2], relative_path)
+        try:
+            archived = path_read_bytes(expected)
+            resolved = path_resolve(expected, strict=False)
+            expected_resolved = path_resolve(
+                path_joinpath(bound[3], relative_path),
+                strict=False,
+            )
+        except OSError:
+            return False
+        expected_bytes = body.encode("utf-8")
+        return bool(
+            path_is_file(expected)
+            and resolved == expected_resolved
+            and archived == expected_bytes
+            and sha256_function(archived).hexdigest() == content_sha256
+        )
+
+    def deny_transaction_start(
+        self: JournalTransaction,
+        *,
+        run_key: str,
+        run_kind: str,
+        session_date: date,
+        intended_run_at: datetime,
+        started_at: datetime,
+    ) -> tuple[int, bool]:
+        del run_key, run_kind, session_date, intended_run_at, started_at
+        self._ensure_active()
+        raise InvalidJournalValue(
+            "scheduled claims require the exact run_scheduled authority"
+        )
+
+    def deny_transaction_complete(
+        self: JournalTransaction,
+        *,
+        run_id: int,
+        finished_at: datetime,
+        market_session_decision: str,
+        outcome: str,
+        result_envelope: ScheduledRunResultEnvelope,
+        report_id: int | None = None,
+        report_path: str | None = None,
+        error_class: str | None = None,
+    ) -> tuple[int, bool]:
+        del (
+            run_id,
+            finished_at,
+            market_session_decision,
+            outcome,
+            result_envelope,
+            report_id,
+            report_path,
+            error_class,
+        )
+        self._ensure_active()
+        raise InvalidJournalValue(
+            "scheduled completion requires the exact run_scheduled authority"
+        )
+
+    def deny_journal_start(
+        self: Journal,
+        *,
+        run_key: str,
+        run_kind: str,
+        session_date: date,
+        intended_run_at: datetime,
+        started_at: datetime,
+    ) -> tuple[int, bool]:
+        del run_key, run_kind, session_date, intended_run_at, started_at
+        self._ensure_open()
+        raise InvalidJournalValue(
+            "scheduled claims require the exact run_scheduled authority"
+        )
+
+    def deny_journal_complete(
+        self: Journal,
+        *,
+        run_id: int,
+        finished_at: datetime,
+        market_session_decision: str,
+        outcome: str,
+        result_envelope: ScheduledRunResultEnvelope,
+        report_id: int | None = None,
+        report_path: str | None = None,
+        error_class: str | None = None,
+    ) -> tuple[int, bool]:
+        del (
+            run_id,
+            finished_at,
+            market_session_decision,
+            outcome,
+            result_envelope,
+            report_id,
+            report_path,
+            error_class,
+        )
+        self._ensure_open()
+        raise InvalidJournalValue(
+            "scheduled completion requires the exact run_scheduled authority"
+        )
+
+    def deny_private_start(self: Journal, **values: object) -> tuple[int, bool]:
+        del values
+        self._ensure_open()
+        raise InvalidJournalValue(
+            "scheduled claims require the exact run_scheduled authority"
+        )
+
+    def deny_private_complete(self: Journal, **values: object) -> tuple[int, bool]:
+        del values
+        self._ensure_open()
+        raise InvalidJournalValue(
+            "scheduled completion requires the exact run_scheduled authority"
+        )
+
+    JournalTransaction.start_scheduled_run = deny_transaction_start
+    JournalTransaction.complete_scheduled_run = deny_transaction_complete
+    Journal.start_scheduled_run = deny_journal_start
+    Journal.complete_scheduled_run = deny_journal_complete
+    Journal._start_scheduled_run = deny_private_start
+    Journal._complete_scheduled_run = deny_private_complete
+
+    def canonical_scheduled_identity(
+        run_key: object,
+        run_kind: object,
+        session_date: object,
+    ) -> tuple[str, str, str]:
+        if type(run_key) is not str or not run_key:
+            raise InvalidJournalValue(
+                "scheduled run key must be a non-empty string"
+            )
+        if (
+            type(run_kind) is not str
+            or not run_kind
+            or run_kind != run_kind.strip()
+        ):
+            raise InvalidJournalValue("scheduled run kind is not canonical")
+        canonical_kind = run_kind.upper()
+        if not is_token(canonical_kind):
+            raise InvalidJournalValue("scheduled run kind is not canonical")
+        if type(session_date) is not date:
+            raise InvalidJournalValue("session date must be a datetime.date")
+        stored_date = (
+            f"{session_date.year:04d}-{session_date.month:02d}-"
+            f"{session_date.day:02d}"
+        )
+        return run_key, canonical_kind, stored_date
+
+    def read_status(
+        journal: Journal,
+        *,
+        run_key: object,
+        run_kind: object,
+        session_date: object,
+    ) -> str:
+        journal._ensure_open()
+        canonical_key, canonical_kind, stored_date = canonical_scheduled_identity(
+            run_key,
+            run_kind,
+            session_date,
+        )
+        row = execute_sql(
+            journal._connection,
+            "SELECT run.run_kind, run.session_date, run.finished_at, run.outcome, "
+            "run.report_id, run.report_path, claim.status, claim.report_id "
+            "FROM scheduled_runs AS run LEFT JOIN report_claims AS claim "
+            "ON claim.session_date = run.session_date "
+            "AND claim.report_kind = run.run_kind "
+            "WHERE run.run_key = ? COLLATE BINARY",
+            (canonical_key,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("scheduled run does not exist")
+        if (str(row[0]), str(row[1])) != (canonical_kind, stored_date):
+            raise IdempotencyConflict(
+                "scheduled run identity conflicts with stored content"
+            )
+        if row[2] is None:
+            if row[6] == "FINALIZED" and row[7] is not None:
+                return "REPORT_FINALIZED"
+            return "IN_PROGRESS"
+        if row[3] == "REPORT_EMITTED" and row[4] is not None and row[5] is not None:
+            return "REPORT_EMITTED"
+        return "COMPLETED_NO_REPORT"
+
+    Journal.read_scheduled_run_status = read_status
+
+    def read_envelope(
+        journal: Journal,
+        *,
+        run_key: object,
+        run_kind: object,
+        session_date: object,
+    ) -> ScheduledRunResultEnvelope | None:
+        journal._ensure_open()
+        canonical_key, canonical_kind, stored_date = canonical_scheduled_identity(
+            run_key,
+            run_kind,
+            session_date,
+        )
+        row = execute_sql(
+            journal._connection,
+            "SELECT run.run_kind, run.session_date, run.finished_at, run.outcome, "
+            "run.report_id, run.report_path, run.result_envelope_json, "
+            "run.result_envelope_sha256, report.report_id, "
+            "report.archive_relative_path, report.body_text, "
+            "report.content_sha256, report.state_sha256, "
+            "report.session_date, report.report_kind "
+            "FROM scheduled_runs AS run "
+            "LEFT JOIN reports AS report ON report.id = run.report_id "
+            "WHERE run.run_key = ? COLLATE BINARY",
+            (canonical_key,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("scheduled run does not exist")
+        if (str(row[0]), str(row[1])) != (canonical_kind, stored_date):
+            raise IdempotencyConflict(
+                "scheduled run identity conflicts with stored content"
+            )
+        if row[2] is None:
+            raise InvalidJournalValue("scheduled run is not complete")
+        if row[6] is None and row[7] is None:
+            return None
+        if (row[6] is None) != (row[7] is None):
+            raise MigrationCorruption(
+                "scheduled result envelope storage is incomplete"
+            )
+        envelope = decode_envelope(row[6], row[7])
+        if (row[8], row[4], row[5]) != (
+            envelope.report_id,
+            envelope.report_row_id,
+            envelope.report_path,
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope report identity is inconsistent"
+            )
+        if (str(row[3]) == "REPORT_EMITTED") != (
+            envelope.report_row_id is not None
+        ):
+            raise MigrationCorruption(
+                "scheduled result envelope conflicts with completion outcome"
+            )
+        if row[9] != envelope.report_path:
+            raise MigrationCorruption(
+                "scheduled result envelope report path is inconsistent"
+            )
+        if envelope.report_id is not None:
+            pins = execute_sql(
+                journal._connection,
+                "SELECT pin.source_observation_id, observation.observation_sha256 "
+                "FROM report_observations AS pin "
+                "JOIN source_observations AS observation "
+                "ON observation.id = pin.source_observation_id "
+                "WHERE pin.report_id = ? ORDER BY pin.observation_ordinal",
+                (envelope.report_row_id,),
+            ).fetchall()
+            if (
+                row[10] != envelope.report_body
+                or row[11] != envelope.report_content_sha256
+                or row[12] != envelope.report_state_sha256
+                or row[13] != str(session_date)
+                or row[14] != run_kind
+                or tuple(int(pin[0]) for pin in pins)
+                != envelope.report_observation_row_ids
+                or tuple(str(pin[1]) for pin in pins)
+                != envelope.report_observation_sha256s
+            ):
+                raise MigrationCorruption(
+                    "scheduled result envelope report material is inconsistent"
+                )
+        return envelope
+
+    Journal.read_scheduled_run_result_envelope = read_envelope
+
+    def claim(
+        store: object,
+        *,
+        kind: object,
+        session_date: object,
+        intended_at: object,
+        publisher: object,
+    ) -> tuple[bool, object | None]:
+        require_runner_stack()
+        journal = getattr(store, "journal", None)
+        if type(journal) is not journal_type:
+            raise InvalidJournalValue("scheduled store Journal is unverified")
+        if type(kind) is not str or type(session_date) is not date:
+            raise InvalidJournalValue("scheduled claim identity is unverified")
+        if type(intended_at) is not datetime:
+            raise InvalidJournalValue("scheduled claim time is unverified")
+        if kind not in {"PREMARKET", "CLOSE"}:
+            raise InvalidJournalValue("scheduled claim kind is unverified")
+        run_key = f"stock-monitor:{session_date.isoformat()}:{kind}"
+        stored_date = session_date.isoformat()
+        stored_intended_at = canonical_timestamp(intended_at)
+        immutable = (
+            run_key,
+            kind,
+            stored_date,
+            stored_intended_at,
+            stored_intended_at,
+        )
+        bound_publisher = None
+        if publisher is not None:
+            bound_publisher = publisher_record(publisher, journal, mint=True)
+            if bound_publisher is None:
+                existing = _sql(
+                    journal._connection,
+                    "SELECT 1 FROM scheduled_runs WHERE run_key = ? COLLATE BINARY",
+                    (run_key,),
+                ).fetchone()
+                if existing is None:
+                    raise InvalidJournalValue(
+                        "scheduled publisher authority is unverified"
+                    )
+        with journal.transaction() as transaction:
+            original_mark_dirty(transaction)
+            existing = execute_sql(
+                journal._connection,
+                "SELECT id, run_key, run_kind, session_date, intended_run_at, "
+                "started_at FROM scheduled_runs WHERE run_key = ? COLLATE BINARY",
+                (run_key,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing[1:]) != immutable:
+                    raise IdempotencyConflict(
+                        "scheduled run identity conflicts with stored content"
+                    )
+                run_id, duplicate = int(existing[0]), True
+            else:
+                cursor = execute_sql(
+                    journal._connection,
+                    "INSERT INTO scheduled_runs("
+                    "run_key, run_kind, session_date, intended_run_at, started_at"
+                    ") VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_key) DO NOTHING",
+                    immutable,
+                )
+                inserted = cursor.rowcount == 1
+                row = execute_sql(
+                    journal._connection,
+                    "SELECT id, run_key, run_kind, session_date, intended_run_at, "
+                    "started_at FROM scheduled_runs "
+                    "WHERE run_key = ? COLLATE BINARY",
+                    (run_key,),
+                ).fetchone()
+                if row is None:
+                    raise JournalError("scheduled run start could not be verified")
+                if tuple(row[1:]) != immutable:
+                    raise IdempotencyConflict(
+                        "scheduled run identity conflicts with stored content"
+                    )
+                run_id, duplicate = int(row[0]), not inserted
+        if duplicate:
+            return True, None
+        authority = object()
+        owners[id(authority)] = (
+            authority,
+            journal,
+            run_id,
+            run_key,
+            kind,
+            session_date,
+            intended_at,
+            bound_publisher,
+        )
+        return False, authority
+
+    def complete(
+        authority: object,
+        store: object,
+        *,
+        finished_at: object,
+        decision: object,
+        result: object,
+    ) -> None:
+        require_runner_stack()
+        record = owners.pop(id(authority), None)
+        journal = getattr(store, "journal", None)
+        if (
+            record is None
+            or record[0] is not authority
+            or record[1] is not journal
+            or type(journal) is not journal_type
+        ):
+            raise InvalidJournalValue("scheduled completion authority is unavailable")
+        if workflow_result_type is None or candidate_type is None:
+            raise InvalidJournalValue("scheduled authority is not configured")
+        if type(result) is not workflow_result_type:
+            raise InvalidJournalValue("scheduled completion result is unverified")
+        if type(result.candidates) is not tuple or any(
+            type(candidate) is not candidate_type for candidate in result.candidates
+        ):
+            raise InvalidJournalValue("scheduled completion candidates are unverified")
+        snapshot = (
+            result.outcome,
+            result.message,
+            result.exit_code,
+            result.reason_codes,
+            result.execution_mode,
+            tuple((candidate.symbol, candidate.role) for candidate in result.candidates),
+            result.report_id,
+            result.report_row_id,
+            result.report_path,
+        )
+        report_id, report_row_id, outward_path = snapshot[6:]
+        bound_publisher = record[7]
+        if any(
+            value is not None for value in (report_id, report_row_id, outward_path)
+        ) and not all(
+            value is not None for value in (report_id, report_row_id, outward_path)
+        ):
+            raise InvalidJournalValue("scheduled report result identity is incomplete")
+        report_path: str | None = None
+        stored_report: StoredReport | None = None
+        if report_id is not None:
+            if (
+                bound_publisher is None
+                or publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+            ):
+                raise InvalidJournalValue("scheduled publisher authority was revoked")
+            if (
+                type(report_id) is not str
+                or type(report_row_id) is not int
+                or type(outward_path) is not str
+            ):
+                raise InvalidJournalValue(
+                    "scheduled report result identity is unverified"
+                )
+            stored_report = journal.read_report(report_id)
+            if stored_report.report_row_id != report_row_id:
+                raise InvalidJournalValue(
+                    "scheduled report row identity is inconsistent"
+                )
+            if stored_report.body != snapshot[1]:
+                raise InvalidJournalValue(
+                    "scheduled result message conflicts with its report body"
+                )
+            report_path = stored_report.archive_relative_path
+            expected_outward_path = str(bound_publisher[2] / report_path)
+            if outward_path != expected_outward_path:
+                raise InvalidJournalValue(
+                    "scheduled outward report path is outside its bound archive root"
+                )
+            if (
+                publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+            ):
+                raise InvalidJournalValue("scheduled publisher authority was revoked")
+        envelope_payload = {
+            "schema": scheduled_schema,
+            "outcome": snapshot[0],
+            "message": snapshot[1],
+            "exit_code": snapshot[2],
+            "reason_codes": list(snapshot[3]),
+            "execution_mode": snapshot[4],
+            "candidates": [
+                {"symbol": symbol, "role": role}
+                for symbol, role in snapshot[5]
+            ],
+            "report_id": report_id,
+            "report_row_id": report_row_id,
+            "report_path": report_path,
+            "report_body": None if stored_report is None else stored_report.body,
+            "report_content_sha256": (
+                None if stored_report is None else stored_report.content_sha256
+            ),
+            "report_state_sha256": (
+                None if stored_report is None else stored_report.state_sha256
+            ),
+            "report_observation_row_ids": list(
+                () if stored_report is None else stored_report.observation_ids
+            ),
+            "report_observation_sha256s": list(
+                () if stored_report is None else stored_report.observation_sha256s
+            ),
+        }
+        envelope_json = canonical_json(envelope_payload)
+        envelope = decode_envelope(
+            envelope_json,
+            sha256_function(envelope_json.encode("utf-8")).hexdigest(),
+        )
+        if type(finished_at) is not datetime or type(decision) is not str:
+            raise InvalidJournalValue("scheduled completion metadata is unverified")
+        stored_finished_at = canonical_timestamp(finished_at)
+        if decision not in {"DUE_WAKE", "MISSED_RUN"}:
+            raise InvalidJournalValue("scheduled completion decision is unverified")
+        stored_outcome = "REPORT_EMITTED" if report_row_id is not None else "NOOP"
+        completion = (
+            stored_finished_at,
+            decision,
+            report_row_id,
+            report_path,
+            stored_outcome,
+            None,
+            envelope_json,
+            sha256_function(envelope_json.encode("utf-8")).hexdigest(),
+        )
+        with journal.transaction() as transaction:
+            if report_id is not None and (
+                publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+            ):
+                raise InvalidJournalValue("scheduled publisher authority was revoked")
+            original_mark_dirty(transaction)
+            row = execute_sql(
+                journal._connection,
+                "SELECT run_kind, session_date, started_at, finished_at, "
+                "market_session_decision, report_id, report_path, outcome, "
+                "error_class, result_envelope_json, result_envelope_sha256 "
+                "FROM scheduled_runs WHERE id = ?",
+                (record[2],),
+            ).fetchone()
+            if row is None:
+                raise InvalidJournalValue("scheduled run row does not exist")
+            if stored_finished_at < str(row[2]):
+                raise InvalidJournalValue(
+                    "scheduled run cannot finish before it starts"
+                )
+            if row[3] is not None:
+                if tuple(row[3:]) != completion:
+                    raise IdempotencyConflict(
+                        "scheduled run completion conflicts with stored content"
+                    )
+                return
+            if (stored_outcome == "REPORT_EMITTED") != (
+                report_row_id is not None
+            ):
+                raise InvalidJournalValue(
+                    "scheduled report outcome conflicts with its report identity"
+                )
+            if report_row_id is not None:
+                report = execute_sql(
+                    journal._connection,
+                    "SELECT report.session_date, report.report_kind, "
+                    "report.archive_relative_path, claim.status, claim.report_id, "
+                    "claim.finalized_at, report.report_id, report.body_text, "
+                    "report.content_sha256, report.state_sha256 "
+                    "FROM reports AS report "
+                    "JOIN report_claims AS claim ON claim.id = report.claim_id "
+                    "WHERE report.id = ?",
+                    (report_row_id,),
+                ).fetchone()
+                if report is None:
+                    raise InvalidJournalValue("report row does not exist")
+                if tuple(str(value) for value in report[:3]) != (
+                    str(row[1]),
+                    str(row[0]),
+                    report_path,
+                ):
+                    raise InvalidJournalValue(
+                        "scheduled report does not match the run identity and path"
+                    )
+                if report[3] != "FINALIZED" or report[4] != report_row_id:
+                    raise InvalidJournalValue("scheduled report is not finalized")
+                if report[6] != report_id:
+                    raise InvalidJournalValue(
+                        "scheduled result envelope conflicts with the report ID"
+                    )
+                pins = execute_sql(
+                    journal._connection,
+                    "SELECT pin.source_observation_id, observation.observation_sha256 "
+                    "FROM report_observations AS pin "
+                    "JOIN source_observations AS observation "
+                    "ON observation.id = pin.source_observation_id "
+                    "WHERE pin.report_id = ? ORDER BY pin.observation_ordinal",
+                    (report_row_id,),
+                ).fetchall()
+                if (
+                    report[7] != envelope.report_body
+                    or report[8] != envelope.report_content_sha256
+                    or report[9] != envelope.report_state_sha256
+                    or tuple(int(pin[0]) for pin in pins)
+                    != envelope.report_observation_row_ids
+                    or tuple(str(pin[1]) for pin in pins)
+                    != envelope.report_observation_sha256s
+                ):
+                    raise InvalidJournalValue(
+                        "scheduled result envelope conflicts with report material"
+                    )
+                finalized_at = report[5]
+                if (
+                    finalized_at is None
+                    or str(finalized_at) < str(row[2])
+                    or str(finalized_at) > stored_finished_at
+                ):
+                    raise InvalidJournalValue(
+                        "scheduled report finalization falls outside the run interval"
+                    )
+            if report_id is not None and (
+                bound_publisher is None
+                or stored_report is None
+                or publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+                or not archive_is_current(
+                    bound_publisher,
+                    report_path,
+                    stored_report.body,
+                    stored_report.content_sha256,
+                )
+            ):
+                raise InvalidJournalValue(
+                    "scheduled publisher or archive authority was revoked"
+                )
+            cursor = execute_sql(
+                journal._connection,
+                "UPDATE scheduled_runs SET finished_at = ?, "
+                "market_session_decision = ?, report_id = ?, report_path = ?, "
+                "outcome = ?, error_class = ?, result_envelope_json = ?, "
+                "result_envelope_sha256 = ? WHERE id = ? AND finished_at IS NULL",
+                (*completion, record[2]),
+            )
+            if cursor.rowcount != 1:
+                raise IdempotencyConflict(
+                    "scheduled run was completed concurrently"
+                )
+            if report_id is not None and (
+                bound_publisher is None
+                or stored_report is None
+                or publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+                or not archive_is_current(
+                    bound_publisher,
+                    report_path,
+                    stored_report.body,
+                    stored_report.content_sha256,
+                )
+            ):
+                raise InvalidJournalValue(
+                    "scheduled publisher or archive authority changed during completion"
+                )
+            persisted = execute_sql(
+                journal._connection,
+                "SELECT finished_at, market_session_decision, report_id, "
+                "report_path, outcome, error_class, result_envelope_json, "
+                "result_envelope_sha256 FROM scheduled_runs WHERE id = ?",
+                (record[2],),
+            ).fetchone()
+            if persisted is None or tuple(persisted) != completion:
+                raise InvalidJournalValue(
+                    "scheduled completion readback is inconsistent"
+                )
+            if report_id is not None and (
+                bound_publisher is None
+                or stored_report is None
+                or publisher_record(bound_publisher[0], journal, mint=False)
+                is not bound_publisher
+                or not archive_is_current(
+                    bound_publisher,
+                    report_path,
+                    stored_report.body,
+                    stored_report.content_sha256,
+                )
+            ):
+                raise InvalidJournalValue(
+                    "scheduled publisher or archive authority failed final readback"
+                )
+        if report_id is not None and (
+            bound_publisher is None
+            or stored_report is None
+            or publisher_record(bound_publisher[0], journal, mint=False)
+            is not bound_publisher
+            or not archive_is_current(
+                bound_publisher,
+                report_path,
+                stored_report.body,
+                stored_report.content_sha256,
+            )
+        ):
+            raise InvalidJournalValue(
+                "scheduled publisher or archive authority changed during commit"
+            )
+
+    def abandon(authority: object | None) -> None:
+        if authority is not None:
+            record = owners.get(id(authority))
+            if record is not None and record[0] is authority:
+                owners.pop(id(authority), None)
+
+    def heal(
+        store: object,
+        publisher: object,
+        *,
+        kind: object,
+        session_date: object,
+        stored: object,
+    ) -> object | None:
+        require_runner_stack(through_store=False)
+        journal = getattr(store, "journal", None)
+        if (
+            type(journal) is not journal_type
+            or workflow_result_type is None
+            or type(stored) is not workflow_result_type
+            or report_type is None
+            or published_type is None
+            or archive_function is None
+            or archive_code is None
+        ):
+            return None
+        bound = publisher_record(publisher, journal, mint=False)
+        if bound is None or "heal_finalized" in getattr(publisher, "__dict__", {}):
+            return None
+        if type(kind) is not str or type(session_date) is not date:
+            return None
+        report_id = stored.report_id
+        report_row_id = stored.report_row_id
+        report_path = stored.report_path
+        if (
+            type(report_id) is not str
+            or type(report_row_id) is not int
+            or type(report_path) is not str
+        ):
+            return None
+        try:
+            material = journal.read_report(report_id)
+        except JournalError:
+            return None
+        if (
+            material.report_row_id != report_row_id
+            or material.report_kind != kind
+            or material.session_date != session_date
+            or material.archive_relative_path != report_path
+            or material.body != stored.message
+        ):
+            return None
+        report = object_new(report_type)
+        for name, value in (
+            ("report_id", material.report_id),
+            ("kind", material.report_kind),
+            ("session_date", material.session_date),
+            ("outcome", "RECOVERED"),
+            ("body", material.body),
+            ("content_sha256", material.content_sha256),
+            ("observation_ids", material.observation_sha256s),
+            ("state_hash", material.state_sha256),
+        ):
+            object_setattr(report, name, value)
+        expected_path = bound[2] / material.archive_relative_path
+        if archive_function.__code__ is not archive_code:
+            return None
+        archive_function(report, bound[2])
+        if archive_function.__code__ is not archive_code:
+            return None
+        current = bound[2]
+        for part in material.archive_relative_path.split("/"):
+            current = current / part
+            if current.is_symlink():
+                return None
+        try:
+            archive_bytes = expected_path.read_bytes()
+        except OSError:
+            return None
+        expected_bytes = material.body.encode("utf-8")
+        if (
+            publisher_record(publisher, journal, mint=False) is not bound
+            or not expected_path.is_file()
+            or expected_path.resolve(strict=False)
+            != (bound[3] / material.archive_relative_path).resolve(strict=False)
+            or archive_bytes != expected_bytes
+            or sha256_function(archive_bytes).hexdigest()
+            != material.content_sha256
+        ):
+            return None
+        published = object_new(published_type)
+        object_setattr(published, "report_id", material.report_id)
+        object_setattr(published, "report_row_id", material.report_row_id)
+        object_setattr(published, "report_path", str(expected_path))
+        object_setattr(published, "status", "ALREADY_EMITTED")
+        return published
+
+    return configure, claim, complete, abandon, heal, read_envelope
+
+
+_scheduled_boundary_values = _make_scheduled_journal_boundary()
+del _make_scheduled_journal_boundary
+from . import scheduled as _scheduled_boundary_module
+
+_scheduled_boundary_token = _scheduled_boundary_module._scheduled_journal_bootstrap_token
+_scheduled_boundary_accept = (
+    _scheduled_boundary_module._accept_scheduled_journal_boundary
+)
+_scheduled_boundary_accept(
+    _scheduled_boundary_token,
+    _scheduled_boundary_values,
+)
+del _scheduled_boundary_accept
+del _scheduled_boundary_token
+del _scheduled_boundary_module
+del _scheduled_boundary_values

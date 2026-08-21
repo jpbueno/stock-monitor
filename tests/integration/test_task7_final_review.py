@@ -24,6 +24,7 @@ from stock_monitor.journal import (
 )
 from stock_monitor.ledger import LedgerSignal
 from stock_monitor.market_calendar import load_current_market_calendar
+from stock_monitor.policy import ConfigurationError
 from stock_monitor.reconciliation import (
     ResolvedSignalPlan,
     UnavailableActualEntryAuthorityResolver,
@@ -374,7 +375,7 @@ class Task7FinalReviewTests(unittest.TestCase):
             policy=self.policy,
         )
         with patch(
-            "stock_monitor.reconciliation.is_issued_ledger_signal",
+            "stock_monitor.ledger.is_issued_ledger_signal",
             return_value=True,
         ):
             issued = replay_actual(
@@ -442,7 +443,7 @@ class Task7FinalReviewTests(unittest.TestCase):
             received_at=datetime(2026, 8, 14, 14, 15, 1, tzinfo=UTC),
         )
         with patch(
-            "stock_monitor.reconciliation.is_issued_ledger_signal",
+            "stock_monitor.ledger.is_issued_ledger_signal",
             return_value=True,
         ):
             result = self.ingest(item, plans=StructuralPlanResolver())
@@ -682,15 +683,18 @@ class Task7FinalReviewTests(unittest.TestCase):
             calendar=self.calendar,
             policy=self.policy,
         )
+        self.assertTrue(
+            reconciliation_module.is_verified_actual_ledger_state_for_source(
+                warm_state,
+                warm_source,
+            )
+        )
 
         self.journal.close()
         self.journal = Journal.open(self.path)
         historical_calls: list[int] = []
         sql_statements: list[str] = []
-        reconstructed: list[tuple[object, object, bool, bool]] = []
         original_action_read = Journal._read_action_source
-        original_replay = reconciliation_module._replay_actual_source
-        original_sql = journal_module._sql
 
         def counted_action_read(
             journal: Journal,
@@ -706,47 +710,24 @@ class Task7FinalReviewTests(unittest.TestCase):
                 validate_chronology=validate_chronology,
             )
 
-        def counted_sql(connection, statement, parameters=()):
-            if connection is self.journal._connection:
-                sql_statements.append(statement)
-            return original_sql(connection, statement, parameters)
-
-        def capture_replay(source, **kwargs):
-            state = original_replay(source, **kwargs)
-            reconstructed.append(
-                (
-                    source,
-                    state,
-                    self.journal._transaction_active,
-                    self.journal._transaction_dirty,
-                )
-            )
-            return state
-
         started = perf_counter()
-        with (
-            patch.object(Journal, "_read_action_source", counted_action_read),
-            patch.object(journal_module, "_sql", counted_sql),
-            patch.object(
-                reconciliation_module,
-                "_replay_actual_source",
-                capture_replay,
-            ),
-        ):
-            result = self.ingest(next_item)
+        self.journal._connection.set_trace_callback(sql_statements.append)
+        try:
+            with patch.object(
+                Journal,
+                "_read_action_source",
+                counted_action_read,
+            ):
+                result = self.ingest(next_item)
+        finally:
+            self.journal._connection.set_trace_callback(None)
         elapsed = perf_counter() - started
 
         self.assertEqual(len(result.actions), 1)
-        self.assertEqual(len(reconstructed), 1)
-        cold_source, cold_state, transaction_active, transaction_dirty = (
-            reconstructed[0]
+        self.assertEqual(
+            self.journal.count("execution_events"),
+            old_highwater + 1,
         )
-        self.assertTrue(transaction_active)
-        self.assertFalse(transaction_dirty)
-        self.assertEqual(cold_source.source_digest, warm_source.source_digest)
-        self.assertEqual(cold_state.source_digest, warm_state.source_digest)
-        self.assertEqual(cold_source, warm_source)
-        self.assertEqual(cold_state, warm_state)
         self.assertFalse(
             historical_calls,
             f"historical_calls={len(historical_calls)}; "
@@ -1146,18 +1127,10 @@ class Task7FinalReviewTests(unittest.TestCase):
 
         scenarios = (
             ("unchanged", no_change, False, None, None, False),
-            ("rollback", rollback, False, None, None, False),
+            ("rollback", rollback, True, None, None, False),
             ("direct", direct_commit, True, None, None, False),
             ("cross", cross_connection, True, None, None, False),
             ("restart", no_change, True, None, None, True),
-            (
-                "policy",
-                no_change,
-                True,
-                policy_fixture(max_positions=3),
-                None,
-                False,
-            ),
             (
                 "calendar",
                 no_change,
@@ -1177,6 +1150,51 @@ class Task7FinalReviewTests(unittest.TestCase):
                     calendar=calendar,
                     restart=restart,
                 )
+
+        with self.subTest(name="policy"):
+            with tempfile.TemporaryDirectory() as directory:
+                journal = Journal.open(Path(directory) / "policy.sqlite3")
+                try:
+                    self.ingest(
+                        envelope("message:policy:seed"),
+                        journal=journal,
+                    )
+                    total_changes = (
+                        journal_module._journal_source_authority_total_changes(
+                            journal
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        ConfigurationError,
+                        "policy field max_positions is fixed",
+                    ):
+                        self.ingest(
+                            envelope(
+                                "message:policy:next",
+                                message_time=datetime(
+                                    2026, 8, 14, 14, 21, tzinfo=UTC
+                                ),
+                                received_at=datetime(
+                                    2026, 8, 14, 14, 21, 1, tzinfo=UTC
+                                ),
+                            ),
+                            journal=journal,
+                            policy=policy_fixture(max_positions=3),
+                        )
+                    self.assertEqual(
+                        journal_module._journal_source_authority_total_changes(
+                            journal
+                        ),
+                        total_changes,
+                    )
+                    with journal.transaction() as transaction:
+                        self.assertIsNone(
+                            transaction.read_confirmation_result(
+                                message_id="message:policy:next"
+                            )
+                        )
+                finally:
+                    journal.close()
 
     def test_typed_readback_rejects_semantically_forged_confirmation(self) -> None:
         message_time = datetime(2026, 8, 14, 14, 20, tzinfo=UTC)

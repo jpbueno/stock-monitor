@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "reviewed",
+  "schedule_id": "TEST_OPTION_FEES_V1",
+  "effective_session": "2026-08-18",
+  "reviewed_at": "2026-08-18T12:00:00.000000Z",
+  "currency": "USD",
+  "contract_multiplier": 100,
+  "entry_fee_per_contract_micros": 1000000,
+  "exit_fee_per_contract_micros": 500000,
+  "close_fee_reserve_per_contract_micros": 1000000,
+  "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

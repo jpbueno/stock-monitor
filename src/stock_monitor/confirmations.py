@@ -45,6 +45,7 @@ class ConfirmationKind(str, Enum):
     SOLD = "SOLD"
     SKIPPED = "SKIPPED"
     OPTION_WINDOW_START = "OPTION_PAPER_WINDOW_START"
+    OPTION_REVIEW = "OPTION_PAPER_REVIEW"
     OPTION_OPEN = "OPTION_PAPER_OPEN"
     OPTION_MARK = "OPTION_PAPER_MARK"
     OPTION_CLOSE = "OPTION_PAPER_CLOSE"
@@ -285,7 +286,7 @@ class ParsedConfirmation:
                 raise ValueError("INVALID_SKIPPED_TIME_BASIS")
         elif self.kind is ConfirmationKind.OPTION_WINDOW_START:
             exact({"event_time"})
-        elif self.kind is ConfirmationKind.OPTION_OPEN:
+        elif self.kind is ConfirmationKind.OPTION_REVIEW:
             exact(
                 {
                     "event_time",
@@ -297,6 +298,8 @@ class ParsedConfirmation:
                     "volume",
                 }
             )
+        elif self.kind is ConfirmationKind.OPTION_OPEN:
+            exact({"event_time", "occ_symbol", "ask"})
         elif self.kind in {ConfirmationKind.OPTION_MARK, ConfirmationKind.OPTION_CLOSE}:
             exact({"event_time", "occ_symbol", "bid", "ask"})
         elif self.kind is ConfirmationKind.RECONCILE_CASH:
@@ -595,8 +598,29 @@ def _parse_confirmation(text: str, session_date: date) -> ParsedConfirmation:
         )
 
     match = _match(
-        rf"OPTION PAPER OPEN (?P<occ>{_OCC}) BID (?P<bid>{_MONEY}) ASK (?P<ask>{_MONEY}) "
+        rf"OPTION PAPER REVIEW (?P<occ>{_OCC}) BID (?P<bid>{_MONEY}) ASK (?P<ask>{_MONEY}) "
         rf"DELTA (?P<delta>{_MONEY}) OI (?P<oi>{_COUNT}) VOLUME (?P<volume>{_COUNT}) AT (?P<at>.+)",
+        text,
+    )
+    if match is not None:
+        try:
+            occ = _validate_occ(match["occ"])
+        except ValueError as error:
+            raise ConfirmationParseError("INVALID_OCC_SYMBOL") from error
+        return ParsedConfirmation(
+            ConfirmationKind.OPTION_REVIEW,
+            text,
+            _parse_time(match["at"], session_date),
+            occ_symbol=occ,
+            bid=_positive_money(match["bid"]),
+            ask=_positive_money(match["ask"]),
+            delta=_decimal(match["delta"]),
+            open_interest=_integer(match["oi"], nonnegative=True),
+            volume=_integer(match["volume"], nonnegative=True),
+        )
+
+    match = _match(
+        rf"OPTION PAPER OPEN (?P<occ>{_OCC}) ASK (?P<ask>{_MONEY}) AT (?P<at>.+)",
         text,
     )
     if match is not None:
@@ -609,11 +633,7 @@ def _parse_confirmation(text: str, session_date: date) -> ParsedConfirmation:
             text,
             _parse_time(match["at"], session_date),
             occ_symbol=occ,
-            bid=_positive_money(match["bid"]),
             ask=_positive_money(match["ask"]),
-            delta=_decimal(match["delta"]),
-            open_interest=_integer(match["oi"], nonnegative=True),
-            volume=_integer(match["volume"], nonnegative=True),
         )
 
     for prefix, kind in (

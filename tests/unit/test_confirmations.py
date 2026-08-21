@@ -65,7 +65,8 @@ class ConfirmationGrammarTests(unittest.TestCase):
             "SOLD spy 5 shares @ 104.00 AT 15:31 ET": ConfirmationKind.SOLD,
             "SKIPPED spy": ConfirmationKind.SKIPPED,
             "OPTION PAPER WINDOW START AT 2026-08-14T14:00:00-04:00": ConfirmationKind.OPTION_WINDOW_START,
-            "OPTION PAPER OPEN AAPL260918C00150000 BID 2.10 ASK 2.20 DELTA 0.35 OI 1000 VOLUME 100 AT 10:20 ET": ConfirmationKind.OPTION_OPEN,
+            "OPTION PAPER REVIEW AAPL260918C00150000 BID 2.10 ASK 2.20 DELTA 0.35 OI 1000 VOLUME 100 AT 10:19 ET": ConfirmationKind.OPTION_REVIEW,
+            "OPTION PAPER OPEN AAPL260918C00150000 ASK 2.20 AT 10:20 ET": ConfirmationKind.OPTION_OPEN,
             "OPTION PAPER MARK AAPL260918C00150000 BID 2.20 ASK 2.30 AT 15:40 ET": ConfirmationKind.OPTION_MARK,
             "OPTION PAPER CLOSE AAPL260918C00150000 BID 2.40 ASK 2.50 AT 15:41 ET": ConfirmationKind.OPTION_CLOSE,
             "RECONCILE CASH -100.25 REASON unrelated withdrawal AT 11:00 ET": ConfirmationKind.RECONCILE_CASH,
@@ -178,10 +179,16 @@ class ConfirmationGrammarTests(unittest.TestCase):
             "SKIPPED .SPY",
             "OPTION PAPER WINDOW START AT 24:00 ET",
             "OPTION PAPER WINDOW START AT not-a-time",
-            "OPTION PAPER OPEN NOTOCC BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1 AT 10:14 ET",
-            "OPTION PAPER OPEN AAPL260231C00150000 BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1 AT 10:14 ET",
-            "OPTION PAPER OPEN AAPL260918C00150000 BID 1 ASK 2 DELTA 0 OI 1 VOLUME 1 AT 10:14 ET",
-            "OPTION PAPER OPEN AAPL260918C00150000 BID 1 ASK 2 DELTA 1 OI 1 VOLUME 1 AT 10:14 ET",
+            "OPTION PAPER REVIEW AAPL260918C00150000 BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1",
+            "OPTION PAPER REVIEW AAPL260918C00150000 BID 1 ASK 2 DELTA 0.3 OI 1 AT 10:14 ET",
+            "OPTION PAPER REVIEW NOTOCC BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1 AT 10:14 ET",
+            "OPTION PAPER REVIEW AAPL260231C00150000 BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1 AT 10:14 ET",
+            "OPTION PAPER REVIEW AAPL260918C00150000 BID 1 ASK 2 DELTA 0 OI 1 VOLUME 1 AT 10:14 ET",
+            "OPTION PAPER REVIEW AAPL260918C00150000 BID 1 ASK 2 DELTA 1 OI 1 VOLUME 1 AT 10:14 ET",
+            "OPTION PAPER OPEN NOTOCC ASK 2 AT 10:14 ET",
+            "OPTION PAPER OPEN AAPL260231C00150000 ASK 2 AT 10:14 ET",
+            "OPTION PAPER OPEN AAPL260918C00150000 ASK 0 AT 10:14 ET",
+            "OPTION PAPER OPEN AAPL260918C00150000 BID 1 ASK 2 DELTA 0.3 OI 1 VOLUME 1 AT 10:14 ET",
             "OPTION PAPER MARK AAPL260918C00150000 BID 2 ASK 1 AT 10:14 ET",
             "OPTION PAPER MARK AAPL260918C00150000 BID 0 ASK 1 AT 10:14 ET",
             "OPTION PAPER CLOSE AAPL260918C00150000 BID 2 ASK 1 AT 10:14 ET",
@@ -338,8 +345,8 @@ class ConfirmationGrammarTests(unittest.TestCase):
     def test_option_delta_is_exactly_micro_precision_and_canonical(self) -> None:
         at = datetime(2026, 8, 14, 10, 14, tzinfo=ET)
         values = {
-            "kind": ConfirmationKind.OPTION_OPEN,
-            "raw_text": "OPTION PAPER OPEN",
+            "kind": ConfirmationKind.OPTION_REVIEW,
+            "raw_text": "OPTION PAPER REVIEW",
             "event_time": at,
             "occ_symbol": "AAPL260918C00150000",
             "bid": Decimal("1"),
@@ -355,7 +362,7 @@ class ConfirmationGrammarTests(unittest.TestCase):
             ParsedConfirmation(delta=Decimal("0.1234567"), **values)
         with self.assertRaises(ConfirmationParseError):
             parse_confirmation(
-                "OPTION PAPER OPEN AAPL260918C00150000 BID 1 ASK 2 "
+                "OPTION PAPER REVIEW AAPL260918C00150000 BID 1 ASK 2 "
                 "DELTA 0.1234567 OI 1 VOLUME 1 AT 10:14 ET",
                 session_date=SESSION,
             )

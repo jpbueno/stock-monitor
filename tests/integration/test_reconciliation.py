@@ -358,6 +358,17 @@ class ReconciliationAssessmentTests(unittest.TestCase):
                 False,
             ),
             (
+                "OPTION PAPER REVIEW AAPL260918C00150000 BID 2 ASK 2.10 "
+                "DELTA 0.35 OI 1000 VOLUME 100 AT 10:19 ET",
+                ActionStatus.COMPLIANT,
+                False,
+            ),
+            (
+                "OPTION PAPER OPEN AAPL260918C00150000 ASK 2.10 AT 10:20 ET",
+                ActionStatus.COMPLIANT,
+                False,
+            ),
+            (
                 "OPTION PAPER MARK AAPL260918C00150000 BID 2 ASK 2.10 AT 15:40 ET",
                 ActionStatus.COMPLIANT,
                 False,

@@ -1,0 +1,7 @@
+{
+  "now": "2025-11-28T12:30:00-05:00",
+  "account": {"configuration": "READY", "market": "OPEN", "review_time": "12:30", "universe": "READY", "breaker": "CLEAR", "candidates": [], "close_state": "HOLD"},
+  "provider_fixture": "READY",
+  "evidence_fixture": "READY",
+  "expected_outcome": "HOLD"
+}

@@ -198,11 +198,42 @@ class RiskJournalAdapterTests(unittest.TestCase):
                     (False, False, False, False, False),
                 )
                 raise RuntimeError("rollback")
-        self.assertTrue(is_verified_journal_window_source(source))
-        self.assertTrue(is_verified_journal_action_source(source.terminal_action))
-        self.assertTrue(is_issued_confirmed_buy_action(action))
-        self.assertTrue(is_issued_journal_event_window(window))
-        self.assertTrue(settlement.source_verified)
+        self.assertEqual(
+            (
+                is_verified_journal_window_source(source),
+                is_verified_journal_action_source(source.terminal_action),
+                is_issued_confirmed_buy_action(action),
+                is_issued_journal_event_window(window),
+                settlement.source_verified,
+            ),
+            (False, False, False, False, False),
+            "total_changes is monotonic, so rollback cannot revive identities",
+        )
+
+        with self.journal.transaction() as transaction:
+            refreshed_source = transaction.read_account_check_window(
+                account_check_event_id=(
+                    source.account_check_action.execution_event_id
+                ),
+                terminal_event_id=source.terminal_action.execution_event_id,
+            )
+        self.assertIsNot(refreshed_source, source)
+        source = refreshed_source
+        _check, action, window = risk_module._issue_account_buy_authority(source)
+        settlement = risk_module._issue_settlement_ledger_from_account_window(
+            event_window=window,
+            calendar_resolver=self.calendar,
+        )
+        self.assertEqual(
+            (
+                is_verified_journal_window_source(source),
+                is_verified_journal_action_source(source.terminal_action),
+                is_issued_confirmed_buy_action(action),
+                is_issued_journal_event_window(window),
+                settlement.source_verified,
+            ),
+            (True, True, True, True, True),
+        )
 
         self.ingest(
             envelope(
@@ -223,6 +254,218 @@ class RiskJournalAdapterTests(unittest.TestCase):
             ),
             (False, False, False, False, False),
         )
+
+    def test_journal_authority_binding_cannot_be_overwritten_cross_owner(
+        self,
+    ) -> None:
+        owner_one_source = self.read_window()
+        _check_one, action_one, window_one = (
+            risk_module._issue_account_buy_authority(owner_one_source)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with Journal.open(Path(directory) / "other.sqlite3") as owner_two:
+                owner_one = self.journal
+                self.journal = owner_two
+                try:
+                    owner_two_source = self.read_window()
+                finally:
+                    self.journal = owner_one
+                _check_two, action_two, window_two = (
+                    risk_module._issue_account_buy_authority(owner_two_source)
+                )
+                self.assertTrue(is_issued_confirmed_buy_action(action_two))
+                self.assertTrue(is_issued_journal_event_window(window_two))
+
+                self.ingest(
+                    envelope(
+                        "message:new-generation",
+                        "FEE SPY 0.03 AT 10:16 ET",
+                        message_time="2026-08-14T10:16:30-04:00",
+                        received_at="2026-08-14T10:16:31-04:00",
+                    )
+                )
+                self.assertEqual(
+                    (
+                        is_issued_confirmed_buy_action(action_one),
+                        is_issued_journal_event_window(window_one),
+                    ),
+                    (False, False),
+                )
+
+                for value in (action_one, window_one):
+                    with self.assertRaisesRegex(
+                        RiskBlock,
+                        "RISK_AUTHORITY_BINDING_UNAVAILABLE",
+                    ):
+                        risk_module._bind_journal_derived_source(
+                            value,
+                            owner_two_source,
+                            "JOURNAL_WINDOW_SOURCE",
+                        )
+
+                self.assertIsNot(owner_one_source, owner_two_source)
+                self.assertEqual(
+                    (
+                        is_issued_confirmed_buy_action(action_one),
+                        is_issued_journal_event_window(window_one),
+                    ),
+                    (False, False),
+                )
+
+    def test_generic_risk_registrar_cannot_mint_copied_authority(self) -> None:
+        source = self.read_window()
+        _check, action, _window = risk_module._issue_account_buy_authority(
+            source
+        )
+        copied = replace(action)
+        self.assertFalse(is_issued_confirmed_buy_action(copied))
+
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_REGISTRAR_UNAVAILABLE",
+        ):
+            risk_module._register_risk_authority(
+                risk_module._CONFIRMED_BUY_AUTHORITIES,
+                copied,
+                exact_type=risk_module.ConfirmedBuyAction,
+            )
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_REGISTRAR_UNAVAILABLE",
+        ):
+            risk_module._install_risk_authority(
+                risk_module._CONFIRMED_BUY_AUTHORITIES,
+                copied,
+                exact_type=risk_module.ConfirmedBuyAction,
+            )
+        self.assertFalse(
+            hasattr(risk_module, "_risk_authority_installer_factory")
+        )
+        self.assertFalse(hasattr(risk_module, "_getframe"))
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_BINDING_UNAVAILABLE",
+        ):
+            risk_module._bind_journal_derived_source(
+                copied,
+                source,
+                "JOURNAL_WINDOW_SOURCE",
+            )
+
+        self.assertFalse(is_issued_confirmed_buy_action(copied))
+
+    def test_generic_identity_registrar_cannot_mint_settlement_or_refresh(
+        self,
+    ) -> None:
+        source = self.read_window()
+        _check, _action, window = risk_module._issue_account_buy_authority(
+            source
+        )
+        settlement = risk_module._issue_settlement_ledger_from_account_window(
+            event_window=window,
+            calendar_resolver=self.calendar,
+        )
+        copied_settlement = replace(settlement)
+        self.assertFalse(copied_settlement.source_verified)
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_REGISTRAR_UNAVAILABLE",
+        ):
+            risk_module._register_identity_authority(
+                risk_module._SETTLEMENT_LEDGER_AUTHORITIES,
+                copied_settlement,
+                risk_module._settlement_ledger_fingerprint(
+                    copied_settlement
+                ),
+            )
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_BINDING_UNAVAILABLE",
+        ):
+            risk_module._bind_journal_derived_source(
+                copied_settlement,
+                window,
+                "ISSUED_EVENT_WINDOW",
+            )
+        self.assertFalse(copied_settlement.source_verified)
+
+        point = risk_module.EquityPoint(
+            session_date=SESSION,
+            equity=Decimal("5000"),
+        )
+        paired = risk_module.evaluate_paired_breakers(
+            canonical_equity=(point,),
+            canonical_closes=(),
+            actual_equity=(point,),
+            actual_closes=(),
+            calendar=self.calendar,
+            as_of=SESSION,
+        )
+        raw_refresh = risk_module.ActualBreakerRefreshAuthority(
+            as_of=datetime.fromisoformat("2026-08-14T10:15:01-04:00"),
+            through_execution_cursor=0,
+            through_close_cursor=0,
+            paired_breaker=paired,
+            calendar_digest=risk_module._calendar_digest(self.calendar),
+            source_digest="a" * 64,
+        )
+        self.assertFalse(
+            risk_module.is_issued_actual_breaker_refresh_authority(
+                raw_refresh
+            )
+        )
+        with self.assertRaisesRegex(
+            RiskBlock,
+            "RISK_AUTHORITY_REGISTRAR_UNAVAILABLE",
+        ):
+            risk_module._register_identity_authority(
+                risk_module._ACTUAL_BREAKER_REFRESH_AUTHORITIES,
+                raw_refresh,
+                risk_module._actual_breaker_refresh_fingerprint(raw_refresh),
+            )
+        self.assertFalse(
+            risk_module.is_issued_actual_breaker_refresh_authority(
+                raw_refresh
+            )
+        )
+
+    def test_settlement_ledger_verifier_finalizes_after_journal_callbacks(
+        self,
+    ) -> None:
+        source = self.read_window()
+        _check, _action, window = risk_module._issue_account_buy_authority(
+            source
+        )
+        settlement = risk_module._issue_settlement_ledger_from_account_window(
+            event_window=window,
+            calendar_resolver=self.calendar,
+        )
+        self.assertTrue(settlement.source_verified)
+        fired = False
+
+        def mutate_during_currentness(sql: str) -> None:
+            nonlocal fired
+            if fired or not sql.upper().startswith("PRAGMA DATA_VERSION"):
+                return
+            fired = True
+            object.__setattr__(
+                settlement,
+                "initial_settled_cash",
+                Decimal("1"),
+            )
+
+        self.journal._connection.set_trace_callback(
+            mutate_during_currentness
+        )
+        try:
+            accepted_while_mutated = settlement.source_verified
+        finally:
+            self.journal._connection.set_trace_callback(None)
+
+        self.assertTrue(fired)
+        self.assertFalse(accepted_while_mutated)
+        self.assertFalse(settlement.source_verified)
 
     def test_pending_clarification_between_check_and_buy_fails_closed(self) -> None:
         source = self.read_window(

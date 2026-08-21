@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
+import stock_monitor.config as config_module
 from stock_monitor.config import ConfigurationError, load_settings
 
 
@@ -58,6 +61,31 @@ class SettingsTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_fees(self, document: object) -> Path:
+        path = self.project_root / "config" / "fees.json"
+        path.write_text(
+            json.dumps(document, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _reviewed_fees(self, **replacements: object) -> dict[str, object]:
+        document: dict[str, object] = {
+            "schema_version": 1,
+            "status": "reviewed",
+            "schedule_id": "TEST_OPTION_FEES_V1",
+            "effective_session": "2026-08-18",
+            "reviewed_at": "2026-08-18T16:00:00.000000Z",
+            "currency": "USD",
+            "contract_multiplier": 100,
+            "entry_fee_per_contract_micros": 10_000,
+            "exit_fee_per_contract_micros": 20_000,
+            "close_fee_reserve_per_contract_micros": 30_000,
+            "source_sha256": "a" * 64,
+        }
+        document.update(replacements)
+        return document
+
     def test_project_and_default_runtime_paths_are_resolved(self) -> None:
         settings = load_settings(self.project_root / ".", ENVIRONMENT)
 
@@ -84,6 +112,138 @@ class SettingsTests(unittest.TestCase):
 
         self.assertNotIn(ENVIRONMENT["APCA_API_KEY_ID"], rendered)
         self.assertNotIn(ENVIRONMENT["APCA_API_SECRET_KEY"], rendered)
+
+    def test_checked_in_fee_review_marker_blocks_phase2_but_not_phase1_settings(
+        self,
+    ) -> None:
+        loader = getattr(config_module, "load_fee_schedule", None)
+        self.assertIsNotNone(loader, "typed Phase 2 fee loader is missing")
+        assert loader is not None
+
+        settings = load_settings(self.project_root, ENVIRONMENT)
+        with self.assertRaisesRegex(ConfigurationError, "explicit.*review"):
+            loader(settings.fees_path)
+
+    def test_reviewed_fee_schedule_loads_as_an_immutable_typed_value(self) -> None:
+        loader = getattr(config_module, "load_fee_schedule", None)
+        schedule_type = getattr(config_module, "FeeSchedule", None)
+        self.assertIsNotNone(loader, "typed Phase 2 fee loader is missing")
+        self.assertIsNotNone(schedule_type, "typed Phase 2 fee schedule is missing")
+        assert loader is not None and schedule_type is not None
+        document = self._reviewed_fees()
+        path = self._write_fees(document)
+
+        schedule = loader(path)
+
+        self.assertIsInstance(schedule, schedule_type)
+        self.assertEqual(schedule.schedule_id, "TEST_OPTION_FEES_V1")
+        self.assertEqual(schedule.effective_session.isoformat(), "2026-08-18")
+        self.assertEqual(
+            schedule.reviewed_at.isoformat(),
+            "2026-08-18T16:00:00+00:00",
+        )
+        self.assertEqual(schedule.currency, "USD")
+        self.assertEqual(schedule.contract_multiplier, 100)
+        self.assertEqual(schedule.entry_fee_per_contract_micros, 10_000)
+        self.assertEqual(schedule.exit_fee_per_contract_micros, 20_000)
+        self.assertEqual(schedule.close_fee_reserve_per_contract_micros, 30_000)
+        self.assertEqual(schedule.source_sha256, "a" * 64)
+        canonical = json.dumps(
+            document,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self.assertEqual(schedule.digest, hashlib.sha256(canonical).hexdigest())
+        with self.assertRaises((AttributeError, TypeError)):
+            schedule.contract_multiplier = 1
+
+    def test_fee_schedule_rejects_unreviewed_unknown_or_unsafe_values(self) -> None:
+        loader = getattr(config_module, "load_fee_schedule", None)
+        self.assertIsNotNone(loader, "typed Phase 2 fee loader is missing")
+        assert loader is not None
+        cases = (
+            ("boolean schema version", {"schema_version": True}),
+            ("wrong schema version", {"schema_version": 2}),
+            ("string schema version", {"schema_version": "1"}),
+            ("unreviewed", {"status": "operator_review_required"}),
+            ("unknown field", {"unexpected": "value"}),
+            ("boolean integer", {"entry_fee_per_contract_micros": True}),
+            ("negative fee", {"exit_fee_per_contract_micros": -1}),
+            ("zero exit fee", {"exit_fee_per_contract_micros": 0}),
+            ("wrong multiplier", {"contract_multiplier": 1}),
+            (
+                "under-reserved close",
+                {
+                    "exit_fee_per_contract_micros": 30_000,
+                    "close_fee_reserve_per_contract_micros": 20_000,
+                },
+            ),
+            ("noncanonical date", {"effective_session": "2026-8-18"}),
+            (
+                "noncanonical timestamp",
+                {"reviewed_at": "2026-08-18T12:00:00-04:00"},
+            ),
+            ("unsafe schedule id", {"schedule_id": "option fees v1"}),
+            ("wrong currency", {"currency": "EUR"}),
+            ("uppercase source hash", {"source_sha256": "A" * 64}),
+        )
+        for case, replacements in cases:
+            with self.subTest(case=case):
+                path = self._write_fees(self._reviewed_fees(**replacements))
+                with self.assertRaises(ConfigurationError) as raised:
+                    loader(path)
+                self.assertNotIn("key-id-canary", str(raised.exception))
+                self.assertNotIn("secret-key-canary", str(raised.exception))
+
+    def test_fee_schedule_authority_rejects_raw_copied_and_mutated_values(self) -> None:
+        loader = getattr(config_module, "load_fee_schedule", None)
+        verifier = getattr(config_module, "is_reviewed_fee_schedule", None)
+        self.assertIsNotNone(loader, "typed Phase 2 fee loader is missing")
+        self.assertIsNotNone(verifier, "fee schedule authority verifier is missing")
+        assert loader is not None and verifier is not None
+        self.assertIsNone(
+            getattr(config_module, "_issue_fee_schedule", None),
+            "caller-accessible raw fee schedule registrar must not exist",
+        )
+        document = self._reviewed_fees()
+        path = self._write_fees(document)
+
+        issued = loader(path)
+
+        self.assertTrue(verifier(issued))
+        self.assertFalse(verifier(document))
+        self.assertFalse(verifier(copy.copy(issued)))
+        object.__setattr__(
+            issued,
+            "entry_fee_per_contract_micros",
+            issued.entry_fee_per_contract_micros + 1,
+        )
+        self.assertFalse(verifier(issued))
+        self.assertTrue(verifier(loader(path)))
+
+    def test_archived_fee_reissuer_accepts_only_a_journal_source_capability(
+        self,
+    ) -> None:
+        reissuer = getattr(config_module, "_reissue_archived_fee_schedule", None)
+        self.assertIsNotNone(reissuer, "archived fee source reissuer is missing")
+        assert reissuer is not None
+        reviewed_bytes = json.dumps(
+            self._reviewed_fees(),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+        class FakeArchivedSource:
+            def __init__(self) -> None:
+                self.reviewed_bytes = reviewed_bytes
+
+            def _is_current_phase2_fee_schedule_source(self) -> bool:
+                return True
+
+        for raw in (reviewed_bytes, self._reviewed_fees(), FakeArchivedSource()):
+            with self.subTest(raw=type(raw).__name__):
+                with self.assertRaises(ConfigurationError):
+                    reissuer(raw)
 
     def test_loader_reads_only_the_four_approved_environment_variables(self) -> None:
         environ = RecordingEnvironment(

@@ -868,18 +868,23 @@ git commit -m "feat: track prospective phase one validation"
 - Create: `src/stock_monitor/sql/003_phase2_paper.sql`
 - Create: `src/stock_monitor/replay.py`
 - Create: `src/stock_monitor/options_paper.py`
+- Create: `tests/fixtures/options/reviewed-fees.json`
 - Modify: `src/stock_monitor/config.py`
+- Modify: `src/stock_monitor/confirmations.py`
 - Modify: `src/stock_monitor/journal.py`
-- Modify: `tests/support.py`
+- Modify: `src/stock_monitor/providers/alpaca.py`
+- Modify: `src/stock_monitor/reconciliation.py`
 - Modify: `tests/architecture/test_brokerage_boundary.py`
+- Modify: `tests/contract/test_alpaca.py`
+- Modify: `tests/integration/test_confirmation_idempotency.py`
 - Modify: `tests/integration/test_journal_migrations.py`
+- Modify: `tests/integration/test_reconciliation.py`
 - Modify: `tests/unit/test_config.py`
+- Modify: `tests/unit/test_confirmations.py`
 - Test: `tests/unit/test_replay.py`
 - Test: `tests/unit/test_option_selection.py`
 - Test: `tests/unit/test_option_accounting.py`
 - Test: `tests/integration/test_phase2_gate.py`
-- Create: `tests/fixtures/options/`
-- Create: `tests/fixtures/replay/`
 
 - [ ] **Step 1: Write failing replay and option-ranking tests**
 
@@ -936,14 +941,24 @@ Run `test_replay`, `test_option_selection`, `test_option_accounting`, and `test_
 
 - [ ] **Step 4: Run Task 9 tests and verify GREEN**
 
-Run: `PYTHONPATH=src python3 -m unittest tests.unit.test_replay tests.unit.test_option_selection tests.unit.test_option_accounting tests.integration.test_phase2_gate -v`
+Run the expanded Task 9 migration, provider, confirmation, reconciliation, replay, option, and Phase 2 authority suites:
 
-Expected: all Task 9 tests pass.
+`PYTHONPATH=src .venv/bin/python -W error -m unittest tests.architecture.test_brokerage_boundary tests.unit.test_config tests.contract.test_alpaca tests.unit.test_confirmations tests.integration.test_confirmation_idempotency tests.integration.test_reconciliation tests.integration.test_journal_migrations tests.unit.test_replay tests.unit.test_option_selection tests.unit.test_option_accounting tests.integration.test_phase2_gate -v`
+
+Run the affected journal, source-authority, provider-boundary, Phase 1 promotion, and accounting regressions:
+
+`PYTHONPATH=src .venv/bin/python -W error -m unittest tests.security.test_network_boundary tests.contract.test_sec tests.contract.test_reference tests.integration.test_journal tests.integration.test_journal_confirmation_sources tests.integration.test_actual_transitions tests.integration.test_phase1_authorities tests.integration.test_signal_lifecycle tests.integration.test_task7_final_review tests.integration.test_task7_source_authorities tests.integration.test_risk_journal_adapter tests.integration.test_separate_ledgers tests.unit.test_evidence tests.unit.test_paper_fills tests.unit.test_equity_curve tests.unit.test_phase1_promotion -v`
+
+Run the complete repository suite with warnings promoted to errors:
+
+`PYTHONPATH=src .venv/bin/python -W error -m unittest discover -s tests -v`
+
+Expected: the expanded Task 9 suites, affected regressions, and complete repository suite all pass with no warnings.
 
 - [ ] **Step 5: Commit Task 9**
 
 ```bash
-git add docs/superpowers/plans/2026-08-14-stock-monitor-implementation.md src/stock_monitor/config.py src/stock_monitor/journal.py src/stock_monitor/options_paper.py src/stock_monitor/replay.py src/stock_monitor/sql/003_phase2_paper.sql tests/architecture/test_brokerage_boundary.py tests/integration/test_journal_migrations.py tests/integration/test_phase2_gate.py tests/support.py tests/unit/test_config.py tests/unit/test_option_accounting.py tests/unit/test_option_selection.py tests/unit/test_replay.py tests/fixtures/options tests/fixtures/replay
+git add docs/superpowers/plans/2026-08-14-stock-monitor-implementation.md src/stock_monitor/config.py src/stock_monitor/confirmations.py src/stock_monitor/journal.py src/stock_monitor/options_paper.py src/stock_monitor/providers/alpaca.py src/stock_monitor/reconciliation.py src/stock_monitor/replay.py src/stock_monitor/sql/003_phase2_paper.sql tests/architecture/test_brokerage_boundary.py tests/contract/test_alpaca.py tests/fixtures/options/reviewed-fees.json tests/integration/test_confirmation_idempotency.py tests/integration/test_journal_migrations.py tests/integration/test_phase2_gate.py tests/integration/test_reconciliation.py tests/unit/test_config.py tests/unit/test_confirmations.py tests/unit/test_option_accounting.py tests/unit/test_option_selection.py tests/unit/test_replay.py
 git commit -m "feat: add replay and paper option validation"
 ```
 

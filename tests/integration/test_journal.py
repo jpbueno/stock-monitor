@@ -22,9 +22,46 @@ from stock_monitor.journal import (
     JournalBusy,
     JournalError,
     MigrationCorruption,
+    ScheduledRunResultEnvelope,
     report_archive_relative_path,
     stable_report_id,
 )
+
+
+def _scheduled_result_envelope(
+    *,
+    outcome: str = "NO_TRADE",
+    message: str = "NO TRADE",
+    exit_code: int = 0,
+    reason_codes: tuple[str, ...] = ("NO_TRADE",),
+    candidates: tuple[tuple[str, str], ...] = (),
+    report_id: str | None = None,
+    report_row_id: int | None = None,
+    report_path: str | None = None,
+    report_state_sha256: str | None = None,
+) -> ScheduledRunResultEnvelope:
+    return ScheduledRunResultEnvelope(
+        outcome=outcome,
+        message=message,
+        exit_code=exit_code,
+        reason_codes=reason_codes,
+        execution_mode="FIXTURE",
+        candidates=candidates,
+        report_id=report_id,
+        report_row_id=report_row_id,
+        report_path=report_path,
+        report_body=None if report_id is None else message,
+        report_content_sha256=(
+            None
+            if report_id is None
+            else hashlib.sha256(message.encode("utf-8")).hexdigest()
+        ),
+        report_state_sha256=(
+            None
+            if report_id is None
+            else (report_state_sha256 or "a" * 64)
+        ),
+    )
 
 
 class JournalTests(unittest.TestCase):
@@ -32,6 +69,71 @@ class JournalTests(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.db_path = Path(self._temporary_directory.name) / "state" / "journal.db"
+
+    @staticmethod
+    def _seed_scheduled_run(
+        journal: Journal,
+        *,
+        run_key: str,
+        run_kind: str,
+        intended_at: datetime,
+        started_at: datetime | None = None,
+    ) -> int:
+        started_at = intended_at if started_at is None else started_at
+        intended_text = intended_at.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        started_text = started_at.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        cursor = journal._connection.execute(
+            "INSERT INTO scheduled_runs("
+            "run_key, run_kind, session_date, intended_run_at, started_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                run_key,
+                run_kind,
+                intended_at.date().isoformat(),
+                intended_text,
+                started_text,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _complete_scheduled_run_storage(
+        journal: Journal,
+        *,
+        run_id: int,
+        finished_at: datetime,
+        decision: str,
+        outcome: str,
+        envelope: ScheduledRunResultEnvelope,
+        report_row_id: int | None = None,
+        report_path: str | None = None,
+    ) -> None:
+        stored_json, stored_sha256 = (
+            journal_module._scheduled_result_envelope_storage(envelope)
+        )
+        finished_text = finished_at.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        journal._connection.execute(
+            "UPDATE scheduled_runs SET finished_at = ?, "
+            "market_session_decision = ?, report_id = ?, report_path = ?, "
+            "outcome = ?, result_envelope_json = ?, "
+            "result_envelope_sha256 = ? WHERE id = ?",
+            (
+                finished_text,
+                decision,
+                report_row_id,
+                report_path,
+                outcome,
+                stored_json,
+                stored_sha256,
+                run_id,
+            ),
+        )
 
     def test_exact_raw_message_replay_is_idempotent(self) -> None:
         at = datetime(2026, 8, 14, 10, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -1605,64 +1707,268 @@ class JournalTests(unittest.TestCase):
         intended = datetime(2026, 8, 14, 19, 30, tzinfo=timezone.utc)
         started = intended + timedelta(seconds=2)
         with Journal.open(self.db_path) as journal:
-            run_id, duplicate = journal.start_scheduled_run(
+            run_id = self._seed_scheduled_run(
+                journal,
                 run_key="close-2026-08-14",
                 run_kind="CLOSE",
-                session_date=session_date,
-                intended_run_at=intended,
                 started_at=started,
+                intended_at=intended,
             )
-            replay_id, replay_duplicate = journal.start_scheduled_run(
-                run_key="close-2026-08-14",
-                run_kind="close",
-                session_date=session_date,
-                intended_run_at=intended,
-                started_at=started,
-            )
-            self.assertEqual(run_id, replay_id)
-            self.assertFalse(duplicate)
-            self.assertTrue(replay_duplicate)
             self.assertEqual(journal.count("scheduled_runs"), 1)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self._seed_scheduled_run(
+                    journal,
+                    run_key="close-2026-08-14",
+                    run_kind="CLOSE",
+                    started_at=started,
+                    intended_at=intended,
+                )
 
-            completed_id, completed_duplicate = journal.complete_scheduled_run(
+            self._complete_scheduled_run_storage(
+                journal,
                 run_id=run_id,
                 finished_at=started + timedelta(seconds=10),
-                market_session_decision="OPEN_NORMAL",
+                decision="OPEN_NORMAL",
                 outcome="NO_OP_ALREADY_EMITTED",
-            )
-            replay_completed_id, replay_completed_duplicate = (
-                journal.complete_scheduled_run(
-                    run_id=run_id,
-                    finished_at=started + timedelta(seconds=10),
-                    market_session_decision="OPEN_NORMAL",
+                envelope=_scheduled_result_envelope(
                     outcome="NO_OP_ALREADY_EMITTED",
-                )
+                    message="NO OP ALREADY EMITTED",
+                    reason_codes=("ALREADY_EMITTED",),
+                ),
             )
-            self.assertEqual(completed_id, replay_completed_id)
-            self.assertFalse(completed_duplicate)
-            self.assertTrue(replay_completed_duplicate)
-            with self.assertRaises(IdempotencyConflict):
-                journal.complete_scheduled_run(
-                    run_id=run_id,
-                    finished_at=started + timedelta(seconds=11),
-                    market_session_decision="OPEN_NORMAL",
-                    outcome="REPORT_EMITTED",
+            with self.assertRaises(sqlite3.DatabaseError):
+                journal._connection.execute(
+                    "UPDATE scheduled_runs SET outcome = outcome WHERE id = ?",
+                    (run_id,),
                 )
 
-            missing_report_run_id, _ = journal.start_scheduled_run(
-                run_key="missing-report-2026-08-14",
-                run_kind="CLOSE",
-                session_date=session_date,
-                intended_run_at=intended,
-                started_at=started,
+    def test_scheduled_result_envelope_round_trips_and_conflicts_exactly(self) -> None:
+        session_date = date(2026, 8, 14)
+        intended = datetime(2026, 8, 14, 19, 30, tzinfo=timezone.utc)
+        envelope = _scheduled_result_envelope(
+            outcome="CANDIDATES",
+            message="ONE PAPER CANDIDATE",
+            reason_codes=("PAPER_PLAN_ONLY", "MANUAL_EXECUTION_REQUIRED"),
+            candidates=(("SPY", "PRIMARY"),),
+        )
+        with Journal.open(self.db_path) as journal:
+            run_id = self._seed_scheduled_run(
+                journal,
+                run_key="result-envelope-2026-08-14",
+                run_kind="PREMARKET",
+                intended_at=intended,
             )
-            with self.assertRaises(InvalidJournalValue):
-                journal.complete_scheduled_run(
-                    run_id=missing_report_run_id,
-                    finished_at=started + timedelta(seconds=10),
-                    market_session_decision="OPEN_NORMAL",
-                    outcome="REPORT_EMITTED",
+            self._complete_scheduled_run_storage(
+                journal,
+                run_id=run_id,
+                finished_at=intended + timedelta(seconds=1),
+                decision="DUE_WAKE",
+                outcome="NOOP",
+                envelope=envelope,
+            )
+            self.assertEqual(
+                journal.read_scheduled_run_result_envelope(
+                    run_key="result-envelope-2026-08-14",
+                    run_kind="PREMARKET",
+                    session_date=session_date,
+                ),
+                envelope,
+            )
+            stored = journal._connection.execute(
+                "SELECT result_envelope_json, result_envelope_sha256 "
+                "FROM scheduled_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            assert stored is not None
+            self.assertNotIn("material", str(stored[0]))
+            self.assertNotIn("source_observation_row_ids", str(stored[0]))
+            self.assertEqual(
+                stored[1],
+                hashlib.sha256(str(stored[0]).encode("utf-8")).hexdigest(),
+            )
+            with self.assertRaises(sqlite3.DatabaseError):
+                journal._connection.execute(
+                    "UPDATE scheduled_runs SET outcome = outcome WHERE id = ?",
+                    (run_id,),
                 )
+
+            state_sha256 = "b" * 64
+            report_id = stable_report_id("CLOSE", session_date, (), state_sha256)
+            report_path = report_archive_relative_path(
+                "CLOSE", session_date, report_id
+            )
+            with patch.object(
+                journal_module,
+                "_utc_now",
+                return_value=intended + timedelta(seconds=1),
+            ):
+                claim = journal.claim_report(session_date, "CLOSE")
+                assert claim.claim_token is not None
+                report = journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Close\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(),
+                    archive_relative_path=report_path,
+                    created_at=intended + timedelta(seconds=1),
+                    outbox_destination="CODEX_TASK",
+                    outbox_payload="close",
+                )
+            report_run_id = self._seed_scheduled_run(
+                journal,
+                run_key="report-envelope-2026-08-14",
+                run_kind="CLOSE",
+                intended_at=intended,
+            )
+            report_envelope = _scheduled_result_envelope(
+                outcome="EMITTED",
+                message="# Close\n",
+                exit_code=3,
+                reason_codes=("SCHEDULED_EMITTED", "PROVIDER_CHECK_FAILED"),
+                report_id=report_id,
+                report_row_id=report.report_row_id,
+                report_path=report_path,
+                report_state_sha256=state_sha256,
+            )
+            self._complete_scheduled_run_storage(
+                journal,
+                run_id=report_run_id,
+                finished_at=intended + timedelta(seconds=2),
+                decision="DUE_WAKE",
+                outcome="REPORT_EMITTED",
+                report_row_id=report.report_row_id,
+                report_path=report_path,
+                envelope=report_envelope,
+            )
+            self.assertEqual(
+                journal.read_scheduled_run_result_envelope(
+                    run_key="report-envelope-2026-08-14",
+                    run_kind="CLOSE",
+                    session_date=session_date,
+                ),
+                report_envelope,
+            )
+
+    def test_scheduled_result_envelope_reader_rejects_corrupt_storage(self) -> None:
+        session_date = date(2026, 8, 14)
+        intended = datetime(2026, 8, 14, 19, 30, tzinfo=timezone.utc)
+        base = {
+            "schema": "stock-monitor/scheduled-result/v1",
+            "outcome": "NO_TRADE",
+            "message": "NO TRADE",
+            "exit_code": 0,
+            "reason_codes": ["NO_TRADE"],
+            "execution_mode": "FIXTURE",
+            "candidates": [],
+            "report_id": None,
+            "report_row_id": None,
+            "report_path": None,
+        }
+        wrong_schema = dict(base, schema="stock-monitor/scheduled-result/v2")
+        extra_field = dict(base, extra="forged")
+        missing_field = dict(base)
+        del missing_field["message"]
+        bool_exit = dict(base, exit_code=True)
+        report_mismatch = dict(
+            base,
+            report_id="a" * 64,
+            report_row_id=1,
+            report_path="reports/2026/08/14/close-forged.md",
+        )
+        canonical = lambda value: json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cases = (
+            ("hash", canonical(base), "a" * 64),
+            (
+                "noncanonical",
+                json.dumps(base, ensure_ascii=False, sort_keys=True),
+                None,
+            ),
+            ("schema", canonical(wrong_schema), None),
+            ("extra", canonical(extra_field), None),
+            ("missing", canonical(missing_field), None),
+            ("bool-exit", canonical(bool_exit), None),
+            ("report-mismatch", canonical(report_mismatch), None),
+        )
+        with Journal.open(self.db_path) as journal:
+            for ordinal, (label, stored_json, explicit_sha256) in enumerate(cases):
+                with self.subTest(case=label):
+                    run_key = f"corrupt-envelope-{ordinal}"
+                    run_id = self._seed_scheduled_run(
+                        journal,
+                        run_key=run_key,
+                        run_kind="CLOSE",
+                        intended_at=intended,
+                    )
+                    stored_sha256 = explicit_sha256 or hashlib.sha256(
+                        stored_json.encode("utf-8")
+                    ).hexdigest()
+                    journal._connection.execute(
+                        "UPDATE scheduled_runs SET finished_at = ?, "
+                        "market_session_decision = 'DUE_WAKE', outcome = 'NOOP', "
+                        "result_envelope_json = ?, result_envelope_sha256 = ? "
+                        "WHERE id = ?",
+                        (
+                            "2026-08-14T19:30:01.000000Z",
+                            stored_json,
+                            stored_sha256,
+                            run_id,
+                        ),
+                    )
+                    with self.assertRaises(MigrationCorruption):
+                        journal.read_scheduled_run_result_envelope(
+                            run_key=run_key,
+                            run_kind="CLOSE",
+                            session_date=session_date,
+                        )
+
+    def test_raw_scheduled_completion_is_denied_before_sql_callbacks(self) -> None:
+        session_date = date(2026, 8, 14)
+        intended = datetime(2026, 8, 14, 19, 30, tzinfo=timezone.utc)
+        envelope = _scheduled_result_envelope(message="ORIGINAL")
+        with Journal.open(self.db_path) as journal:
+            run_id = self._seed_scheduled_run(
+                journal,
+                run_key="envelope-snapshot",
+                run_kind="CLOSE",
+                intended_at=intended,
+            )
+            trace_fired = False
+
+            def mutate_after_snapshot(statement: str) -> None:
+                nonlocal trace_fired
+                if not trace_fired and statement.startswith("BEGIN"):
+                    trace_fired = True
+                    object.__setattr__(envelope, "message", "FORGED")
+
+            journal._connection.set_trace_callback(mutate_after_snapshot)
+            try:
+                with self.assertRaises(InvalidJournalValue):
+                    journal.complete_scheduled_run(
+                        run_id=run_id,
+                        finished_at=intended + timedelta(seconds=1),
+                        market_session_decision="DUE_WAKE",
+                        outcome="NOOP",
+                        result_envelope=envelope,
+                    )
+            finally:
+                journal._connection.set_trace_callback(None)
+
+            self.assertFalse(trace_fired)
+            self.assertEqual(envelope.message, "ORIGINAL")
+            self.assertEqual(
+                journal._connection.execute(
+                    "SELECT finished_at FROM scheduled_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone(),
+                (None,),
+            )
 
     def test_scheduled_completion_report_must_match_the_run_identity_and_path(self) -> None:
         session_date = date(2026, 8, 14)
@@ -1690,12 +1996,11 @@ class JournalTests(unittest.TestCase):
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
-            run_id, _ = journal.start_scheduled_run(
+            run_id = self._seed_scheduled_run(
+                journal,
                 run_key="premarket-2026-08-14",
                 run_kind="PREMARKET",
-                session_date=session_date,
-                intended_run_at=now,
-                started_at=now,
+                intended_at=now,
             )
             with self.assertRaises(InvalidJournalValue):
                 journal.complete_scheduled_run(
@@ -1705,14 +2010,21 @@ class JournalTests(unittest.TestCase):
                     outcome="REPORT_EMITTED",
                     report_id=report.report_row_id,
                     report_path=archive_path,
+                    result_envelope=_scheduled_result_envelope(
+                        outcome="EMITTED",
+                        message="# Close\n",
+                        reason_codes=("SCHEDULED_EMITTED",),
+                        report_id=report_id,
+                        report_row_id=report.report_row_id,
+                        report_path=archive_path,
+                    ),
                 )
 
-            close_run_id, _ = journal.start_scheduled_run(
+            close_run_id = self._seed_scheduled_run(
+                journal,
                 run_key="close-2026-08-14",
                 run_kind="CLOSE",
-                session_date=session_date,
-                intended_run_at=now,
-                started_at=now,
+                intended_at=now,
             )
             with self.assertRaises(InvalidJournalValue):
                 journal.complete_scheduled_run(
@@ -1722,14 +2034,33 @@ class JournalTests(unittest.TestCase):
                     outcome="REPORT_EMITTED",
                     report_id=report.report_row_id,
                     report_path="reports/2026/08/14/wrong.md",
+                    result_envelope=_scheduled_result_envelope(
+                        outcome="EMITTED",
+                        message="# Close\n",
+                        reason_codes=("SCHEDULED_EMITTED",),
+                        report_id=report_id,
+                        report_row_id=report.report_row_id,
+                        report_path=archive_path,
+                    ),
                 )
-            journal.complete_scheduled_run(
+            correct_envelope = _scheduled_result_envelope(
+                outcome="EMITTED",
+                message="# Close\n",
+                reason_codes=("SCHEDULED_EMITTED",),
+                report_id=report_id,
+                report_row_id=report.report_row_id,
+                report_path=archive_path,
+                report_state_sha256=state_sha256,
+            )
+            self._complete_scheduled_run_storage(
+                journal,
                 run_id=close_run_id,
                 finished_at=now + timedelta(seconds=2),
-                market_session_decision="OPEN",
+                decision="OPEN",
                 outcome="REPORT_EMITTED",
-                report_id=report.report_row_id,
+                report_row_id=report.report_row_id,
                 report_path=archive_path,
+                envelope=correct_envelope,
             )
 
     def test_scheduled_emission_requires_finalization_within_the_run(self) -> None:
@@ -1758,12 +2089,11 @@ class JournalTests(unittest.TestCase):
                 outbox_destination="CODEX_TASK",
                 outbox_payload="close",
             )
-            run_id, _ = journal.start_scheduled_run(
+            run_id = self._seed_scheduled_run(
+                journal,
                 run_key="close-impossible-chronology",
                 run_kind="CLOSE",
-                session_date=session_date,
-                intended_run_at=now,
-                started_at=now,
+                intended_at=now,
             )
 
             with self.assertRaises(InvalidJournalValue):
@@ -1774,20 +2104,35 @@ class JournalTests(unittest.TestCase):
                     outcome="REPORT_EMITTED",
                     report_id=report.report_row_id,
                     report_path=archive_path,
+                    result_envelope=_scheduled_result_envelope(
+                        outcome="EMITTED",
+                        message="# Close\n",
+                        reason_codes=("SCHEDULED_EMITTED",),
+                        report_id=report_id,
+                        report_row_id=report.report_row_id,
+                        report_path=archive_path,
+                    ),
                 )
 
         with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA recursive_triggers = ON")
+            envelope_json = "{}"
+            envelope_sha256 = hashlib.sha256(
+                envelope_json.encode("utf-8")
+            ).hexdigest()
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute(
                     "UPDATE scheduled_runs SET finished_at = ?, "
                     "market_session_decision = 'OPEN', outcome = 'REPORT_EMITTED', "
-                    "report_id = ?, report_path = ? WHERE id = ?",
+                    "report_id = ?, report_path = ?, result_envelope_json = ?, "
+                    "result_envelope_sha256 = ? WHERE id = ?",
                     (
                         "2026-08-14T12:45:02.000000Z",
                         report.report_row_id,
                         archive_path,
+                        envelope_json,
+                        envelope_sha256,
                         run_id,
                     ),
                 )

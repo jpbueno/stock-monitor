@@ -18,6 +18,7 @@ from stock_monitor.journal import (
     Journal,
     JournalTransaction,
     MigrationCorruption,
+    is_verified_journal_action_source,
 )
 from stock_monitor.ledger import LedgerSignal
 from stock_monitor.market_calendar import load_current_market_calendar
@@ -124,6 +125,42 @@ class ConfirmationIdempotencyTests(unittest.TestCase):
                 for table in ("raw_messages", "execution_events", "outbox")
             },
         )
+
+    def test_option_review_and_open_are_distinct_idempotent_source_actions(
+        self,
+    ) -> None:
+        item = envelope(
+            message_id="message:option-review-open",
+            text=(
+                "OPTION PAPER REVIEW AAPL260918C00150000 BID 2.10 ASK 2.20 "
+                "DELTA 0.35 OI 1000 VOLUME 100 AT 10:19 ET\n"
+                "OPTION PAPER OPEN AAPL260918C00150000 ASK 2.20 AT 10:20 ET"
+            ),
+        )
+
+        first = self.ingest(item)
+        duplicate = self.ingest(item)
+
+        self.assertEqual(
+            tuple(action.kind for action in first.actions),
+            (ConfirmationKind.OPTION_REVIEW, ConfirmationKind.OPTION_OPEN),
+        )
+        self.assertTrue(duplicate.duplicate)
+        self.assertEqual(duplicate.actions, first.actions)
+        self.assertEqual(self.journal.count("raw_messages"), 1)
+        self.assertEqual(self.journal.count("execution_events"), 2)
+        with self.journal.transaction() as transaction:
+            review_source = transaction.read_action_source(
+                execution_event_id=first.actions[0].event_row_id
+            )
+            open_source = transaction.read_action_source(
+                execution_event_id=first.actions[1].event_row_id
+            )
+        self.assertTrue(is_verified_journal_action_source(review_source))
+        self.assertTrue(is_verified_journal_action_source(open_source))
+        self.assertNotEqual(review_source.action_ordinal, open_source.action_ordinal)
+        self.assertEqual(review_source.domain_kind, "OPTION_PAPER_REVIEW")
+        self.assertEqual(open_source.domain_kind, "OPTION_PAPER_OPEN")
 
     def test_maximum_supported_batch_keeps_next_ingest_well_below_writer_timeout(
         self,
@@ -277,7 +314,7 @@ class ConfirmationIdempotencyTests(unittest.TestCase):
             )
         )
         with patch(
-            "stock_monitor.reconciliation.is_issued_ledger_signal",
+            "stock_monitor.ledger.is_issued_ledger_signal",
             return_value=True,
         ):
             result = self.ingest(item)
@@ -288,6 +325,10 @@ class ConfirmationIdempotencyTests(unittest.TestCase):
         )
         self.assertIn(
             "AUTHORITY_CONTEXT_UNVERIFIED",
+            result.actions[0].reason_codes,
+        )
+        self.assertNotIn(
+            "SIGNAL_AUTHORITY_UNVERIFIED",
             result.actions[0].reason_codes,
         )
 

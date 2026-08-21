@@ -1,0 +1,42 @@
+{
+  "now": "2026-08-14T08:45:00-04:00",
+  "account": {
+    "configuration": "READY",
+    "market": "OPEN",
+    "review_time": "15:30",
+    "universe": "READY",
+    "breaker": "CLEAR",
+    "candidates": [
+      {
+        "symbol": "AAPL",
+        "role": "PRIMARY",
+        "setup": "PULLBACK_RECLAIM",
+        "score_components": [
+          {"label": "Trend and market regime", "earned": 25, "available": 25},
+          {"label": "Relative strength", "earned": 20, "available": 20},
+          {"label": "Setup quality", "earned": 20, "available": 20},
+          {"label": "Volume confirmation", "earned": 12, "available": 15},
+          {"label": "Verified catalyst/context", "earned": 9, "available": 10},
+          {"label": "Liquidity and execution", "earned": 9, "available": 10}
+        ],
+        "trigger": "225.10",
+        "maximum_entry": "225.25",
+        "recommended_stop": "220.25",
+        "target": "235.25",
+        "shares": 5,
+        "planned_risk": "25.00",
+        "provider": "ALPACA",
+        "feed": "SIP",
+        "observed_at": "2026-08-14T08:44:00-04:00",
+        "invalidations": ["trigger not reached", "spread exceeds reviewed limit"],
+        "sources": [
+          {"label": "Issuer evidence", "url": "https://investor.apple.com/"}
+        ]
+      }
+    ],
+    "close_state": "HOLD"
+  },
+  "provider_fixture": "READY",
+  "evidence_fixture": "READY",
+  "expected_outcome": "CANDIDATES"
+}

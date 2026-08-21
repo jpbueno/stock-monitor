@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
+from threading import RLock
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+from weakref import ReferenceType, ref
 
 from .domain import ConfigurationError
 from .policy import Policy
@@ -75,6 +79,24 @@ _SCOPED_REFERENCE_ROLE = re.compile(
     r"(?:ISSUER_IR|CORPORATE_ACTION):[A-Z][A-Z0-9.-]{0,14}\Z"
 )
 _REFERENCE_FEED = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_FEE_SCHEDULE_ID = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_REVIEWED_FEE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "schedule_id",
+        "effective_session",
+        "reviewed_at",
+        "currency",
+        "contract_multiplier",
+        "entry_fee_per_contract_micros",
+        "exit_fee_per_contract_micros",
+        "close_fee_reserve_per_contract_micros",
+        "source_sha256",
+    }
+)
+_FEE_REVIEW_MARKER_FIELDS = frozenset({"schema_version", "status", "purpose"})
 
 
 @dataclass(frozen=True)
@@ -92,6 +114,33 @@ class Sources:
     reference_hosts: tuple[str, ...]
     reference_urls: tuple[str, ...]
     reference_sources: tuple[ReferenceSource, ...]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class FeeSchedule:
+    """Exact reviewed per-contract fee inputs for Phase 2 paper accounting."""
+
+    schedule_id: str
+    effective_session: date
+    reviewed_at: datetime
+    currency: str
+    contract_multiplier: int
+    entry_fee_per_contract_micros: int
+    exit_fee_per_contract_micros: int
+    close_fee_reserve_per_contract_micros: int
+    source_sha256: str
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedFeeSchedule:
+    reference: ReferenceType[FeeSchedule]
+    fingerprint: tuple[object, ...]
+    reviewed_bytes: bytes
+
+
+_ISSUED_FEE_SCHEDULES: dict[int, _IssuedFeeSchedule] = {}
+_ISSUED_FEE_SCHEDULES_LOCK = RLock()
 
 
 @dataclass(frozen=True)
@@ -418,13 +467,262 @@ def _load_sources(path: Path) -> Sources:
     )
 
 
-def _validate_fees_file(path: Path) -> None:
+def _fee_schedule_fingerprint(schedule: FeeSchedule) -> tuple[object, ...]:
+    return (
+        schedule.schedule_id,
+        schedule.effective_session,
+        schedule.reviewed_at,
+        schedule.currency,
+        schedule.contract_multiplier,
+        schedule.entry_fee_per_contract_micros,
+        schedule.exit_fee_per_contract_micros,
+        schedule.close_fee_reserve_per_contract_micros,
+        schedule.source_sha256,
+        schedule.digest,
+    )
+
+
+def _fee_document(path: Path) -> dict[str, object]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ConfigurationError(f"cannot load fees.json: {type(error).__name__}") from None
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if (
+        not isinstance(document, dict)
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 1
+    ):
         raise ConfigurationError("fees.json is missing supported schema_version 1")
+    return document
+
+
+def _fee_integer(document: Mapping[str, object], name: str) -> int:
+    value = document.get(name)
+    if type(value) is not int or value < 0:
+        raise ConfigurationError(f"fees.json field {name} must be a nonnegative integer")
+    return value
+
+
+def _fee_date(value: object) -> date:
+    if not isinstance(value, str):
+        raise ConfigurationError("fees.json effective_session must be a canonical date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise ConfigurationError(
+            "fees.json effective_session must be a canonical date"
+        ) from None
+    if parsed.isoformat() != value:
+        raise ConfigurationError("fees.json effective_session must be a canonical date")
+    return parsed
+
+
+def _fee_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ConfigurationError("fees.json reviewed_at must be a canonical UTC timestamp")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        raise ConfigurationError(
+            "fees.json reviewed_at must be a canonical UTC timestamp"
+        ) from None
+    canonical = parsed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if canonical != value:
+        raise ConfigurationError("fees.json reviewed_at must be a canonical UTC timestamp")
+    return parsed
+
+
+def _parse_reviewed_fee_schedule(document: Mapping[str, object]) -> FeeSchedule:
+    if (
+        type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 1
+    ):
+        raise ConfigurationError("fees.json is missing supported schema_version 1")
+    if document.get("status") != "reviewed":
+        raise ConfigurationError("Phase 2 fee schedule requires explicit operator review")
+    if set(document) != _REVIEWED_FEE_FIELDS:
+        raise ConfigurationError("fees.json reviewed schedule fields are not exact")
+    schedule_id = document.get("schedule_id")
+    if not isinstance(schedule_id, str) or _FEE_SCHEDULE_ID.fullmatch(schedule_id) is None:
+        raise ConfigurationError("fees.json schedule_id is malformed")
+    if document.get("currency") != "USD":
+        raise ConfigurationError("fees.json currency must be USD")
+    contract_multiplier = _fee_integer(document, "contract_multiplier")
+    if contract_multiplier != 100:
+        raise ConfigurationError("fees.json contract_multiplier must be 100")
+    entry_fee = _fee_integer(document, "entry_fee_per_contract_micros")
+    exit_fee = _fee_integer(document, "exit_fee_per_contract_micros")
+    if exit_fee == 0:
+        raise ConfigurationError(
+            "fees.json exit fee must be positive because FEE confirmations are positive"
+        )
+    close_reserve = _fee_integer(
+        document,
+        "close_fee_reserve_per_contract_micros",
+    )
+    if close_reserve < exit_fee:
+        raise ConfigurationError(
+            "fees.json close fee reserve cannot be below the reviewed exit fee"
+        )
+    source_sha256 = document.get("source_sha256")
+    if (
+        not isinstance(source_sha256, str)
+        or _LOWER_SHA256.fullmatch(source_sha256) is None
+    ):
+        raise ConfigurationError("fees.json source_sha256 is malformed")
+    digest = hashlib.sha256(
+        json.dumps(
+            document,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return FeeSchedule(
+        schedule_id=schedule_id,
+        effective_session=_fee_date(document.get("effective_session")),
+        reviewed_at=_fee_timestamp(document.get("reviewed_at")),
+        currency="USD",
+        contract_multiplier=contract_multiplier,
+        entry_fee_per_contract_micros=entry_fee,
+        exit_fee_per_contract_micros=exit_fee,
+        close_fee_reserve_per_contract_micros=close_reserve,
+        source_sha256=source_sha256,
+        digest=digest,
+    )
+
+
+def _validate_fees_file(path: Path) -> None:
+    document = _fee_document(path)
+    status = document.get("status")
+    if status == "operator_review_required":
+        if (
+            set(document) != _FEE_REVIEW_MARKER_FIELDS
+            or not isinstance(document.get("purpose"), str)
+            or not str(document["purpose"]).strip()
+        ):
+            raise ConfigurationError("fees.json operator review marker is malformed")
+        return
+    _parse_reviewed_fee_schedule(document)
+
+
+def _canonical_reviewed_fee_bytes(document: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        document,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def load_fee_schedule(path: Path) -> FeeSchedule:
+    """Issue an identity-bound fee authority only from exact reviewed bytes."""
+    document = _fee_document(Path(path))
+    schedule = _parse_reviewed_fee_schedule(document)
+    reviewed_bytes = _canonical_reviewed_fee_bytes(document)
+    identity = id(schedule)
+
+    def discard(dead: ReferenceType[FeeSchedule]) -> None:
+        with _ISSUED_FEE_SCHEDULES_LOCK:
+            current = _ISSUED_FEE_SCHEDULES.get(identity)
+            if current is not None and current.reference is dead:
+                _ISSUED_FEE_SCHEDULES.pop(identity, None)
+
+    issued = _IssuedFeeSchedule(
+        reference=ref(schedule, discard),
+        fingerprint=_fee_schedule_fingerprint(schedule),
+        reviewed_bytes=reviewed_bytes,
+    )
+    with _ISSUED_FEE_SCHEDULES_LOCK:
+        _ISSUED_FEE_SCHEDULES[identity] = issued
+    return schedule
+
+
+def is_reviewed_fee_schedule(schedule: object) -> bool:
+    """Return whether *schedule* is the current untampered issued object."""
+    if not isinstance(schedule, FeeSchedule):
+        return False
+    with _ISSUED_FEE_SCHEDULES_LOCK:
+        issued = _ISSUED_FEE_SCHEDULES.get(id(schedule))
+        return (
+            issued is not None
+            and issued.reference() is schedule
+            and issued.fingerprint == _fee_schedule_fingerprint(schedule)
+        )
+
+
+def _read_reviewed_fee_schedule_bytes(schedule: object) -> bytes:
+    """Return canonical reviewed bytes only for one exact issued schedule."""
+    if not is_reviewed_fee_schedule(schedule):
+        raise ConfigurationError("fee schedule authority is unverified")
+    with _ISSUED_FEE_SCHEDULES_LOCK:
+        issued = _ISSUED_FEE_SCHEDULES.get(id(schedule))
+        if issued is None or issued.reference() is not schedule:
+            raise ConfigurationError("fee schedule authority is unverified")
+        return bytes(issued.reviewed_bytes)
+
+
+def _reissue_archived_fee_schedule(source: object) -> FeeSchedule:
+    """Reissue only from an exact current Journal fee-schedule capability."""
+    try:
+        from .journal import (
+            Phase2FeeScheduleSource,
+            is_verified_phase2_fee_schedule_source,
+        )
+    except (ImportError, AttributeError):
+        raise ConfigurationError("archived fee schedule authority is unavailable") from None
+    if type(source) is not Phase2FeeScheduleSource or not (
+        is_verified_phase2_fee_schedule_source(source)
+    ):
+        raise ConfigurationError("archived fee schedule authority is unverified")
+    try:
+        current = source._is_current_phase2_fee_schedule_source()
+    except Exception:
+        current = False
+    if type(current) is not bool or not current:
+        raise ConfigurationError("archived fee schedule authority is unverified")
+    reviewed_bytes = source.reviewed_bytes
+    if type(reviewed_bytes) is not bytes or not reviewed_bytes:
+        raise ConfigurationError("archived fee schedule bytes are invalid")
+    try:
+        text = reviewed_bytes.decode("utf-8")
+        document = json.loads(text)
+    except (UnicodeError, json.JSONDecodeError):
+        raise ConfigurationError("archived fee schedule bytes are invalid") from None
+    if not isinstance(document, dict) or _canonical_reviewed_fee_bytes(document) != reviewed_bytes:
+        raise ConfigurationError("archived fee schedule bytes are not canonical")
+    schedule = _parse_reviewed_fee_schedule(document)
+    expected = (
+        source.schedule_id,
+        source.effective_session,
+        source.reviewed_at,
+        source.currency,
+        source.contract_multiplier,
+        source.entry_fee_per_contract_micros,
+        source.exit_fee_per_contract_micros,
+        source.close_fee_reserve_per_contract_micros,
+        source.source_sha256,
+        source.schedule_digest,
+    )
+    if _fee_schedule_fingerprint(schedule) != expected:
+        raise ConfigurationError("archived fee schedule fields are inconsistent")
+    identity = id(schedule)
+
+    def discard(dead: ReferenceType[FeeSchedule]) -> None:
+        with _ISSUED_FEE_SCHEDULES_LOCK:
+            current = _ISSUED_FEE_SCHEDULES.get(identity)
+            if current is not None and current.reference is dead:
+                _ISSUED_FEE_SCHEDULES.pop(identity, None)
+
+    issued = _IssuedFeeSchedule(
+        reference=ref(schedule, discard),
+        fingerprint=_fee_schedule_fingerprint(schedule),
+        reviewed_bytes=reviewed_bytes,
+    )
+    with _ISSUED_FEE_SCHEDULES_LOCK:
+        _ISSUED_FEE_SCHEDULES[identity] = issued
+    return schedule
 
 
 def _operator_root(project_root: Path, configured_home: str) -> Path:
@@ -518,4 +816,12 @@ def load_settings(project_root: Path, environ: Mapping[str, str]) -> Settings:
     )
 
 
-__all__ = ["ConfigurationError", "Settings", "Sources", "load_settings"]
+__all__ = [
+    "ConfigurationError",
+    "FeeSchedule",
+    "Settings",
+    "Sources",
+    "is_reviewed_fee_schedule",
+    "load_fee_schedule",
+    "load_settings",
+]

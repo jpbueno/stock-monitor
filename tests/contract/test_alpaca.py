@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
 import unittest
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
+import stock_monitor.providers.alpaca as alpaca_module
 from stock_monitor.providers.alpaca import (
     AlpacaCredentials,
     AlpacaMarketData,
@@ -12,7 +15,13 @@ from stock_monitor.providers.alpaca import (
     ProviderIncompleteError,
     TimeWindow,
     is_ingestible_provider_fetch_cohort,
+    is_ingestible_provider_option_chain,
+    is_issued_normalized_market_fact,
+    is_issued_provider_option_chain,
     is_issued_provider_fetch_cohort,
+    normalized_market_facts_share_owner,
+    provider_fetch_cohorts_share_owner,
+    read_provider_fetch_bundle,
     recompute_alpaca_page_metadata,
 )
 from stock_monitor.providers.http import HttpResponse, HttpTransportError
@@ -49,6 +58,71 @@ class RoutingTransport:
 
 
 class AlpacaContractTests(unittest.TestCase):
+    def test_replay_only_scope_cannot_be_reminted_as_ingestible(self) -> None:
+        client = AlpacaMarketData(
+            RoutingTransport(
+                lambda _: (
+                    200,
+                    '{"quotes":{"SPY":['
+                    '{"t":"2026-05-01T19:59:59Z","bp":1,"ap":1.01}'
+                    ']},"next_page_token":null}',
+                )
+            ),
+            credentials(),
+            now=lambda: NOW,
+        )
+        cohort = client.historical_quotes(("SPY",), WINDOW)
+        manifest = read_provider_fetch_bundle(cohort).manifest
+        preexisting_twin = alpaca_module._issue_provider_fetch_cohort(
+            owner=client,
+            manifest=manifest,
+            values=cohort,
+        )
+
+        alpaca_module._mark_provider_fetch_cohort_replay_only(cohort)
+        reminted = alpaca_module._issue_provider_fetch_cohort(
+            owner=client,
+            manifest=manifest,
+            values=cohort,
+        )
+
+        self.assertTrue(is_issued_provider_fetch_cohort(reminted))
+        self.assertFalse(is_ingestible_provider_fetch_cohort(cohort))
+        self.assertFalse(is_ingestible_provider_fetch_cohort(preexisting_twin))
+        self.assertFalse(is_ingestible_provider_fetch_cohort(reminted))
+
+    def test_replay_only_option_chain_cannot_be_reminted_as_ingestible(
+        self,
+    ) -> None:
+        client = AlpacaMarketData(
+            FixtureTransport("providers/alpaca/option-snapshots.json"),
+            credentials(),
+            now=lambda: NOW,
+        )
+        chain = client.option_chain("SPY")
+        manifest = read_provider_fetch_bundle(chain).manifest
+        preexisting_twin = alpaca_module._issue_provider_option_chain(
+            owner=client,
+            manifest=manifest,
+            snapshots=chain,
+        )
+        self.assertTrue(is_ingestible_provider_option_chain(chain))
+        self.assertTrue(is_ingestible_provider_option_chain(preexisting_twin))
+
+        alpaca_module._mark_provider_option_chain_replay_only(chain)
+        reminted = alpaca_module._issue_provider_option_chain(
+            owner=client,
+            manifest=manifest,
+            snapshots=chain,
+        )
+
+        self.assertTrue(is_issued_provider_option_chain(reminted))
+        self.assertFalse(is_ingestible_provider_option_chain(chain))
+        self.assertFalse(
+            is_ingestible_provider_option_chain(preexisting_twin)
+        )
+        self.assertFalse(is_ingestible_provider_option_chain(reminted))
+
     def test_intraday_bar_page_metadata_recomputes_from_exact_raw_page(self) -> None:
         payload = (
             b'{"bars":{"AAPL":[{"c":"20.40","h":"20.50",'
@@ -299,6 +373,7 @@ class AlpacaContractTests(unittest.TestCase):
         ).option_chain("SPY")
 
         self.assertEqual(len(snapshots), 1)
+        self.assertTrue(is_issued_provider_option_chain(snapshots))
         snapshot = snapshots[0]
         self.assertEqual(snapshot.occ_symbol, "SPY260918C00650000")
         self.assertEqual(snapshot.feed, "indicative")
@@ -306,6 +381,179 @@ class AlpacaContractTests(unittest.TestCase):
         self.assertEqual(snapshot.daily_volume, 234)
         self.assertNotIn("contracts", transport.requested_urls[0])
         self.assertIn("/v1beta1/options/snapshots/SPY", transport.requested_urls[0])
+        self.assertIs(
+            read_provider_fetch_bundle(snapshots).manifest,
+            read_provider_fetch_bundle(snapshot).manifest,
+        )
+        copied_chain = copy.copy(snapshots)
+        self.assertFalse(is_issued_provider_option_chain(copied_chain))
+        with self.assertRaisesRegex(ValueError, "authority"):
+            read_provider_fetch_bundle(copied_chain)
+
+    def test_option_chain_authority_revokes_when_page_observation_changes(
+        self,
+    ) -> None:
+        mutations = (
+            ("source_timestamp", NOW - timedelta(seconds=1)),
+            ("feed", "sip"),
+            ("delay_seconds", 1),
+            ("content_hash", "0" * 64),
+        )
+        for field_name, replacement in mutations:
+            with self.subTest(field_name=field_name):
+                chain = AlpacaMarketData(
+                    FixtureTransport(
+                        "providers/alpaca/option-snapshots.json"
+                    ),
+                    credentials(),
+                    now=lambda: NOW,
+                ).option_chain("SPY")
+                observation = read_provider_fetch_bundle(chain).pages[
+                    0
+                ].observation
+                self.assertTrue(is_issued_provider_option_chain(chain))
+                self.assertTrue(is_ingestible_provider_option_chain(chain))
+
+                object.__setattr__(
+                    observation,
+                    field_name,
+                    replacement,
+                )
+
+                self.assertFalse(is_issued_provider_option_chain(chain))
+                self.assertFalse(is_ingestible_provider_option_chain(chain))
+                with self.assertRaisesRegex(ValueError, "authority"):
+                    read_provider_fetch_bundle(chain)
+
+    def test_option_snapshot_is_bound_to_exact_raw_provider_item(self) -> None:
+        client = AlpacaMarketData(
+            FixtureTransport("providers/alpaca/option-snapshots.json"),
+            credentials(),
+            now=lambda: NOW,
+        )
+        snapshot = client.option_chain("SPY")[0]
+
+        self.assertTrue(is_issued_normalized_market_fact(snapshot))
+        source = alpaca_module._normalized_market_fact_source(snapshot)
+        bundle = read_provider_fetch_bundle(snapshot)
+        self.assertEqual(source.kind, "OPTION_SNAPSHOT")
+        self.assertEqual(source.symbol, "SPY")
+        self.assertEqual(source.feed, "indicative")
+        self.assertEqual(source.page_ordinal, 1)
+        self.assertEqual(source.source_item_ordinal, 1)
+        self.assertEqual(
+            source.source_item_path,
+            "$.snapshots.SPY260918C00650000",
+        )
+        self.assertEqual(source.fetch_manifest.collection, "snapshots")
+        self.assertEqual(source.fetch_manifest.requested_symbols, ("SPY",))
+        self.assertIs(bundle.manifest, source.fetch_manifest)
+        self.assertEqual(len(bundle.pages), 1)
+        self.assertIn(b'"SPY260918C00650000"', bundle.pages[0].payload)
+
+        copied = copy.copy(snapshot)
+        self.assertFalse(is_issued_normalized_market_fact(copied))
+        with self.assertRaisesRegex(ValueError, "authority"):
+            read_provider_fetch_bundle(copied)
+
+        forged = replace(snapshot, ask=Decimal("99.99"))
+        with self.assertRaisesRegex(ProviderDataError, "raw provider item"):
+            alpaca_module._issue_market_fact_from_fetch(
+                forged,
+                owner=client,
+                fetch_manifest=source.fetch_manifest,
+                page_ordinal=source.page_ordinal,
+                source_item_ordinal=source.source_item_ordinal,
+                source_item_path=source.source_item_path,
+            )
+        self.assertFalse(is_issued_normalized_market_fact(forged))
+
+    def test_option_snapshot_tamper_invalidates_raw_bundle_authority(self) -> None:
+        snapshot = AlpacaMarketData(
+            FixtureTransport("providers/alpaca/option-snapshots.json"),
+            credentials(),
+            now=lambda: NOW,
+        ).option_chain("SPY")[0]
+        self.assertTrue(is_issued_normalized_market_fact(snapshot))
+
+        object.__setattr__(snapshot, "ask", Decimal("99.99"))
+
+        self.assertFalse(is_issued_normalized_market_fact(snapshot))
+        with self.assertRaisesRegex(ValueError, "authority"):
+            read_provider_fetch_bundle(snapshot)
+
+    def test_option_snapshot_pagination_retains_exact_owner_and_manifest(self) -> None:
+        first_body = (
+            '{"snapshots":{"SPY260918C00650000":{'
+            '"latestQuote":{"t":"2026-08-14T12:58:00Z",'
+            '"bp":"1.00","ap":"1.05"},'
+            '"greeks":{"delta":"0.35"},"dailyBar":{"v":150}}},'
+            '"next_page_token":"page-2"}'
+        )
+        second_body = (
+            '{"snapshots":{"SPY260918C00660000":{'
+            '"latestQuote":{"t":"2026-08-14T12:59:00Z",'
+            '"bp":"0.90","ap":"0.95"},'
+            '"greeks":{"delta":"0.33"},"dailyBar":{"v":125}}},'
+            '"next_page_token":null}'
+        )
+
+        def responder(url: str) -> tuple[int, str]:
+            token = parse_qs(urlsplit(url).query).get("page_token")
+            return (200, second_body if token == ["page-2"] else first_body)
+
+        first_client = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        )
+        snapshots = first_client.option_chain("SPY")
+        self.assertEqual(
+            tuple(snapshot.occ_symbol for snapshot in snapshots),
+            ("SPY260918C00650000", "SPY260918C00660000"),
+        )
+        first_source = alpaca_module._normalized_market_fact_source(
+            snapshots[0]
+        )
+        second_source = alpaca_module._normalized_market_fact_source(
+            snapshots[1]
+        )
+        self.assertIs(first_source.fetch_manifest, second_source.fetch_manifest)
+        self.assertEqual((first_source.page_ordinal, second_source.page_ordinal), (1, 2))
+        self.assertEqual(
+            (first_source.source_item_ordinal, second_source.source_item_ordinal),
+            (1, 1),
+        )
+        bundle = read_provider_fetch_bundle(snapshots[0])
+        self.assertEqual(
+            tuple(page.payload for page in bundle.pages),
+            (first_body.encode("utf-8"), second_body.encode("utf-8")),
+        )
+        self.assertEqual(
+            tuple(page.page.request_page_token for page in bundle.pages),
+            (None, "page-2"),
+        )
+        self.assertTrue(
+            normalized_market_facts_share_owner(snapshots[0], snapshots[1])
+        )
+        self.assertTrue(provider_fetch_cohorts_share_owner(snapshots))
+
+        other_snapshot = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        ).option_chain("SPY")[0]
+        self.assertFalse(
+            normalized_market_facts_share_owner(snapshots[0], other_snapshot)
+        )
+        other_chain = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        ).option_chain("SPY")
+        self.assertFalse(
+            provider_fetch_cohorts_share_owner(snapshots, other_chain)
+        )
 
     def test_empty_option_response_is_not_an_ambiguous_success(self) -> None:
         transport = RoutingTransport(

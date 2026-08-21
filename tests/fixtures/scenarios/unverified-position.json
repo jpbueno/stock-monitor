@@ -1,0 +1,7 @@
+{
+  "now": "2026-08-14T15:30:00-04:00",
+  "account": {"configuration": "READY", "market": "OPEN", "review_time": "15:30", "universe": "READY", "breaker": "CLEAR", "candidates": [], "close_state": "POSITION_UNVERIFIED"},
+  "provider_fixture": "READY",
+  "evidence_fixture": "READY",
+  "expected_outcome": "POSITION_UNVERIFIED"
+}

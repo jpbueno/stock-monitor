@@ -581,11 +581,6 @@ def _issue_phase1_adherence_from_journal_source(
         )
         if value is not None
     )
-    if any(
-        not phase1_sources_share_owner(source, nested)
-        for nested in nested_sources
-    ):
-        raise ValidationError("PHASE1_ADHERENCE_SOURCE_OWNER_MISMATCH")
     if (
         getattr(disposition_source, "signal_source", None) is not signal_source
     ):
@@ -605,10 +600,6 @@ def _issue_phase1_adherence_from_journal_source(
         len(evidence_sources) != len(_PHASE1_ADHERENCE_CHECK_NAMES)
         or tuple(item.check_name for item in evidence_sources)
         != _PHASE1_ADHERENCE_CHECK_NAMES
-        or any(
-            not phase1_sources_share_owner(source, item)
-            for item in evidence_sources
-        )
     ):
         raise ValidationError("PHASE1_ADHERENCE_CHECKLIST_INCOMPLETE")
     checks = tuple(
@@ -628,6 +619,12 @@ def _issue_phase1_adherence_from_journal_source(
             strict=True,
         )
     )
+    if not phase1_sources_share_owner(
+        source,
+        *nested_sources,
+        *evidence_sources,
+    ):
+        raise ValidationError("PHASE1_ADHERENCE_SOURCE_OWNER_MISMATCH")
     evaluated_at = source.query_cutoff
     payload = {
         "namespace": "stock-monitor/phase1-adherence-authority/v1",
@@ -1207,6 +1204,13 @@ def _issue_phase1_promotion_from_journal_source(
     disposition_sources = tuple(source.disposition_sources)
     adherence_sources = tuple(source.adherence_check_sources)
     adherence_review_sources = tuple(source.adherence_review_sources)
+    same_owner_sources = (
+        *signal_sources,
+        *disposition_sources,
+        *adherence_review_sources,
+        source.canonical_history,
+        source.actual_history,
+    )
     if (
         not signal_sources
         or source.expected_signal_count != len(signal_sources)
@@ -1221,12 +1225,10 @@ def _issue_phase1_promotion_from_journal_source(
         or any(
             signal.validation_window_id != source.validation_window_id
             or signal.publication_session not in expected_sessions
-            or not phase1_sources_share_owner(source, signal)
             for signal in signal_sources
         )
         or any(
             not isinstance(item, Phase1PublishedSignalDispositionSource)
-            or not phase1_sources_share_owner(source, item)
             for item in disposition_sources
         )
         or any(
@@ -1235,7 +1237,6 @@ def _issue_phase1_promotion_from_journal_source(
         )
         or any(
             not isinstance(item, Phase1AdherenceReviewSource)
-            or not phase1_sources_share_owner(source, item)
             or item.query_cutoff != source.query_cutoff
             for item in adherence_review_sources
         )
@@ -1399,8 +1400,7 @@ def _issue_phase1_promotion_from_journal_source(
 
     histories = (source.canonical_history, source.actual_history)
     if any(
-        not phase1_sources_share_owner(source, history)
-        or history.validation_window_id != source.validation_window_id
+        history.validation_window_id != source.validation_window_id
         or history.through_session != source.through_session
         or history.query_cutoff != source.query_cutoff
         for history in histories
@@ -1425,6 +1425,9 @@ def _issue_phase1_promotion_from_journal_source(
             canonical_closed_by_id.get(closed_trade.trade_id) != closed_trade
         ):
             raise ValidationError("PHASE1_VALIDATION_TRADE_SOURCE_MISMATCH")
+
+    if not phase1_sources_share_owner(source, *same_owner_sources):
+        raise ValidationError("PHASE1_VALIDATION_WINDOW_SOURCE_UNVERIFIED")
 
     window = Phase1Window(
         started_on=source.started_session,

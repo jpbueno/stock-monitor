@@ -7,11 +7,12 @@ projections; durable Journal adapters are intentionally deferred to later tasks.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, ROUND_CEILING, localcontext
 from hashlib import sha256
+from sys import _getframe
 from threading import RLock
 from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo
@@ -34,6 +35,7 @@ from .risk import (
     AccountCheck,
     ActualBreakerRefreshAuthority,
     BreakerState,
+    ClosedTrade,
     ConfirmedBuyAction,
     ExecutionEvent,
     JournalEventWindow,
@@ -52,6 +54,8 @@ from .risk import (
     is_issued_paired_breaker_state,
     is_issued_portfolio_risk_authority,
 )
+from . import journal as _journal_authority_module
+from . import reconciliation as _reconciliation_authority_module
 
 
 _ZERO = Decimal("0")
@@ -65,25 +69,47 @@ _MAX_ENTRIES_PER_SESSION = 1
 _MAX_SPREAD = Decimal("0.0025")
 _ET = ZoneInfo("America/New_York")
 _EVENT_AUTHORITY_LOCK = RLock()
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase1DerivedAuthorityRecord:
+    """One inseparable seal, provenance manifest, and child manifest."""
+
+    seal: object
+    bindings: tuple[tuple[object, str], ...]
+    children: tuple[object, ...]
+    semantic_verifier: Callable[..., bool]
+
+
 _VERIFIED_LEDGER_BATCH_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[
+        ReferenceType[object],
+        object,
+        tuple[LedgerEvent, ...],
+        Callable[..., bool],
+    ],
 ] = {}
 _VERIFIED_REPLAY_COHORT_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
 ] = {}
 _ACTUAL_PROJECTION_COHORT_AUTHORITIES: dict[
     int,
     tuple[
         ReferenceType[object],
-        tuple[object, ...],
+        object,
         ReferenceType[object],
+        object,
+        tuple[object, ...],
+        object,
+        object,
+        Callable[..., bool],
     ],
 ] = {}
 _ISSUED_LEDGER_SIGNALS: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
 ] = {}
 _EXECUTION_QUOTE_AUTHORITIES: dict[
     int,
@@ -95,16 +121,44 @@ _ACTUAL_BUY_CONTEXT_AUTHORITIES: dict[
 ] = {}
 _PAPER_ENTRY_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
 ] = {}
 _SHADOW_FILL_DISPOSITION_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
 ] = {}
 _PHASE1_SOURCE_BINDINGS: dict[
     int,
     tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
 ] = {}
+_PHASE1_CANONICAL_LEDGER_REPLAY_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        object,
+        ReferenceType[object],
+        tuple[object, ...],
+        object,
+        Callable[..., object],
+    ],
+] = {}
+_PHASE1_CANONICAL_LEDGER_REPLAY_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/phase1-canonical-ledger-replay/v1"
+)
+_LEDGER_SIGNAL_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/ledger-signal-authority/v1"
+)
+_PAPER_ENTRY_FINGERPRINT_DOMAIN = b"stock-monitor/paper-entry-authority/v1"
+_SHADOW_FILL_FINGERPRINT_DOMAIN = b"stock-monitor/shadow-fill-authority/v1"
+_ACTUAL_PROJECTION_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/actual-projection-cohort-authority/v1"
+)
+_VERIFIED_REPLAY_COHORT_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/verified-ledger-replay-cohort-authority/v1"
+)
+_VERIFIED_LEDGER_BATCH_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/verified-ledger-event-batch-authority/v1"
+)
 
 
 def _precision(*values: Decimal) -> int:
@@ -312,12 +366,14 @@ class LedgerSignal:
         plan_decision: LongPlanDecision,
     ) -> LedgerSignal:
         """Consume sealed Task 5 role output and sealed Task 6 sizing output."""
+        if cls is not LedgerSignal:
+            raise RiskBlock("PUBLICATION_SIGNAL_ISSUER_UNVERIFIED")
         from .screening import (
             PublicationDecision,
             is_issued_publication_decision,
         )
 
-        if not isinstance(decision, PublicationDecision) or not (
+        if type(decision) is not PublicationDecision or not (
             is_issued_publication_decision(decision)
         ):
             raise RiskBlock("PUBLICATION_AUTHORITY_UNVERIFIED")
@@ -372,53 +428,73 @@ class LedgerSignal:
             tick_size=candidate.tick_size,
             trigger_price=candidate.trigger_price,
         )
-        identity = id(signal)
-
-        def discard(dead: ReferenceType[object]) -> None:
-            with _EVENT_AUTHORITY_LOCK:
-                current = _ISSUED_LEDGER_SIGNALS.get(identity)
-                if current is not None and current[0] is dead:
-                    _ISSUED_LEDGER_SIGNALS.pop(identity, None)
-
-        reference = ref(signal, discard)
-        with _EVENT_AUTHORITY_LOCK:
-            _ISSUED_LEDGER_SIGNALS[identity] = (
-                reference,
-                _ledger_signal_fingerprint(signal),
-            )
+        _register_phase1_derived_authority(
+            _ISSUED_LEDGER_SIGNALS,
+            signal,
+            sources=(),
+            children=(decision, plan_decision),
+        )
         return signal
 
 
-def _ledger_signal_fingerprint(signal: LedgerSignal) -> tuple[object, ...]:
+def _ledger_signal_fingerprint(signal: LedgerSignal) -> object:
+    if type(signal) is not LedgerSignal:
+        raise TypeError("ledger signal authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        signal,
+        domain=_LEDGER_SIGNAL_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
+
+
+def _publication_signal_children_are_current(
+    children: tuple[object, ...],
+) -> bool:
+    """Verify the exact publication decision/plan pair before final sealing."""
+    if type(children) is not tuple or len(children) != 2:
+        return False
+    decision, plan_decision = children
+    from .screening import (
+        PublicationDecision,
+        is_issued_publication_decision_for_plan,
+    )
+
     return (
-        signal.signal_id,
-        signal.symbol,
-        signal.role,
-        signal.publication_session,
-        signal.maximum_entry,
-        signal.recommended_stop,
-        signal.target,
-        signal.planned_shares,
-        signal.tick_size,
-        signal.trigger_price,
+        type(decision) is PublicationDecision
+        and type(plan_decision) is LongPlanDecision
+        and is_issued_publication_decision_for_plan(decision, plan_decision)
     )
 
 
 def is_issued_ledger_signal(signal: object) -> bool:
-    if not isinstance(signal, LedgerSignal):
+    if type(signal) is not LedgerSignal:
         return False
-    try:
-        fingerprint = _ledger_signal_fingerprint(signal)
-    except Exception:
+    candidate = _phase1_derived_authority_candidate(
+        _ISSUED_LEDGER_SIGNALS,
+        signal,
+    )
+    if candidate is None:
         return False
-    with _EVENT_AUTHORITY_LOCK:
-        issued = _ISSUED_LEDGER_SIGNALS.get(id(signal))
-        registered = (
-            issued is not None
-            and issued[0]() is signal
-            and issued[1] == fingerprint
-        )
-    return registered and _phase1_sources_are_current(signal)
+    record = candidate[1]
+    resolved = candidate[2]
+    if resolved:
+        if (
+            len(resolved) != 1
+            or resolved[0][1] not in {"SIGNAL", "CANONICAL_REPLAY"}
+            or len(record.children) != 0
+            or not _phase1_authority_sources_are_current(resolved)
+        ):
+            return False
+    elif not _publication_signal_children_are_current(record.children):
+        return False
+    return _is_current_phase1_derived_authority(
+        _ISSUED_LEDGER_SIGNALS,
+        signal,
+        candidate,
+        _ledger_signal_fingerprint,
+    )
 
 
 def _ledger_signal_digest(signal: LedgerSignal) -> str:
@@ -620,58 +696,47 @@ class PaperEntryAuthority:
 
 def _paper_entry_fingerprint(
     authority: PaperEntryAuthority,
-) -> tuple[object, ...]:
-    return (
-        authority.signal_id,
-        authority.signal_digest,
-        authority.lifecycle_event_id,
-        authority.trigger_observation_id,
-        authority.trigger_stream_id,
-        authority.trigger_feed,
-        authority.trigger_at,
-        authority.trigger_received_at,
-        authority.trigger_sequence,
-        authority.trigger_source_cursor,
-        authority.trigger_source_ordinal,
-        authority.trigger_stream_through_cursor,
-        authority.trigger_cohort_ordinal,
-        authority.trigger_price,
-        authority.quote_observation_id,
-        authority.quote_stream_id,
-        authority.quote_feed,
-        authority.quote_at,
-        authority.quote_received_at,
-        authority.quote_sequence,
-        authority.quote_source_cursor,
-        authority.quote_source_ordinal,
-        authority.quote_stream_through_cursor,
-        authority.quote_cohort_ordinal,
-        authority.bid,
-        authority.ask,
-        authority.source_digest,
-        authority.session_complete_digest,
-        authority.cohort_through_ordinal,
-        authority.cohort_received_through,
-        authority.canonical_event_id,
-        authority.lifecycle_cursor,
-        authority.action_ordinal,
-        authority.calendar_digest,
+) -> object:
+    if type(authority) is not PaperEntryAuthority:
+        raise TypeError("paper entry authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        authority,
+        domain=_PAPER_ENTRY_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
     )
 
 
 def is_issued_paper_entry_authority(authority: object) -> bool:
     """Return false until Task 8 verifies and registers source lineage."""
-    if not isinstance(authority, PaperEntryAuthority):
+    if type(authority) is not PaperEntryAuthority:
         return False
-    try:
-        fingerprint = _paper_entry_fingerprint(authority)
-    except Exception:
-        return False
-    return _has_ledger_authority(
+    candidate = _phase1_derived_authority_candidate(
         _PAPER_ENTRY_AUTHORITIES,
         authority,
-        fingerprint,
-    ) and _phase1_sources_are_current(authority)
+    )
+    record = None if candidate is None else candidate[1]
+    signal = (
+        None
+        if record is None or len(record.children) != 1
+        else record.children[0]
+    )
+    if (
+        candidate is None
+        or len(candidate[2]) != 1
+        or candidate[2][0][1] not in {"ENTRY", "CANONICAL_REPLAY"}
+        or type(signal) is not LedgerSignal
+        or not is_issued_ledger_signal(signal)
+        or not _phase1_authority_sources_are_current(candidate[2])
+    ):
+        return False
+    return _is_current_phase1_derived_authority(
+        _PAPER_ENTRY_AUTHORITIES,
+        authority,
+        candidate,
+        _paper_entry_fingerprint,
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -751,35 +816,47 @@ class ShadowFillDispositionAuthority:
 
 def _shadow_fill_disposition_fingerprint(
     authority: ShadowFillDispositionAuthority,
-) -> tuple[object, ...]:
-    return (
-        authority.signal_id,
-        authority.lifecycle_event_id,
-        authority.trigger_observation_id,
-        authority.quote_observation_id,
-        authority.trigger_at,
-        authority.filled_at,
-        authority.fill_price,
-        authority.source_digest,
-        authority.session_complete_digest,
-        authority.calendar_digest,
-        authority.lifecycle_cursor,
-        authority.action_ordinal,
+) -> object:
+    if type(authority) is not ShadowFillDispositionAuthority:
+        raise TypeError("shadow fill authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        authority,
+        domain=_SHADOW_FILL_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
     )
 
 
 def is_issued_shadow_fill_disposition_authority(authority: object) -> bool:
-    if not isinstance(authority, ShadowFillDispositionAuthority):
+    if type(authority) is not ShadowFillDispositionAuthority:
         return False
-    try:
-        fingerprint = _shadow_fill_disposition_fingerprint(authority)
-    except Exception:
-        return False
-    return _has_ledger_authority(
+    candidate = _phase1_derived_authority_candidate(
         _SHADOW_FILL_DISPOSITION_AUTHORITIES,
         authority,
-        fingerprint,
-    ) and _phase1_sources_are_current(authority)
+    )
+    record = None if candidate is None else candidate[1]
+    source = (
+        None
+        if candidate is None or len(candidate[2]) != 1
+        else candidate[2][0][0]
+    )
+    if (
+        candidate is None
+        or len(candidate[2]) != 1
+        or candidate[2][0][1] != "SHADOW_FILL"
+        or record is None
+        or len(record.children) != 1
+        or record.children[0] is not getattr(source, "signal_source", None)
+        or not _phase1_authority_sources_are_current(candidate[2])
+    ):
+        return False
+    return _is_current_phase1_derived_authority(
+        _SHADOW_FILL_DISPOSITION_AUTHORITIES,
+        authority,
+        candidate,
+        _shadow_fill_disposition_fingerprint,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1395,6 +1472,119 @@ def _execution_quote_fingerprint(
     )
 
 
+_Phase1DerivedRegistry = dict[
+    int,
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
+]
+_Phase1DerivedCandidate = tuple[
+    tuple[ReferenceType[object], _Phase1DerivedAuthorityRecord],
+    _Phase1DerivedAuthorityRecord,
+    tuple[tuple[object, str], ...],
+]
+
+
+def _phase1_derived_authority_candidate(
+    registry: _Phase1DerivedRegistry,
+    value: object,
+) -> _Phase1DerivedCandidate | None:
+    """Capture exact registry and source-binding records without callbacks."""
+    identity = id(value)
+    with _EVENT_AUTHORITY_LOCK:
+        issued = registry.get(identity)
+        if (
+            issued is None
+            or issued[0]() is not value
+            or type(issued[1]) is not _Phase1DerivedAuthorityRecord
+        ):
+            return None
+        record = issued[1]
+        if (
+            type(record.bindings) is not tuple
+            or type(record.children) is not tuple
+        ):
+            return None
+        resolved = record.bindings
+        if any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[1]) is not str
+            for item in resolved
+        ):
+            return None
+        return issued, record, resolved
+
+
+def _phase1_authority_sources_are_current(
+    resolved: tuple[tuple[object, str], ...],
+) -> bool:
+    """Complete callback-bearing Journal verification before final sealing."""
+    from . import journal as journal_module
+
+    verifier_names = {
+        "SIGNAL": "is_verified_phase1_signal_source",
+        "ENTRY": "is_verified_phase1_entry_source",
+        "SHADOW_FILL": "is_verified_phase1_shadow_fill_source",
+        "CANONICAL_REPLAY": "is_verified_phase1_canonical_replay_source",
+    }
+    for source, kind in resolved:
+        verifier_name = verifier_names.get(kind)
+        verifier = (
+            None
+            if verifier_name is None
+            else getattr(journal_module, verifier_name, None)
+        )
+        if verifier is None or not verifier(source):
+            return False
+    return True
+
+
+def _is_current_phase1_derived_authority(
+    registry: _Phase1DerivedRegistry,
+    value: object,
+    candidate: _Phase1DerivedCandidate,
+    fingerprint_factory: Callable[..., object],
+) -> bool:
+    """Finish with a fresh hook-free seal and exact registry identities."""
+    issued, record, resolved = candidate
+    captured_fingerprint = record.seal
+    captured_children = record.children
+    captured_semantic_verifier = record.semantic_verifier
+    try:
+        if not captured_semantic_verifier(value, resolved, captured_children):
+            return False
+        fingerprint = fingerprint_factory(value)
+    except Exception:
+        return False
+    from . import journal as journal_module
+
+    identity = id(value)
+    with _EVENT_AUTHORITY_LOCK:
+        current = registry.get(identity)
+        if (
+            current is not issued
+            or current[0]() is not value
+            or current[1] is not record
+            or current[1].seal is not captured_fingerprint
+            or current[1].bindings is not resolved
+            or current[1].children is not captured_children
+            or current[1].semantic_verifier is not captured_semantic_verifier
+        ):
+            return False
+        if any(
+            current_source is not captured_source
+            or current_kind != captured_kind
+            for (current_source, current_kind), (
+                captured_source,
+                captured_kind,
+            ) in zip(current[1].bindings, resolved, strict=True)
+        ):
+            return False
+        return journal_module._source_fingerprint_seals_equal(
+            captured_fingerprint,
+            fingerprint,
+        )
+
+
 def _has_ledger_authority(
     registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
     value: object,
@@ -1409,50 +1599,960 @@ def _has_ledger_authority(
         )
 
 
-def _register_phase1_derived_authority(
-    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
-    value: object,
-    fingerprint: tuple[object, ...],
-) -> None:
-    identity = id(value)
+def _make_hook_free_ledger_event_digest(
+    *,
+    sha256_factory: Callable[..., object],
+    decimal_type: type[Decimal],
+    date_type: type[date],
+    datetime_type: type[datetime],
+    utc_value: object,
+    safe_tz_types: tuple[type[object], ...],
+    event_type: type[LedgerEvent],
+    lot_type: type[LedgerLot],
+    decision_type: type[ComplianceDecision],
+) -> tuple[Callable[[LedgerEvent], str], Callable[[object], str | None]]:
+    """Build the event digest without resolving any mutable module globals."""
 
-    def discard(dead: ReferenceType[object]) -> None:
-        with _EVENT_AUTHORITY_LOCK:
-            current = registry.get(identity)
-            if current is not None and current[0] is dead:
-                registry.pop(identity, None)
+    def quote_string(value: str) -> str:
+        pieces = ['"']
+        escapes = {
+            '"': '\\"',
+            "\\": "\\\\",
+            "\b": "\\b",
+            "\f": "\\f",
+            "\n": "\\n",
+            "\r": "\\r",
+            "\t": "\\t",
+        }
+        for character in value:
+            escaped = escapes.get(character)
+            if escaped is not None:
+                pieces.append(escaped)
+                continue
+            codepoint = ord(character)
+            if codepoint < 0x20 or codepoint > 0x7F:
+                if codepoint <= 0xFFFF:
+                    pieces.append(f"\\u{codepoint:04x}")
+                else:
+                    adjusted = codepoint - 0x10000
+                    high = 0xD800 + (adjusted >> 10)
+                    low = 0xDC00 + (adjusted & 0x3FF)
+                    pieces.append(f"\\u{high:04x}\\u{low:04x}")
+            else:
+                pieces.append(character)
+        pieces.append('"')
+        return "".join(pieces)
 
-    reference = ref(value, discard)
-    with _EVENT_AUTHORITY_LOCK:
-        registry[identity] = (reference, fingerprint)
+    def encode_json(value: object) -> str:
+        if value is None:
+            return "null"
+        if type(value) is bool:
+            return "true" if value else "false"
+        if type(value) is int:
+            return str(value)
+        if type(value) is str:
+            return quote_string(value)
+        if type(value) is list:
+            return "[" + ",".join(encode_json(item) for item in value) + "]"
+        if type(value) is dict:
+            keys = tuple(value)
+            if any(type(key) is not str for key in keys):
+                raise TypeError("canonical digest keys must be exact strings")
+            return "{" + ",".join(
+                quote_string(key) + ":" + encode_json(value[key])
+                for key in sorted(keys)
+            ) + "}"
+        raise TypeError("canonical digest leaf type is unverified")
 
-
-def _bind_phase1_sources(
-    value: object,
-    sources: Sequence[tuple[object, str]],
-) -> None:
-    """Bind an issued value to exact live Journal-owned source identities."""
-    frozen_sources = tuple(sources)
-    if not frozen_sources:
-        return
-    identity = id(value)
-
-    def discard(dead: ReferenceType[object]) -> None:
-        with _EVENT_AUTHORITY_LOCK:
-            current = _PHASE1_SOURCE_BINDINGS.get(identity)
-            if current is not None and current[0] is dead:
-                _PHASE1_SOURCE_BINDINGS.pop(identity, None)
-
-    value_reference = ref(value, discard)
-    with _EVENT_AUTHORITY_LOCK:
-        _PHASE1_SOURCE_BINDINGS[identity] = (
-            value_reference,
-            frozen_sources,
+    def safe_datetime(value: object) -> bool:
+        return (
+            type(value) is datetime_type
+            and any(type(value.tzinfo) is candidate for candidate in safe_tz_types)
         )
+
+    def timestamp(value: object) -> str:
+        if not safe_datetime(value):
+            raise TypeError("canonical digest datetime is unverified")
+        return (
+            value.astimezone(utc_value)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def money_micros(value: object) -> int:
+        if type(value) is not decimal_type:
+            raise TypeError("canonical digest money is unverified")
+        scaled = value.scaleb(6)
+        integral = scaled.to_integral_value()
+        if scaled.as_tuple() != integral.as_tuple():
+            raise TypeError("canonical digest money is not exact micros")
+        return int(integral)
+
+    def digest(event: LedgerEvent) -> str:
+        if type(event) is not event_type:
+            raise TypeError("ledger event type is unverified")
+        lot = object.__getattribute__(event, "lot")
+        decision = object.__getattribute__(event, "decision")
+        if (
+            type(lot) is not lot_type
+            or type(decision) is not decision_type
+            or type(lot.shares) is not int
+            or type(lot.total_cost_micros) is not int
+            or lot.total_cost_micros != money_micros(lot.price) * lot.shares
+            or type(decision.reason_codes) is not tuple
+            or any(type(reason) is not str for reason in decision.reason_codes)
+        ):
+            raise TypeError("ledger event child type is unverified")
+        payload = {
+            "ledger_name": event.ledger_name,
+            "signal_id": event.signal_id,
+            "lot": {
+                "price_micros": money_micros(lot.price),
+                "shares": lot.shares,
+                "total_cost_micros": lot.total_cost_micros,
+                "at": timestamp(lot.at),
+                "parent_order_id": lot.parent_order_id,
+            },
+            "signal_digest": event.signal_digest,
+            "user_confirmed_stop_micros": (
+                None
+                if event.user_confirmed_stop is None
+                else money_micros(event.user_confirmed_stop)
+            ),
+            "recommended_stop_micros": (
+                None
+                if event.recommended_stop is None
+                else money_micros(event.recommended_stop)
+            ),
+            "profit_target_taken": event.profit_target_taken,
+            "decision": {
+                "status": decision.status,
+                "compliant": decision.compliant,
+                "reconciliation_required": decision.reconciliation_required,
+                "reason_codes": list(decision.reason_codes),
+            },
+            "event_id": event.event_id,
+            "cursor": event.cursor,
+            "ordinal": event.ordinal,
+            "authority_basis": event.authority_basis,
+            "message_time": (
+                None if event.message_time is None else timestamp(event.message_time)
+            ),
+            "received_at": (
+                None if event.received_at is None else timestamp(event.received_at)
+            ),
+        }
+        encoded = encode_json(
+            {
+                "namespace": "stock-monitor/ledger-event/v1",
+                "payload": payload,
+            }
+        ).encode("utf-8")
+        return sha256_factory(encoded).hexdigest()
+
+    def signal_source_digest(source: object) -> str | None:
+        session = getattr(source, "publication_session", None)
+        if (
+            type(session) is not date_type
+            or type(getattr(source, "signal_id", None)) is not str
+            or type(getattr(source, "symbol", None)) is not str
+            or type(getattr(source, "role", None)) is not str
+            or any(
+                type(getattr(source, field_name, None)) is not int
+                for field_name in (
+                    "maximum_entry_micros",
+                    "recommended_stop_micros",
+                    "target_micros",
+                    "planned_shares",
+                    "tick_size_micros",
+                    "trigger_price_micros",
+                )
+            )
+        ):
+            return None
+        payload = {
+            "version": 2,
+            "signal_id": source.signal_id,
+            "symbol": source.symbol,
+            "role": source.role,
+            "publication_session": session.isoformat(),
+            "maximum_entry_micros": source.maximum_entry_micros,
+            "recommended_stop_micros": source.recommended_stop_micros,
+            "target_micros": source.target_micros,
+            "planned_shares": source.planned_shares,
+            "tick_size_micros": source.tick_size_micros,
+            "trigger_price_micros": source.trigger_price_micros,
+        }
+        encoded = encode_json(payload).encode("utf-8")
+        return sha256_factory(encoded).hexdigest()
+
+    return digest, signal_source_digest
+
+
+def _make_phase1_derived_semantic_validators(
+    *,
+    decimal_type: type[Decimal],
+    signal_digest_from_source: Callable[[object], str | None],
+    signal_type: type[LedgerSignal],
+    paper_type: type[PaperEntryAuthority],
+    shadow_type: type[ShadowFillDispositionAuthority],
+    replay_cohort_type: type[VerifiedLedgerReplayCohort],
+    event_type: type[LedgerEvent],
+    lot_type: type[LedgerLot],
+    decision_type: type[ComplianceDecision],
+    date_type: type[date],
+    datetime_type: type[datetime],
+    safe_tz_types: tuple[type[object], ...],
+    event_digest: Callable[[LedgerEvent], str],
+) -> tuple[
+    Callable[[object, tuple[tuple[object, str], ...], tuple[object, ...]], bool],
+    Callable[[object, tuple[tuple[object, str], ...], tuple[object, ...]], bool],
+    Callable[[object, tuple[tuple[object, str], ...], tuple[object, ...]], bool],
+    Callable[[object, tuple[tuple[object, str], ...], tuple[object, ...]], bool],
+]:
+    """Capture callback-free source-to-authority semantic rederivation."""
+
+    def same_str(value: object, expected: object) -> bool:
+        return type(value) is str and type(expected) is str and value == expected
+
+    def same_int(value: object, expected: object) -> bool:
+        return type(value) is int and type(expected) is int and value == expected
+
+    def same_optional_int(value: object, expected: object) -> bool:
+        return (value is None and expected is None) or same_int(value, expected)
+
+    def same_date_identity(value: object, expected: object) -> bool:
+        return (
+            type(value) is date_type
+            and type(expected) is date_type
+            and value is expected
+        )
+
+    def safe_datetime(value: object) -> bool:
+        return (
+            type(value) is datetime_type
+            and any(type(value.tzinfo) is candidate for candidate in safe_tz_types)
+        )
+
+    def same_datetime_identity(value: object, expected: object) -> bool:
+        return (
+            safe_datetime(value)
+            and safe_datetime(expected)
+            and value is expected
+        )
+
+    def expected_money(micros: object) -> Decimal | None:
+        if type(micros) is not int:
+            return None
+        return decimal_type(micros).scaleb(-6)
+
+    def same_money(value: object, micros: object) -> bool:
+        expected = expected_money(micros)
+        return (
+            expected is not None
+            and type(value) is decimal_type
+            and value.as_tuple() == expected.as_tuple()
+        )
+
+    def money_micros(value: object) -> int | None:
+        if type(value) is not decimal_type:
+            return None
+        scaled = value.scaleb(6)
+        integral = scaled.to_integral_value()
+        if scaled.as_tuple() != integral.as_tuple():
+            return None
+        return int(integral)
+
+    def same_decimal(value: object, expected: object) -> bool:
+        return (
+            type(value) is decimal_type
+            and type(expected) is decimal_type
+            and value == expected
+        )
+
+    def signal_semantics(
+        value: object,
+        sources: tuple[tuple[object, str], ...],
+        children: tuple[object, ...],
+    ) -> bool:
+        if (
+            type(value) is not signal_type
+            or type(value.signal_id) is not str
+            or type(value.symbol) is not str
+            or type(value.role) is not str
+            or type(value.publication_session) is not date_type
+            or type(value.maximum_entry) is not decimal_type
+            or type(value.recommended_stop) is not decimal_type
+            or type(value.target) is not decimal_type
+            or type(value.planned_shares) is not int
+            or type(value.tick_size) is not decimal_type
+            or type(value.trigger_price) is not decimal_type
+        ):
+            return False
+        if len(sources) == 1:
+            if len(children) != 0:
+                return False
+            root_source, binding_kind = sources[0]
+            if binding_kind == "CANONICAL_REPLAY":
+                signal_sources = getattr(root_source, "signal_sources", ())
+                if type(signal_sources) is not tuple:
+                    return False
+                matching_sources = tuple(
+                    candidate
+                    for candidate in signal_sources
+                    if type(getattr(candidate, "signal_id", None)) is str
+                    and candidate.signal_id == value.signal_id
+                    and type(getattr(candidate, "role", None)) is str
+                    and candidate.role == "PRIMARY"
+                )
+                if len(matching_sources) != 1:
+                    return False
+                source = matching_sources[0]
+            else:
+                source = root_source
+            return (
+                same_str(
+                    value.signal_id,
+                    getattr(source, "signal_id", None),
+                )
+                and same_str(value.symbol, getattr(source, "symbol", None))
+                and same_str(value.role, getattr(source, "role", None))
+                and same_date_identity(
+                    value.publication_session,
+                    getattr(source, "publication_session", None),
+                )
+                and same_money(
+                    value.maximum_entry,
+                    getattr(source, "maximum_entry_micros", None),
+                )
+                and same_money(
+                    value.recommended_stop,
+                    getattr(source, "recommended_stop_micros", None),
+                )
+                and same_money(
+                    value.target,
+                    getattr(source, "target_micros", None),
+                )
+                and same_int(
+                    value.planned_shares,
+                    getattr(source, "planned_shares", None),
+                )
+                and same_money(
+                    value.tick_size,
+                    getattr(source, "tick_size_micros", None),
+                )
+                and same_money(
+                    value.trigger_price,
+                    getattr(source, "trigger_price_micros", None),
+                )
+            )
+        if len(sources) != 0 or len(children) != 2:
+            return False
+        decision, plan_decision = children
+        publication = getattr(decision, "primary", None)
+        candidate = getattr(publication, "candidate", None)
+        plan = getattr(plan_decision, "plan", None)
+        if publication is None or candidate is None or plan is None:
+            return False
+        session = getattr(candidate, "publication_session", None)
+        candidate_symbol = getattr(candidate, "symbol", None)
+        return (
+            type(session) is date_type
+            and type(candidate_symbol) is str
+            and same_str(
+                value.signal_id,
+                f"{session.isoformat()}:{candidate_symbol}",
+            )
+            and same_str(value.symbol, candidate_symbol)
+            and same_str(value.role, getattr(publication, "role", None))
+            and same_date_identity(value.publication_session, session)
+            and same_decimal(
+                value.maximum_entry,
+                getattr(candidate, "maximum_permitted_entry", None),
+            )
+            and same_decimal(
+                value.recommended_stop,
+                getattr(candidate, "recommended_stop", None),
+            )
+            and same_decimal(
+                value.target,
+                getattr(candidate, "target_price", None),
+            )
+            and same_int(value.planned_shares, getattr(plan, "quantity", None))
+            and same_decimal(
+                value.tick_size,
+                getattr(candidate, "tick_size", None),
+            )
+            and same_decimal(
+                value.trigger_price,
+                getattr(candidate, "trigger_price", None),
+            )
+        )
+
+    def paper_semantics(
+        value: object,
+        sources: tuple[tuple[object, str], ...],
+        children: tuple[object, ...],
+    ) -> bool:
+        if (
+            type(value) is not paper_type
+            or len(sources) != 1
+            or len(children) != 1
+            or type(children[0]) is not signal_type
+            or any(
+                type(getattr(value, field_name)) is not str
+                for field_name in (
+                    "signal_id",
+                    "signal_digest",
+                    "lifecycle_event_id",
+                    "trigger_observation_id",
+                    "trigger_stream_id",
+                    "trigger_feed",
+                    "quote_observation_id",
+                    "quote_stream_id",
+                    "quote_feed",
+                    "source_digest",
+                    "session_complete_digest",
+                    "canonical_event_id",
+                    "calendar_digest",
+                )
+            )
+            or any(
+                not safe_datetime(getattr(value, field_name))
+                for field_name in (
+                    "trigger_at",
+                    "trigger_received_at",
+                    "quote_at",
+                    "quote_received_at",
+                    "cohort_received_through",
+                )
+            )
+            or any(
+                type(getattr(value, field_name)) is not int
+                for field_name in (
+                    "trigger_source_cursor",
+                    "trigger_source_ordinal",
+                    "trigger_stream_through_cursor",
+                    "trigger_cohort_ordinal",
+                    "quote_source_cursor",
+                    "quote_source_ordinal",
+                    "quote_stream_through_cursor",
+                    "quote_cohort_ordinal",
+                    "cohort_through_ordinal",
+                    "lifecycle_cursor",
+                    "action_ordinal",
+                )
+            )
+            or any(
+                sequence is not None and type(sequence) is not int
+                for sequence in (value.trigger_sequence, value.quote_sequence)
+            )
+            or any(
+                type(getattr(value, field_name)) is not decimal_type
+                for field_name in ("trigger_price", "bid", "ask")
+            )
+        ):
+            return False
+        root_source, binding_kind = sources[0]
+        if binding_kind == "CANONICAL_REPLAY":
+            entry_sources = getattr(root_source, "entry_sources", ())
+            if type(entry_sources) is not tuple:
+                return False
+            matching_sources = tuple(
+                candidate
+                for candidate in entry_sources
+                if getattr(candidate, "signal_source", None) is not None
+                and type(
+                    getattr(
+                        getattr(candidate, "signal_source", None),
+                        "signal_id",
+                        None,
+                    )
+                ) is str
+                and candidate.signal_source.signal_id == value.signal_id
+            )
+            if len(matching_sources) != 1:
+                return False
+            source = matching_sources[0]
+        else:
+            source = root_source
+        signal = children[0]
+        observations = getattr(source, "observations", ())
+        completion = getattr(source, "completion", None)
+        lifecycle = getattr(source, "lifecycle_event", None)
+        if completion is None or lifecycle is None or type(observations) is not tuple:
+            return False
+        by_id = {
+            getattr(item, "observation_id", None): item for item in observations
+        }
+        trigger = by_id.get(getattr(lifecycle, "trigger_observation_id", None))
+        quote = by_id.get(getattr(lifecycle, "quote_observation_id", None))
+        signal_source = getattr(source, "signal_source", None)
+        if trigger is None or quote is None or signal_source is None:
+            return False
+        return (
+            same_str(value.signal_id, signal.signal_id)
+            and same_str(
+                value.signal_digest,
+                signal_digest_from_source(signal_source),
+            )
+            and same_str(
+                value.lifecycle_event_id,
+                lifecycle.lifecycle_event_id,
+            )
+            and same_str(
+                value.trigger_observation_id,
+                trigger.observation_id,
+            )
+            and same_str(value.trigger_stream_id, trigger.stream_id)
+            and same_str(value.trigger_feed, trigger.feed)
+            and same_datetime_identity(value.trigger_at, trigger.source_time)
+            and same_datetime_identity(
+                value.trigger_received_at,
+                trigger.received_at,
+            )
+            and same_optional_int(
+                value.trigger_sequence,
+                trigger.provider_sequence,
+            )
+            and same_int(value.trigger_source_cursor, trigger.source_cursor)
+            and same_int(value.trigger_source_ordinal, trigger.source_ordinal)
+            and same_int(
+                value.trigger_stream_through_cursor,
+                trigger.stream_through_cursor,
+            )
+            and same_int(value.trigger_cohort_ordinal, trigger.cohort_ordinal)
+            and same_money(value.trigger_price, trigger.trade_price_micros)
+            and same_str(value.quote_observation_id, quote.observation_id)
+            and same_str(value.quote_stream_id, quote.stream_id)
+            and same_str(value.quote_feed, quote.feed)
+            and same_datetime_identity(value.quote_at, quote.source_time)
+            and same_datetime_identity(
+                value.quote_received_at,
+                quote.received_at,
+            )
+            and same_optional_int(value.quote_sequence, quote.provider_sequence)
+            and same_int(value.quote_source_cursor, quote.source_cursor)
+            and same_int(value.quote_source_ordinal, quote.source_ordinal)
+            and same_int(
+                value.quote_stream_through_cursor,
+                quote.stream_through_cursor,
+            )
+            and same_int(value.quote_cohort_ordinal, quote.cohort_ordinal)
+            and same_money(value.bid, quote.bid_micros)
+            and same_money(value.ask, quote.ask_micros)
+            and same_str(
+                value.source_digest,
+                getattr(source, "source_digest", None),
+            )
+            and same_str(
+                value.session_complete_digest,
+                completion.source_digest,
+            )
+            and same_int(
+                value.cohort_through_ordinal,
+                completion.cohort_through_ordinal,
+            )
+            and same_datetime_identity(
+                value.cohort_received_through,
+                completion.received_through,
+            )
+            and same_str(
+                value.canonical_event_id,
+                lifecycle.lifecycle_event_id,
+            )
+            and same_int(value.lifecycle_cursor, lifecycle.row_id)
+            and same_int(value.action_ordinal, lifecycle.event_ordinal)
+            and same_str(
+                value.calendar_digest,
+                getattr(source, "calendar_digest", None),
+            )
+        )
+
+    def shadow_semantics(
+        value: object,
+        sources: tuple[tuple[object, str], ...],
+        children: tuple[object, ...],
+    ) -> bool:
+        if (
+            type(value) is not shadow_type
+            or len(sources) != 1
+            or any(
+                type(getattr(value, field_name)) is not str
+                for field_name in (
+                    "signal_id",
+                    "lifecycle_event_id",
+                    "trigger_observation_id",
+                    "quote_observation_id",
+                    "source_digest",
+                    "session_complete_digest",
+                    "calendar_digest",
+                )
+            )
+            or any(
+                not safe_datetime(getattr(value, field_name))
+                for field_name in ("trigger_at", "filled_at")
+            )
+            or type(value.fill_price) is not decimal_type
+            or type(value.lifecycle_cursor) is not int
+            or type(value.action_ordinal) is not int
+        ):
+            return False
+        source = sources[0][0]
+        signal = getattr(source, "signal_source", None)
+        if len(children) != 1 or children[0] is not signal:
+            return False
+        observations = getattr(source, "observations", ())
+        completion = getattr(source, "completion", None)
+        lifecycle = getattr(source, "lifecycle_event", None)
+        if completion is None or lifecycle is None or type(observations) is not tuple:
+            return False
+        by_id = {
+            getattr(item, "observation_id", None): item for item in observations
+        }
+        trigger = by_id.get(getattr(lifecycle, "trigger_observation_id", None))
+        quote = by_id.get(getattr(lifecycle, "quote_observation_id", None))
+        if trigger is None or quote is None or signal is None:
+            return False
+        return (
+            same_str(value.signal_id, signal.signal_id)
+            and same_str(
+                value.lifecycle_event_id,
+                lifecycle.lifecycle_event_id,
+            )
+            and same_str(
+                value.trigger_observation_id,
+                trigger.observation_id,
+            )
+            and same_str(value.quote_observation_id, quote.observation_id)
+            and same_datetime_identity(value.trigger_at, trigger.source_time)
+            and same_datetime_identity(value.filled_at, quote.source_time)
+            and same_money(value.fill_price, signal.maximum_entry_micros)
+            and same_str(
+                value.source_digest,
+                getattr(source, "source_digest", None),
+            )
+            and same_str(
+                value.session_complete_digest,
+                completion.source_digest,
+            )
+            and same_str(
+                value.calendar_digest,
+                getattr(source, "calendar_digest", None),
+            )
+            and same_int(value.lifecycle_cursor, lifecycle.row_id)
+            and same_int(value.action_ordinal, lifecycle.event_ordinal)
+        )
+
+    def replay_cohort_semantics(
+        value: object,
+        sources: tuple[tuple[object, str], ...],
+        children: tuple[object, ...],
+    ) -> bool:
+        if (
+            type(value) is not replay_cohort_type
+            or len(sources) != 1
+            or any(type(event) is not event_type for event in children)
+        ):
+            return False
+        source = sources[0][0]
+        expected_references: list[tuple[str, str, str]] = []
+        cursors: list[int] = []
+        for event in children:
+            lot = object.__getattribute__(event, "lot")
+            decision = object.__getattribute__(event, "decision")
+            if (
+                type(event.ledger_name) is not str
+                or type(event.signal_id) is not str
+                or type(lot) is not lot_type
+                or type(lot.price) is not decimal_type
+                or type(lot.shares) is not int
+                or not safe_datetime(lot.at)
+                or (
+                    lot.parent_order_id is not None
+                    and type(lot.parent_order_id) is not str
+                )
+                or type(lot.total_cost_micros) is not int
+                or lot.total_cost_micros
+                != money_micros(lot.price) * lot.shares
+                or (
+                    event.user_confirmed_stop is not None
+                    and type(event.user_confirmed_stop) is not decimal_type
+                )
+                or type(decision) is not decision_type
+                or type(decision.status) is not str
+                or type(decision.compliant) is not bool
+                or type(decision.reconciliation_required) is not bool
+                or type(decision.reason_codes) is not tuple
+                or any(type(reason) is not str for reason in decision.reason_codes)
+                or type(event.event_id) is not str
+                or (event.cursor is not None and type(event.cursor) is not int)
+                or type(event.ordinal) is not int
+                or (
+                    event.authority_basis is not None
+                    and type(event.authority_basis) is not str
+                )
+                or type(event.signal_digest) is not str
+                or not safe_datetime(event.message_time)
+                or not safe_datetime(event.received_at)
+                or (
+                    event.recommended_stop is not None
+                    and type(event.recommended_stop) is not decimal_type
+                )
+                or type(event.profit_target_taken) is not bool
+            ):
+                return False
+            expected_references.append(
+                (event.event_id, event_digest(event), event.signal_digest)
+            )
+            if event.cursor is not None:
+                cursors.append(event.cursor)
+        if (
+            type(value.ledger_name) is not str
+            or value.ledger_name != "CANONICAL"
+            or type(value.references) is not tuple
+            or len(value.references) != len(expected_references)
+            or any(
+                type(reference) is not tuple
+                or len(reference) != 3
+                or any(type(item) is not str for item in reference)
+                or not same_str(reference[0], expected[0])
+                or not same_str(reference[1], expected[1])
+                or not same_str(reference[2], expected[2])
+                for reference, expected in zip(
+                    value.references,
+                    expected_references,
+                    strict=True,
+                )
+            )
+            or not same_int(value.expected_count, len(children))
+            or not same_optional_int(
+                value.start_cursor,
+                cursors[0] if cursors else None,
+            )
+            or not same_optional_int(
+                value.terminal_cursor,
+                cursors[-1] if cursors else None,
+            )
+            or not same_datetime_identity(
+                value.query_cutoff,
+                getattr(source, "query_cutoff", None),
+            )
+            or not same_str(
+                value.source_digest,
+                getattr(source, "source_digest", None),
+            )
+        ):
+            return False
+        return True
+
+    return (
+        signal_semantics,
+        paper_semantics,
+        shadow_semantics,
+        replay_cohort_semantics,
+    )
+
+
+def _make_phase1_derived_authority_registrar(
+    *,
+    frame_getter: Callable[..., object],
+    trusted_globals: dict[str, object],
+    risk_block: type[RiskBlock],
+    authority_lock: RLock,
+    reference_factory: Callable[..., ReferenceType[object]],
+    binding_registry: dict[
+        int,
+        tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
+    ],
+    record_type: type[_Phase1DerivedAuthorityRecord],
+    source_verifier: Callable[[tuple[tuple[object, str], ...]], bool],
+    policies: tuple[
+        tuple[
+            _Phase1DerivedRegistry,
+            type[object],
+            Callable[..., object],
+            tuple[object, ...],
+            frozenset[str],
+            object | None,
+            Callable[[tuple[object, ...]], bool] | None,
+            Callable[
+                [object, tuple[tuple[object, str], ...], tuple[object, ...]],
+                bool,
+            ],
+        ],
+        ...,
+    ],
+) -> Callable[..., None]:
+    """Capture immutable issuer code identities in one construction closure."""
+
+    def register(
+        registry: _Phase1DerivedRegistry,
+        value: object,
+        _untrusted_fingerprint: object | None = None,
+        *,
+        sources: tuple[tuple[object, str], ...] = (),
+        children: tuple[object, ...] = (),
+    ) -> None:
+        del _untrusted_fingerprint
+        policy = next(
+            (candidate for candidate in policies if registry is candidate[0]),
+            None,
+        )
+        if policy is None:
+            raise risk_block("PHASE1_DERIVED_AUTHORITY_ISSUER_UNVERIFIED")
+        (
+            trusted_registry,
+            exact_type,
+            fingerprint_factory,
+            issuer_codes,
+            allowed_kinds,
+            child_issuer_code,
+            child_verifier,
+            semantic_verifier,
+        ) = policy
+        caller_frame = frame_getter(1)
+        if (
+            caller_frame.f_globals is not trusted_globals
+            or not (
+                any(caller_frame.f_code is code for code in issuer_codes)
+                or caller_frame.f_code is child_issuer_code
+            )
+        ):
+            raise risk_block("PHASE1_DERIVED_AUTHORITY_ISSUER_UNVERIFIED")
+        if (
+            type(value) is not exact_type
+            or type(sources) is not tuple
+            or type(children) is not tuple
+        ):
+            raise risk_block("PHASE1_DERIVED_AUTHORITY_SOURCE_UNVERIFIED")
+        if caller_frame.f_code is child_issuer_code:
+            if (
+                len(sources) != 0
+                or child_verifier is None
+                or not child_verifier(children)
+            ):
+                raise risk_block("PHASE1_DERIVED_AUTHORITY_SOURCE_UNVERIFIED")
+        elif (
+            len(sources) != 1
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or item[1] not in allowed_kinds
+                for item in sources
+            )
+            or not source_verifier(sources)
+        ):
+            raise risk_block("PHASE1_DERIVED_AUTHORITY_SOURCE_UNVERIFIED")
+        try:
+            semantically_exact = semantic_verifier(value, sources, children)
+        except Exception:
+            semantically_exact = False
+        if not semantically_exact:
+            raise risk_block("PHASE1_DERIVED_AUTHORITY_CONTENT_UNVERIFIED")
+        record = record_type(
+            seal=fingerprint_factory(value),
+            bindings=sources,
+            children=children,
+            semantic_verifier=semantic_verifier,
+        )
+        identity = id(value)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current = trusted_registry.get(identity)
+                if current is not None and current[0] is dead:
+                    trusted_registry.pop(identity, None)
+
+        reference = reference_factory(value, discard)
+        with authority_lock:
+            if (
+                trusted_registry.get(identity) is not None
+                or binding_registry.get(identity) is not None
+            ):
+                raise risk_block("PHASE1_DERIVED_AUTHORITY_ALREADY_ISSUED")
+            trusted_registry[identity] = (reference, record)
+
+    return register
+
+
+def _make_phase1_source_binder(
+    *,
+    frame_getter: Callable[..., object],
+    trusted_globals: dict[str, object],
+    risk_block: type[RiskBlock],
+    authority_lock: RLock,
+    reference_factory: Callable[..., ReferenceType[object]],
+    binding_registry: dict[
+        int,
+        tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
+    ],
+    event_type: type[LedgerEvent],
+    issuer_code: object,
+    source_verifier: Callable[[tuple[tuple[object, str], ...]], bool],
+) -> Callable[[object, Sequence[tuple[object, str]]], None]:
+    """Capture the sole replay-event binder issuer in a construction closure."""
+
+    def bind(
+        value: object,
+        sources: Sequence[tuple[object, str]],
+    ) -> None:
+        caller_frame = frame_getter(1)
+        if (
+            caller_frame.f_globals is not trusted_globals
+            or caller_frame.f_code is not issuer_code
+            or type(value) is not event_type
+            or type(sources) is not tuple
+            or len(sources) != 1
+            or type(sources[0]) is not tuple
+            or len(sources[0]) != 2
+            or sources[0][1] != "CANONICAL_REPLAY"
+        ):
+            raise risk_block("PHASE1_SOURCE_BINDING_ISSUER_UNVERIFIED")
+        frozen_sources = sources
+        if not source_verifier(frozen_sources):
+            raise risk_block("PHASE1_SOURCE_BINDING_ISSUER_UNVERIFIED")
+        identity = id(value)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current = binding_registry.get(identity)
+                if current is not None and current[0] is dead:
+                    binding_registry.pop(identity, None)
+
+        value_reference = reference_factory(value, discard)
+        with authority_lock:
+            if binding_registry.get(identity) is not None:
+                raise risk_block("PHASE1_SOURCE_BINDING_ALREADY_ISSUED")
+            binding_registry[identity] = (
+                value_reference,
+                frozen_sources,
+            )
+
+    return bind
 
 
 def _phase1_bound_sources(value: object) -> tuple[tuple[object, str], ...]:
+    if type(value) is LedgerSignal:
+        registry: _Phase1DerivedRegistry | None = _ISSUED_LEDGER_SIGNALS
+    elif type(value) is PaperEntryAuthority:
+        registry = _PAPER_ENTRY_AUTHORITIES
+    elif type(value) is ShadowFillDispositionAuthority:
+        registry = _SHADOW_FILL_DISPOSITION_AUTHORITIES
+    elif type(value) is VerifiedLedgerReplayCohort:
+        registry = _VERIFIED_REPLAY_COHORT_AUTHORITIES
+    else:
+        registry = None
     with _EVENT_AUTHORITY_LOCK:
+        if registry is not None:
+            issued = registry.get(id(value))
+            if (
+                issued is None
+                or issued[0]() is not value
+                or type(issued[1]) is not _Phase1DerivedAuthorityRecord
+            ):
+                return ()
+            return issued[1].bindings
         binding = _PHASE1_SOURCE_BINDINGS.get(id(value))
         if binding is None or binding[0]() is not value:
             return ()
@@ -2082,101 +3182,130 @@ def _calendar_payload(resolver: SessionCalendarResolver) -> list[object]:
 
 def _verified_batch_fingerprint(
     batch: VerifiedLedgerEventBatch,
-) -> tuple[object, ...]:
-    return (batch.references,)
+) -> object:
+    if type(batch) is not VerifiedLedgerEventBatch:
+        raise TypeError("verified ledger batch type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        batch,
+        domain=_VERIFIED_LEDGER_BATCH_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
 
 
 def _replay_cohort_fingerprint(
     cohort: VerifiedLedgerReplayCohort,
-) -> tuple[object, ...]:
-    return (
-        cohort.ledger_name,
-        cohort.references,
-        cohort.expected_count,
-        cohort.start_cursor,
-        cohort.terminal_cursor,
-        cohort.query_cutoff,
-        cohort.source_digest,
-    )
+) -> object:
+    if type(cohort) is not VerifiedLedgerReplayCohort:
+        raise TypeError("verified replay cohort type is unverified")
+    from . import journal as journal_module
 
-
-def _actual_projection_position_fingerprint(position: object) -> tuple[object, ...]:
-    return (
-        getattr(position, "signal_id"),
-        getattr(position, "symbol"),
-        getattr(position, "lineage_kind"),
-        getattr(position, "signal_digest"),
-        tuple(
-            (
-                lot.source_event_id,
-                lot.source_cursor,
-                lot.remaining_shares,
-                lot.unit_cost_micros,
-                lot.acquired_at.astimezone(UTC).isoformat(
-                    timespec="microseconds"
-                ),
-                lot.received_at.astimezone(UTC).isoformat(
-                    timespec="microseconds"
-                ),
-                lot.parent_order_id,
-            )
-            for lot in getattr(position, "lots")
-        ),
-        getattr(position, "recommended_stop_micros"),
-        getattr(position, "user_stop_micros"),
-        getattr(position, "target_micros"),
-        getattr(position, "tick_micros"),
-        getattr(position, "cumulative_buy_cost_micros"),
-        getattr(position, "cumulative_sale_proceeds_micros"),
-        getattr(position, "linked_fees_micros"),
-        tuple(getattr(position, "reason_codes")),
-        tuple(getattr(position, "lifecycle_event_ids")),
+    return journal_module._source_fingerprint_seal(
+        cohort,
+        domain=_VERIFIED_REPLAY_COHORT_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
     )
 
 
 def _actual_projection_cohort_fingerprint(
     cohort: ActualProjectionCohort,
-) -> tuple[object, ...]:
-    return (
-        tuple(
-            _actual_projection_position_fingerprint(position)
-            for position in cohort.positions
-        ),
-        cohort.projection_start_cursor,
-        cohort.projection_terminal_cursor,
-        cohort.source_through_cursor,
-        cohort.physical_source_highwater_cursor,
-        cohort.query_cutoff.astimezone(UTC).isoformat(timespec="microseconds"),
-        cohort.journal_source_digest,
-        cohort.actual_state_digest,
-        cohort.calendar_digest,
-        cohort.policy_digest,
-        cohort.expected_action_count,
-        cohort.expected_posting_count,
+) -> object:
+    if type(cohort) is not ActualProjectionCohort:
+        raise TypeError("actual projection cohort type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        cohort,
+        domain=_ACTUAL_PROJECTION_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
     )
 
 
 def is_issued_actual_projection_cohort(cohort: object) -> bool:
-    if not isinstance(cohort, ActualProjectionCohort):
+    if type(cohort) is not ActualProjectionCohort:
         return False
-    try:
-        fingerprint = _actual_projection_cohort_fingerprint(cohort)
-    except Exception:
-        return False
+    identity = id(cohort)
     with _EVENT_AUTHORITY_LOCK:
-        issued = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(id(cohort))
+        issued = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(identity)
         if (
             issued is None
             or issued[0]() is not cohort
-            or issued[1] != fingerprint
         ):
             return False
         source = issued[2]()
+        state = issued[3]
+        registered_positions = issued[4]
+        journal_candidate = issued[5]
+        state_candidate = issued[6]
+        content_verifier = issued[7]
     if source is None:
         return False
-    from .journal import is_verified_journal_replay_source
+    from .journal import JournalActualReplaySource
+    from .reconciliation import (
+        ActualLedgerState,
+        is_verified_actual_ledger_state_for_source,
+    )
 
-    return is_verified_journal_replay_source(source)
+    if (
+        type(source) is not JournalActualReplaySource
+        or type(state) is not ActualLedgerState
+        or not is_verified_actual_ledger_state_for_source(state, source)
+    ):
+        return False
+    try:
+        fingerprint = content_verifier(
+            cohort,
+            source,
+            state,
+            _verification_candidates=(
+                journal_candidate,
+                state_candidate,
+            ),
+        )
+        cohort_positions = object.__getattribute__(cohort, "positions")
+        state_positions = object.__getattribute__(state, "positions")
+        strategy_positions = tuple(
+            position
+            for position in state_positions
+            if position.lineage_kind in {"ACTUAL_EVENT", "ACTUAL_GROUP"}
+        )
+    except Exception:
+        return False
+    if (
+        cohort_positions is not registered_positions
+        or type(state_positions) is not tuple
+        or len(strategy_positions) != len(registered_positions)
+        or any(
+            state_position is not registered_position
+            for state_position, registered_position in zip(
+                strategy_positions,
+                registered_positions,
+                strict=True,
+            )
+        )
+    ):
+        return False
+    from . import journal as journal_module
+
+    captured_fingerprint = issued[1]
+    with _EVENT_AUTHORITY_LOCK:
+        current = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(identity)
+        return (
+            current is issued
+            and current[0]() is cohort
+            and current[1] is captured_fingerprint
+            and current[2]() is source
+            and current[3] is state
+            and current[4] is registered_positions
+            and current[5] is journal_candidate
+            and current[6] is state_candidate
+            and current[7] is content_verifier
+            and journal_module._source_fingerprint_seals_equal(
+                captured_fingerprint,
+                fingerprint,
+            )
+        )
 
 
 def _issue_actual_projection_from_journal(
@@ -2265,37 +3394,42 @@ def _issue_actual_projection_from_journal(
         expected_action_count=source.expected_action_count,
         expected_posting_count=source.expected_posting_count,
     )
-    identity = id(cohort)
-
-    def discard(dead: ReferenceType[object]) -> None:
-        with _EVENT_AUTHORITY_LOCK:
-            current = _ACTUAL_PROJECTION_COHORT_AUTHORITIES.get(identity)
-            if current is not None and current[0] is dead:
-                _ACTUAL_PROJECTION_COHORT_AUTHORITIES.pop(identity, None)
-
-    reference = ref(cohort, discard)
-    with _EVENT_AUTHORITY_LOCK:
-        _ACTUAL_PROJECTION_COHORT_AUTHORITIES[identity] = (
-            reference,
-            _actual_projection_cohort_fingerprint(cohort),
-            ref(source),
-        )
+    # Constructors are module-global callback surfaces.  Re-establish the
+    # exact source/state authorities after construction, then enter the
+    # callback-free semantic/seal/install phase with no later virtual work.
+    if (
+        not is_verified_journal_replay_source(source)
+        or not is_verified_actual_ledger_state(state)
+        or not is_verified_actual_ledger_state_for_source(state, source)
+    ):
+        raise RiskBlock("ACTUAL_REPLAY_COHORT_MISMATCH")
+    _install_actual_projection_authority(cohort, source, state)
     return cohort
 
 
 def is_issued_verified_replay_cohort(cohort: object) -> bool:
     """Return false until Task 7/8 registers a source-row-verified cohort."""
-    if not isinstance(cohort, VerifiedLedgerReplayCohort):
+    if type(cohort) is not VerifiedLedgerReplayCohort:
         return False
-    try:
-        fingerprint = _replay_cohort_fingerprint(cohort)
-    except Exception:
-        return False
-    return _has_ledger_authority(
+    candidate = _phase1_derived_authority_candidate(
         _VERIFIED_REPLAY_COHORT_AUTHORITIES,
         cohort,
-        fingerprint,
-    ) and _phase1_sources_are_current(cohort)
+    )
+    record = None if candidate is None else candidate[1]
+    if (
+        candidate is None
+        or len(candidate[2]) != 1
+        or candidate[2][0][1] != "CANONICAL_REPLAY"
+        or record is None
+        or not _phase1_authority_sources_are_current(candidate[2])
+    ):
+        return False
+    return _is_current_phase1_derived_authority(
+        _VERIFIED_REPLAY_COHORT_AUTHORITIES,
+        cohort,
+        candidate,
+        _replay_cohort_fingerprint,
+    )
 
 
 def _replay_cohort_authorizes_stream(
@@ -2349,32 +3483,1409 @@ def _replay_cohort_authorizes_stream(
     return tuple(references) == cohort.references
 
 
-def _register_verified_batch(batch: VerifiedLedgerEventBatch) -> None:
-    identity = id(batch)
+def _make_verified_batch_registrar(
+    *,
+    frame_getter: Callable[..., object],
+    trusted_globals: dict[str, object],
+    risk_block: type[RiskBlock],
+    authority_lock: RLock,
+    reference_factory: Callable[..., ReferenceType[object]],
+    registry: dict[
+        int,
+        tuple[
+            ReferenceType[object],
+            object,
+            tuple[LedgerEvent, ...],
+            Callable[..., bool],
+        ],
+    ],
+    batch_type: type[VerifiedLedgerEventBatch],
+    event_type: type[LedgerEvent],
+    lot_type: type[LedgerLot],
+    decision_type: type[ComplianceDecision],
+    decimal_type: type[Decimal],
+    datetime_type: type[datetime],
+    safe_tz_types: tuple[type[object], ...],
+    fingerprint_factory: Callable[[VerifiedLedgerEventBatch], object],
+    event_digest: Callable[[LedgerEvent], str],
+    paper_issuer_code: object,
+    paper_authority_type: type[PaperEntryAuthority],
+    signal_type: type[LedgerSignal],
+    paper_authority_verifier: Callable[[object], bool],
+    authority_candidate_factory: Callable[..., object],
+    authority_candidate_recheck: Callable[..., bool],
+    paper_registry: _Phase1DerivedRegistry,
+    signal_registry: _Phase1DerivedRegistry,
+    paper_fingerprint_factory: Callable[..., object],
+    signal_fingerprint_factory: Callable[..., object],
+    issuer_codes: tuple[object, ...],
+) -> Callable[..., None]:
+    """Capture immutable exact batch issuer code identities once."""
 
-    def discard(dead: ReferenceType[object]) -> None:
-        with _EVENT_AUTHORITY_LOCK:
-            current = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(identity)
-            if current is not None and current[0] is dead:
-                _VERIFIED_LEDGER_BATCH_AUTHORITIES.pop(identity, None)
-
-    reference = ref(batch, discard)
-    with _EVENT_AUTHORITY_LOCK:
-        _VERIFIED_LEDGER_BATCH_AUTHORITIES[identity] = (
-            reference,
-            _verified_batch_fingerprint(batch),
+    def safe_datetime(value: object) -> bool:
+        return (
+            type(value) is datetime_type
+            and any(type(value.tzinfo) is candidate for candidate in safe_tz_types)
         )
+
+    def same_decimal(value: object, expected: object) -> bool:
+        return (
+            type(value) is decimal_type
+            and type(expected) is decimal_type
+            and value.as_tuple() == expected.as_tuple()
+        )
+
+    def money_micros(value: object) -> int | None:
+        if type(value) is not decimal_type:
+            return None
+        scaled = value.scaleb(6)
+        integral = scaled.to_integral_value()
+        if scaled.as_tuple() != integral.as_tuple():
+            return None
+        return int(integral)
+
+    def paper_authority_candidates(
+        authority: object,
+    ) -> tuple[object, object, object] | None:
+        if type(authority) is not paper_authority_type:
+            return None
+        authority_candidate = authority_candidate_factory(
+            paper_registry,
+            authority,
+        )
+        if authority_candidate is None:
+            return None
+        authority_record = authority_candidate[1]
+        if (
+            type(authority_record.children) is not tuple
+            or len(authority_record.children) != 1
+            or type(authority_record.children[0]) is not signal_type
+        ):
+            return None
+        signal = authority_record.children[0]
+        signal_candidate = authority_candidate_factory(
+            signal_registry,
+            signal,
+        )
+        if signal_candidate is None:
+            return None
+        return authority_candidate, signal, signal_candidate
+
+    def paper_event_is_exact(
+        event: object,
+        authority: object,
+        signal: object,
+    ) -> bool:
+        if (
+            type(event) is not event_type
+            or type(authority) is not paper_authority_type
+            or type(signal) is not signal_type
+            or type(authority.signal_id) is not str
+            or type(authority.signal_digest) is not str
+            or type(authority.canonical_event_id) is not str
+            or type(authority.lifecycle_cursor) is not int
+            or type(authority.action_ordinal) is not int
+            or type(authority.source_digest) is not str
+            or not safe_datetime(authority.quote_at)
+            or not safe_datetime(authority.quote_received_at)
+            or type(signal.signal_id) is not str
+            or type(signal.maximum_entry) is not decimal_type
+            or type(signal.planned_shares) is not int
+        ):
+            return False
+        lot = object.__getattribute__(event, "lot")
+        decision = object.__getattribute__(event, "decision")
+        expected_unit_micros = money_micros(signal.maximum_entry)
+        return (
+            type(lot) is lot_type
+            and type(decision) is decision_type
+            and type(event.ledger_name) is str
+            and event.ledger_name == "CANONICAL"
+            and type(event.signal_id) is str
+            and event.signal_id == authority.signal_id
+            and event.signal_id == signal.signal_id
+            and same_decimal(lot.price, signal.maximum_entry)
+            and type(lot.shares) is int
+            and lot.shares == signal.planned_shares
+            and lot.at is authority.quote_at
+            and lot.parent_order_id is None
+            and type(lot.total_cost_micros) is int
+            and type(expected_unit_micros) is int
+            and lot.total_cost_micros
+            == expected_unit_micros * lot.shares
+            and event.user_confirmed_stop is None
+            and type(decision.status) is str
+            and decision.status == "COMPLIANT"
+            and decision.compliant is True
+            and decision.reconciliation_required is False
+            and type(decision.reason_codes) is tuple
+            and len(decision.reason_codes) == 0
+            and type(event.event_id) is str
+            and event.event_id == authority.canonical_event_id
+            and type(event.cursor) is int
+            and event.cursor == authority.lifecycle_cursor
+            and type(event.ordinal) is int
+            and event.ordinal == authority.action_ordinal
+            and type(event.authority_basis) is str
+            and event.authority_basis == authority.source_digest
+            and type(event.signal_digest) is str
+            and event.signal_digest == authority.signal_digest
+            and event.message_time is authority.quote_received_at
+            and event.received_at is authority.quote_received_at
+            and event.recommended_stop is None
+            and event.profit_target_taken is False
+        )
+
+    def event_is_hook_free(event: object) -> bool:
+        if type(event) is not event_type:
+            return False
+        lot = object.__getattribute__(event, "lot")
+        decision = object.__getattribute__(event, "decision")
+        return (
+            type(event.ledger_name) is str
+            and type(event.signal_id) is str
+            and type(lot) is lot_type
+            and type(lot.price) is decimal_type
+            and type(lot.shares) is int
+            and safe_datetime(lot.at)
+            and (
+                lot.parent_order_id is None
+                or type(lot.parent_order_id) is str
+            )
+            and type(lot.total_cost_micros) is int
+            and (
+                event.user_confirmed_stop is None
+                or type(event.user_confirmed_stop) is decimal_type
+            )
+            and type(decision) is decision_type
+            and type(decision.status) is str
+            and type(decision.compliant) is bool
+            and type(decision.reconciliation_required) is bool
+            and type(decision.reason_codes) is tuple
+            and all(type(reason) is str for reason in decision.reason_codes)
+            and type(event.event_id) is str
+            and (event.cursor is None or type(event.cursor) is int)
+            and type(event.ordinal) is int
+            and (
+                event.authority_basis is None
+                or type(event.authority_basis) is str
+            )
+            and (event.signal_digest is None or type(event.signal_digest) is str)
+            and (
+                event.message_time is None or safe_datetime(event.message_time)
+            )
+            and (event.received_at is None or safe_datetime(event.received_at))
+            and (
+                event.recommended_stop is None
+                or type(event.recommended_stop) is decimal_type
+            )
+            and type(event.profit_target_taken) is bool
+        )
+
+    def content_is_current(
+        batch: object,
+        events: object,
+    ) -> bool:
+        if (
+            type(batch) is not batch_type
+            or type(events) is not tuple
+            or any(not event_is_hook_free(event) for event in events)
+        ):
+            return False
+        expected_references = tuple(
+            (event.event_id, event_digest(event)) for event in events
+        )
+        return (
+            type(batch.references) is tuple
+            and len(batch.references) == len(expected_references)
+            and all(
+                type(reference) is tuple
+                and len(reference) == 2
+                and type(reference[0]) is str
+                and type(reference[1]) is str
+                and reference[0] == expected[0]
+                and reference[1] == expected[1]
+                for reference, expected in zip(
+                    batch.references,
+                    expected_references,
+                    strict=True,
+                )
+            )
+        )
+
+    def register(
+        batch: object,
+        *,
+        events: tuple[LedgerEvent, ...] = (),
+        paper_authority: object = None,
+    ) -> None:
+        caller_frame = frame_getter(1)
+        if (
+            caller_frame.f_globals is not trusted_globals
+            or caller_frame.f_code not in issuer_codes
+        ):
+            raise risk_block("VERIFIED_LEDGER_BATCH_ISSUER_UNVERIFIED")
+        paper_candidates: tuple[object, object, object] | None = None
+        if caller_frame.f_code is paper_issuer_code:
+            if (
+                type(events) is not tuple
+                or len(events) != 1
+                or type(paper_authority) is not paper_authority_type
+                or paper_authority_verifier(paper_authority) is not True
+            ):
+                raise risk_block("VERIFIED_LEDGER_BATCH_SOURCE_UNVERIFIED")
+            paper_candidates = paper_authority_candidates(paper_authority)
+            if paper_candidates is None:
+                raise risk_block("VERIFIED_LEDGER_BATCH_SOURCE_UNVERIFIED")
+            authority_candidate, signal, signal_candidate = paper_candidates
+            if (
+                not authority_candidate_recheck(
+                    paper_registry,
+                    paper_authority,
+                    authority_candidate,
+                    paper_fingerprint_factory,
+                )
+                or not authority_candidate_recheck(
+                    signal_registry,
+                    signal,
+                    signal_candidate,
+                    signal_fingerprint_factory,
+                )
+                or not paper_event_is_exact(
+                    events[0],
+                    paper_authority,
+                    signal,
+                )
+            ):
+                raise risk_block("VERIFIED_LEDGER_BATCH_SOURCE_UNVERIFIED")
+        elif paper_authority is not None:
+            raise risk_block("VERIFIED_LEDGER_BATCH_SOURCE_UNVERIFIED")
+        if not content_is_current(batch, events):
+            raise risk_block("VERIFIED_LEDGER_BATCH_CONTENT_UNVERIFIED")
+        fingerprint = fingerprint_factory(batch)
+        if paper_candidates is not None:
+            authority_candidate, signal, signal_candidate = paper_candidates
+            if (
+                not authority_candidate_recheck(
+                    paper_registry,
+                    paper_authority,
+                    authority_candidate,
+                    paper_fingerprint_factory,
+                )
+                or not authority_candidate_recheck(
+                    signal_registry,
+                    signal,
+                    signal_candidate,
+                    signal_fingerprint_factory,
+                )
+            ):
+                raise risk_block("VERIFIED_LEDGER_BATCH_SOURCE_UNVERIFIED")
+        identity = id(batch)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current = registry.get(identity)
+                if current is not None and current[0] is dead:
+                    registry.pop(identity, None)
+
+        reference = reference_factory(batch, discard)
+        with authority_lock:
+            if registry.get(identity) is not None:
+                raise risk_block("VERIFIED_LEDGER_BATCH_ALREADY_ISSUED")
+            registry[identity] = (
+                reference,
+                fingerprint,
+                events,
+                content_is_current,
+            )
+
+    return register
+
+
+def _make_actual_projection_authority_installer(
+    *,
+    frame_getter: Callable[..., object],
+    trusted_globals: dict[str, object],
+    risk_block: type[RiskBlock],
+    authority_lock: RLock,
+    reference_factory: Callable[..., ReferenceType[object]],
+    registry: dict[
+        int,
+        tuple[
+            ReferenceType[object],
+            object,
+            ReferenceType[object],
+            object,
+            tuple[object, ...],
+            object,
+            object,
+            Callable[..., object],
+        ],
+    ],
+    cohort_type: type[ActualProjectionCohort],
+    source_type: type[object],
+    state_type: type[object],
+    action_type: type[object],
+    position_type: type[object],
+    closed_trade_type: type[object],
+    datetime_type: type[datetime],
+    safe_tz_types: tuple[type[object], ...],
+    fingerprint_factory: Callable[[ActualProjectionCohort], object],
+    journal_candidate_factory: Callable[[object], object | None],
+    journal_candidate_recheck: Callable[[object], bool],
+    state_candidate_factory: Callable[[object, object], object | None],
+    state_candidate_recheck: Callable[[object], bool],
+    issuer_code: object,
+) -> Callable[..., object]:
+    """Build one typed actual-projection grant behind its exact issuer frame."""
+
+    def install(
+        cohort: ActualProjectionCohort,
+        source: object,
+        state: object,
+        *,
+        _verification_candidates: object = None,
+    ) -> object:
+        verification_mode = _verification_candidates is not None
+        if verification_mode:
+            if (
+                type(_verification_candidates) is not tuple
+                or len(_verification_candidates) != 2
+            ):
+                raise risk_block(
+                    "ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED"
+                )
+            journal_candidate, state_candidate = _verification_candidates
+        else:
+            caller_frame = frame_getter(1)
+            if (
+                caller_frame.f_globals is not trusted_globals
+                or caller_frame.f_code is not issuer_code
+            ):
+                raise risk_block(
+                    "ACTUAL_PROJECTION_COHORT_ISSUER_UNVERIFIED"
+                )
+            journal_candidate = journal_candidate_factory(source)
+            state_candidate = state_candidate_factory(state, source)
+        if (
+            type(cohort) is not cohort_type
+            or type(source) is not source_type
+            or type(state) is not state_type
+            or journal_candidate is None
+            or state_candidate is None
+        ):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        positions = object.__getattribute__(cohort, "positions")
+        state_positions = object.__getattribute__(state, "positions")
+        if (
+            type(positions) is not tuple
+            or any(
+                cursor is not None and type(cursor) is not int
+                for cursor in (
+                    cohort.projection_start_cursor,
+                    cohort.projection_terminal_cursor,
+                    cohort.source_through_cursor,
+                    cohort.physical_source_highwater_cursor,
+                )
+            )
+            or type(cohort.query_cutoff) is not datetime_type
+            or not any(
+                type(cohort.query_cutoff.tzinfo) is candidate
+                for candidate in safe_tz_types
+            )
+            or any(
+                type(digest) is not str
+                for digest in (
+                    cohort.journal_source_digest,
+                    cohort.actual_state_digest,
+                    cohort.calendar_digest,
+                    cohort.policy_digest,
+                )
+            )
+            or type(cohort.expected_action_count) is not int
+            or type(cohort.expected_posting_count) is not int
+        ):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        actions = object.__getattribute__(source, "actions")
+        state_closed_trades = object.__getattribute__(state, "closed_trades")
+        source_through_execution_cursor = object.__getattribute__(
+            source,
+            "through_execution_cursor",
+        )
+        source_physical_highwater = object.__getattribute__(
+            source,
+            "source_through_cursor",
+        )
+        source_query_cutoff = object.__getattribute__(source, "query_cutoff")
+        source_digest = object.__getattribute__(source, "source_digest")
+        source_expected_action_count = object.__getattribute__(
+            source,
+            "expected_action_count",
+        )
+        source_expected_posting_count = object.__getattribute__(
+            source,
+            "expected_posting_count",
+        )
+        state_digest = object.__getattribute__(state, "source_digest")
+        state_calendar_digest = object.__getattribute__(state, "calendar_digest")
+        state_policy_digest = object.__getattribute__(state, "policy_digest")
+        if (
+            type(state_positions) is not tuple
+            or type(state_closed_trades) is not tuple
+            or type(actions) is not tuple
+            or any(
+                cursor is not None and type(cursor) is not int
+                for cursor in (
+                    source_through_execution_cursor,
+                    source_physical_highwater,
+                )
+            )
+            or type(source_query_cutoff) is not datetime_type
+            or not any(
+                type(source_query_cutoff.tzinfo) is candidate
+                for candidate in safe_tz_types
+            )
+            or type(source_digest) is not str
+            or type(source_expected_action_count) is not int
+            or type(source_expected_posting_count) is not int
+            or type(state_digest) is not str
+            or type(state_calendar_digest) is not str
+            or type(state_policy_digest) is not str
+            or any(
+                type(action) is not action_type
+                or type(action.event_id) is not str
+                or type(action.execution_event_id) is not int
+                for action in actions
+            )
+            or any(
+                type(position) is not position_type
+                or type(position.lineage_kind) is not str
+                or type(position.lifecycle_event_ids) is not tuple
+                or any(
+                    type(event_id) is not str
+                    for event_id in position.lifecycle_event_ids
+                )
+                for position in state_positions
+            )
+            or any(
+                type(trade) is not closed_trade_type
+                or type(trade.source_event_ids) is not tuple
+                or any(
+                    type(event_id) is not str
+                    for event_id in trade.source_event_ids
+                )
+                for trade in state_closed_trades
+            )
+        ):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        strategy_positions = tuple(
+            position
+            for position in state_positions
+            if position.lineage_kind in {"ACTUAL_EVENT", "ACTUAL_GROUP"}
+        )
+        actions_by_id = {
+            action.event_id: action for action in actions
+        }
+        if len(actions_by_id) != len(actions):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        lifecycle_ids = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        event_id
+                        for position in strategy_positions
+                        for event_id in position.lifecycle_event_ids
+                    ),
+                    *(
+                        event_id
+                        for trade in state_closed_trades
+                        for event_id in trade.source_event_ids
+                    ),
+                )
+            )
+        )
+        if any(event_id not in actions_by_id for event_id in lifecycle_ids):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        lifecycle_cursors = tuple(
+            sorted(
+                actions_by_id[event_id].execution_event_id
+                for event_id in lifecycle_ids
+            )
+        )
+        if (
+            len(positions) != len(strategy_positions)
+            or any(
+                position is not state_position
+                for position, state_position in zip(
+                    positions,
+                    strategy_positions,
+                    strict=True,
+                )
+            )
+            or cohort.projection_start_cursor
+            != (lifecycle_cursors[0] if lifecycle_cursors else None)
+            or cohort.projection_terminal_cursor
+            != (lifecycle_cursors[-1] if lifecycle_cursors else None)
+            or cohort.source_through_cursor
+            != source_through_execution_cursor
+            or cohort.physical_source_highwater_cursor
+            != source_physical_highwater
+            or cohort.query_cutoff is not source_query_cutoff
+            or cohort.journal_source_digest != source_digest
+            or cohort.actual_state_digest != state_digest
+            or cohort.calendar_digest != state_calendar_digest
+            or cohort.policy_digest != state_policy_digest
+            or cohort.expected_action_count
+            != source_expected_action_count
+            or cohort.expected_posting_count
+            != source_expected_posting_count
+        ):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        fingerprint = fingerprint_factory(cohort)
+        if (
+            not journal_candidate_recheck(journal_candidate)
+            or not state_candidate_recheck(state_candidate)
+        ):
+            raise risk_block("ACTUAL_PROJECTION_COHORT_CONTENT_UNVERIFIED")
+        if verification_mode:
+            return fingerprint
+        identity = id(cohort)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current = registry.get(identity)
+                if current is not None and current[0] is dead:
+                    registry.pop(identity, None)
+
+        cohort_reference = reference_factory(cohort, discard)
+        source_reference = reference_factory(source)
+        with authority_lock:
+            if registry.get(identity) is not None:
+                raise risk_block("ACTUAL_PROJECTION_COHORT_ALREADY_ISSUED")
+            registry[identity] = (
+                cohort_reference,
+                fingerprint,
+                source_reference,
+                state,
+                positions,
+                journal_candidate,
+                state_candidate,
+                install,
+            )
+        return fingerprint
+
+    return install
+
+
+def _make_canonical_replay_authority_installer(
+    *,
+    frame_getter: Callable[..., object],
+    trusted_globals: dict[str, object],
+    risk_block: type[RiskBlock],
+    authority_lock: RLock,
+    reference_factory: Callable[..., ReferenceType[object]],
+    binding_registry: dict[
+        int,
+        tuple[ReferenceType[object], tuple[tuple[object, str], ...]],
+    ],
+    registry: dict[
+        int,
+        tuple[
+            ReferenceType[object],
+            object,
+            ReferenceType[object],
+            tuple[object, ...],
+        ],
+    ],
+    replay_type: type[Phase1CanonicalLedgerReplay],
+    source_type: type[object],
+    signal_source_type: type[object],
+    entry_source_type: type[object],
+    lifecycle_source_type: type[object],
+    posting_source_type: type[object],
+    closed_trade_source_type: type[object],
+    pair_type: type[LedgerPair],
+    signal_type: type[LedgerSignal],
+    paper_type: type[PaperEntryAuthority],
+    event_type: type[LedgerEvent],
+    lot_type: type[LedgerLot],
+    decision_type: type[ComplianceDecision],
+    batch_type: type[VerifiedLedgerEventBatch],
+    cohort_type: type[VerifiedLedgerReplayCohort],
+    position_type: type[LedgerPosition],
+    canonical_type: type[CanonicalLedger],
+    actual_type: type[ActualLedger],
+    closed_trade_type: type[ClosedTrade],
+    decimal_type: type[Decimal],
+    date_type: type[date],
+    datetime_type: type[datetime],
+    utc_value: object,
+    safe_tz_types: tuple[type[object], ...],
+    signal_semantic_verifier: Callable[..., bool],
+    paper_semantic_verifier: Callable[..., bool],
+    event_digest: Callable[[LedgerEvent], str],
+    fingerprint_factory: Callable[[Phase1CanonicalLedgerReplay], object],
+    source_candidate_factory: Callable[[object], object | None],
+    source_candidate_recheck: Callable[[object], bool],
+    issuer_code: object,
+) -> Callable[..., object]:
+    """Atomically bind one typed canonical replay and its exact child graph."""
+
+    def same_money(value: object, expected: object) -> bool:
+        return (
+            type(value) is decimal_type
+            and type(expected) is decimal_type
+            and value.as_tuple() == expected.as_tuple()
+        )
+
+    def same_str(value: object, expected: object) -> bool:
+        return type(value) is str and type(expected) is str and value == expected
+
+    def same_int(value: object, expected: object) -> bool:
+        return type(value) is int and type(expected) is int and value == expected
+
+    def same_optional_int(value: object, expected: object) -> bool:
+        return (value is None and expected is None) or same_int(value, expected)
+
+    def safe_datetime(value: object) -> bool:
+        return (
+            type(value) is datetime_type
+            and any(type(value.tzinfo) is candidate for candidate in safe_tz_types)
+        )
+
+    def money_from_source(micros: object) -> Decimal | None:
+        if type(micros) is not int:
+            return None
+        return decimal_type(micros).scaleb(-6)
+
+    def money_micros(value: object) -> int | None:
+        if type(value) is not decimal_type:
+            return None
+        scaled = value.scaleb(6)
+        integral = scaled.to_integral_value()
+        if scaled.as_tuple() != integral.as_tuple():
+            return None
+        return int(integral)
+
+    def install(
+        replay: Phase1CanonicalLedgerReplay,
+        source: object,
+        *,
+        signals: tuple[LedgerSignal, ...],
+        event_manifests: tuple[tuple[object, ...], ...],
+        batch: VerifiedLedgerEventBatch,
+        cohort: VerifiedLedgerReplayCohort,
+        _verification_source_candidate: object = None,
+    ) -> object:
+        verification_mode = _verification_source_candidate is not None
+        if verification_mode:
+            source_candidate = _verification_source_candidate
+        else:
+            caller_frame = frame_getter(1)
+            if (
+                caller_frame.f_globals is not trusted_globals
+                or caller_frame.f_code is not issuer_code
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_ISSUER_UNVERIFIED")
+            source_candidate = source_candidate_factory(source)
+        if (
+            source_candidate is None
+            or type(replay) is not replay_type
+            or type(source) is not source_type
+            or type(signals) is not tuple
+            or any(type(signal) is not signal_type for signal in signals)
+            or type(event_manifests) is not tuple
+            or any(
+                type(manifest) is not tuple or len(manifest) != 6
+                for manifest in event_manifests
+            )
+            or (
+                not verification_mode
+                and type(batch) is not batch_type
+            )
+            or (verification_mode and batch is not None)
+            or type(cohort) is not cohort_type
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_ISSUER_UNVERIFIED")
+        source_signal_sources = object.__getattribute__(source, "signal_sources")
+        source_entry_sources = object.__getattribute__(source, "entry_sources")
+        source_lifecycle_events = object.__getattribute__(
+            source,
+            "lifecycle_events",
+        )
+        source_postings = object.__getattribute__(source, "postings")
+        source_closed_trades = object.__getattribute__(source, "closed_trades")
+        source_query_cutoff = object.__getattribute__(source, "query_cutoff")
+        source_digest = object.__getattribute__(source, "source_digest")
+        source_canonical_cash_micros = object.__getattribute__(
+            source,
+            "canonical_cash_micros",
+        )
+        source_settled_buying_power_micros = object.__getattribute__(
+            source,
+            "settled_buying_power_micros",
+        )
+        source_realized_pnl_micros = object.__getattribute__(
+            source,
+            "realized_pnl_micros",
+        )
+        source_lifecycle_terminal_cursor = object.__getattribute__(
+            source,
+            "lifecycle_terminal_cursor",
+        )
+        source_posting_terminal_cursor = object.__getattribute__(
+            source,
+            "posting_terminal_cursor",
+        )
+        if (
+            type(source_signal_sources) is not tuple
+            or type(source_entry_sources) is not tuple
+            or type(source_lifecycle_events) is not tuple
+            or type(source_postings) is not tuple
+            or type(source_closed_trades) is not tuple
+            or not safe_datetime(source_query_cutoff)
+            or type(source_digest) is not str
+            or type(source_canonical_cash_micros) is not int
+            or type(source_settled_buying_power_micros) is not int
+            or type(source_realized_pnl_micros) is not int
+            or (
+                source_lifecycle_terminal_cursor is not None
+                and type(source_lifecycle_terminal_cursor) is not int
+            )
+            or (
+                source_posting_terminal_cursor is not None
+                and type(source_posting_terminal_cursor) is not int
+            )
+            or any(
+                type(signal_source) is not signal_source_type
+                or type(signal_source.signal_id) is not str
+                or type(signal_source.role) is not str
+                or type(signal_source.planned_shares) is not int
+                for signal_source in source_signal_sources
+            )
+            or any(
+                type(entry_source) is not entry_source_type
+                or type(entry_source.signal_source) is not signal_source_type
+                or type(entry_source.signal_source.signal_id) is not str
+                for entry_source in source_entry_sources
+            )
+            or any(
+                type(lifecycle) is not lifecycle_source_type
+                or type(lifecycle.signal_id) is not str
+                or type(lifecycle.event_kind) is not str
+                or type(lifecycle.row_id) is not int
+                or (
+                    lifecycle.shares is not None
+                    and type(lifecycle.shares) is not int
+                )
+                or (
+                    lifecycle.price_micros is not None
+                    and type(lifecycle.price_micros) is not int
+                )
+                or (
+                    lifecycle.recommended_stop_micros is not None
+                    and type(lifecycle.recommended_stop_micros) is not int
+                )
+                for lifecycle in source_lifecycle_events
+            )
+            or any(
+                type(posting) is not posting_source_type
+                or type(posting.signal_id) is not str
+                or type(posting.entry_kind) is not str
+                or (
+                    posting.shares_delta is not None
+                    and type(posting.shares_delta) is not int
+                )
+                for posting in source_postings
+            )
+            or any(
+                type(trade) is not closed_trade_source_type
+                or type(trade.session_date) is not date_type
+                or type(trade.pnl_micros) is not int
+                or type(trade.signal_id) is not str
+                or not safe_datetime(trade.at)
+                or type(trade.row_id) is not int
+                or type(trade.trade_id) is not str
+                or not safe_datetime(trade.message_time)
+                or not safe_datetime(trade.received_at)
+                for trade in source_closed_trades
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_SOURCE_UNVERIFIED")
+        events = tuple(manifest[0] for manifest in event_manifests)
+        if (
+            any(type(event) is not event_type for event in events)
+            or any(
+                not signal_semantic_verifier(
+                    signal,
+                    ((source, "CANONICAL_REPLAY"),),
+                    (),
+                )
+                for signal in signals
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        signal_by_id = {signal.signal_id: signal for signal in signals}
+        primary_source_by_id = {
+            signal_source.signal_id: signal_source
+            for signal_source in source_signal_sources
+            if signal_source.role == "PRIMARY"
+        }
+        entry_signal_ids = tuple(
+            entry_source.signal_source.signal_id
+            for entry_source in source_entry_sources
+        )
+        remaining_by_signal_id = {
+            signal_id: 0 for signal_id in primary_source_by_id
+        }
+        if (
+            len(signal_by_id) != len(signals)
+            or len(primary_source_by_id) != len(signals)
+            or set(signal_by_id) != set(primary_source_by_id)
+            or len(entry_signal_ids) != len(set(entry_signal_ids))
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        buy_signal_ids: list[str] = []
+        for posting in source_postings:
+            if posting.entry_kind not in {"BUY", "SALE"}:
+                continue
+            if (
+                posting.signal_id not in remaining_by_signal_id
+                or type(posting.shares_delta) is not int
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+            remaining_by_signal_id[posting.signal_id] += posting.shares_delta
+            if posting.entry_kind == "BUY":
+                buy_signal_ids.append(posting.signal_id)
+        if (
+            len(buy_signal_ids) != len(set(buy_signal_ids))
+            or set(buy_signal_ids) != set(entry_signal_ids)
+            or any(
+                remaining < 0
+                or remaining > signal_by_id[signal_id].planned_shares
+                for signal_id, remaining in remaining_by_signal_id.items()
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+
+        def expected_open_state(
+            signal: LedgerSignal,
+            remaining: int,
+        ) -> tuple[Decimal, bool] | None:
+            exited_shares = signal.planned_shares - remaining
+            partials = tuple(
+                lifecycle
+                for lifecycle in source_lifecycle_events
+                if lifecycle.signal_id == signal.signal_id
+                and lifecycle.event_kind == "PARTIAL_EXIT"
+            )
+            if exited_shares == 0:
+                return None if partials else (signal.recommended_stop, False)
+            if len(partials) != 1:
+                return None
+            partial = partials[0]
+            stop_micros = partial.recommended_stop_micros
+            price_micros = partial.price_micros
+            signal_stop_micros = money_micros(signal.recommended_stop)
+            tick_micros = money_micros(signal.tick_size)
+            if (
+                type(partial.shares) is not int
+                or partial.shares != exited_shares
+                or type(stop_micros) is not int
+                or type(price_micros) is not int
+                or type(signal_stop_micros) is not int
+                or type(tick_micros) is not int
+                or tick_micros <= 0
+                or stop_micros <= signal_stop_micros
+                or stop_micros >= price_micros
+                or stop_micros % tick_micros != 0
+            ):
+                return None
+            return (decimal_type(stop_micros).scaleb(-6), True)
+
+        expected_event_references: list[tuple[str, str]] = []
+        expected_cohort_references: list[tuple[str, str, str]] = []
+        cursors: list[int] = []
+        manifest_signal_ids: list[str] = []
+        for manifest in event_manifests:
+            (
+                event,
+                signal,
+                authority,
+                remaining_shares,
+                recommended_stop,
+                profit_target_taken,
+            ) = manifest
+            if (
+                type(event) is not event_type
+                or type(signal) is not signal_type
+                or not any(signal is candidate for candidate in signals)
+                or type(authority) is not paper_type
+                or type(remaining_shares) is not int
+                or remaining_shares <= 0
+                or type(recommended_stop) is not decimal_type
+                or type(profit_target_taken) is not bool
+                or not paper_semantic_verifier(
+                    authority,
+                    ((source, "CANONICAL_REPLAY"),),
+                    (signal,),
+                )
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+            lot = object.__getattribute__(event, "lot")
+            decision = object.__getattribute__(event, "decision")
+            expected_event_id = (
+                authority.canonical_event_id
+                if remaining_shares == signal.planned_shares
+                else (
+                    f"{authority.canonical_event_id}:remaining:"
+                    f"{remaining_shares}"
+                )
+            )
+            expected_recommended_stop = (
+                recommended_stop if profit_target_taken else None
+            )
+            authoritative_remaining = remaining_by_signal_id.get(
+                signal.signal_id
+            )
+            authoritative_open_state = (
+                None
+                if authoritative_remaining is None
+                else expected_open_state(signal, authoritative_remaining)
+            )
+            if (
+                authoritative_remaining is None
+                or authoritative_remaining <= 0
+                or remaining_shares != authoritative_remaining
+                or authoritative_open_state is None
+                or not same_money(
+                    recommended_stop,
+                    authoritative_open_state[0],
+                )
+                or profit_target_taken is not authoritative_open_state[1]
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+            if (
+                type(lot) is not lot_type
+                or type(decision) is not decision_type
+                or type(event.ledger_name) is not str
+                or event.ledger_name != "CANONICAL"
+                or type(event.signal_id) is not str
+                or event.signal_id != signal.signal_id
+                or not same_money(lot.price, signal.maximum_entry)
+                or type(lot.shares) is not int
+                or lot.shares != remaining_shares
+                or lot.at is not authority.quote_at
+                or lot.parent_order_id is not None
+                or type(lot.total_cost_micros) is not int
+                or lot.total_cost_micros
+                != money_micros(lot.price) * lot.shares
+                or event.user_confirmed_stop is not None
+                or type(decision.status) is not str
+                or decision.status != "COMPLIANT"
+                or decision.compliant is not True
+                or decision.reconciliation_required is not False
+                or type(decision.reason_codes) is not tuple
+                or len(decision.reason_codes) != 0
+                or type(event.event_id) is not str
+                or event.event_id != expected_event_id
+                or type(event.cursor) is not int
+                or event.cursor != authority.lifecycle_cursor
+                or type(event.ordinal) is not int
+                or event.ordinal != authority.action_ordinal
+                or type(event.authority_basis) is not str
+                or event.authority_basis != authority.source_digest
+                or type(event.signal_digest) is not str
+                or event.signal_digest != authority.signal_digest
+                or event.message_time is not authority.quote_received_at
+                or event.received_at is not authority.quote_received_at
+                or event.profit_target_taken is not profit_target_taken
+                or (
+                    expected_recommended_stop is None
+                    and event.recommended_stop is not None
+                )
+                or (
+                    expected_recommended_stop is not None
+                    and not same_money(
+                        event.recommended_stop,
+                        expected_recommended_stop,
+                    )
+                )
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+            digest = event_digest(event)
+            expected_event_references.append((event.event_id, digest))
+            expected_cohort_references.append(
+                (event.event_id, digest, event.signal_digest)
+            )
+            cursors.append(event.cursor)
+            manifest_signal_ids.append(signal.signal_id)
+        canonical_event_order = tuple(
+            sorted(
+                events,
+                key=lambda event: (
+                    event.ledger_name,
+                    event.lot.at.astimezone(utc_value),
+                    event.cursor,
+                    event.ordinal,
+                    event.event_id,
+                ),
+            )
+        )
+        expected_open_signal_ids = {
+            signal_id
+            for signal_id, remaining in remaining_by_signal_id.items()
+            if remaining > 0
+        }
+        if (
+            len(manifest_signal_ids) != len(set(manifest_signal_ids))
+            or set(manifest_signal_ids) != expected_open_signal_ids
+            or any(
+                event is not canonical_event
+                for event, canonical_event in zip(
+                    events,
+                    canonical_event_order,
+                    strict=True,
+                )
+            )
+            or any(
+                prior >= current
+                for prior, current in zip(cursors, cursors[1:])
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        batch_matches = (
+            type(batch) is batch_type
+            and type(batch.references) is tuple
+            and len(batch.references) == len(expected_event_references)
+            and all(
+                type(reference) is tuple
+                and len(reference) == 2
+                and type(reference[0]) is str
+                and type(reference[1]) is str
+                and reference[0] == expected[0]
+                and reference[1] == expected[1]
+                for reference, expected in zip(
+                    batch.references,
+                    expected_event_references,
+                    strict=True,
+                )
+            )
+        )
+        if (
+            (not verification_mode and not batch_matches)
+            or type(cohort.references) is not tuple
+            or len(cohort.references) != len(expected_cohort_references)
+            or any(
+                type(reference) is not tuple
+                or len(reference) != 3
+                or any(type(item) is not str for item in reference)
+                or reference[0] != expected[0]
+                or reference[1] != expected[1]
+                or reference[2] != expected[2]
+                for reference, expected in zip(
+                    cohort.references,
+                    expected_cohort_references,
+                    strict=True,
+                )
+            )
+            or type(cohort.ledger_name) is not str
+            or cohort.ledger_name != "CANONICAL"
+            or type(cohort.expected_count) is not int
+            or cohort.expected_count != len(events)
+            or not same_optional_int(
+                cohort.start_cursor,
+                cursors[0] if cursors else None,
+            )
+            or not same_optional_int(
+                cohort.terminal_cursor,
+                cursors[-1] if cursors else None,
+            )
+            or cohort.query_cutoff is not source_query_cutoff
+            or type(cohort.source_digest) is not str
+            or not same_str(
+                cohort.source_digest,
+                source_digest,
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        pair = object.__getattribute__(replay, "ledger_pair")
+        pair_signals = object.__getattribute__(pair, "_signals")
+        pair_events = object.__getattribute__(pair, "_events")
+        pair_cohort = object.__getattribute__(pair, "_canonical_replay_cohort")
+        canonical = object.__getattribute__(pair, "_canonical")
+        actual = object.__getattribute__(pair, "_actual")
+        canonical_positions = object.__getattribute__(canonical, "open_positions")
+        if (
+            type(pair) is not pair_type
+            or type(pair_signals) is not tuple
+            or len(pair_signals) != len(signals)
+            or any(
+                pair_signal is not signal
+                for pair_signal, signal in zip(
+                    pair_signals,
+                    signals,
+                    strict=True,
+                )
+            )
+            or type(pair_events) is not tuple
+            or len(pair_events) != len(events)
+            or any(
+                pair_event is not event
+                for pair_event, event in zip(
+                    pair_events,
+                    events,
+                    strict=True,
+                )
+            )
+            or pair_cohort is not cohort
+            or object.__getattribute__(pair, "_actual_replay_cohort") is not None
+            or object.__getattribute__(pair, "_canonical_replay_verified")
+            is not True
+            or object.__getattribute__(pair, "_actual_replay_verified") is not False
+            or object.__getattribute__(pair, "_replay_verified") is not False
+            or object.__getattribute__(pair, "_sealed") is not True
+            or type(canonical) is not canonical_type
+            or type(actual) is not actual_type
+            or type(canonical_positions) is not tuple
+            or len(canonical_positions) != len(events)
+            or not same_int(canonical.events_applied, len(events))
+            or canonical.breaker_state is not None
+            or type(actual.open_positions) is not tuple
+            or len(actual.open_positions) != 0
+            or not same_int(actual.events_applied, 0)
+            or actual.reconciliation_required is not False
+            or type(actual.reason_codes) is not tuple
+            or len(actual.reason_codes) != 0
+            or actual.stop_unverified is not False
+            or actual.breaker_state is not None
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        for manifest in event_manifests:
+            event, signal = manifest[:2]
+            matching_positions = tuple(
+                position
+                for position in canonical_positions
+                if type(position) is position_type
+                and type(position.signal_id) is str
+                and position.signal_id == signal.signal_id
+            )
+            if len(matching_positions) != 1:
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+            position = matching_positions[0]
+            expected_stop = (
+                signal.recommended_stop
+                if event.recommended_stop is None
+                else event.recommended_stop
+            )
+            if (
+                type(position.symbol) is not str
+                or position.symbol != signal.symbol
+                or type(position.ledger_name) is not str
+                or position.ledger_name != "CANONICAL"
+                or not same_money(position.recommended_stop, expected_stop)
+                or position.user_confirmed_stop is not None
+                or not same_money(position.target, signal.target)
+                or not same_money(position.tick_size, signal.tick_size)
+                or type(position.lots) is not tuple
+                or len(position.lots) != 1
+                or type(position.lots[0]) is not lot_type
+                or not same_money(position.lots[0].price, event.lot.price)
+                or type(position.lots[0].shares) is not int
+                or position.lots[0].shares != event.lot.shares
+                or position.lots[0].at is not event.lot.at
+                or position.lots[0].parent_order_id is not None
+                or type(position.lots[0].total_cost_micros) is not int
+                or position.lots[0].total_cost_micros
+                != money_micros(position.lots[0].price)
+                * position.lots[0].shares
+                or event.lot.total_cost_micros
+                != position.lots[0].total_cost_micros
+                or position.reconciled is not True
+                or type(position.reason_codes) is not tuple
+                or len(position.reason_codes) != 0
+                or position.profit_target_taken is not event.profit_target_taken
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        postings = object.__getattribute__(replay, "postings")
+        closed_trades = object.__getattribute__(replay, "closed_trades")
+        if (
+            type(postings) is not tuple
+            or type(source_postings) is not tuple
+            or len(postings) != len(source_postings)
+            or any(
+                posting is not source_posting
+                for posting, source_posting in zip(
+                    postings,
+                    source_postings,
+                    strict=True,
+                )
+            )
+            or type(closed_trades) is not tuple
+            or type(source_closed_trades) is not tuple
+            or len(closed_trades) != len(source_closed_trades)
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        for trade, source_trade in zip(
+            closed_trades,
+            source_closed_trades,
+            strict=True,
+        ):
+            expected_pnl = money_from_source(
+                getattr(source_trade, "pnl_micros", None)
+            )
+            if (
+                type(trade) is not closed_trade_type
+                or type(trade.session_date) is not date_type
+                or trade.session_date is not getattr(
+                    source_trade,
+                    "session_date",
+                    None,
+                )
+                or not same_money(trade.pnl, expected_pnl)
+                or type(trade.signal_id) is not str
+                or trade.signal_id != getattr(source_trade, "signal_id", None)
+                or not safe_datetime(trade.at)
+                or trade.at is not getattr(source_trade, "at", None)
+                or type(trade.cursor) is not int
+                or trade.cursor != getattr(source_trade, "row_id", None)
+                or type(trade.ordinal) is not int
+                or trade.ordinal != 0
+                or trade.equity_after is not None
+                or type(trade.source_id) is not str
+                or trade.source_id != getattr(source_trade, "trade_id", None)
+                or not safe_datetime(trade.message_time)
+                or trade.message_time is not getattr(
+                    source_trade,
+                    "message_time",
+                    None,
+                )
+                or not safe_datetime(trade.received_at)
+                or trade.received_at is not getattr(
+                    source_trade,
+                    "received_at",
+                    None,
+                )
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_CHILD_UNVERIFIED")
+        canonical_cash = money_from_source(
+            source_canonical_cash_micros
+        )
+        settled_buying_power = money_from_source(
+            source_settled_buying_power_micros
+        )
+        realized_pnl = money_from_source(
+            source_realized_pnl_micros
+        )
+        expected_projection_terminal = cursors[-1] if cursors else None
+        if (
+            object.__getattribute__(replay, "cohort") is not cohort
+            or not same_money(replay.canonical_cash, canonical_cash)
+            or not same_money(
+                replay.settled_buying_power,
+                settled_buying_power,
+            )
+            or not same_money(replay.realized_pnl, realized_pnl)
+            or not same_optional_int(
+                replay.projection_terminal_cursor,
+                expected_projection_terminal,
+            )
+            or not same_optional_int(
+                replay.lifecycle_source_terminal_cursor,
+                source_lifecycle_terminal_cursor,
+            )
+            or not same_optional_int(
+                replay.posting_source_terminal_cursor,
+                source_posting_terminal_cursor,
+            )
+            or not safe_datetime(replay.query_cutoff)
+            or replay.query_cutoff is not source_query_cutoff
+            or type(replay.source_digest) is not str
+            or not same_str(
+                replay.source_digest,
+                source_digest,
+            )
+        ):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_CONTENT_UNVERIFIED")
+        children = (
+            pair,
+            cohort,
+            postings,
+            closed_trades,
+            signals,
+            events,
+            event_manifests,
+        )
+        bindings = ((source, "CANONICAL_REPLAY"),)
+        fingerprint = fingerprint_factory(replay)
+        if not source_candidate_recheck(source_candidate):
+            raise risk_block("PHASE1_CANONICAL_REPLAY_SOURCE_UNVERIFIED")
+        if verification_mode:
+            return fingerprint
+        identity = id(replay)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current_binding = binding_registry.get(identity)
+                if current_binding is not None and current_binding[0] is dead:
+                    binding_registry.pop(identity, None)
+                current_authority = registry.get(identity)
+                if current_authority is not None and current_authority[0] is dead:
+                    registry.pop(identity, None)
+
+        replay_reference = reference_factory(replay, discard)
+        source_reference = reference_factory(source)
+        with authority_lock:
+            if (
+                binding_registry.get(identity) is not None
+                or registry.get(identity) is not None
+            ):
+                raise risk_block("PHASE1_CANONICAL_REPLAY_ALREADY_ISSUED")
+            binding_registry[identity] = (replay_reference, bindings)
+            registry[identity] = (
+                replay_reference,
+                fingerprint,
+                source_reference,
+                children,
+                source_candidate,
+                install,
+            )
+        return fingerprint
+
+    return install
 
 
 def _is_issued_verified_batch(batch: object) -> bool:
-    if not isinstance(batch, VerifiedLedgerEventBatch):
+    if type(batch) is not VerifiedLedgerEventBatch:
         return False
+    identity = id(batch)
     with _EVENT_AUTHORITY_LOCK:
-        registered = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(id(batch))
+        registered = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(identity)
+        if registered is None or registered[0]() is not batch:
+            return False
+        captured_fingerprint = registered[1]
+        events = registered[2]
+        content_is_current = registered[3]
+    try:
+        if not content_is_current(batch, events):
+            return False
+        fingerprint = _verified_batch_fingerprint(batch)
+    except Exception:
+        return False
+    from . import journal as journal_module
+
+    with _EVENT_AUTHORITY_LOCK:
+        current = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(identity)
         return (
-            registered is not None
-            and registered[0]() is batch
-            and registered[1] == _verified_batch_fingerprint(batch)
+            current is registered
+            and current[0]() is batch
+            and current[1] is captured_fingerprint
+            and current[2] is events
+            and current[3] is content_is_current
+            and journal_module._source_fingerprint_seals_equal(
+                captured_fingerprint,
+                fingerprint,
+            )
         )
 
 
@@ -2418,7 +4929,7 @@ def _issue_live_verified_ledger_event_batch(
     batch = VerifiedLedgerEventBatch(
         ((event.event_id, _ledger_event_content_digest(event)),)
     )
-    _register_verified_batch(batch)
+    _register_verified_batch(batch, events=(event,))
     return batch
 
 
@@ -2426,24 +4937,9 @@ def _issue_paper_verified_ledger_event_batch(
     event: LedgerEvent,
     authority: PaperEntryAuthority,
 ) -> VerifiedLedgerEventBatch:
-    if (
-        not isinstance(event, LedgerEvent)
-        or event.ledger_name != "CANONICAL"
-        or not is_issued_paper_entry_authority(authority)
-        or event.event_id != authority.canonical_event_id
-        or event.signal_id != authority.signal_id
-        or event.signal_digest != authority.signal_digest
-        or event.message_time is None
-        or event.received_at is None
-        or event.lot.at != authority.quote_at
-        or event.authority_basis != authority.source_digest
-    ):
-        raise RiskBlock("LEDGER_EVENT_SOURCE_EVIDENCE_REQUIRED")
-    batch = VerifiedLedgerEventBatch(
-        ((event.event_id, _ledger_event_content_digest(event)),)
-    )
-    _register_verified_batch(batch)
-    return batch
+    """Reject raw paper events; the ledger method constructs them internally."""
+    del event, authority
+    raise RiskBlock("LEDGER_EVENT_SOURCE_EVIDENCE_REQUIRED")
 
 
 def _batch_authorizes_event(
@@ -3558,8 +6054,27 @@ class LedgerPair:
             message_time=authority.quote_received_at,
             received_at=authority.quote_received_at,
         )
-        batch = _issue_paper_verified_ledger_event_batch(event, authority)
-        self._append(event, verified_event_batch=batch)
+        batch = VerifiedLedgerEventBatch(
+            ((event.event_id, _ledger_event_content_digest(event)),)
+        )
+        _register_verified_batch(
+            batch,
+            events=(event,),
+            paper_authority=authority,
+        )
+        with _EVENT_AUTHORITY_LOCK:
+            registered_batch = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(id(batch))
+        if registered_batch is None or registered_batch[0]() is not batch:
+            raise RiskBlock("VERIFIED_LEDGER_BATCH_CONTENT_UNVERIFIED")
+        try:
+            self._append(event, verified_event_batch=batch)
+        finally:
+            with _EVENT_AUTHORITY_LOCK:
+                if (
+                    _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(id(batch))
+                    is registered_batch
+                ):
+                    _VERIFIED_LEDGER_BATCH_AUTHORITIES.pop(id(batch), None)
 
     def _decision_and_event(
         self,
@@ -4074,9 +6589,176 @@ class Phase1CanonicalLedgerReplay:
 
     @property
     def source_verified(self) -> bool:
-        return bool(_phase1_bound_sources(self)) and _phase1_sources_are_current(
-            self
+        bindings = _phase1_bound_sources(self)
+        return (
+            len(bindings) == 1
+            and bindings[0][1] == "CANONICAL_REPLAY"
+            and is_verified_phase1_canonical_ledger_replay_for_source(
+                self,
+                bindings[0][0],
+            )
         )
+
+
+def _phase1_canonical_ledger_replay_fingerprint(
+    replay: Phase1CanonicalLedgerReplay,
+) -> object:
+    """Seal every replay field plus the complete ten-slot LedgerPair graph."""
+    if type(replay) is not Phase1CanonicalLedgerReplay:
+        raise TypeError("Phase 1 canonical ledger replay type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        replay,
+        domain=_PHASE1_CANONICAL_LEDGER_REPLAY_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
+
+
+def _is_current_phase1_canonical_ledger_replay_authority(
+    replay: object,
+    source: object,
+) -> bool:
+    """Pure final authority check after Journal currentness was established."""
+    from . import journal as journal_module
+
+    Phase1CanonicalReplaySource = journal_module.Phase1CanonicalReplaySource
+
+    if type(replay) is not Phase1CanonicalLedgerReplay or (
+        type(source) is not Phase1CanonicalReplaySource
+    ):
+        return False
+    identity = id(replay)
+    with _EVENT_AUTHORITY_LOCK:
+        issued = _PHASE1_CANONICAL_LEDGER_REPLAY_AUTHORITIES.get(identity)
+        binding = _PHASE1_SOURCE_BINDINGS.get(identity)
+        if (
+            issued is None
+            or issued[0]() is not replay
+            or issued[2]() is not source
+            or type(issued[3]) is not tuple
+            or len(issued[3]) != 7
+            or binding is None
+            or binding[0]() is not replay
+            or len(binding[1]) != 1
+            or binding[1][0][0] is not source
+            or binding[1][0][1] != "CANONICAL_REPLAY"
+        ):
+            return False
+        captured_issued = issued
+        captured_fingerprint = issued[1]
+        captured_children = issued[3]
+        source_candidate = issued[4]
+        content_verifier = issued[5]
+    replay_children = (
+        object.__getattribute__(replay, "ledger_pair"),
+        object.__getattribute__(replay, "cohort"),
+        object.__getattribute__(replay, "postings"),
+        object.__getattribute__(replay, "closed_trades"),
+    )
+    if any(
+        child is not captured_child
+        for child, captured_child in zip(
+            replay_children,
+            captured_children[:4],
+            strict=True,
+        )
+    ):
+        return False
+    pair, cohort, _postings, _closed_trades, signals, events, manifests = (
+        captured_children
+    )
+    try:
+        pair_signals = object.__getattribute__(pair, "_signals")
+        pair_events = object.__getattribute__(pair, "_events")
+        pair_cohort = object.__getattribute__(pair, "_canonical_replay_cohort")
+    except (AttributeError, TypeError):
+        return False
+    if (
+        type(pair) is not LedgerPair
+        or type(cohort) is not VerifiedLedgerReplayCohort
+        or type(signals) is not tuple
+        or type(events) is not tuple
+        or type(manifests) is not tuple
+        or type(pair_signals) is not tuple
+        or len(pair_signals) != len(signals)
+        or any(
+            pair_signal is not signal
+            for pair_signal, signal in zip(pair_signals, signals, strict=True)
+        )
+        or type(pair_events) is not tuple
+        or len(pair_events) != len(events)
+        or any(
+            pair_event is not event
+            for pair_event, event in zip(pair_events, events, strict=True)
+        )
+        or pair_cohort is not cohort
+        or len(manifests) != len(events)
+        or any(
+            type(manifest) is not tuple
+            or len(manifest) != 6
+            or manifest[0] is not event
+            for manifest, event in zip(manifests, events, strict=True)
+        )
+    ):
+        return False
+    try:
+        fingerprint = content_verifier(
+            replay,
+            source,
+            signals=signals,
+            event_manifests=manifests,
+            batch=None,
+            cohort=cohort,
+            _verification_source_candidate=source_candidate,
+        )
+    except Exception:
+        return False
+    with _EVENT_AUTHORITY_LOCK:
+        current = _PHASE1_CANONICAL_LEDGER_REPLAY_AUTHORITIES.get(identity)
+        current_binding = _PHASE1_SOURCE_BINDINGS.get(identity)
+        return (
+            current is captured_issued
+            and current[0]() is replay
+            and current[1] is captured_fingerprint
+            and current[2]() is source
+            and current[3] is captured_children
+            and current[4] is source_candidate
+            and current[5] is content_verifier
+            and current_binding is binding
+            and current_binding[0]() is replay
+            and len(current_binding[1]) == 1
+            and current_binding[1][0][0] is source
+            and current_binding[1][0][1] == "CANONICAL_REPLAY"
+            and journal_module._source_fingerprint_seals_equal(
+                captured_fingerprint,
+                fingerprint,
+            )
+        )
+
+
+def is_verified_phase1_canonical_ledger_replay_for_source(
+    replay: object,
+    source: object,
+) -> bool:
+    """Verify one exact issued replay against its exact current Journal source."""
+    from .journal import (
+        Phase1CanonicalReplaySource,
+        is_verified_phase1_canonical_replay_source,
+    )
+
+    if type(replay) is not Phase1CanonicalLedgerReplay or (
+        type(source) is not Phase1CanonicalReplaySource
+    ):
+        return False
+    # Journal currentness may invoke SQLite callbacks, so it must precede the
+    # final callback-free replay fingerprint and registry comparison.
+    if not is_verified_phase1_canonical_replay_source(source):
+        return False
+    return _is_current_phase1_canonical_ledger_replay_authority(
+        replay,
+        source,
+    )
 
 
 def _phase1_signal_source_coordinates(source: object) -> tuple[object, ...]:
@@ -4095,6 +6777,8 @@ def _construct_phase1_signal(
     binding_source: object,
     binding_kind: str,
 ) -> LedgerSignal:
+    """Convert source fields without minting provenance or authority."""
+    del binding_source, binding_kind
     signal = LedgerSignal(
         signal_id=getattr(source, "signal_id"),
         symbol=getattr(source, "symbol"),
@@ -4109,12 +6793,6 @@ def _construct_phase1_signal(
         tick_size=money_from_micros(getattr(source, "tick_size_micros")),
         trigger_price=money_from_micros(getattr(source, "trigger_price_micros")),
     )
-    _register_phase1_derived_authority(
-        _ISSUED_LEDGER_SIGNALS,
-        signal,
-        _ledger_signal_fingerprint(signal),
-    )
-    _bind_phase1_sources(signal, ((binding_source, binding_kind),))
     return signal
 
 
@@ -4149,11 +6827,17 @@ def _issue_ledger_signal_from_phase1_source(source: object) -> LedgerSignal:
         raise RiskBlock("PHASE1_SIGNAL_SOURCE_MISMATCH")
     if source.role != "PRIMARY" or source.planned_shares <= 0:
         raise RiskBlock("PHASE1_SIGNAL_NOT_TRADABLE")
-    return _construct_phase1_signal(
+    signal = _construct_phase1_signal(
         source,
         binding_source=source,
         binding_kind="SIGNAL",
     )
+    _register_phase1_derived_authority(
+        _ISSUED_LEDGER_SIGNALS,
+        signal,
+        sources=((source, "SIGNAL"),),
+    )
+    return signal
 
 
 def _signal_matches_phase1_source(signal: LedgerSignal, source: object) -> bool:
@@ -4249,6 +6933,8 @@ def _paper_entry_from_source_material(
     binding_source: object,
     binding_kind: str,
 ) -> PaperEntryAuthority:
+    """Convert validated-looking fields without minting any authority."""
+    del binding_source, binding_kind
     observations = tuple(getattr(source, "observations"))
     completion = getattr(source, "completion")
     lifecycle = getattr(source, "lifecycle_event")
@@ -4375,12 +7061,6 @@ def _paper_entry_from_source_material(
         action_ordinal=lifecycle.event_ordinal,
         calendar_digest=calendar_digest,
     )
-    _register_phase1_derived_authority(
-        _PAPER_ENTRY_AUTHORITIES,
-        authority,
-        _paper_entry_fingerprint(authority),
-    )
-    _bind_phase1_sources(authority, ((binding_source, binding_kind),))
     return authority
 
 
@@ -4409,13 +7089,20 @@ def _issue_paper_entry_authority_from_phase1_source(
     calendar_digest = _calendar_digest(calendar_resolver)
     if source.calendar_digest != calendar_digest:
         raise RiskBlock("PHASE1_CALENDAR_SOURCE_MISMATCH")
-    return _paper_entry_from_source_material(
+    authority = _paper_entry_from_source_material(
         source,
         signal=signal,
         calendar_digest=calendar_digest,
         binding_source=source,
         binding_kind="ENTRY",
     )
+    _register_phase1_derived_authority(
+        _PAPER_ENTRY_AUTHORITIES,
+        authority,
+        sources=((source, "ENTRY"),),
+        children=(signal,),
+    )
+    return authority
 
 
 def _issue_shadow_fill_disposition_from_phase1_source(
@@ -4548,9 +7235,9 @@ def _issue_shadow_fill_disposition_from_phase1_source(
     _register_phase1_derived_authority(
         _SHADOW_FILL_DISPOSITION_AUTHORITIES,
         authority,
-        _shadow_fill_disposition_fingerprint(authority),
+        sources=((source, "SHADOW_FILL"),),
+        children=(signal,),
     )
-    _bind_phase1_sources(authority, ((source, "SHADOW_FILL"),))
     return authority
 
 
@@ -4654,8 +7341,6 @@ def _issue_canonical_ledger_replay_from_phase1_source(
         Phase1CanonicalReplaySource,
         is_verified_phase1_canonical_replay_source,
     )
-    from .risk import ClosedTrade
-
     if not isinstance(source, Phase1CanonicalReplaySource) or not (
         is_verified_phase1_canonical_replay_source(source)
     ):
@@ -4762,6 +7447,12 @@ def _issue_canonical_ledger_replay_from_phase1_source(
         )
         for signal_source in primary_signal_sources
     )
+    for signal in signals:
+        _register_phase1_derived_authority(
+            _ISSUED_LEDGER_SIGNALS,
+            signal,
+            sources=((source, "CANONICAL_REPLAY"),),
+        )
     by_signal = {signal.signal_id: signal for signal in signals}
     if len(by_signal) != len(signals):
         raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
@@ -4787,6 +7478,7 @@ def _issue_canonical_ledger_replay_from_phase1_source(
     ):
         raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_MISMATCH")
     events: list[LedgerEvent] = []
+    event_manifests: list[tuple[object, ...]] = []
     for entry_source in source.entry_sources:
         signal = by_signal.get(entry_source.signal_source.signal_id)
         if signal is None:
@@ -4806,6 +7498,12 @@ def _issue_canonical_ledger_replay_from_phase1_source(
             binding_source=source,
             binding_kind="CANONICAL_REPLAY",
         )
+        _register_phase1_derived_authority(
+            _PAPER_ENTRY_AUTHORITIES,
+            authority,
+            sources=((source, "CANONICAL_REPLAY"),),
+            children=(signal,),
+        )
         event = _canonical_event_from_paper_authority(
             signal,
             authority,
@@ -4819,45 +7517,77 @@ def _issue_canonical_ledger_replay_from_phase1_source(
             )
         _bind_phase1_sources(event, ((source, "CANONICAL_REPLAY"),))
         events.append(event)
+        event_manifests.append(
+            (
+                event,
+                signal,
+                authority,
+                remaining,
+                recommended_stop,
+                profit_target_taken,
+            )
+        )
     ordered_events = tuple(sorted(events, key=_ledger_projection_order_key))
+    manifests_by_event_identity = {
+        id(manifest[0]): manifest for manifest in event_manifests
+    }
+    ordered_event_manifests = tuple(
+        manifests_by_event_identity[id(event)] for event in ordered_events
+    )
     batch = VerifiedLedgerEventBatch(
         tuple(
             (event.event_id, _ledger_event_content_digest(event))
             for event in ordered_events
         )
     )
-    _register_verified_batch(batch)
-    references = tuple(
-        (
-            event.event_id,
-            _ledger_event_content_digest(event),
-            event.signal_digest,
+    _register_verified_batch(batch, events=ordered_events)
+    with _EVENT_AUTHORITY_LOCK:
+        registered_batch = _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(id(batch))
+    if registered_batch is None or registered_batch[0]() is not batch:
+        raise RiskBlock("VERIFIED_LEDGER_BATCH_CONTENT_UNVERIFIED")
+    try:
+        references = tuple(
+            (
+                event.event_id,
+                _ledger_event_content_digest(event),
+                event.signal_digest,
+            )
+            for event in ordered_events
+            if event.signal_digest is not None
         )
-        for event in ordered_events
-        if event.signal_digest is not None
-    )
-    cursors = tuple(event.cursor for event in ordered_events if event.cursor is not None)
-    cohort = VerifiedLedgerReplayCohort(
-        ledger_name="CANONICAL",
-        references=references,
-        expected_count=len(ordered_events),
-        start_cursor=(cursors[0] if cursors else None),
-        terminal_cursor=(cursors[-1] if cursors else None),
-        query_cutoff=source.query_cutoff,
-        source_digest=source.source_digest,
-    )
-    _register_phase1_derived_authority(
-        _VERIFIED_REPLAY_COHORT_AUTHORITIES,
-        cohort,
-        _replay_cohort_fingerprint(cohort),
-    )
-    _bind_phase1_sources(cohort, ((source, "CANONICAL_REPLAY"),))
-    pair = LedgerPair(
-        signals=signals,
-        events=ordered_events,
-        verified_event_batch=batch,
-        verified_replay_cohorts=(cohort,),
-    )
+        cursors = tuple(
+            event.cursor
+            for event in ordered_events
+            if event.cursor is not None
+        )
+        cohort = VerifiedLedgerReplayCohort(
+            ledger_name="CANONICAL",
+            references=references,
+            expected_count=len(ordered_events),
+            start_cursor=(cursors[0] if cursors else None),
+            terminal_cursor=(cursors[-1] if cursors else None),
+            query_cutoff=source.query_cutoff,
+            source_digest=source.source_digest,
+        )
+        _register_phase1_derived_authority(
+            _VERIFIED_REPLAY_COHORT_AUTHORITIES,
+            cohort,
+            sources=((source, "CANONICAL_REPLAY"),),
+            children=ordered_events,
+        )
+        pair = LedgerPair(
+            signals=signals,
+            events=ordered_events,
+            verified_event_batch=batch,
+            verified_replay_cohorts=(cohort,),
+        )
+    finally:
+        with _EVENT_AUTHORITY_LOCK:
+            if (
+                _VERIFIED_LEDGER_BATCH_AUTHORITIES.get(id(batch))
+                is registered_batch
+            ):
+                _VERIFIED_LEDGER_BATCH_AUTHORITIES.pop(id(batch), None)
     closed_trades = tuple(
         ClosedTrade(
             session_date=trade.session_date,
@@ -4887,8 +7617,266 @@ def _issue_canonical_ledger_replay_from_phase1_source(
         query_cutoff=source.query_cutoff,
         source_digest=source.source_digest,
     )
-    _bind_phase1_sources(replay, ((source, "CANONICAL_REPLAY"),))
+    # The source verifier may execute SQLite currentness checks.  Finish that
+    # callback-capable boundary before sealing the derived replay, then install
+    # the source binding and exact replay authority together with no later
+    # callback-bearing operation.
+    if not is_verified_phase1_canonical_replay_source(source):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_SOURCE_UNVERIFIED")
+    _install_canonical_replay_authority(
+        replay,
+        source,
+        signals=signals,
+        event_manifests=ordered_event_manifests,
+        batch=batch,
+        cohort=cohort,
+    )
     return replay
+
+
+# Freeze the exact original issuer code objects and trusted registry/helper
+# identities.  The construction factories and frame accessor are deleted so a
+# caller cannot manufacture a new registrar with its own code object.
+(
+    _ledger_event_content_digest,
+    _phase1_signal_source_digest,
+) = _make_hook_free_ledger_event_digest(
+    sha256_factory=sha256,
+    decimal_type=Decimal,
+    date_type=date,
+    datetime_type=datetime,
+    utc_value=UTC,
+    safe_tz_types=(ZoneInfo, type(UTC)),
+    event_type=LedgerEvent,
+    lot_type=LedgerLot,
+    decision_type=ComplianceDecision,
+)
+(
+    _signal_semantics,
+    _paper_semantics,
+    _shadow_semantics,
+    _replay_cohort_semantics,
+) = _make_phase1_derived_semantic_validators(
+    decimal_type=Decimal,
+    signal_digest_from_source=_phase1_signal_source_digest,
+    signal_type=LedgerSignal,
+    paper_type=PaperEntryAuthority,
+    shadow_type=ShadowFillDispositionAuthority,
+    replay_cohort_type=VerifiedLedgerReplayCohort,
+    event_type=LedgerEvent,
+    lot_type=LedgerLot,
+    decision_type=ComplianceDecision,
+    date_type=date,
+    datetime_type=datetime,
+    safe_tz_types=(ZoneInfo, type(UTC)),
+    event_digest=_ledger_event_content_digest,
+)
+_register_phase1_derived_authority = _make_phase1_derived_authority_registrar(
+    frame_getter=_getframe,
+    trusted_globals=globals(),
+    risk_block=RiskBlock,
+    authority_lock=_EVENT_AUTHORITY_LOCK,
+    reference_factory=ref,
+    binding_registry=_PHASE1_SOURCE_BINDINGS,
+    record_type=_Phase1DerivedAuthorityRecord,
+    source_verifier=_phase1_authority_sources_are_current,
+    policies=(
+        (
+            _ISSUED_LEDGER_SIGNALS,
+            LedgerSignal,
+            _ledger_signal_fingerprint,
+            (
+                _issue_ledger_signal_from_phase1_source.__code__,
+                _issue_canonical_ledger_replay_from_phase1_source.__code__,
+            ),
+            frozenset({"SIGNAL", "CANONICAL_REPLAY"}),
+            LedgerSignal.from_publication_decision.__func__.__code__,
+            _publication_signal_children_are_current,
+            _signal_semantics,
+        ),
+        (
+            _PAPER_ENTRY_AUTHORITIES,
+            PaperEntryAuthority,
+            _paper_entry_fingerprint,
+            (
+                _issue_paper_entry_authority_from_phase1_source.__code__,
+                _issue_canonical_ledger_replay_from_phase1_source.__code__,
+            ),
+            frozenset({"ENTRY", "CANONICAL_REPLAY"}),
+            None,
+            None,
+            _paper_semantics,
+        ),
+        (
+            _SHADOW_FILL_DISPOSITION_AUTHORITIES,
+            ShadowFillDispositionAuthority,
+            _shadow_fill_disposition_fingerprint,
+            (_issue_shadow_fill_disposition_from_phase1_source.__code__,),
+            frozenset({"SHADOW_FILL"}),
+            None,
+            None,
+            _shadow_semantics,
+        ),
+        (
+            _VERIFIED_REPLAY_COHORT_AUTHORITIES,
+            VerifiedLedgerReplayCohort,
+            _replay_cohort_fingerprint,
+            (_issue_canonical_ledger_replay_from_phase1_source.__code__,),
+            frozenset({"CANONICAL_REPLAY"}),
+            None,
+            None,
+            _replay_cohort_semantics,
+        ),
+    ),
+)
+_bind_phase1_sources = _make_phase1_source_binder(
+    frame_getter=_getframe,
+    trusted_globals=globals(),
+    risk_block=RiskBlock,
+    authority_lock=_EVENT_AUTHORITY_LOCK,
+    reference_factory=ref,
+    binding_registry=_PHASE1_SOURCE_BINDINGS,
+    event_type=LedgerEvent,
+    issuer_code=_issue_canonical_ledger_replay_from_phase1_source.__code__,
+    source_verifier=_phase1_authority_sources_are_current,
+)
+_register_verified_batch = _make_verified_batch_registrar(
+    frame_getter=_getframe,
+    trusted_globals=globals(),
+    risk_block=RiskBlock,
+    authority_lock=_EVENT_AUTHORITY_LOCK,
+    reference_factory=ref,
+    registry=_VERIFIED_LEDGER_BATCH_AUTHORITIES,
+    batch_type=VerifiedLedgerEventBatch,
+    event_type=LedgerEvent,
+    lot_type=LedgerLot,
+    decision_type=ComplianceDecision,
+    decimal_type=Decimal,
+    datetime_type=datetime,
+    safe_tz_types=(ZoneInfo, type(UTC)),
+    fingerprint_factory=_verified_batch_fingerprint,
+    event_digest=_ledger_event_content_digest,
+    paper_issuer_code=LedgerPair.record_authorized_canonical_fill.__code__,
+    paper_authority_type=PaperEntryAuthority,
+    signal_type=LedgerSignal,
+    paper_authority_verifier=is_issued_paper_entry_authority,
+    authority_candidate_factory=_phase1_derived_authority_candidate,
+    authority_candidate_recheck=_is_current_phase1_derived_authority,
+    paper_registry=_PAPER_ENTRY_AUTHORITIES,
+    signal_registry=_ISSUED_LEDGER_SIGNALS,
+    paper_fingerprint_factory=_paper_entry_fingerprint,
+    signal_fingerprint_factory=_ledger_signal_fingerprint,
+    issuer_codes=(
+        _issue_live_verified_ledger_event_batch.__code__,
+        LedgerPair.record_authorized_canonical_fill.__code__,
+        _issue_canonical_ledger_replay_from_phase1_source.__code__,
+    ),
+)
+_install_actual_projection_authority = (
+    _make_actual_projection_authority_installer(
+        frame_getter=_getframe,
+        trusted_globals=globals(),
+        risk_block=RiskBlock,
+        authority_lock=_EVENT_AUTHORITY_LOCK,
+        reference_factory=ref,
+        registry=_ACTUAL_PROJECTION_COHORT_AUTHORITIES,
+        cohort_type=ActualProjectionCohort,
+        source_type=_journal_authority_module.JournalActualReplaySource,
+        state_type=_reconciliation_authority_module.ActualLedgerState,
+        action_type=_journal_authority_module.JournalActionSource,
+        position_type=_reconciliation_authority_module.ActualPositionState,
+        closed_trade_type=(
+            _reconciliation_authority_module.ActualClosedTrade
+        ),
+        datetime_type=datetime,
+        safe_tz_types=(ZoneInfo, type(UTC)),
+        fingerprint_factory=_actual_projection_cohort_fingerprint,
+        journal_candidate_factory=(
+            _journal_authority_module._journal_replay_source_authority_candidate
+        ),
+        journal_candidate_recheck=(
+            _journal_authority_module._is_current_journal_authority_candidate_without_callbacks
+        ),
+        state_candidate_factory=(
+            _reconciliation_authority_module._actual_ledger_state_authority_candidate
+        ),
+        state_candidate_recheck=(
+            _reconciliation_authority_module._is_current_actual_ledger_state_authority_candidate_without_callbacks
+        ),
+        issuer_code=_issue_actual_projection_from_journal.__code__,
+    )
+)
+_install_canonical_replay_authority = (
+    _make_canonical_replay_authority_installer(
+        frame_getter=_getframe,
+        trusted_globals=globals(),
+        risk_block=RiskBlock,
+        authority_lock=_EVENT_AUTHORITY_LOCK,
+        reference_factory=ref,
+        binding_registry=_PHASE1_SOURCE_BINDINGS,
+        registry=_PHASE1_CANONICAL_LEDGER_REPLAY_AUTHORITIES,
+        replay_type=Phase1CanonicalLedgerReplay,
+        source_type=_journal_authority_module.Phase1CanonicalReplaySource,
+        signal_source_type=_journal_authority_module.Phase1SignalSource,
+        entry_source_type=_journal_authority_module.Phase1EntrySource,
+        lifecycle_source_type=(
+            _journal_authority_module.Phase1LifecycleEventSource
+        ),
+        posting_source_type=(
+            _journal_authority_module.Phase1CanonicalPostingSource
+        ),
+        closed_trade_source_type=(
+            _journal_authority_module.Phase1ClosedTradeSource
+        ),
+        pair_type=LedgerPair,
+        signal_type=LedgerSignal,
+        paper_type=PaperEntryAuthority,
+        event_type=LedgerEvent,
+        lot_type=LedgerLot,
+        decision_type=ComplianceDecision,
+        batch_type=VerifiedLedgerEventBatch,
+        cohort_type=VerifiedLedgerReplayCohort,
+        position_type=LedgerPosition,
+        canonical_type=CanonicalLedger,
+        actual_type=ActualLedger,
+        closed_trade_type=ClosedTrade,
+        decimal_type=Decimal,
+        date_type=date,
+        datetime_type=datetime,
+        utc_value=UTC,
+        safe_tz_types=(ZoneInfo, type(UTC)),
+        signal_semantic_verifier=_signal_semantics,
+        paper_semantic_verifier=_paper_semantics,
+        event_digest=_ledger_event_content_digest,
+        fingerprint_factory=_phase1_canonical_ledger_replay_fingerprint,
+        source_candidate_factory=(
+            _journal_authority_module._phase1_source_authority_candidate
+        ),
+        source_candidate_recheck=(
+            _journal_authority_module._is_current_journal_authority_candidate_without_callbacks
+        ),
+        issuer_code=(
+            _issue_canonical_ledger_replay_from_phase1_source.__code__
+        ),
+    )
+)
+del (
+    _make_hook_free_ledger_event_digest,
+    _make_phase1_derived_semantic_validators,
+    _make_phase1_derived_authority_registrar,
+    _make_phase1_source_binder,
+    _make_verified_batch_registrar,
+    _make_actual_projection_authority_installer,
+    _make_canonical_replay_authority_installer,
+    _signal_semantics,
+    _paper_semantics,
+    _shadow_semantics,
+    _replay_cohort_semantics,
+    _phase1_signal_source_digest,
+    _journal_authority_module,
+    _reconciliation_authority_module,
+    _getframe,
+)
 
 
 __all__ = [
@@ -4910,4 +7898,5 @@ __all__ = [
     "is_issued_paper_entry_authority",
     "is_issued_shadow_fill_disposition_authority",
     "is_issued_verified_replay_cohort",
+    "is_verified_phase1_canonical_ledger_replay_for_source",
 ]

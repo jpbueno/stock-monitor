@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
 from hashlib import sha256
+from sys import _getframe
 from threading import RLock
 from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo
@@ -61,57 +62,73 @@ _MAX_LIVE_EXPOSURE = Decimal("1000")
 _MAX_POSITION_RISK = Decimal("25")
 _MAX_COMBINED_RISK = Decimal("50")
 _VALIDATION_CAPITAL = Decimal("5000")
+_PORTFOLIO_RISK_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/portfolio-risk-authority/v1"
+)
+_BREAKER_HISTORY_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/breaker-history-authority/v1"
+)
 _ET = ZoneInfo("America/New_York")
 _MARK_SESSION_AUTHORITY = object()
 _BREAKER_EVALUATION_AUTHORITY = object()
 _AUTHORITY_LOCK = RLock()
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _RiskAuthorityRecord:
+    seal: object
+    children: tuple[object, ...]
+    journal_binding: tuple[object, str, object] | None = None
+    phase1_bindings: tuple[tuple[object, str, object], ...] = ()
+
+
 _JOURNAL_WINDOW_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _CONFIRMED_BUY_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _POSITION_EVENT_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PHASE1_POSITION_EVIDENCE_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _MARK_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PHASE1_POSITION_EXIT_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PHASE1_EQUITY_POINT_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _BREAKER_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _BREAKER_HISTORY_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PAIRED_BREAKER_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _PORTFOLIO_RISK_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 _ACTUAL_BREAKER_REFRESH_AUTHORITIES: dict[
     int,
@@ -131,7 +148,7 @@ _PHASE1_DERIVED_SOURCE_BINDINGS: dict[
 ] = {}
 _LONG_PLAN_AUTHORITIES: dict[
     int,
-    tuple[ReferenceType[object], tuple[object, ...]],
+    tuple[ReferenceType[object], object],
 ] = {}
 MAX_HOLD_SESSIONS = 10
 CONSECUTIVE_LOSS_LIMIT = 3
@@ -615,8 +632,17 @@ def _calendar_digest(resolver: SessionCalendarResolver) -> str:
 
 def _portfolio_risk_fingerprint(
     authority: PortfolioRiskAuthority,
-) -> tuple[object, ...]:
-    return (_portfolio_authority_digest(authority),)
+) -> object:
+    """Return a hook-free exact structural seal for one portfolio authority."""
+    if type(authority) is not PortfolioRiskAuthority:
+        raise TypeError("portfolio risk authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        authority,
+        domain=_PORTFOLIO_RISK_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -671,28 +697,29 @@ def _actual_breaker_refresh_fingerprint(
 
 def is_issued_actual_breaker_refresh_authority(authority: object) -> bool:
     """Return false until a later typed Journal adapter proves completeness."""
-    return isinstance(
+    del authority
+    return False
+
+
+def _is_current_portfolio_risk_authority_without_callbacks(
+    authority: object,
+) -> bool:
+    """Pure final authority, binding, and source-identity verification."""
+    return _is_current_risk_authority_without_callbacks(
+        _PORTFOLIO_RISK_AUTHORITIES,
         authority,
-        ActualBreakerRefreshAuthority,
-    ) and _has_identity_authority(
-        _ACTUAL_BREAKER_REFRESH_AUTHORITIES,
-        authority,
-        _actual_breaker_refresh_fingerprint(authority),
+        exact_type=PortfolioRiskAuthority,
     )
 
 
 def is_issued_portfolio_risk_authority(authority: object) -> bool:
-    if not isinstance(authority, PortfolioRiskAuthority):
+    if type(authority) is not PortfolioRiskAuthority:
         return False
-    try:
-        fingerprint = _portfolio_risk_fingerprint(authority)
-    except Exception:
+    # Bound-source verifiers may execute SQLite callbacks.  Finish every one
+    # before the callback-free exact source, authority, and registry checks.
+    if not _phase1_derived_sources_are_current(authority):
         return False
-    return _has_identity_authority(
-        _PORTFOLIO_RISK_AUTHORITIES,
-        authority,
-        fingerprint,
-    ) and _phase1_derived_sources_are_current(authority)
+    return _is_current_portfolio_risk_authority_without_callbacks(authority)
 
 
 def _issue_portfolio_risk_authority(
@@ -714,6 +741,7 @@ def _issue_portfolio_risk_authority(
     from .ledger import (
         LedgerPair,
         Phase1CanonicalLedgerReplay,
+        _is_current_phase1_canonical_ledger_replay_authority,
         _phase1_bound_sources as _ledger_phase1_bound_sources,
     )
 
@@ -724,14 +752,11 @@ def _issue_portfolio_risk_authority(
         if not (
             scope == "CANONICAL_PUBLICATION"
             and ledger_name == "CANONICAL"
-            and isinstance(
-                phase1_canonical_replay,
-                Phase1CanonicalLedgerReplay,
-            )
+            and type(phase1_canonical_replay)
+            is Phase1CanonicalLedgerReplay
             and phase1_canonical_replay.ledger_pair is ledger_pair
             and phase1_canonical_replay.cohort
             is ledger_pair.canonical_replay_cohort
-            and phase1_canonical_replay.source_verified
         ):
             raise RiskBlock("PHASE1_CANONICAL_REPLAY_UNVERIFIED")
         replay_sources = tuple(
@@ -756,15 +781,6 @@ def _issue_portfolio_risk_authority(
             phase1_sources_share_owner(replay_source, history_source)
             and replay_source.validation_window_id
             == history_source.validation_window_id
-            and replay_source.query_cutoff == phase1_canonical_replay.query_cutoff
-            and replay_source.source_digest
-            == phase1_canonical_replay.source_digest
-            and money_from_micros(replay_source.canonical_cash_micros)
-            == phase1_canonical_replay.canonical_cash
-            and money_from_micros(replay_source.settled_buying_power_micros)
-            == phase1_canonical_replay.settled_buying_power
-            and money_from_micros(replay_source.realized_pnl_micros)
-            == phase1_canonical_replay.realized_pnl
         ):
             raise RiskBlock("PHASE1_SOURCE_LINEAGE_MISMATCH")
         phase1_source_bindings = (
@@ -785,11 +801,6 @@ def _issue_portfolio_risk_authority(
         and as_of.astimezone(_ET).time().replace(tzinfo=None) != time(8, 45)
     ):
         raise RiskBlock("PUBLICATION_CUTOFF_MISMATCH")
-    if (
-        phase1_canonical_replay is not None
-        and phase1_canonical_replay.query_cutoff != as_of
-    ):
-        raise RiskBlock("PORTFOLIO_REPLAY_CUTOFF_MISMATCH")
     scoped_events = tuple(
         event
         for event in ledger_pair.events
@@ -868,6 +879,28 @@ def _issue_portfolio_risk_authority(
     required_as_of = calendar_resolver.previous_session(request.session_date)
     if breaker_state.as_of != required_as_of:
         raise RiskBlock("BREAKER_AS_OF_MISMATCH")
+    if phase1_canonical_replay is not None:
+        # Every SQLite/currentness and caller-dispatchable calendar/policy
+        # operation is complete.  This final pure replay seal must immediately
+        # precede all LedgerPair and cash/risk derivation.
+        if not _is_current_phase1_canonical_ledger_replay_authority(
+            phase1_canonical_replay,
+            replay_source,
+        ):
+            raise RiskBlock("PHASE1_CANONICAL_REPLAY_UNVERIFIED")
+        if (
+            replay_source.query_cutoff != phase1_canonical_replay.query_cutoff
+            or phase1_canonical_replay.query_cutoff != as_of
+            or replay_source.source_digest
+            != phase1_canonical_replay.source_digest
+            or money_from_micros(replay_source.canonical_cash_micros)
+            != phase1_canonical_replay.canonical_cash
+            or money_from_micros(replay_source.settled_buying_power_micros)
+            != phase1_canonical_replay.settled_buying_power
+            or money_from_micros(replay_source.realized_pnl_micros)
+            != phase1_canonical_replay.realized_pnl
+        ):
+            raise RiskBlock("PHASE1_SOURCE_LINEAGE_MISMATCH")
     snapshot = (
         ledger_pair.canonical if ledger_name == "CANONICAL" else ledger_pair.actual
     )
@@ -1058,13 +1091,20 @@ def _issue_portfolio_risk_authority(
             else actual_breaker_refresh.through_close_cursor
         ),
     )
-    _register_identity_authority(
+    if (
+        phase1_canonical_replay is not None
+        and not _is_current_phase1_canonical_ledger_replay_authority(
+            phase1_canonical_replay,
+            replay_source,
+        )
+    ):
+        raise RiskBlock("PHASE1_CANONICAL_REPLAY_UNVERIFIED")
+    _install_risk_authority(
         _PORTFOLIO_RISK_AUTHORITIES,
         authority,
-        _portfolio_risk_fingerprint(authority),
+        exact_type=PortfolioRiskAuthority,
+        phase1_bindings=phase1_source_bindings,
     )
-    if phase1_source_bindings:
-        _bind_phase1_derived_sources(authority, phase1_source_bindings)
     return authority
 
 
@@ -1310,54 +1350,97 @@ def _issue_long_plan_decision(
     policy: Policy,
 ) -> LongPlanDecision:
     if (
-        not is_issued_portfolio_risk_authority(authority)
+        type(decision) is not LongPlanDecision
+        or type(authority) is not PortfolioRiskAuthority
+        or not is_issued_portfolio_risk_authority(authority)
         or decision.portfolio_authority is not authority
         or decision.authority_scope != authority.scope
         or decision.as_of != authority.as_of
         or decision.request is not authority.request
-        or decision.authority_digest != _portfolio_authority_digest(authority)
     ):
         raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
-    if not isinstance(policy, Policy):
+    if type(policy) is not Policy:
         raise TypeError("long plan policy must be a Policy")
     policy.validate()
     if authority.policy_digest != _policy_digest(policy):
         raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
+
+    # Exhaust accepted calendar callbacks before reading any capacity scalar
+    # used to authorize the decision.  The canonical digest deliberately runs
+    # first because it includes calendar authority material after state fields.
+    authority_digest = _portfolio_authority_digest(authority)
+    calendar_resolver = authority.portfolio_state.calendar_resolver
+    if not isinstance(calendar_resolver, SessionCalendarResolver):
+        raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
+    try:
+        calendar_resolver.is_open(authority.request.session_date)
+    except RiskBlock as error:
+        if error.reason_code != "CALENDAR_COVERAGE_MISSING":
+            raise
+    try:
+        calendar_resolver.previous_session(authority.request.session_date)
+    except RiskBlock:
+        pass
+    if not _is_current_portfolio_risk_authority_without_callbacks(authority):
+        raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
+
+    calendars = object.__getattribute__(calendar_resolver, "calendars")
+    if type(calendars) is not tuple or any(
+        type(calendar) is not MarketCalendar for calendar in calendars
+    ):
+        raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
+    diagnostic_calendar = SessionCalendarResolver.for_diagnostics(calendars)
+    diagnostic_state = replace(
+        authority.portfolio_state,
+        calendar_resolver=diagnostic_calendar,
+    )
     expected = plan_long_diagnostic(
         authority.request,
-        authority.portfolio_state,
+        diagnostic_state,
         policy,
     )
-    if (
-        decision.eligible != expected.eligible
-        or decision.reason_codes != expected.reason_codes
-        or decision.plan != expected.plan
-        or decision.target != expected.target
+    expected = replace(
+        expected,
+        authority_scope=authority.scope,
+        authority_digest=authority_digest,
+        as_of=authority.as_of,
+        portfolio_authority=authority,
+    )
+    from . import journal as journal_module
+
+    if not journal_module._source_fingerprint_seals_equal(
+        _risk_authority_seal(decision, exact_type=LongPlanDecision),
+        _risk_authority_seal(expected, exact_type=LongPlanDecision),
     ):
         raise RiskBlock("PLAN_DECISION_CONTENT_MISMATCH")
-    _register_identity_authority(
+    if not _is_current_portfolio_risk_authority_without_callbacks(authority):
+        raise RiskBlock("PORTFOLIO_AUTHORITY_UNVERIFIED")
+    _install_risk_authority(
         _LONG_PLAN_AUTHORITIES,
         decision,
-        _long_plan_fingerprint(decision),
+        exact_type=LongPlanDecision,
+        children=(authority,),
     )
     return decision
 
 
 def is_issued_long_plan_decision(decision: object) -> bool:
-    if not isinstance(decision, LongPlanDecision):
+    if type(decision) is not LongPlanDecision:
         return False
-    try:
-        fingerprint = _long_plan_fingerprint(decision)
-    except Exception:
-        return False
-    return (
-        _has_identity_authority(
-            _LONG_PLAN_AUTHORITIES,
-            decision,
-            fingerprint,
+    authority = decision.portfolio_authority
+    if (
+        type(authority) is not PortfolioRiskAuthority
+        or not is_issued_portfolio_risk_authority(authority)
+        or not _is_current_portfolio_risk_authority_without_callbacks(
+            authority
         )
-        and decision.portfolio_authority is not None
-        and is_issued_portfolio_risk_authority(decision.portfolio_authority)
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _LONG_PLAN_AUTHORITIES,
+        decision,
+        exact_type=LongPlanDecision,
+        children=(authority,),
     )
 
 
@@ -1983,11 +2066,17 @@ def _issue_confirmed_buy_action(**fields: object) -> ConfirmedBuyAction:
 
 
 def is_issued_confirmed_buy_action(action: object) -> bool:
-    return isinstance(action, ConfirmedBuyAction) and _has_identity_authority(
-        _CONFIRMED_BUY_AUTHORITIES,
-        action,
-        _confirmed_buy_fingerprint(action),
-    ) and _journal_derived_source_is_current(action)
+    if type(action) is not ConfirmedBuyAction:
+        return False
+    return (
+        _journal_derived_source_is_current(action)
+        and _journal_derived_source_is_current_without_callbacks(action)
+        and _is_current_risk_authority_without_callbacks(
+            _CONFIRMED_BUY_AUTHORITIES,
+            action,
+            exact_type=ConfirmedBuyAction,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -2081,59 +2170,354 @@ def _authority_fingerprint(
 
 
 def _register_identity_authority(
-    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
+    registry: dict[int, tuple[ReferenceType[object], object]],
     value: object,
-    fingerprint: tuple[object, ...],
+    fingerprint: object,
 ) -> None:
-    identity = id(value)
-
-    def discard(dead: ReferenceType[object]) -> None:
-        with _AUTHORITY_LOCK:
-            current = registry.get(identity)
-            if current is not None and current[0] is dead:
-                registry.pop(identity, None)
-
-    reference = ref(value, discard)
-    with _AUTHORITY_LOCK:
-        registry[identity] = (reference, fingerprint)
+    del registry, value, fingerprint
+    raise RiskBlock("RISK_AUTHORITY_REGISTRAR_UNAVAILABLE")
 
 
 def _has_identity_authority(
-    registry: dict[int, tuple[ReferenceType[object], tuple[object, ...]]],
+    registry: dict[int, tuple[ReferenceType[object], object]],
     value: object,
-    fingerprint: tuple[object, ...],
+    fingerprint: object,
 ) -> bool:
+    from .journal import _fingerprints_equal
+
     with _AUTHORITY_LOCK:
         registered = registry.get(id(value))
         return (
             registered is not None
             and registered[0]() is value
-            and registered[1] == fingerprint
+            and _fingerprints_equal(registered[1], fingerprint)
         )
+
+
+def _risk_authority_seal(
+    value: object,
+    *,
+    exact_type: type[object],
+) -> object:
+    """Build one hook-free exact structural seal for a risk authority."""
+    if type(value) is not exact_type:
+        raise TypeError("risk authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        value,
+        domain=(
+            b"stock-monitor/risk-authority/v1\x00"
+            + exact_type.__name__.encode("ascii")
+        ),
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
+
+
+def _register_risk_authority(
+    registry: dict[int, tuple[ReferenceType[object], object]],
+    value: object,
+    *,
+    exact_type: type[object],
+    children: Sequence[object] = (),
+) -> None:
+    del registry, value, exact_type, children
+    raise RiskBlock("RISK_AUTHORITY_REGISTRAR_UNAVAILABLE")
+
+
+def _is_current_risk_authority_without_callbacks(
+    registry: dict[int, tuple[ReferenceType[object], object]],
+    value: object,
+    *,
+    exact_type: type[object],
+    children: Sequence[object] = (),
+) -> bool:
+    """Pure final root, child, provenance, and registry-record check."""
+    if type(value) is not exact_type:
+        return False
+    expected_children = tuple(children)
+    identity = id(value)
+    with _AUTHORITY_LOCK:
+        registered = registry.get(identity)
+        if (
+            registered is None
+            or registered[0]() is not value
+            or type(registered[1]) is not _RiskAuthorityRecord
+        ):
+            return False
+        record = registered[1]
+        assert isinstance(record, _RiskAuthorityRecord)
+        if len(record.children) != len(expected_children) or any(
+            stored is not expected
+            for stored, expected in zip(
+                record.children,
+                expected_children,
+                strict=True,
+            )
+        ):
+            return False
+        journal_binding = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity)
+        phase1_binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
+        if record.journal_binding is None:
+            if journal_binding is not None:
+                return False
+        else:
+            source, source_kind, _owner = record.journal_binding
+            if (
+                journal_binding is None
+                or journal_binding[0]() is not value
+                or journal_binding[1]() is not source
+                or journal_binding[2] != source_kind
+            ):
+                return False
+        if not record.phase1_bindings:
+            if phase1_binding is not None:
+                return False
+        else:
+            if (
+                phase1_binding is None
+                or phase1_binding[0]() is not value
+                or len(phase1_binding[1]) != len(record.phase1_bindings)
+                or any(
+                    bound_source is not recorded_source
+                    or bound_kind != recorded_kind
+                    for (bound_source, bound_kind), (
+                        recorded_source,
+                        recorded_kind,
+                        _recorded_owner,
+                    ) in zip(
+                        phase1_binding[1],
+                        record.phase1_bindings,
+                        strict=True,
+                    )
+                )
+            ):
+                return False
+    if record.journal_binding is not None:
+        source, source_kind, recorded_owner = record.journal_binding
+        current_owner = _risk_binding_owner_without_callbacks(
+            source,
+            source_kind,
+        )
+        if current_owner is not recorded_owner:
+            return False
+    if any(
+        _risk_binding_owner_without_callbacks(source, source_kind)
+        is not recorded_owner
+        for source, source_kind, recorded_owner in record.phase1_bindings
+    ):
+        return False
+    try:
+        seal = _risk_authority_seal(value, exact_type=exact_type)
+    except Exception:
+        return False
+    from . import journal as journal_module
+
+    with _AUTHORITY_LOCK:
+        current = registry.get(identity)
+        current_journal_binding = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(
+            identity
+        )
+        current_phase1_binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(
+            identity
+        )
+        return (
+            current is registered
+            and current[0]() is value
+            and current[1] is record
+            and current_journal_binding is journal_binding
+            and current_phase1_binding is phase1_binding
+            and journal_module._source_fingerprint_seals_equal(
+                record.seal,
+                seal,
+            )
+        )
+
+
+def _risk_binding_owner_without_callbacks(
+    source: object,
+    source_kind: str,
+) -> object | None:
+    """Return the exact owner of one already-current provenance root."""
+    if source_kind == "ISSUED_EVENT_WINDOW":
+        if type(source) is not JournalEventWindow or not (
+            _is_current_risk_authority_without_callbacks(
+                _JOURNAL_WINDOW_AUTHORITIES,
+                source,
+                exact_type=JournalEventWindow,
+                children=(source.terminal_action,),
+            )
+        ):
+            return None
+        with _AUTHORITY_LOCK:
+            registered = _JOURNAL_WINDOW_AUTHORITIES.get(id(source))
+            if (
+                registered is None
+                or registered[0]() is not source
+                or type(registered[1]) is not _RiskAuthorityRecord
+            ):
+                return None
+            record = registered[1]
+            assert isinstance(record, _RiskAuthorityRecord)
+            if record.journal_binding is None:
+                return None
+            return record.journal_binding[2]
+    from . import journal as journal_module
+
+    candidate = journal_module._journal_any_source_authority_candidate(source)
+    if candidate is None or not (
+        journal_module._is_current_journal_authority_candidate_without_callbacks(
+            candidate
+        )
+    ):
+        return None
+    return candidate[2]
+
+
+def _risk_authority_installer_factory(
+    allowed_specs: tuple[
+        tuple[
+            object,
+            type[object],
+            frozenset[object],
+        ],
+        ...,
+    ],
+):
+    """Create the only issuer-frame-gated risk authority installer."""
+    get_caller_frame = _getframe
+    trusted_globals = globals()
+
+    def install(
+        registry: dict[int, tuple[ReferenceType[object], object]],
+        value: object,
+        *,
+        exact_type: type[object],
+        children: tuple[object, ...] = (),
+        journal_binding: tuple[object, str] | None = None,
+        phase1_bindings: tuple[tuple[object, str], ...] = (),
+    ) -> None:
+        caller_frame = get_caller_frame(1)
+        caller_code = caller_frame.f_code
+        if not any(
+            registry is allowed_registry
+            and exact_type is allowed_type
+            and caller_code in allowed_callers
+            for allowed_registry, allowed_type, allowed_callers in allowed_specs
+        ) or caller_frame.f_globals is not trusted_globals:
+            raise RiskBlock("RISK_AUTHORITY_REGISTRAR_UNAVAILABLE")
+        if type(value) is not exact_type or type(children) is not tuple:
+            raise RiskBlock("RISK_AUTHORITY_REGISTRATION_INVALID")
+        if journal_binding is not None and (
+            type(journal_binding) is not tuple
+            or len(journal_binding) != 2
+            or type(journal_binding[1]) is not str
+        ):
+            raise RiskBlock("RISK_AUTHORITY_REGISTRATION_INVALID")
+        if type(phase1_bindings) is not tuple or any(
+            type(binding) is not tuple
+            or len(binding) != 2
+            or type(binding[1]) is not str
+            for binding in phase1_bindings
+        ):
+            raise RiskBlock("RISK_AUTHORITY_REGISTRATION_INVALID")
+
+        recorded_journal_binding: tuple[object, str, object] | None = None
+        if journal_binding is not None:
+            source, source_kind = journal_binding
+            owner = _risk_binding_owner_without_callbacks(
+                source,
+                source_kind,
+            )
+            if owner is None:
+                raise RiskBlock("RISK_AUTHORITY_SOURCE_UNVERIFIED")
+            recorded_journal_binding = (source, source_kind, owner)
+
+        recorded_phase1_bindings: list[tuple[object, str, object]] = []
+        for source, source_kind in phase1_bindings:
+            owner = _risk_binding_owner_without_callbacks(
+                source,
+                source_kind,
+            )
+            if owner is None:
+                raise RiskBlock("RISK_AUTHORITY_SOURCE_UNVERIFIED")
+            recorded_phase1_bindings.append((source, source_kind, owner))
+
+        record = _RiskAuthorityRecord(
+            seal=_risk_authority_seal(value, exact_type=exact_type),
+            children=children,
+            journal_binding=recorded_journal_binding,
+            phase1_bindings=tuple(recorded_phase1_bindings),
+        )
+        identity = id(value)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with _AUTHORITY_LOCK:
+                current = registry.get(identity)
+                if current is not None and current[0] is dead:
+                    registry.pop(identity, None)
+                journal_current = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(
+                    identity
+                )
+                if journal_current is not None and journal_current[0] is dead:
+                    _JOURNAL_DERIVED_SOURCE_BINDINGS.pop(identity, None)
+                phase1_current = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
+                if phase1_current is not None and phase1_current[0] is dead:
+                    _PHASE1_DERIVED_SOURCE_BINDINGS.pop(identity, None)
+
+        reference = ref(value, discard)
+        with _AUTHORITY_LOCK:
+            if (
+                registry.get(identity) is not None
+                or _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity) is not None
+                or _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity) is not None
+            ):
+                raise RiskBlock("RISK_AUTHORITY_ALREADY_ISSUED")
+            registry[identity] = (reference, record)
+            if recorded_journal_binding is not None:
+                source, source_kind, _owner = recorded_journal_binding
+                _JOURNAL_DERIVED_SOURCE_BINDINGS[identity] = (
+                    reference,
+                    ref(source),
+                    source_kind,
+                )
+            if recorded_phase1_bindings:
+                _PHASE1_DERIVED_SOURCE_BINDINGS[identity] = (
+                    reference,
+                    tuple(
+                        (source, source_kind)
+                        for source, source_kind, _owner
+                        in recorded_phase1_bindings
+                    ),
+                )
+
+    return install
+
+
+def _registered_risk_authority_children(
+    registry: dict[int, tuple[ReferenceType[object], object]],
+    value: object,
+) -> tuple[object, ...] | None:
+    """Return the exact immutable child manifest for one registered root."""
+    with _AUTHORITY_LOCK:
+        registered = registry.get(id(value))
+        if (
+            registered is None
+            or registered[0]() is not value
+            or type(registered[1]) is not _RiskAuthorityRecord
+        ):
+            return None
+        record = registered[1]
+        assert isinstance(record, _RiskAuthorityRecord)
+        return record.children
 
 
 def _bind_phase1_derived_sources(
     value: object,
     sources: Sequence[tuple[object, str]],
 ) -> None:
-    """Bind a risk authority to exact owner-current Phase 1 sources."""
-    frozen_sources = tuple(sources)
-    if not frozen_sources:
-        return
-    identity = id(value)
-
-    def discard(dead: ReferenceType[object]) -> None:
-        with _AUTHORITY_LOCK:
-            current = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
-            if current is not None and current[0] is dead:
-                _PHASE1_DERIVED_SOURCE_BINDINGS.pop(identity, None)
-
-    value_reference = ref(value, discard)
-    with _AUTHORITY_LOCK:
-        _PHASE1_DERIVED_SOURCE_BINDINGS[identity] = (
-            value_reference,
-            frozen_sources,
-        )
+    del value, sources
+    raise RiskBlock("RISK_AUTHORITY_BINDING_UNAVAILABLE")
 
 
 def _phase1_bound_sources(value: object) -> tuple[tuple[object, str], ...]:
@@ -2168,6 +2552,35 @@ def _phase1_derived_sources_are_current(value: object) -> bool:
         if verifier is None or not verifier(source):
             return False
     return True
+
+
+def _phase1_derived_sources_are_current_without_callbacks(
+    value: object,
+) -> bool:
+    """Purely recheck all exact Phase 1 bindings after public callbacks."""
+    from . import journal as journal_module
+
+    identity = id(value)
+    with _AUTHORITY_LOCK:
+        binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
+        if (
+            binding is None
+            or binding[0]() is not value
+            or not binding[1]
+        ):
+            return False
+        captured = binding
+        sources = tuple(source for source, _kind in binding[1])
+    if any(
+        not journal_module._is_current_journal_source_authority_without_callbacks(
+            source
+        )
+        for source in sources
+    ):
+        return False
+    with _AUTHORITY_LOCK:
+        current = _PHASE1_DERIVED_SOURCE_BINDINGS.get(identity)
+        return current is captured and current[0]() is value
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -2283,10 +2696,11 @@ def _phase1_equity_point_authority_fingerprint(
 
 def is_issued_phase1_equity_point_authority(value: object) -> bool:
     """Return whether Journal material issued this exact current identity."""
-    if not isinstance(value, Phase1EquityPointAuthority):
+    if type(value) is not Phase1EquityPointAuthority:
         return False
     try:
-        fingerprint = _phase1_equity_point_authority_fingerprint(value)
+        if not _phase1_derived_sources_are_current(value):
+            return False
         document_digest = sha256(
             json.dumps(
                 _phase1_equity_point_authority_document(value),
@@ -2297,14 +2711,51 @@ def is_issued_phase1_equity_point_authority(value: object) -> bool:
         ).hexdigest()
     except Exception:
         return False
+    if document_digest != value.authority_digest or not (
+        _phase1_derived_sources_are_current_without_callbacks(value)
+    ):
+        return False
+    bound_sources = _phase1_bound_sources(value)
+    if len(bound_sources) != 1 or bound_sources[0][1] != "EQUITY_MARK":
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _PHASE1_EQUITY_POINT_AUTHORITIES,
+        value,
+        exact_type=Phase1EquityPointAuthority,
+        children=(bound_sources[0][0],),
+    )
+
+
+def _is_current_phase1_equity_point_authority_without_callbacks(
+    value: object,
+    mark_source: object,
+) -> bool:
+    """Pure final identity/fingerprint check for one already-verified point."""
+    from .journal import Phase1EquityMarkSource
+
+    if (
+        type(value) is not Phase1EquityPointAuthority
+        or type(mark_source) is not Phase1EquityMarkSource
+    ):
+        return False
+    with _AUTHORITY_LOCK:
+        binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(id(value))
+        if (
+            binding is None
+            or binding[0]() is not value
+            or len(binding[1]) != 1
+            or binding[1][0][0] is not mark_source
+            or binding[1][0][1] != "EQUITY_MARK"
+        ):
+            return False
     return (
-        _has_identity_authority(
+        value.source_digest == mark_source.source_digest
+        and _is_current_risk_authority_without_callbacks(
             _PHASE1_EQUITY_POINT_AUTHORITIES,
             value,
-            fingerprint,
+            exact_type=Phase1EquityPointAuthority,
+            children=(mark_source,),
         )
-        and document_digest == value.authority_digest
-        and _phase1_derived_sources_are_current(value)
     )
 
 
@@ -2456,7 +2907,10 @@ def _issue_phase1_equity_point_from_source(
         raise RiskBlock("PHASE1_EQUITY_MARK_SOURCE_INCOMPLETE")
     from urllib.parse import parse_qs, urlsplit
 
-    from .ledger import Phase1CanonicalLedgerReplay
+    from .ledger import (
+        Phase1CanonicalLedgerReplay,
+        is_verified_phase1_canonical_ledger_replay_for_source,
+    )
     from .phase1 import EquityMark, PaperPosition, mark_equity
     from .providers.alpaca import (
         Bar,
@@ -2518,8 +2972,11 @@ def _issue_phase1_equity_point_from_source(
         None,
     )
     if (
-        not isinstance(canonical_replay, Phase1CanonicalLedgerReplay)
-        or not canonical_replay.source_verified
+        type(canonical_replay) is not Phase1CanonicalLedgerReplay
+        or not is_verified_phase1_canonical_ledger_replay_for_source(
+            canonical_replay,
+            canonical_source,
+        )
         or canonical_replay.source_digest
         != getattr(canonical_source, "source_digest", None)
         or canonical_replay.query_cutoff != query_cutoff
@@ -2980,19 +3437,19 @@ def _issue_phase1_equity_point_from_source(
             ).encode("utf-8")
         ).hexdigest(),
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _PHASE1_EQUITY_POINT_AUTHORITIES,
         authority,
-        _phase1_equity_point_authority_fingerprint(authority),
+        exact_type=Phase1EquityPointAuthority,
+        children=(source,),
+        phase1_bindings=((source, "EQUITY_MARK"),),
     )
-    _bind_phase1_derived_sources(authority, ((source, "EQUITY_MARK"),))
     return authority
 
 
 def _inherit_phase1_derived_sources(value: object, parent: object) -> None:
-    sources = _phase1_bound_sources(parent)
-    if sources:
-        _bind_phase1_derived_sources(value, sources)
+    del value, parent
+    raise RiskBlock("RISK_AUTHORITY_BINDING_UNAVAILABLE")
 
 
 def _bind_journal_derived_source(
@@ -3000,20 +3457,8 @@ def _bind_journal_derived_source(
     source: object,
     source_kind: str,
 ) -> None:
-    identity = id(value)
-
-    def discard(dead: ReferenceType[object]) -> None:
-        with _AUTHORITY_LOCK:
-            current = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity)
-            if current is not None and current[0] is dead:
-                _JOURNAL_DERIVED_SOURCE_BINDINGS.pop(identity, None)
-
-    with _AUTHORITY_LOCK:
-        _JOURNAL_DERIVED_SOURCE_BINDINGS[identity] = (
-            ref(value, discard),
-            ref(source),
-            source_kind,
-        )
+    del value, source, source_kind
+    raise RiskBlock("RISK_AUTHORITY_BINDING_UNAVAILABLE")
 
 
 def _journal_derived_source_is_current(value: object) -> bool:
@@ -3034,6 +3479,45 @@ def _journal_derived_source_is_current(value: object) -> bool:
     if source_kind == "ISSUED_EVENT_WINDOW":
         return is_issued_journal_event_window(source)
     return False
+
+
+def _journal_derived_source_is_current_without_callbacks(
+    value: object,
+) -> bool:
+    """Purely recheck one exact Journal binding after public callbacks."""
+    from . import journal as journal_module
+
+    identity = id(value)
+    with _AUTHORITY_LOCK:
+        binding = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity)
+        if binding is None or binding[0]() is not value:
+            return False
+        captured = binding
+        source = binding[1]()
+        source_kind = binding[2]
+    if source is None:
+        return False
+    if source_kind == "ISSUED_EVENT_WINDOW":
+        source_is_current = (
+            type(source) is JournalEventWindow
+            and _is_current_risk_authority_without_callbacks(
+                _JOURNAL_WINDOW_AUTHORITIES,
+                source,
+                exact_type=JournalEventWindow,
+                children=(source.terminal_action,),
+            )
+        )
+    else:
+        source_is_current = (
+            journal_module._is_current_journal_source_authority_without_callbacks(
+                source
+            )
+        )
+    if not source_is_current:
+        return False
+    with _AUTHORITY_LOCK:
+        current = _JOURNAL_DERIVED_SOURCE_BINDINGS.get(identity)
+        return current is captured and current[0]() is value
 
 
 def _issue_journal_event_window(
@@ -3352,36 +3836,49 @@ def _issue_account_buy_authority(
         account_check=account_check,
         terminal_action=terminal_action,
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _CONFIRMED_BUY_AUTHORITIES,
         terminal_action,
-        _confirmed_buy_fingerprint(terminal_action),
+        exact_type=ConfirmedBuyAction,
+        journal_binding=(source, "JOURNAL_WINDOW_SOURCE"),
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _JOURNAL_WINDOW_AUTHORITIES,
         window,
-        _authority_fingerprint(window),
-    )
-    _bind_journal_derived_source(
-        terminal_action,
-        source,
-        "JOURNAL_WINDOW_SOURCE",
-    )
-    _bind_journal_derived_source(
-        window,
-        source,
-        "JOURNAL_WINDOW_SOURCE",
+        exact_type=JournalEventWindow,
+        children=(terminal_action,),
+        journal_binding=(source, "JOURNAL_WINDOW_SOURCE"),
     )
     return account_check, terminal_action, window
 
 
 def is_issued_journal_event_window(window: object) -> bool:
     """Return whether *window* is the exact unmodified adapter-issued object."""
-    return isinstance(window, JournalEventWindow) and _has_identity_authority(
+    if type(window) is not JournalEventWindow:
+        return False
+    terminal_action = window.terminal_action
+    if (
+        terminal_action is None
+        or type(terminal_action) is not ConfirmedBuyAction
+        or not _journal_derived_source_is_current(window)
+        or not is_issued_confirmed_buy_action(terminal_action)
+        or not _journal_derived_source_is_current_without_callbacks(window)
+        or not _journal_derived_source_is_current_without_callbacks(
+            terminal_action
+        )
+        or not _is_current_risk_authority_without_callbacks(
+            _CONFIRMED_BUY_AUTHORITIES,
+            terminal_action,
+            exact_type=ConfirmedBuyAction,
+        )
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
         _JOURNAL_WINDOW_AUTHORITIES,
         window,
-        _authority_fingerprint(window),
-    ) and _journal_derived_source_is_current(window)
+        exact_type=JournalEventWindow,
+        children=(terminal_action,),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3942,16 +4439,19 @@ class SettlementLedger:
                     SessionCalendarResolver,
                 )
                 or not self.calendar_resolver.release_verified
+                or not _journal_derived_source_is_current(self)
             ):
                 return False
-            fingerprint = _settlement_ledger_fingerprint(self)
         except Exception:
             return False
-        return _has_identity_authority(
-            _SETTLEMENT_LEDGER_AUTHORITIES,
-            self,
-            fingerprint,
-        ) and _journal_derived_source_is_current(self)
+        return (
+            _journal_derived_source_is_current_without_callbacks(self)
+            and _is_current_risk_authority_without_callbacks(
+                _SETTLEMENT_LEDGER_AUTHORITIES,
+                self,
+                exact_type=SettlementLedger,
+            )
+        )
 
     @property
     def reason_codes(self) -> tuple[str, ...]:
@@ -4406,15 +4906,11 @@ def _issue_settlement_ledger_from_account_window(
         initialized_at=event_window.account_check.at,
         calendar_resolver=calendar_resolver,
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _SETTLEMENT_LEDGER_AUTHORITIES,
         ledger,
-        _settlement_ledger_fingerprint(ledger),
-    )
-    _bind_journal_derived_source(
-        ledger,
-        event_window,
-        "ISSUED_EVENT_WINDOW",
+        exact_type=SettlementLedger,
+        journal_binding=(event_window, "ISSUED_EVENT_WINDOW"),
     )
     return ledger
 
@@ -4598,15 +5094,11 @@ def _issue_settlement_replay(
         postings=tuple(postings),
         replay_authority=replay_authority,
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _SETTLEMENT_LEDGER_AUTHORITIES,
         ledger,
-        _settlement_ledger_fingerprint(ledger),
-    )
-    _bind_journal_derived_source(
-        ledger,
-        source,
-        "JOURNAL_REPLAY_SOURCE",
+        exact_type=SettlementLedger,
+        journal_binding=(source, "JOURNAL_REPLAY_SOURCE"),
     )
     return ledger
 
@@ -4969,7 +5461,7 @@ def _phase1_signal_evidence_fingerprint(
     )
 
 
-def _issue_phase1_signal_evidence_authority(
+def _build_phase1_signal_evidence_authority(
     signal_source: object,
     reviewed_bundle: object,
     decision: object,
@@ -5137,14 +5629,30 @@ def _issue_phase1_signal_evidence_authority(
     )
     source_digest = sha256(_phase1_signal_evidence_bytes(authority)).hexdigest()
     authority = replace(authority, source_digest=source_digest)
-    _register_identity_authority(
+    return authority
+
+
+def _issue_phase1_signal_evidence_authority(
+    signal_source: object,
+    reviewed_bundle: object,
+    decision: object,
+    *,
+    review_at: datetime,
+    calendar_resolver: SessionCalendarResolver,
+) -> Phase1SignalEvidenceAuthority:
+    authority = _build_phase1_signal_evidence_authority(
+        signal_source,
+        reviewed_bundle,
+        decision,
+        review_at=review_at,
+        calendar_resolver=calendar_resolver,
+    )
+    _install_risk_authority(
         _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
         authority,
-        _phase1_signal_evidence_fingerprint(authority),
-    )
-    _bind_phase1_derived_sources(
-        authority,
-        ((signal_source, "SIGNAL_SOURCE"),),
+        exact_type=Phase1SignalEvidenceAuthority,
+        children=(reviewed_bundle, decision, signal_source),
+        phase1_bindings=((signal_source, "SIGNAL_SOURCE"),),
     )
     return authority
 
@@ -5190,7 +5698,7 @@ def _issue_phase1_signal_evidence_authority_from_source(
     decision = source.evidence_decision
     if not is_reviewed_evidence_decision(decision):
         raise RiskBlock("PHASE1_REVIEWED_EVIDENCE_UNVERIFIED")
-    authority = _issue_phase1_signal_evidence_authority(
+    authority = _build_phase1_signal_evidence_authority(
         signal_source,
         reviewed_bundle,
         decision,
@@ -5229,25 +5737,24 @@ def _issue_phase1_signal_evidence_authority_from_source(
         != source.manifest_digest
     ):
         raise RiskBlock("PHASE1_SIGNAL_EVIDENCE_MANIFEST_MISMATCH")
-    _bind_phase1_derived_sources(
+    _install_risk_authority(
+        _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
         authority,
-        ((source, "SIGNAL_EVIDENCE"),),
+        exact_type=Phase1SignalEvidenceAuthority,
+        children=(reviewed_bundle, decision, signal_source),
+        phase1_bindings=((source, "SIGNAL_EVIDENCE"),),
     )
     return authority
 
 
 def is_issued_phase1_signal_evidence_authority(value: object) -> bool:
-    if not isinstance(value, Phase1SignalEvidenceAuthority):
+    if type(value) is not Phase1SignalEvidenceAuthority:
         return False
     try:
-        fingerprint = _phase1_signal_evidence_fingerprint(value)
-        return (
-            _has_identity_authority(
-                _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
-                value,
-                fingerprint,
-            )
-            and _phase1_derived_sources_are_current(value)
+        # Source, evidence, and datetime verifiers may dispatch callbacks.
+        # Complete them before the pure source/child/root authority checks.
+        if not (
+            _phase1_derived_sources_are_current(value)
             and _is_reviewed_bundle(value.reviewed_bundle)
             and is_reviewed_evidence_decision(value.evidence_decision)
             and value.evidence_decision._reviewed_bundle
@@ -5259,6 +5766,19 @@ def is_issued_phase1_signal_evidence_authority(value: object) -> bool:
             == getattr(value.signal_source, "source_digest", None)
             and sha256(_phase1_signal_evidence_bytes(value)).hexdigest()
             == value.source_digest
+        ):
+            return False
+        if not _phase1_derived_sources_are_current_without_callbacks(value):
+            return False
+        return _is_current_risk_authority_without_callbacks(
+            _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+            value,
+            exact_type=Phase1SignalEvidenceAuthority,
+            children=(
+                value.reviewed_bundle,
+                value.evidence_decision,
+                value.signal_source,
+            ),
         )
     except Exception:
         return False
@@ -5413,31 +5933,49 @@ def _issue_phase1_position_evidence_authority(
         position_digest=position_digest,
         source_digest=source_digest,
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
         authority,
-        _phase1_position_evidence_fingerprint(authority),
+        exact_type=Phase1PositionEvidenceAuthority,
+        children=(signal_evidence,),
+        phase1_bindings=_phase1_bound_sources(signal_evidence),
     )
-    _inherit_phase1_derived_sources(authority, signal_evidence)
     return authority
 
 
 def is_issued_phase1_position_evidence_authority(value: object) -> bool:
-    if not isinstance(value, Phase1PositionEvidenceAuthority):
+    if type(value) is not Phase1PositionEvidenceAuthority:
         return False
     try:
-        return (
-            _has_identity_authority(
-                _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
-                value,
-                _phase1_position_evidence_fingerprint(value),
-            )
+        if not (
+            type(value.signal_evidence) is Phase1SignalEvidenceAuthority
             and is_issued_phase1_signal_evidence_authority(
                 value.signal_evidence
             )
             and value.position_digest
             == _position_revision_digest(value.position)
             and _phase1_derived_sources_are_current(value)
+        ):
+            return False
+        if not (
+            _phase1_derived_sources_are_current_without_callbacks(value)
+            and _is_current_risk_authority_without_callbacks(
+                _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+                value.signal_evidence,
+                exact_type=Phase1SignalEvidenceAuthority,
+                children=(
+                    value.signal_evidence.reviewed_bundle,
+                    value.signal_evidence.evidence_decision,
+                    value.signal_evidence.signal_source,
+                ),
+            )
+        ):
+            return False
+        return _is_current_risk_authority_without_callbacks(
+            _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
+            value,
+            exact_type=Phase1PositionEvidenceAuthority,
+            children=(value.signal_evidence,),
         )
     except Exception:
         return False
@@ -5694,17 +6232,22 @@ def _issue_position_event_context(
 
 
 def is_issued_position_event_context(context: object) -> bool:
-    if not isinstance(context, PositionEventContext):
+    if type(context) is not PositionEventContext:
         return False
-    try:
-        fingerprint = _position_event_context_fingerprint(context)
-    except Exception:
+    if not (
+        _phase1_derived_sources_are_current(context)
+        and _phase1_derived_sources_are_current_without_callbacks(context)
+    ):
         return False
-    return _has_identity_authority(
+    bound_sources = _phase1_bound_sources(context)
+    if len(bound_sources) != 1:
+        return False
+    return _is_current_risk_authority_without_callbacks(
         _POSITION_EVENT_AUTHORITIES,
         context,
-        fingerprint,
-    ) and _phase1_derived_sources_are_current(context)
+        exact_type=PositionEventContext,
+        children=(bound_sources[0][0],),
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -5858,17 +6401,36 @@ def _market_mark_fingerprint(mark: MarketMark) -> tuple[object, ...]:
 
 
 def is_issued_market_mark(mark: object) -> bool:
-    if not isinstance(mark, MarketMark):
+    if type(mark) is not MarketMark:
         return False
-    try:
-        fingerprint = _market_mark_fingerprint(mark)
-    except Exception:
+    children = _registered_risk_authority_children(_MARK_AUTHORITIES, mark)
+    if (
+        children is None
+        or len(children) != 1
+        or type(children[0]) is not PositionEventContext
+        or not is_issued_position_event_context(children[0])
+        or not _is_current_risk_authority_without_callbacks(
+            _POSITION_EVENT_AUTHORITIES,
+            children[0],
+            exact_type=PositionEventContext,
+            children=tuple(
+                source
+                for source, _kind in _phase1_bound_sources(children[0])
+            ),
+        )
+        or not _phase1_derived_sources_are_current(mark)
+    ):
         return False
-    return _has_identity_authority(
+    if _phase1_bound_sources(mark) and not (
+        _phase1_derived_sources_are_current_without_callbacks(mark)
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
         _MARK_AUTHORITIES,
         mark,
-        fingerprint,
-    ) and _phase1_derived_sources_are_current(mark)
+        exact_type=MarketMark,
+        children=children,
+    )
 
 
 def build_market_mark(
@@ -5977,10 +6539,12 @@ def build_market_mark(
         review_cursor=(position_event_context.cursor if operational else None),
     )
     if operational:
-        _register_identity_authority(
+        assert position_event_context is not None
+        _install_risk_authority(
             _MARK_AUTHORITIES,
             mark,
-            _market_mark_fingerprint(mark),
+            exact_type=MarketMark,
+            children=(position_event_context,),
         )
     return mark
 
@@ -6359,21 +6923,53 @@ def _phase1_position_exit_authority_fingerprint(
 
 
 def is_issued_phase1_position_exit_authority(authority: object) -> bool:
-    if not isinstance(authority, Phase1PositionExitAuthority):
+    if type(authority) is not Phase1PositionExitAuthority:
+        return False
+    children = _registered_risk_authority_children(
+        _PHASE1_POSITION_EXIT_AUTHORITIES,
+        authority,
+    )
+    if (
+        children is None
+        or len(children) != 3
+        or children[0] is not authority.event_context
+        or children[1] is not authority.mark
+        or type(children[0]) is not PositionEventContext
+        or type(children[1]) is not MarketMark
+        or not _phase1_derived_sources_are_current(authority)
+        or not is_issued_position_event_context(authority.event_context)
+        or not is_issued_market_mark(authority.mark)
+    ):
         return False
     try:
-        fingerprint = _phase1_position_exit_authority_fingerprint(authority)
         digest = _phase1_position_exit_authority_digest(authority)
     except Exception:
         return False
-    return (
-        digest == authority.authority_digest
-        and _has_identity_authority(
-            _PHASE1_POSITION_EXIT_AUTHORITIES,
-            authority,
-            fingerprint,
+    if digest != authority.authority_digest or not (
+        _phase1_derived_sources_are_current_without_callbacks(authority)
+    ):
+        return False
+    context_sources = _phase1_bound_sources(authority.event_context)
+    if len(context_sources) != 1 or not (
+        _is_current_risk_authority_without_callbacks(
+            _POSITION_EVENT_AUTHORITIES,
+            authority.event_context,
+            exact_type=PositionEventContext,
+            children=(context_sources[0][0],),
         )
-        and _phase1_derived_sources_are_current(authority)
+        and _is_current_risk_authority_without_callbacks(
+            _MARK_AUTHORITIES,
+            authority.mark,
+            exact_type=MarketMark,
+            children=(authority.event_context,),
+        )
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _PHASE1_POSITION_EXIT_AUTHORITIES,
+        authority,
+        exact_type=Phase1PositionExitAuthority,
+        children=children,
     )
 
 
@@ -7343,6 +7939,137 @@ class _Phase1ExitMarketMaterial:
     atr14: Decimal
 
 
+def _phase1_exit_provider_authorities_are_current(source: object) -> bool:
+    """Purely recheck the exact provider graph behind one exit review."""
+    from .journal import (
+        Phase1ExitReviewMarketSource,
+        _is_current_phase1_source_authority_without_callbacks,
+    )
+    from .providers.alpaca import (
+        Bar,
+        ProviderFetchCohort,
+        Quote,
+        is_issued_normalized_market_fact,
+        is_issued_provider_fetch_cohort,
+        provider_fetch_cohorts_share_owner,
+    )
+
+    if type(source) is not Phase1ExitReviewMarketSource or not (
+        _is_current_phase1_source_authority_without_callbacks(source)
+    ):
+        return False
+    try:
+        symbol = object.__getattribute__(source, "symbol")
+        cohorts = (
+            object.__getattribute__(source, "daily_bar_cohort"),
+            object.__getattribute__(source, "execution_bar_cohort"),
+            object.__getattribute__(source, "quote_cohort"),
+        )
+        provider_fact_groups = tuple(
+            tuple(cohort[symbol]) for cohort in cohorts
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        type(symbol) is not str
+        or not symbol
+        or any(type(cohort) is not ProviderFetchCohort for cohort in cohorts)
+        or any(not is_issued_provider_fetch_cohort(cohort) for cohort in cohorts)
+        or not provider_fetch_cohorts_share_owner(*cohorts)
+        or any(
+            type(fact) is not expected_type
+            or not is_issued_normalized_market_fact(fact)
+            for facts, expected_type in zip(
+                provider_fact_groups,
+                (Bar, Bar, Quote),
+                strict=True,
+            )
+            for fact in facts
+        )
+    ):
+        return False
+    return True
+
+
+def _phase1_exit_market_material_matches_current_provider(
+    source: object,
+    material: _Phase1ExitMarketMaterial,
+) -> bool:
+    """Compare derived market scalars with one fresh callback-free provider read."""
+    from .indicators import wilder_atr
+
+    if type(material) is not _Phase1ExitMarketMaterial or not (
+        _phase1_exit_provider_authorities_are_current(source)
+    ):
+        return False
+    try:
+        symbol = object.__getattribute__(source, "symbol")
+        daily_bars = tuple(
+            object.__getattribute__(source, "daily_bar_cohort")[symbol]
+        )
+        execution_bars = tuple(
+            object.__getattribute__(source, "execution_bar_cohort")[symbol]
+        )
+        quotes = tuple(
+            object.__getattribute__(source, "quote_cohort")[symbol]
+        )
+        stored_quotes = object.__getattribute__(source, "quote_facts")
+        stored_daily = object.__getattribute__(source, "daily_bar_facts")
+        source_observations = object.__getattribute__(source, "observations")
+        if (
+            type(stored_quotes) is not tuple
+            or type(stored_daily) is not tuple
+            or type(source_observations) is not tuple
+            or len(daily_bars) != 14
+            or not execution_bars
+            or len(quotes) != len(stored_quotes)
+            or len(daily_bars) != len(stored_daily)
+        ):
+            return False
+        previous_low = daily_bars[-2].low
+        current_low = min(bar.low for bar in execution_bars)
+        atr14 = wilder_atr(daily_bars, 14).quantize(
+            Decimal("0.000001"),
+            rounding=ROUND_CEILING,
+        )
+        if quotes:
+            provider_quote, mark_observation = max(
+                zip(quotes, stored_quotes, strict=True),
+                key=lambda item: (
+                    item[0].timestamp,
+                    -1 if item[0].sequence is None else item[0].sequence,
+                ),
+            )
+            mark_price = provider_quote.bid
+            mark_at = provider_quote.timestamp
+        else:
+            mark_observation = stored_daily[-1]
+            close_micros = money_to_micros(daily_bars[-1].close)
+            mark_price = money_from_micros((close_micros * 999) // 1000)
+            mark_at = material.mark_at
+    except (AttributeError, DomainValidationError, TypeError, ValueError):
+        return False
+    if not _phase1_exit_provider_authorities_are_current(source):
+        return False
+    return (
+        len(material.observations) == len(source_observations)
+        and all(
+            actual is expected
+            for actual, expected in zip(
+                material.observations,
+                source_observations,
+                strict=True,
+            )
+        )
+        and material.mark_observation is mark_observation
+        and material.mark_price == mark_price
+        and material.mark_at is mark_at
+        and material.previous_session_low == previous_low
+        and material.current_session_low == current_low
+        and material.atr14 == atr14
+    )
+
+
 def _phase1_exit_review_market_material(
     source: object,
     *,
@@ -7721,6 +8448,11 @@ def _phase1_exit_review_market_material(
     expected_sessions.reverse()
     if daily_sessions != tuple(expected_sessions):
         raise RiskBlock("PHASE1_EXIT_DAILY_HISTORY_INCOMPLETE")
+    # Calendar methods above are caller-dispatchable.  Recheck the exact
+    # Journal/provider graph after the final callback and before copying any
+    # market scalar into an operational decision.
+    if not _phase1_exit_provider_authorities_are_current(source):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_UNVERIFIED")
     if expected_daily_end == review_session:
         daily_current = daily_bars[-1]
         if (
@@ -7770,7 +8502,7 @@ def _phase1_exit_review_market_material(
         close_micros = money_to_micros(daily_bars[-1].close)
         mark_price = money_from_micros((close_micros * 999) // 1000)
         mark_at = review_close
-    return _Phase1ExitMarketMaterial(
+    material = _Phase1ExitMarketMaterial(
         observations=observations,
         mark_observation=mark_observation,
         mark_price=mark_price,
@@ -7779,6 +8511,12 @@ def _phase1_exit_review_market_material(
         current_session_low=current_low,
         atr14=atr14,
     )
+    if not _phase1_exit_market_material_matches_current_provider(
+        source,
+        material,
+    ):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_UNVERIFIED")
+    return material
 
 
 @dataclass(frozen=True, slots=True)
@@ -7951,14 +8689,12 @@ def _derive_phase1_position_exit_material_from_verified_source(
         current_session_low=market.current_session_low,
         atr14=market.atr14,
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _POSITION_EVENT_AUTHORITIES,
         event_context,
-        _position_event_context_fingerprint(event_context),
-    )
-    _bind_phase1_derived_sources(
-        event_context,
-        ((source, "EXIT_REVIEW_MARKET"),),
+        exact_type=PositionEventContext,
+        children=(source,),
+        phase1_bindings=((source, "EXIT_REVIEW_MARKET"),),
     )
     mark = build_market_mark(
         position,
@@ -7974,7 +8710,6 @@ def _derive_phase1_position_exit_material_from_verified_source(
         event_context_verified=True,
         position_event_context=event_context,
     )
-    _bind_phase1_derived_sources(mark, ((source, "EXIT_REVIEW_MARKET"),))
     steps = _phase1_position_exit_steps_from_observations(
         position=position,
         mark=mark,
@@ -8085,6 +8820,7 @@ def _issue_phase1_position_exit_authority_from_source(
     """Recompute the complete canonical exit batch from one exact review."""
     from .journal import (
         Phase1ExitReviewSource,
+        _is_current_phase1_source_authority_without_callbacks,
         is_verified_phase1_exit_review_source,
         phase1_sources_share_owner,
     )
@@ -8227,12 +8963,44 @@ def _issue_phase1_position_exit_authority_from_source(
         source_digest=source.source_digest,
         authority_digest=authority_digest,
     )
-    _register_identity_authority(
+    mark_observation_matches = tuple(
+        fact
+        for fact in (
+            *tuple(market_source.daily_bar_facts),
+            *tuple(market_source.quote_facts),
+        )
+        if getattr(fact, "observation_id", None) == mark_observation_id
+    )
+    if len(mark_observation_matches) != 1:
+        raise RiskBlock("PHASE1_EXIT_REVIEW_MARK_UNAVAILABLE")
+    final_market_material = _Phase1ExitMarketMaterial(
+        observations=tuple(market_source.observations),
+        mark_observation=mark_observation_matches[0],
+        mark_price=mark.price,
+        mark_at=mark.at,
+        previous_session_low=mark.previous_session_low,
+        current_session_low=mark.current_session_low,
+        atr14=mark.atr14,
+    )
+    # All calendar, Journal-currentness, policy, and derived-evidence callbacks
+    # are complete.  This final pass is deliberately callback-free and proves
+    # both exact source identities plus every provider-derived market scalar
+    # immediately before the authority becomes visible.
+    if (
+        not _is_current_phase1_source_authority_without_callbacks(source)
+        or not _phase1_exit_market_material_matches_current_provider(
+            market_source,
+            final_market_material,
+        )
+    ):
+        raise RiskBlock("PHASE1_EXIT_PROVIDER_COHORT_UNVERIFIED")
+    _install_risk_authority(
         _PHASE1_POSITION_EXIT_AUTHORITIES,
         authority,
-        _phase1_position_exit_authority_fingerprint(authority),
+        exact_type=Phase1PositionExitAuthority,
+        children=(event_context, mark, source),
+        phase1_bindings=((source, "EXIT_REVIEW"),),
     )
-    _bind_phase1_derived_sources(authority, ((source, "EXIT_REVIEW"),))
     return authority
 
 
@@ -8446,67 +9214,61 @@ class BreakerHistoryAuthority:
 
 def _breaker_history_fingerprint(
     history: BreakerHistoryAuthority,
-) -> tuple[object, ...]:
-    return (
-        history.ledger_name,
-        tuple(
-            (
-                point.session_date,
-                point.equity,
-                point.at,
-                point.cursor,
-                point.ordinal,
-                point.source_id,
-                point.message_time,
-                point.received_at,
-            )
-            for point in history.equity
-        ),
-        tuple(
-            (
-                trade.session_date,
-                trade.pnl,
-                trade.signal_id,
-                trade.at,
-                trade.cursor,
-                trade.ordinal,
-                trade.equity_after,
-                trade.source_id,
-                trade.message_time,
-                trade.received_at,
-            )
-            for trade in history.closes
-        ),
-        history.start_cursor,
-        history.terminal_cursor,
-        history.close_start_cursor,
-        history.close_terminal_cursor,
-        history.through_session,
-        _calendar_digest(history.calendar_resolver),
-        history.calendar_resolver.release_verified,
-        history.source_digest,
-        history.query_cutoff,
-        history.equity_expected_count,
-        history.close_expected_count,
-        history.close_stream_through_cursor,
-        history.validation_window_id,
-        history.window_start_session,
-        history.window_start_source_id,
+) -> object:
+    """Return a hook-free exact structural seal for one breaker history."""
+    if type(history) is not BreakerHistoryAuthority:
+        raise TypeError("breaker history authority type is unverified")
+    from . import journal as journal_module
+
+    return journal_module._source_fingerprint_seal(
+        history,
+        domain=_BREAKER_HISTORY_FINGERPRINT_DOMAIN,
+        root_mode=journal_module._MERKLE_OPAQUE_STRUCTURAL,
+    )
+
+
+def _is_current_breaker_history_authority_without_callbacks(
+    history: object,
+) -> bool:
+    """Pure final history, binding, and source-identity verification."""
+    return _is_current_risk_authority_without_callbacks(
+        _BREAKER_HISTORY_AUTHORITIES,
+        history,
+        exact_type=BreakerHistoryAuthority,
     )
 
 
 def is_issued_breaker_history_authority(history: object) -> bool:
-    if not isinstance(history, BreakerHistoryAuthority):
+    from .journal import Phase1BreakerHistorySource
+
+    if type(history) is not BreakerHistoryAuthority:
+        return False
+    with _AUTHORITY_LOCK:
+        binding = _PHASE1_DERIVED_SOURCE_BINDINGS.get(id(history))
+        if (
+            binding is None
+            or binding[0]() is not history
+            or len(binding[1]) != 1
+            or binding[1][0][1] != "BREAKER_HISTORY"
+            or type(binding[1][0][0]) is not Phase1BreakerHistorySource
+        ):
+            return False
+        source = binding[1][0][0]
+    # Source and calendar verification may execute SQLite or accepted resolver
+    # callbacks.  Finish all of them before the hook-free authority seal and
+    # exact registry/binding recheck.
+    if not _phase1_derived_sources_are_current(history):
         return False
     try:
-        fingerprint = _breaker_history_fingerprint(history)
+        calendar_digest = _calendar_digest(history.calendar_resolver)
     except Exception:
         return False
-    return _has_identity_authority(
-        _BREAKER_HISTORY_AUTHORITIES,
-        history,
-        fingerprint,
-    ) and _phase1_derived_sources_are_current(history)
+    if (
+        calendar_digest != source.calendar_digest
+        or history.source_digest != source.source_digest
+    ):
+        return False
+    return _is_current_breaker_history_authority_without_callbacks(history)
 
 
 def _issue_breaker_history_authority(
@@ -8752,6 +9514,37 @@ def _issue_breaker_history_authority(
     return history
 
 
+def _phase1_breaker_equity_authorities_are_current(
+    source: object,
+    mark_sources: tuple[object, ...],
+    authorities: tuple[object, ...],
+) -> bool:
+    """Purely recheck the complete exact mark/authority cohort."""
+    from .journal import (
+        Phase1BreakerHistorySource,
+        Phase1EquityMarkSource,
+    )
+
+    if (
+        type(source) is not Phase1BreakerHistorySource
+        or len(mark_sources) != len(authorities)
+    ):
+        return False
+    return all(
+        type(mark_source) is Phase1EquityMarkSource
+        and type(authority) is Phase1EquityPointAuthority
+        and _is_current_phase1_equity_point_authority_without_callbacks(
+            authority,
+            mark_source,
+        )
+        for mark_source, authority in zip(
+            mark_sources,
+            authorities,
+            strict=True,
+        )
+    )
+
+
 def _issue_breaker_history_from_phase1_source(
     source: object,
     *,
@@ -8761,6 +9554,7 @@ def _issue_breaker_history_from_phase1_source(
     from .journal import (
         Phase1BreakerHistorySource,
         Phase1EquityMarkSource,
+        _is_current_phase1_source_authority_without_callbacks,
         is_verified_phase1_breaker_history_source,
         phase1_sources_share_owner,
     )
@@ -8782,9 +9576,12 @@ def _issue_breaker_history_from_phase1_source(
         source.expected_mark_source_count != len(equity_mark_sources)
         or len(equity_authorities) != len(equity_mark_sources)
         or len(equity_mark_sources) != max(0, len(persisted_points) - 1)
-        or any(
-            not phase1_sources_share_owner(source, mark_source)
-            for mark_source in equity_mark_sources
+        or (
+            bool(equity_mark_sources)
+            and not phase1_sources_share_owner(
+                source,
+                *equity_mark_sources,
+            )
         )
     ):
         raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_INCOMPLETE")
@@ -8835,25 +9632,24 @@ def _issue_breaker_history_from_phase1_source(
         ):
             raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_MISMATCH")
 
-    points = tuple(
+    # Validate every calendar/session rule against the durable point values
+    # first.  Operational authority values are copied only after all of those
+    # caller-dispatchable callbacks have completed.
+    persisted_value_points = tuple(
         EquityPoint(
             session_date=point.session_date,
-            equity=(
-                money_from_micros(point.equity_micros)
-                if index == 0
-                else equity_authorities[index - 1].point.equity
-            ),
+            equity=money_from_micros(point.equity_micros),
             at=point.at,
             cursor=point.source_cursor,
             source_id=point.point_id,
             message_time=point.message_time,
             received_at=point.received_at,
         )
-        for index, point in enumerate(persisted_points)
+        for point in persisted_points
     )
     terminal_equity_by_session = {
         point.session_date: point
-        for point in points
+        for point in persisted_value_points
         if point.at is not None
         and point.at.astimezone(_ET).time().replace(tzinfo=None)
         == calendar_resolver.session(point.session_date).close_time
@@ -8879,14 +9675,15 @@ def _issue_breaker_history_from_phase1_source(
         for trade in source.closed_trades
     )
     if (
-        source.expected_equity_count != len(points)
+        source.expected_equity_count != len(persisted_value_points)
         or source.expected_close_count != len(trades)
-        or not points
-        or source.equity_terminal_cursor != points[-1].cursor
+        or not persisted_value_points
+        or source.equity_terminal_cursor != persisted_value_points[-1].cursor
         or source.close_terminal_cursor
         != (trades[-1].cursor if trades else None)
-        or source.window_start_session != points[0].session_date
-        or source.window_start_source_id != points[0].source_id
+        or source.window_start_session
+        != persisted_value_points[0].session_date
+        or source.window_start_source_id != persisted_value_points[0].source_id
         or any(
             point.validation_window_id != source.validation_window_id
             or point.ledger_name != source.ledger_name
@@ -8901,7 +9698,7 @@ def _issue_breaker_history_from_phase1_source(
         raise RiskBlock("PHASE1_BREAKER_HISTORY_SOURCE_MISMATCH")
     diagnostic = _issue_breaker_history_authority(
         ledger_name=source.ledger_name,
-        equity=points,
+        equity=persisted_value_points,
         closes=trades,
         through_session=source.through_session,
         terminal_cursor=source.equity_terminal_cursor,
@@ -8911,19 +9708,61 @@ def _issue_breaker_history_from_phase1_source(
         close_expected_count=source.expected_close_count,
         close_stream_through_cursor=source.close_source_highwater,
     )
+    if (
+        not _is_current_phase1_source_authority_without_callbacks(source)
+        or not _phase1_breaker_equity_authorities_are_current(
+            source,
+            equity_mark_sources,
+            equity_authorities,
+        )
+    ):
+        raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_INCOMPLETE")
+    points = tuple(
+        EquityPoint(
+            session_date=point.session_date,
+            equity=(
+                money_from_micros(point.equity_micros)
+                if index == 0
+                else equity_authorities[index - 1].point.equity
+            ),
+            at=point.at,
+            cursor=point.source_cursor,
+            source_id=point.point_id,
+            message_time=point.message_time,
+            received_at=point.received_at,
+        )
+        for index, point in enumerate(persisted_points)
+    )
     history = replace(
         diagnostic,
+        equity=points,
         source_digest=source.source_digest,
         validation_window_id=source.validation_window_id,
         window_start_session=source.window_start_session,
         window_start_source_id=source.window_start_source_id,
     )
-    _register_identity_authority(
+    if (
+        not _phase1_breaker_equity_authorities_are_current(
+            source,
+            equity_mark_sources,
+            equity_authorities,
+        )
+        or any(
+            point.equity != authority.point.equity
+            for point, authority in zip(
+                history.equity[1:],
+                equity_authorities,
+                strict=True,
+            )
+        )
+    ):
+        raise RiskBlock("PHASE1_BREAKER_EQUITY_AUTHORITY_INCOMPLETE")
+    _install_risk_authority(
         _BREAKER_HISTORY_AUTHORITIES,
         history,
-        _breaker_history_fingerprint(history),
+        exact_type=BreakerHistoryAuthority,
+        phase1_bindings=((source, "BREAKER_HISTORY"),),
     )
-    _bind_phase1_derived_sources(history, ((source, "BREAKER_HISTORY"),))
     return history
 
 
@@ -9128,18 +9967,47 @@ def _breaker_fingerprint(state: BreakerState) -> tuple[object, ...]:
     )
 
 
-def is_issued_breaker_state(state: object) -> bool:
-    if not isinstance(state, BreakerState):
+def _is_current_breaker_state_without_callbacks(state: object) -> bool:
+    if type(state) is not BreakerState:
         return False
-    try:
-        fingerprint = _breaker_fingerprint(state)
-    except Exception:
-        return False
-    return _has_identity_authority(
+    children = _registered_risk_authority_children(
         _BREAKER_AUTHORITIES,
         state,
-        fingerprint,
-    ) and _phase1_derived_sources_are_current(state)
+    )
+    if (
+        children is None
+        or len(children) != 1
+        or type(children[0]) is not BreakerHistoryAuthority
+        or not _phase1_derived_sources_are_current_without_callbacks(state)
+        or not _is_current_breaker_history_authority_without_callbacks(
+            children[0]
+        )
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _BREAKER_AUTHORITIES,
+        state,
+        exact_type=BreakerState,
+        children=children,
+    )
+
+
+def is_issued_breaker_state(state: object) -> bool:
+    if type(state) is not BreakerState:
+        return False
+    children = _registered_risk_authority_children(
+        _BREAKER_AUTHORITIES,
+        state,
+    )
+    if (
+        children is None
+        or len(children) != 1
+        or type(children[0]) is not BreakerHistoryAuthority
+        or not _phase1_derived_sources_are_current(state)
+        or not is_issued_breaker_history_authority(children[0])
+    ):
+        return False
+    return _is_current_breaker_state_without_callbacks(state)
 
 
 def _paired_breaker_fingerprint(
@@ -9156,21 +10024,27 @@ def _paired_breaker_fingerprint(
 
 
 def is_issued_paired_breaker_state(state: object) -> bool:
-    if not isinstance(state, PairedBreakerState):
+    if type(state) is not PairedBreakerState:
         return False
-    try:
-        fingerprint = _paired_breaker_fingerprint(state)
-    except Exception:
+    if (
+        type(state.canonical) is not BreakerState
+        or type(state.actual) is not BreakerState
+        or not is_issued_breaker_state(state.canonical)
+        or not is_issued_breaker_state(state.actual)
+        or not _phase1_derived_sources_are_current(state)
+    ):
         return False
-    return (
-        _has_identity_authority(
-            _PAIRED_BREAKER_AUTHORITIES,
-            state,
-            fingerprint,
-        )
-        and is_issued_breaker_state(state.canonical)
-        and is_issued_breaker_state(state.actual)
-        and _phase1_derived_sources_are_current(state)
+    if not (
+        _phase1_derived_sources_are_current_without_callbacks(state)
+        and _is_current_breaker_state_without_callbacks(state.canonical)
+        and _is_current_breaker_state_without_callbacks(state.actual)
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _PAIRED_BREAKER_AUTHORITIES,
+        state,
+        exact_type=PairedBreakerState,
+        children=(state.canonical, state.actual),
     )
 
 
@@ -9460,12 +10334,13 @@ def evaluate_authorized_breakers(
         history_digest=history.source_digest,
         calendar_digest=_calendar_digest(history.calendar_resolver),
     )
-    _register_identity_authority(
+    _install_risk_authority(
         _BREAKER_AUTHORITIES,
         state,
-        _breaker_fingerprint(state),
+        exact_type=BreakerState,
+        children=(history,),
+        phase1_bindings=_phase1_bound_sources(history),
     )
-    _inherit_phase1_derived_sources(state, history)
     return state
 
 
@@ -9515,17 +10390,17 @@ def combine_breaker_states(
             actual=actual,
         )
     if authoritative_children:
-        _register_identity_authority(
-            _PAIRED_BREAKER_AUTHORITIES,
-            paired,
-            _paired_breaker_fingerprint(paired),
-        )
         phase1_sources = (
             *_phase1_bound_sources(canonical),
             *_phase1_bound_sources(actual),
         )
-        if phase1_sources:
-            _bind_phase1_derived_sources(paired, phase1_sources)
+        _install_risk_authority(
+            _PAIRED_BREAKER_AUTHORITIES,
+            paired,
+            exact_type=PairedBreakerState,
+            children=(canonical, actual),
+            phase1_bindings=phase1_sources,
+        )
     return paired
 
 
@@ -9542,6 +10417,100 @@ def evaluate_paired_breakers(
     canonical = evaluate_breakers(canonical_equity, canonical_closes, calendar)
     actual = evaluate_breakers(actual_equity, actual_closes, calendar)
     return combine_breaker_states(canonical, actual, as_of=as_of)
+
+
+_install_risk_authority = _risk_authority_installer_factory(
+    (
+        (
+            _LONG_PLAN_AUTHORITIES,
+            LongPlanDecision,
+            frozenset({_issue_long_plan_decision.__code__}),
+        ),
+        (
+            _PHASE1_EQUITY_POINT_AUTHORITIES,
+            Phase1EquityPointAuthority,
+            frozenset({_issue_phase1_equity_point_from_source.__code__}),
+        ),
+        (
+            _CONFIRMED_BUY_AUTHORITIES,
+            ConfirmedBuyAction,
+            frozenset({_issue_account_buy_authority.__code__}),
+        ),
+        (
+            _JOURNAL_WINDOW_AUTHORITIES,
+            JournalEventWindow,
+            frozenset({_issue_account_buy_authority.__code__}),
+        ),
+        (
+            _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+            Phase1SignalEvidenceAuthority,
+            frozenset(
+                {
+                    _issue_phase1_signal_evidence_authority.__code__,
+                    _issue_phase1_signal_evidence_authority_from_source.__code__,
+                }
+            ),
+        ),
+        (
+            _PHASE1_POSITION_EVIDENCE_AUTHORITIES,
+            Phase1PositionEvidenceAuthority,
+            frozenset({_issue_phase1_position_evidence_authority.__code__}),
+        ),
+        (
+            _MARK_AUTHORITIES,
+            MarketMark,
+            frozenset({build_market_mark.__code__}),
+        ),
+        (
+            _POSITION_EVENT_AUTHORITIES,
+            PositionEventContext,
+            frozenset(
+                {
+                    _derive_phase1_position_exit_material_from_verified_source.__code__,
+                }
+            ),
+        ),
+        (
+            _PHASE1_POSITION_EXIT_AUTHORITIES,
+            Phase1PositionExitAuthority,
+            frozenset(
+                {_issue_phase1_position_exit_authority_from_source.__code__}
+            ),
+        ),
+        (
+            _BREAKER_AUTHORITIES,
+            BreakerState,
+            frozenset({evaluate_authorized_breakers.__code__}),
+        ),
+        (
+            _PAIRED_BREAKER_AUTHORITIES,
+            PairedBreakerState,
+            frozenset({combine_breaker_states.__code__}),
+        ),
+        (
+            _PORTFOLIO_RISK_AUTHORITIES,
+            PortfolioRiskAuthority,
+            frozenset({_issue_portfolio_risk_authority.__code__}),
+        ),
+        (
+            _SETTLEMENT_LEDGER_AUTHORITIES,
+            SettlementLedger,
+            frozenset(
+                {
+                    _issue_settlement_ledger_from_account_window.__code__,
+                    _issue_settlement_replay.__code__,
+                }
+            ),
+        ),
+        (
+            _BREAKER_HISTORY_AUTHORITIES,
+            BreakerHistoryAuthority,
+            frozenset({_issue_breaker_history_from_phase1_source.__code__}),
+        ),
+    )
+)
+del _risk_authority_installer_factory
+del _getframe
 
 
 __all__ = [

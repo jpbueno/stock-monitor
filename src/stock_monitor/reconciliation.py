@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, localcontext
 from enum import Enum
+from sys import _getframe
 from threading import RLock
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from weakref import ReferenceType, WeakKeyDictionary, ref
 from zoneinfo import ZoneInfo
 
+from . import journal as _journal_authority_module
+from . import market_calendar as _market_calendar_authority_module
 from .confirmations import (
     ConfirmationEnvelope,
     ConfirmationKind,
@@ -36,7 +40,7 @@ from .journal import (
     is_verified_journal_action_source,
     is_verified_journal_replay_source,
 )
-from .ledger import LedgerSignal, is_issued_ledger_signal
+from .market_calendar import MarketCalendar
 from .policy import Policy
 from .risk import (
     RiskBlock,
@@ -44,6 +48,9 @@ from .risk import (
     _calendar_digest,
     _policy_digest,
 )
+
+if TYPE_CHECKING:
+    from .ledger import LedgerSignal
 
 
 _ET = ZoneInfo("America/New_York")
@@ -81,7 +88,9 @@ class ResolvedSignalPlan:
     publication_source_digest: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.signal, LedgerSignal):
+        from .ledger import LedgerSignal
+
+        if type(self.signal) is not LedgerSignal:
             raise ValueError("INVALID_RESOLVED_SIGNAL_PLAN")
         if type(self.report_id) is not str or not self.report_id:
             raise ValueError("INVALID_RESOLVED_SIGNAL_PLAN")
@@ -306,18 +315,18 @@ class ActualTransition:
 _ACTUAL_STATE_AUTHORITY_LOCK = RLock()
 _ACTUAL_STATE_AUTHORITIES: dict[
     int,
-    tuple[
-        ReferenceType[object],
-        tuple[object, ...],
-        ReferenceType[object],
-    ],
+    tuple[object, ...],
 ] = {}
+_ACTUAL_LEDGER_STATE_FINGERPRINT_DOMAIN = (
+    b"stock-monitor/actual-ledger-state/v1"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _IncrementalIngestionCheckpoint:
     owner: ReferenceType[object]
     source_generation: int
+    total_changes: int
     data_version: int
     calendar_digest: str
     policy_digest: str
@@ -332,7 +341,7 @@ class _IncrementalIngestionCheckpoint:
 _INGESTION_CHECKPOINT_LOCK = RLock()
 _INGESTION_CHECKPOINTS: WeakKeyDictionary[
     Journal,
-    tuple[_IncrementalIngestionCheckpoint, tuple[object, ...]],
+    tuple[object, ...],
 ] = WeakKeyDictionary()
 
 
@@ -341,6 +350,7 @@ def _ingestion_checkpoint_fingerprint(
 ) -> tuple[object, ...]:
     return (
         checkpoint.source_generation,
+        checkpoint.total_changes,
         checkpoint.data_version,
         checkpoint.calendar_digest,
         checkpoint.policy_digest,
@@ -396,61 +406,572 @@ def _store_incremental_ingestion_checkpoint(
     journal: Journal,
     checkpoint: _IncrementalIngestionCheckpoint,
 ) -> None:
-    fingerprint = _ingestion_checkpoint_fingerprint(checkpoint)
-    with _INGESTION_CHECKPOINT_LOCK:
-        _INGESTION_CHECKPOINTS[journal] = (checkpoint, fingerprint)
+    del journal, checkpoint
+    raise RiskBlock("INCREMENTAL_INGESTION_CHECKPOINT_ISSUER_UNVERIFIED")
 
 
-def _actual_state_authority_fingerprint(
-    state: ActualLedgerState,
-) -> tuple[object, ...]:
-    posting_fingerprint = tuple(
-        (
-            posting.row_id,
-            posting.posting_key,
-            posting.ledger_name,
-            posting.account_name,
-            posting.entry_kind,
-            posting.execution_event_id,
-            posting.account_check_id,
-            posting.symbol,
-            posting.amount_micros,
-            posting.shares_delta,
-            posting.unit_price_micros,
-            posting.occurred_at,
-            posting.details_json,
-            posting.row_reference.table,
-            posting.row_reference.row_id,
-            posting.row_reference.row_digest,
-        )
-        for posting in state.settlement_ledger
+def _make_incremental_ingestion_checkpoint_api(
+    *,
+    trusted_globals: dict[str, object],
+    issuer_function: object,
+    frame_getter: object,
+    checkpoint_type: type[_IncrementalIngestionCheckpoint],
+    journal_type: type[Journal],
+    state_type: type[ActualLedgerState],
+    calendar_type: type[SessionCalendarResolver],
+    policy_type: type[Policy],
+    policy_validate: object,
+    private_state_builder: object,
+    state_digest: object,
+    calendar_digest: object,
+    policy_digest: object,
+    journal_data_version: object,
+    checkpoint_lock: RLock,
+    registry: WeakKeyDictionary[Journal, tuple[object, ...]],
+    seal_factory: object,
+    seal_equal: object,
+    opaque_structural_mode: str,
+) -> tuple[object, object]:
+    """Capture the only checkpoint loader/mint path behind one issuer frame."""
+
+    required = (
+        issuer_function,
+        frame_getter,
+        policy_validate,
+        private_state_builder,
+        state_digest,
+        calendar_digest,
+        policy_digest,
+        journal_data_version,
+        seal_factory,
+        seal_equal,
     )
-    return (
-        _actual_state_digest(state),
-        state.source_digest,
-        state.cache_matches_replay,
-        posting_fingerprint,
+    if any(not callable(value) for value in required):
+        raise TypeError("incremental checkpoint dependency is invalid")
+
+    function_type = type(_make_incremental_ingestion_checkpoint_api)
+    issuer_code = issuer_function.__code__
+    missing = object()
+    bindings: list[tuple[dict[str, object], str, object]] = []
+    classes: list[tuple[type[object], tuple[tuple[str, object], ...]]] = []
+    seen_bindings: set[tuple[int, str]] = set()
+    seen_functions: set[int] = set()
+    seen_classes: set[int] = set()
+    pending = [
+        issuer_function,
+        private_state_builder,
+        state_digest,
+        calendar_digest,
+        policy_digest,
+        policy_validate,
+        journal_data_version,
+        seal_factory,
+        seal_equal,
+    ]
+    while pending:
+        dependency = pending.pop()
+        if type(dependency) is not function_type or id(dependency) in seen_functions:
+            continue
+        seen_functions.add(id(dependency))
+        namespace = dependency.__globals__
+        for name in dependency.__code__.co_names:
+            if name not in namespace:
+                continue
+            value = namespace[name]
+            key = (id(namespace), name)
+            if key not in seen_bindings:
+                seen_bindings.add(key)
+                bindings.append((namespace, name, value))
+            if (
+                type(value) is function_type
+                and type(value.__module__) is str
+                and value.__module__.startswith("stock_monitor.")
+            ):
+                pending.append(value)
+            elif (
+                type(value) is type
+                and value is not journal_type
+                and type(value.__module__) is str
+                and value.__module__.startswith("stock_monitor.")
+                and id(value) not in seen_classes
+            ):
+                seen_classes.add(id(value))
+                classes.append((value, tuple(vars(value).items())))
+    bindings.extend(
+        (
+            (trusted_globals, "_private_incremental_state", private_state_builder),
+            (trusted_globals, "_actual_state_digest", state_digest),
+            (trusted_globals, "_calendar_digest", calendar_digest),
+            (trusted_globals, "_policy_digest", policy_digest),
+        )
+    )
+    binding_manifest = tuple(bindings)
+    class_manifest = tuple(classes)
+    checkpoint_domain = b"stock-monitor/incremental-ingestion-checkpoint/v2"
+    object_getattribute = object.__getattribute__
+    weak_reference_type = ReferenceType
+    timezone_type = type(UTC)
+    zoneinfo_type = ZoneInfo
+
+    def dependencies_are_current() -> bool:
+        if any(
+            namespace.get(name, missing) is not expected
+            for namespace, name, expected in binding_manifest
+        ):
+            return False
+        for dependency_type, expected_items in class_manifest:
+            current = vars(dependency_type)
+            if len(current) != len(expected_items) or any(
+                current.get(name, missing) is not expected
+                for name, expected in expected_items
+            ):
+                return False
+        return True
+
+    def timestamp_parts(value: object) -> tuple[int, ...] | None:
+        if type(value) is not datetime:
+            return None
+        timezone = object_getattribute(value, "tzinfo")
+        if type(timezone) not in {timezone_type, zoneinfo_type}:
+            return None
+        try:
+            utc_value = datetime.astimezone(value, UTC)
+            local_value = datetime.astimezone(value, _ET)
+        except Exception:
+            return None
+        return (
+            object_getattribute(utc_value, "year"),
+            object_getattribute(utc_value, "month"),
+            object_getattribute(utc_value, "day"),
+            object_getattribute(utc_value, "hour"),
+            object_getattribute(utc_value, "minute"),
+            object_getattribute(utc_value, "second"),
+            object_getattribute(utc_value, "microsecond"),
+            object_getattribute(local_value, "year"),
+            object_getattribute(local_value, "month"),
+            object_getattribute(local_value, "day"),
+        )
+
+    def connection_total_changes(journal: Journal) -> int | None:
+        try:
+            connection = object_getattribute(journal, "_connection")
+            if type(connection) is not sqlite3.Connection:
+                return None
+            total_changes = object_getattribute(connection, "total_changes")
+        except Exception:
+            return None
+        if type(total_changes) is not int or total_changes < 0:
+            return None
+        return total_changes
+
+    def fingerprint(checkpoint: _IncrementalIngestionCheckpoint) -> object:
+        return seal_factory(  # type: ignore[operator]
+            checkpoint,
+            domain=checkpoint_domain,
+            root_mode=opaque_structural_mode,
+        )
+
+    def checkpoint_shape_is_exact(
+        checkpoint: object,
+        *,
+        journal: Journal,
+    ) -> bool:
+        if type(checkpoint) is not checkpoint_type:
+            return False
+        owner = object_getattribute(checkpoint, "owner")
+        if type(owner) is not weak_reference_type or owner() is not journal:
+            return False
+        scalar_fields = (
+            object_getattribute(checkpoint, "source_generation"),
+            object_getattribute(checkpoint, "total_changes"),
+            object_getattribute(checkpoint, "data_version"),
+            object_getattribute(checkpoint, "terminal_cursor"),
+        )
+        if any(type(value) is not int or value < 0 for value in scalar_fields):
+            return False
+        if scalar_fields[-1] < 1:
+            return False
+        for name in ("calendar_digest", "policy_digest"):
+            digest = object_getattribute(checkpoint, name)
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                return False
+        if type(object_getattribute(checkpoint, "state")) is not state_type:
+            return False
+        if timestamp_parts(object_getattribute(checkpoint, "query_cutoff")) is None:
+            return False
+        for name in ("cache_economic_highwater", "account_value_effective_at"):
+            value = object_getattribute(checkpoint, name)
+            if value is not None and timestamp_parts(value) is None:
+                return False
+        stop_effective = object_getattribute(checkpoint, "stop_effective_at")
+        if type(stop_effective) is not tuple:
+            return False
+        return all(
+            type(item) is tuple
+            and len(item) == 2
+            and type(item[0]) is str
+            and bool(item[0])
+            and timestamp_parts(item[1]) is not None
+            for item in stop_effective
+        )
+
+    def loader(
+        journal: Journal,
+        *,
+        identity: tuple[int, int, int | None],
+        query_cutoff: datetime,
+        calendar: SessionCalendarResolver,
+        policy: Policy,
+    ) -> _IncrementalIngestionCheckpoint | None:
+        if (
+            type(journal) is not journal_type
+            or type(identity) is not tuple
+            or len(identity) != 3
+            or type(identity[0]) is not int
+            or type(identity[1]) is not int
+            or type(identity[2]) not in {int, type(None)}
+            or timestamp_parts(query_cutoff) is None
+            or not isinstance(calendar, calendar_type)
+            or type(policy) is not policy_type
+            or not dependencies_are_current()
+        ):
+            return None
+        try:
+            policy_validate(policy)  # type: ignore[operator]
+            current_calendar_digest = calendar_digest(calendar)  # type: ignore[operator]
+            current_policy_digest = policy_digest(policy)  # type: ignore[operator]
+            current_data_version = journal_data_version(journal)  # type: ignore[operator]
+        except Exception:
+            return None
+        current_total_changes = connection_total_changes(journal)
+        if (
+            current_total_changes is None
+            or type(current_data_version) is not int
+            or current_data_version != identity[1]
+            or type(current_calendar_digest) is not str
+            or type(current_policy_digest) is not str
+            or not dependencies_are_current()
+        ):
+            return None
+        with checkpoint_lock:
+            issued = registry.get(journal)
+        if type(issued) is not tuple or len(issued) != 8:
+            return None
+        checkpoint, expected_seal = issued[0], issued[1]
+        if not checkpoint_shape_is_exact(checkpoint, journal=journal):
+            return None
+        checkpoint_cutoff = timestamp_parts(checkpoint.query_cutoff)
+        requested_cutoff = timestamp_parts(query_cutoff)
+        if checkpoint_cutoff is None or requested_cutoff is None:
+            return None
+        state = checkpoint.state
+        try:
+            if (
+                issued[2]() is not journal
+                or issued[3] != current_total_changes
+                or issued[4] != identity[1]
+                or issued[5] != identity[2]
+                or issued[6] != current_calendar_digest
+                or issued[7] != current_policy_digest
+                or checkpoint.total_changes != current_total_changes
+                or checkpoint.data_version != identity[1]
+                or checkpoint.terminal_cursor != identity[2]
+                or checkpoint.calendar_digest != current_calendar_digest
+                or checkpoint.policy_digest != current_policy_digest
+                or state.calendar_digest != checkpoint.calendar_digest
+                or state.policy_digest != checkpoint.policy_digest
+                or state.through_cursor != checkpoint.terminal_cursor
+                or state.query_cutoff is not checkpoint.query_cutoff
+                or type(state.settlement_ledger) is not tuple
+                or len(state.settlement_ledger) != 0
+                or state.journal_source_digest is not None
+                or state.cache_matches_replay is not False
+                or type(state.source_digest) is not str
+                or state_digest(state) != state.source_digest  # type: ignore[operator]
+                or requested_cutoff[:7] < checkpoint_cutoff[:7]
+                or requested_cutoff[7:] != checkpoint_cutoff[7:]
+            ):
+                return None
+            current_seal = fingerprint(checkpoint)
+        except Exception:
+            return None
+        if (
+            not dependencies_are_current()
+            or connection_total_changes(journal) != current_total_changes
+            or not seal_equal(expected_seal, current_seal)  # type: ignore[operator]
+        ):
+            return None
+        with checkpoint_lock:
+            current = registry.get(journal)
+            return checkpoint if current is issued else None
+
+    def installer(
+        journal: Journal,
+        *,
+        identity: tuple[int, int, int | None],
+        query_cutoff: datetime,
+        terminal_cursor: int,
+        actual_state: ActualLedgerState,
+        calendar: SessionCalendarResolver,
+        policy: Policy,
+        cache_economic_highwater: datetime | None,
+        account_value_effective_at: datetime | None,
+        stop_effective_at: tuple[tuple[str, datetime], ...],
+    ) -> None:
+        caller = frame_getter(1)  # type: ignore[operator]
+        if caller.f_code is not issuer_code or caller.f_globals is not trusted_globals:
+            raise RiskBlock("INCREMENTAL_INGESTION_CHECKPOINT_ISSUER_UNVERIFIED")
+        if (
+            type(journal) is not journal_type
+            or type(identity) is not tuple
+            or len(identity) != 3
+            or type(identity[0]) is not int
+            or type(identity[1]) is not int
+            or type(identity[2]) is not int
+            or type(terminal_cursor) is not int
+            or terminal_cursor < 1
+            or identity[2] != terminal_cursor
+            or type(actual_state) is not state_type
+            or timestamp_parts(query_cutoff) is None
+            or not isinstance(calendar, calendar_type)
+            or type(policy) is not policy_type
+            or type(stop_effective_at) is not tuple
+            or not dependencies_are_current()
+        ):
+            raise ValueError("INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED")
+        policy_validate(policy)  # type: ignore[operator]
+        current_calendar_digest = calendar_digest(calendar)  # type: ignore[operator]
+        current_policy_digest = policy_digest(policy)  # type: ignore[operator]
+        checkpoint_state = private_state_builder(  # type: ignore[operator]
+            actual_state,
+            query_cutoff=query_cutoff,
+            through_cursor=terminal_cursor,
+        )
+        if (
+            type(checkpoint_state) is not state_type
+            or checkpoint_state.query_cutoff is not query_cutoff
+            or checkpoint_state.through_cursor != terminal_cursor
+            or checkpoint_state.calendar_digest != current_calendar_digest
+            or checkpoint_state.policy_digest != current_policy_digest
+            or type(checkpoint_state.settlement_ledger) is not tuple
+            or len(checkpoint_state.settlement_ledger) != 0
+            or checkpoint_state.journal_source_digest is not None
+            or checkpoint_state.cache_matches_replay is not False
+            or type(checkpoint_state.source_digest) is not str
+            or state_digest(checkpoint_state) != checkpoint_state.source_digest  # type: ignore[operator]
+            or not dependencies_are_current()
+        ):
+            raise ValueError("INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED")
+        current_data_version = journal_data_version(journal)  # type: ignore[operator]
+        current_total_changes = connection_total_changes(journal)
+        if (
+            type(current_data_version) is not int
+            or current_data_version != identity[1]
+            or current_total_changes is None
+        ):
+            raise ValueError("INCREMENTAL_INGESTION_CHECKPOINT_STALE")
+        checkpoint = checkpoint_type(
+            owner=ref(journal),
+            source_generation=identity[0],
+            total_changes=current_total_changes,
+            data_version=identity[1],
+            calendar_digest=current_calendar_digest,
+            policy_digest=current_policy_digest,
+            query_cutoff=query_cutoff,
+            terminal_cursor=terminal_cursor,
+            state=checkpoint_state,
+            cache_economic_highwater=cache_economic_highwater,
+            account_value_effective_at=account_value_effective_at,
+            stop_effective_at=stop_effective_at,
+        )
+        if not checkpoint_shape_is_exact(checkpoint, journal=journal):
+            raise ValueError("INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED")
+        checkpoint_seal = fingerprint(checkpoint)
+        issued = (
+            checkpoint,
+            checkpoint_seal,
+            ref(journal),
+            current_total_changes,
+            identity[1],
+            terminal_cursor,
+            current_calendar_digest,
+            current_policy_digest,
+        )
+        if (
+            not dependencies_are_current()
+            or connection_total_changes(journal) != current_total_changes
+        ):
+            raise ValueError("INCREMENTAL_INGESTION_CHECKPOINT_STALE")
+        with checkpoint_lock:
+            current = registry.get(journal)
+            if current is not None:
+                if (
+                    type(current) is not tuple
+                    or len(current) != 8
+                    or current[2]() is not journal
+                    or type(current[3]) is not int
+                    or type(current[5]) is not int
+                    or current[3] >= current_total_changes
+                    or current[5] >= terminal_cursor
+                ):
+                    raise RiskBlock("INCREMENTAL_INGESTION_CHECKPOINT_OVERWRITE")
+            registry[journal] = issued
+
+    return loader, installer
+
+
+_ActualLedgerStateAuthorityIssued = tuple[object, ...]
+_ActualLedgerStateAuthorityCandidate = tuple[
+    ActualLedgerState,
+    JournalActualReplaySource,
+    _ActualLedgerStateAuthorityIssued,
+    object,
+    object,
+    object,
+]
+
+
+def _make_actual_ledger_state_authority_candidate_api(
+    *,
+    authority_lock: RLock,
+    registry: dict[int, _ActualLedgerStateAuthorityIssued],
+    state_type: type[ActualLedgerState],
+    source_type: type[JournalActualReplaySource],
+    seal_factory: object,
+    seal_equal: object,
+    fingerprint_domain: bytes,
+    opaque_structural_mode: str,
+    semantic_rechecker: object,
+) -> tuple[object, object, object]:
+    """Capture immutable state-authority primitives behind deleted setup."""
+
+    if (
+        not callable(seal_factory)
+        or not callable(seal_equal)
+        or not callable(semantic_rechecker)
+    ):
+        raise TypeError("actual ledger state seal dependency is invalid")
+
+    def fingerprint(state: ActualLedgerState) -> object:
+        if type(state) is not state_type:
+            raise TypeError("actual ledger state type is unverified")
+        return seal_factory(  # type: ignore[operator]
+            state,
+            domain=fingerprint_domain,
+            root_mode=opaque_structural_mode,
+        )
+
+    def candidate(
+        state: object,
+        source: object,
+    ) -> _ActualLedgerStateAuthorityCandidate | None:
+        if type(state) is not state_type or type(source) is not source_type:
+            return None
+        with authority_lock:
+            issued = registry.get(id(state))
+            if (
+                issued is None
+                or type(issued) is not tuple
+                or len(issued) != 6
+                or issued[0]() is not state
+                or issued[2]() is not source
+                or issued[4] is not semantic_rechecker
+            ):
+                return None
+            return (
+                state,
+                source,
+                issued,
+                issued[1],
+                issued[3],
+                issued[5],
+            )
+
+    def is_current_without_callbacks(
+        captured: object,
+    ) -> bool:
+        if type(captured) is not tuple or len(captured) != 6:
+            return False
+        (
+            state,
+            source,
+            issued,
+            expected_fingerprint,
+            source_candidate,
+            material,
+        ) = captured
+        if (
+            type(state) is not state_type
+            or type(source) is not source_type
+            or type(issued) is not tuple
+            or len(issued) != 6
+            or issued[0]() is not state
+            or issued[1] is not expected_fingerprint
+            or issued[2]() is not source
+            or issued[3] is not source_candidate
+            or issued[4] is not semantic_rechecker
+            or issued[5] is not material
+        ):
+            return False
+        try:
+            if not semantic_rechecker(  # type: ignore[operator]
+                state,
+                source,
+                source_candidate,
+                expected_fingerprint,
+                material,
+            ):
+                return False
+            current_fingerprint = fingerprint(state)
+        except Exception:
+            return False
+        with authority_lock:
+            current = registry.get(id(state))
+            return (
+                current is issued
+                and current[0]() is state
+                and current[1] is expected_fingerprint
+                and current[2]() is source
+                and current[3] is source_candidate
+                and current[4] is semantic_rechecker
+                and current[5] is material
+                and seal_equal(  # type: ignore[operator]
+                    expected_fingerprint,
+                    current_fingerprint,
+                )
+            )
+
+    return fingerprint, candidate, is_current_without_callbacks
+
+def _is_current_actual_ledger_state_authority_for_source(
+    state: object,
+    source: object,
+) -> bool:
+    """Pure exact registry/source check after Journal currentness completed."""
+    candidate = _actual_ledger_state_authority_candidate(state, source)
+    return candidate is not None and (
+        _is_current_actual_ledger_state_authority_candidate_without_callbacks(
+            candidate
+        )
     )
 
 
 def is_verified_actual_ledger_state(state: object) -> bool:
     """Return whether replay issued this exact immutable derived state."""
-    if not isinstance(state, ActualLedgerState):
-        return False
-    try:
-        fingerprint = _actual_state_authority_fingerprint(state)
-    except Exception:
+    if type(state) is not ActualLedgerState:
         return False
     with _ACTUAL_STATE_AUTHORITY_LOCK:
         issued = _ACTUAL_STATE_AUTHORITIES.get(id(state))
-        if (
-            issued is None
-            or issued[0]() is not state
-            or issued[1] != fingerprint
-        ):
-            return False
-        source = issued[2]()
-    return source is not None and is_verified_journal_replay_source(source)
+        source = None if issued is None else issued[2]()
+    if type(source) is not JournalActualReplaySource or not (
+        is_verified_journal_replay_source(source)
+    ):
+        return False
+    return _is_current_actual_ledger_state_authority_for_source(state, source)
 
 
 def is_verified_actual_ledger_state_for_source(
@@ -458,20 +979,15 @@ def is_verified_actual_ledger_state_for_source(
     source: object,
 ) -> bool:
     """Bind a replay-issued state to its exact in-process Journal source."""
-    if not isinstance(state, ActualLedgerState) or not isinstance(
-        source,
-        JournalActualReplaySource,
+    if type(state) is not ActualLedgerState or (
+        type(source) is not JournalActualReplaySource
     ):
         return False
-    with _ACTUAL_STATE_AUTHORITY_LOCK:
-        issued = _ACTUAL_STATE_AUTHORITIES.get(id(state))
-        return (
-            issued is not None
-            and issued[0]() is state
-            and issued[1] == _actual_state_authority_fingerprint(state)
-            and issued[2]() is source
-            and is_verified_journal_replay_source(source)
-        )
+    # Journal currentness may invoke SQLite callbacks.  Complete it before the
+    # final callback-free state seal and exact registry comparison.
+    if not is_verified_journal_replay_source(source):
+        return False
+    return _is_current_actual_ledger_state_authority_for_source(state, source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +1113,8 @@ def _entry_reasons(
     resolver: SignalPlanResolver,
     query_cutoff: datetime,
 ) -> tuple[list[str], LedgerSignal | None]:
+    from .ledger import is_issued_ledger_signal
+
     assert action.symbol is not None
     assert action.event_time is not None
     assert action.quantity is not None
@@ -811,6 +1329,7 @@ def assess_confirmation(
         else:
             reasons.append("FEE_LINEAGE_AMBIGUOUS")
     elif action.kind in {
+        ConfirmationKind.OPTION_REVIEW,
         ConfirmationKind.OPTION_OPEN,
         ConfirmationKind.OPTION_MARK,
         ConfirmationKind.OPTION_CLOSE,
@@ -2664,6 +3183,676 @@ def _replay_actual_source(
     )
 
 
+def _make_actual_ledger_state_authority_api(
+    *,
+    trusted_globals: dict[str, object],
+    issuer_code: object,
+    frame_getter: object,
+    replay_builder: object,
+    authority_lock: RLock,
+    registry: dict[int, tuple[object, ...]],
+    state_type: type[ActualLedgerState],
+    position_type: type[ActualPositionState],
+    lot_type: type[ActualLot],
+    closed_trade_type: type[ActualClosedTrade],
+    source_type: type[JournalActualReplaySource],
+    resolver_protocol: type[SignalPlanResolver],
+    unavailable_resolver_type: type[UnavailableSignalPlanResolver],
+    calendar_resolver_type: type[SessionCalendarResolver],
+    market_calendar_type: type[MarketCalendar],
+    policy_type: type[Policy],
+    policy_validate: object,
+    validated_calendar_registry: dict[int, tuple[object, ...]],
+    release_calendar_registry: dict[int, tuple[object, ...]],
+    calendar_authority_lock: RLock,
+    calendar_fingerprint: object,
+    journal_fingerprints_equal: object,
+    journal_source_verifier: object,
+    journal_candidate_factory: object,
+    journal_candidate_recheck: object,
+    seal_factory: object,
+    seal_equal: object,
+    opaque_structural_mode: str,
+) -> tuple[object, object]:
+    """Build the callback-first, closure-captured actual-state mint seam."""
+
+    required_callables = (
+        frame_getter,
+        replay_builder,
+        policy_validate,
+        calendar_fingerprint,
+        journal_fingerprints_equal,
+        journal_source_verifier,
+        journal_candidate_factory,
+        journal_candidate_recheck,
+        seal_factory,
+        seal_equal,
+    )
+    if any(not callable(value) for value in required_callables):
+        raise TypeError("actual ledger state authority dependency is invalid")
+
+    function_type = type(_make_actual_ledger_state_authority_api)
+    missing = object()
+    binding_manifest: list[tuple[dict[str, object], str, object]] = []
+    class_manifest: list[tuple[type[object], tuple[tuple[str, object], ...]]] = []
+    seen_bindings: set[tuple[int, str]] = set()
+    seen_functions: set[int] = set()
+    seen_classes: set[int] = set()
+    pending = [
+        replay_builder,
+        policy_validate,
+        calendar_fingerprint,
+        journal_fingerprints_equal,
+        journal_source_verifier,
+        journal_candidate_factory,
+        journal_candidate_recheck,
+        seal_factory,
+        seal_equal,
+    ]
+
+    def enqueue_class_callables(dependency_type: type[object]) -> None:
+        if id(dependency_type) in seen_classes:
+            return
+        seen_classes.add(id(dependency_type))
+        expected_items = tuple(vars(dependency_type).items())
+        class_manifest.append((dependency_type, expected_items))
+        for _name, member in expected_items:
+            if type(member) is function_type:
+                pending.append(member)
+            elif type(member) in {classmethod, staticmethod}:
+                pending.append(member.__func__)
+            elif type(member) is property:
+                pending.extend(
+                    function
+                    for function in (member.fget, member.fset, member.fdel)
+                    if function is not None
+                )
+
+    # Replay dispatches through these exact class methods and properties.  Seed
+    # their code and globals explicitly: a self-restoring class-method patch is
+    # otherwise invisible to a manifest rooted only at module-level helpers.
+    enqueue_class_callables(calendar_resolver_type)
+    enqueue_class_callables(market_calendar_type)
+
+    while pending:
+        dependency = pending.pop()
+        if type(dependency) is not function_type or id(dependency) in seen_functions:
+            continue
+        seen_functions.add(id(dependency))
+        dependency_globals = dependency.__globals__
+        for name in dependency.__code__.co_names:
+            if name not in dependency_globals:
+                continue
+            value = dependency_globals[name]
+            binding_key = (id(dependency_globals), name)
+            if binding_key not in seen_bindings:
+                seen_bindings.add(binding_key)
+                binding_manifest.append((dependency_globals, name, value))
+            if (
+                type(value) is function_type
+                and type(value.__module__) is str
+                and value.__module__.startswith("stock_monitor.")
+            ):
+                pending.append(value)
+            elif (
+                type(value) is type
+                and type(value.__module__) is str
+                and value.__module__.startswith("stock_monitor.")
+                and id(value) not in seen_classes
+            ):
+                seen_classes.add(id(value))
+                class_manifest.append((value, tuple(vars(value).items())))
+
+    binding_manifest.append(
+        (trusted_globals, "_replay_actual_source", replay_builder)
+    )
+    binding_manifest_tuple = tuple(binding_manifest)
+    class_manifest_tuple = tuple(class_manifest)
+    policy_fields = (
+        ("capital", Decimal),
+        ("max_live_exposure", Decimal),
+        ("max_position_risk", Decimal),
+        ("max_combined_risk", Decimal),
+        ("max_positions", int),
+        ("max_entries_per_session", int),
+        ("min_score", int),
+        ("max_monthly_drawdown", Decimal),
+        ("max_weekly_drawdown", Decimal),
+        ("universe_max_age_days", int),
+        ("live_quote_max_age_seconds", int),
+        ("disagreement_tolerance", Decimal),
+    )
+    calendar_domain = b"stock-monitor/actual-state-calendar-material/v1"
+    policy_domain = b"stock-monitor/actual-state-policy-material/v1"
+    state_domain = _ACTUAL_LEDGER_STATE_FINGERPRINT_DOMAIN
+    object_getattribute = object.__getattribute__
+    object_new = object.__new__
+    object_setattr = object.__setattr__
+    weak_reference = ref
+    timezone_type = type(UTC)
+    timedelta_type = timedelta
+    zoneinfo_type = ZoneInfo
+
+    def dependencies_are_current() -> bool:
+        for namespace, name, expected in binding_manifest_tuple:
+            if namespace.get(name, missing) is not expected:
+                return False
+        for dependency_type, expected_items in class_manifest_tuple:
+            current = vars(dependency_type)
+            if len(current) != len(expected_items) or any(
+                current.get(name, missing) is not expected
+                for name, expected in expected_items
+            ):
+                return False
+        return True
+
+    def fingerprint(value: object, *, domain: bytes) -> object:
+        return seal_factory(  # type: ignore[operator]
+            value,
+            domain=domain,
+            root_mode=opaque_structural_mode,
+        )
+
+    def calendar_authorities_are_current(
+        safe_calendar: object,
+        captured: object,
+        *,
+        require_release: bool,
+    ) -> bool:
+        if (
+            type(safe_calendar) is not calendar_resolver_type
+            or type(require_release) is not bool
+            or object_getattribute(safe_calendar, "_require_release")
+            is not require_release
+            or type(captured) is not tuple
+        ):
+            return False
+        calendars = object_getattribute(safe_calendar, "calendars")
+        if type(calendars) is not tuple or len(calendars) != len(captured):
+            return False
+        for item, authority in zip(calendars, captured, strict=True):
+            if (
+                type(item) is not market_calendar_type
+                or type(authority) is not tuple
+                or len(authority) != 4
+                or authority[0] is not item
+            ):
+                return False
+            expected_seal, validated_record, release_record = authority[1:]
+            try:
+                # The opaque seal runs before the legacy calendar fingerprint,
+                # so an injected container/leaf cannot dispatch equality hooks.
+                if not seal_equal(  # type: ignore[operator]
+                    expected_seal,
+                    fingerprint(item, domain=calendar_domain),
+                ):
+                    return False
+                current_calendar_fingerprint = calendar_fingerprint(item)  # type: ignore[operator]
+                if (
+                    type(validated_record) is not tuple
+                    or len(validated_record) != 2
+                    or validated_record[0]() is not item
+                    or not journal_fingerprints_equal(  # type: ignore[operator]
+                        validated_record[1],
+                        current_calendar_fingerprint,
+                    )
+                    or (
+                        require_release
+                        and (
+                            type(release_record) is not tuple
+                            or len(release_record) != 2
+                            or release_record[0]() is not item
+                            or not journal_fingerprints_equal(  # type: ignore[operator]
+                                release_record[1],
+                                current_calendar_fingerprint,
+                            )
+                        )
+                    )
+                ):
+                    return False
+            except Exception:
+                return False
+            with calendar_authority_lock:
+                if (
+                    validated_calendar_registry.get(id(item))
+                    is not validated_record
+                    or (
+                        require_release
+                        and release_calendar_registry.get(id(item))
+                        is not release_record
+                    )
+                ):
+                    return False
+            try:
+                if not seal_equal(  # type: ignore[operator]
+                    expected_seal,
+                    fingerprint(item, domain=calendar_domain),
+                ):
+                    return False
+            except Exception:
+                return False
+        try:
+            return safe_calendar.release_verified is require_release
+        except Exception:
+            return False
+
+    def material_is_current(material: object) -> bool:
+        if type(material) is not tuple or len(material) != 5:
+            return False
+        (
+            safe_calendar,
+            calendar_seal,
+            safe_policy,
+            policy_seal,
+            calendar_authorities,
+        ) = material
+        if (
+            type(safe_calendar) is not calendar_resolver_type
+            or type(safe_policy) is not policy_type
+        ):
+            return False
+        require_release = object_getattribute(
+            safe_calendar,
+            "_require_release",
+        )
+        if type(require_release) is not bool:
+            return False
+        try:
+            return bool(
+                seal_equal(  # type: ignore[operator]
+                    calendar_seal,
+                    fingerprint(safe_calendar, domain=calendar_domain),
+                )
+                and seal_equal(  # type: ignore[operator]
+                    policy_seal,
+                    fingerprint(safe_policy, domain=policy_domain),
+                )
+                and calendar_authorities_are_current(
+                    safe_calendar,
+                    calendar_authorities,
+                    require_release=require_release,
+                )
+            )
+        except Exception:
+            return False
+
+    def datetime_value(value: object) -> tuple[object, ...] | None:
+        if type(value) is not datetime:
+            return None
+        timezone = object_getattribute(value, "tzinfo")
+        if type(timezone) not in {timezone_type, zoneinfo_type}:
+            return None
+        try:
+            offset = datetime.utcoffset(value)
+        except Exception:
+            return None
+        if type(offset) is not timedelta_type:
+            return None
+        zone_key: str | None = None
+        if type(timezone) is zoneinfo_type:
+            zone_key = object_getattribute(timezone, "key")
+            if type(zone_key) is not str:
+                return None
+        return (
+            b"datetime",
+            object_getattribute(value, "year"),
+            object_getattribute(value, "month"),
+            object_getattribute(value, "day"),
+            object_getattribute(value, "hour"),
+            object_getattribute(value, "minute"),
+            object_getattribute(value, "second"),
+            object_getattribute(value, "microsecond"),
+            object_getattribute(value, "fold"),
+            object_getattribute(offset, "days"),
+            object_getattribute(offset, "seconds"),
+            object_getattribute(offset, "microseconds"),
+            zone_key,
+        )
+
+    def scalar_or_tuple(value: object) -> object:
+        if value is None or type(value) in {bool, int, str, bytes}:
+            return value
+        if type(value) is datetime:
+            normalized = datetime_value(value)
+            return missing if normalized is None else normalized
+        if type(value) is tuple:
+            normalized_items: list[object] = []
+            for item in value:
+                normalized = scalar_or_tuple(item)
+                if normalized is missing:
+                    return missing
+                normalized_items.append(normalized)
+            return tuple(normalized_items)
+        return missing
+
+    def lot_value(value: object) -> tuple[object, ...] | None:
+        if type(value) is not lot_type:
+            return None
+        normalized = tuple(
+            scalar_or_tuple(object_getattribute(value, name))
+            for name in (
+                "source_event_id",
+                "source_cursor",
+                "remaining_shares",
+                "unit_cost_micros",
+                "acquired_at",
+                "received_at",
+                "parent_order_id",
+            )
+        )
+        if any(item is missing for item in normalized):
+            return None
+        return (lot_type, *normalized)
+
+    def position_value(value: object) -> tuple[object, ...] | None:
+        if type(value) is not position_type:
+            return None
+        lots = object_getattribute(value, "lots")
+        if type(lots) is not tuple:
+            return None
+        normalized_lots = tuple(lot_value(item) for item in lots)
+        if any(item is None for item in normalized_lots):
+            return None
+        normalized = tuple(
+            scalar_or_tuple(object_getattribute(value, name))
+            for name in (
+                "signal_id",
+                "symbol",
+                "lineage_kind",
+                "signal_digest",
+                "recommended_stop_micros",
+                "user_stop_micros",
+                "target_micros",
+                "tick_micros",
+                "cumulative_buy_cost_micros",
+                "cumulative_sale_proceeds_micros",
+                "linked_fees_micros",
+                "reason_codes",
+                "lifecycle_event_ids",
+            )
+        )
+        if any(item is missing for item in normalized):
+            return None
+        return (position_type, normalized_lots, *normalized)
+
+    def closed_trade_value(value: object) -> tuple[object, ...] | None:
+        if type(value) is not closed_trade_type:
+            return None
+        normalized = tuple(
+            scalar_or_tuple(object_getattribute(value, name))
+            for name in (
+                "signal_id",
+                "symbol",
+                "opened_at",
+                "closed_at",
+                "source_cursor",
+                "source_ordinal",
+                "buy_cost_micros",
+                "gross_sale_micros",
+                "fees_micros",
+                "pnl_micros",
+                "source_event_ids",
+                "source_digest",
+            )
+        )
+        if any(item is missing for item in normalized):
+            return None
+        return (closed_trade_type, *normalized)
+
+    def state_semantic_value(value: object) -> tuple[object, ...] | None:
+        if type(value) is not state_type:
+            return None
+        positions = object_getattribute(value, "positions")
+        closed_trades = object_getattribute(value, "closed_trades")
+        if type(positions) is not tuple or type(closed_trades) is not tuple:
+            return None
+        normalized_positions = tuple(position_value(item) for item in positions)
+        normalized_closed = tuple(
+            closed_trade_value(item) for item in closed_trades
+        )
+        if any(item is None for item in normalized_positions) or any(
+            item is None for item in normalized_closed
+        ):
+            return None
+        normalized = tuple(
+            scalar_or_tuple(object_getattribute(value, name))
+            for name in (
+                "query_cutoff",
+                "through_cursor",
+                "strategy_settled_cash_micros",
+                "user_confirmed_cash_micros",
+                "reconciliation_reasons",
+                "source_digest",
+                "cache_matches_replay",
+                "calendar_digest",
+                "calendar_release_verified",
+                "journal_source_digest",
+                "policy_digest",
+            )
+        )
+        if any(item is missing for item in normalized):
+            return None
+        # Settlement rows are independently pinned to the exact Journal tuple.
+        return (
+            state_type,
+            normalized_positions,
+            normalized_closed,
+            b"exact-journal-postings",
+            *normalized,
+        )
+
+    def derive_expected(
+        source: JournalActualReplaySource,
+        source_candidate: object,
+        material: object,
+    ) -> ActualLedgerState | None:
+        if (
+            type(source) is not source_type
+            or not dependencies_are_current()
+            or not material_is_current(material)
+            or not journal_candidate_recheck(source_candidate)  # type: ignore[operator]
+        ):
+            return None
+        (
+            safe_calendar,
+            _calendar_seal,
+            safe_policy,
+            _policy_seal,
+            _calendar_authorities,
+        ) = material
+        try:
+            expected = replay_builder(  # type: ignore[operator]
+                source,
+                plans=unavailable_resolver_type(),
+                calendar=safe_calendar,
+                policy=safe_policy,
+                require_verified=False,
+            )
+        except Exception:
+            return None
+        if (
+            type(expected) is not state_type
+            or expected.settlement_ledger is not source.postings
+            or expected.query_cutoff is not source.query_cutoff
+            or not dependencies_are_current()
+            or not material_is_current(material)
+            or not journal_candidate_recheck(source_candidate)  # type: ignore[operator]
+        ):
+            return None
+        return expected
+
+    def semantic_rechecker(
+        state: object,
+        source: object,
+        source_candidate: object,
+        expected_state_seal: object,
+        material: object,
+    ) -> bool:
+        if type(state) is not state_type or type(source) is not source_type:
+            return False
+        expected = derive_expected(source, source_candidate, material)
+        if expected is None:
+            return False
+        try:
+            current_state_seal = fingerprint(state, domain=state_domain)
+        except Exception:
+            return False
+        current_semantics = state_semantic_value(state)
+        expected_semantics = state_semantic_value(expected)
+        return bool(
+            state.settlement_ledger is source.postings
+            and state.query_cutoff is source.query_cutoff
+            and expected.settlement_ledger is source.postings
+            and expected.query_cutoff is source.query_cutoff
+            and current_semantics is not None
+            and expected_semantics is not None
+            and seal_equal(  # type: ignore[operator]
+                expected_state_seal,
+                current_state_seal,
+            )
+            and journal_fingerprints_equal(  # type: ignore[operator]
+                current_semantics,
+                expected_semantics,
+            )
+            and dependencies_are_current()
+            and material_is_current(material)
+            and journal_candidate_recheck(source_candidate)  # type: ignore[operator]
+        )
+
+    def installer(
+        source: object,
+        *,
+        plans: object,
+        calendar: object,
+        policy: object,
+    ) -> ActualLedgerState:
+        caller = frame_getter(1)  # type: ignore[operator]
+        if caller.f_code is not issuer_code or caller.f_globals is not trusted_globals:
+            raise RiskBlock("ACTUAL_LEDGER_STATE_ISSUER_UNVERIFIED")
+        if type(source) is not source_type:
+            raise TypeError("source must be a JournalActualReplaySource")
+        if not isinstance(plans, resolver_protocol):
+            raise TypeError("plans must implement SignalPlanResolver")
+        if not isinstance(calendar, calendar_resolver_type):
+            raise TypeError("calendar must be a SessionCalendarResolver")
+        if type(policy) is not policy_type:
+            raise TypeError("policy must be an exact Policy")
+
+        policy_validate(policy)  # type: ignore[operator]
+        policy_values: dict[str, object] = {}
+        for name, required_type in policy_fields:
+            value = object_getattribute(policy, name)
+            if type(value) is not required_type:
+                raise ValueError("ACTUAL_LEDGER_POLICY_UNVERIFIED")
+            policy_values[name] = value
+        safe_policy = policy_type(**policy_values)
+        policy_validate(safe_policy)  # type: ignore[operator]
+
+        release_verified = calendar.release_verified
+        if type(release_verified) is not bool:
+            raise ValueError("ACTUAL_LEDGER_CALENDAR_UNVERIFIED")
+        calendars = object_getattribute(calendar, "calendars")
+        if type(calendars) is not tuple or not calendars or any(
+            type(item) is not market_calendar_type for item in calendars
+        ):
+            raise ValueError("ACTUAL_LEDGER_CALENDAR_UNVERIFIED")
+        calendars = tuple(calendars)
+        with calendar_authority_lock:
+            validated_records = tuple(
+                validated_calendar_registry.get(id(item)) for item in calendars
+            )
+            release_records = tuple(
+                release_calendar_registry.get(id(item)) for item in calendars
+            )
+        safe_calendar = object_new(calendar_resolver_type)
+        object_setattr(safe_calendar, "calendars", calendars)
+        object_setattr(safe_calendar, "_require_release", release_verified)
+        calendar_authorities = tuple(
+            (
+                item,
+                fingerprint(item, domain=calendar_domain),
+                validated_record,
+                release_record,
+            )
+            for item, validated_record, release_record in zip(
+                calendars,
+                validated_records,
+                release_records,
+                strict=True,
+            )
+        )
+        if not calendar_authorities_are_current(
+            safe_calendar,
+            calendar_authorities,
+            require_release=release_verified,
+        ):
+            raise ValueError("ACTUAL_LEDGER_CALENDAR_UNVERIFIED")
+
+        # The accepted resolver/protocol checks above may dispatch caller code.
+        # Journal verification and candidate capture are therefore deliberately
+        # last before the callback-free reconstruction phase.
+        if not journal_source_verifier(source):  # type: ignore[operator]
+            raise ValueError("JOURNAL_ACTUAL_REPLAY_SOURCE_UNVERIFIED")
+        source_candidate = journal_candidate_factory(source)  # type: ignore[operator]
+        if source_candidate is None or not journal_candidate_recheck(  # type: ignore[operator]
+            source_candidate
+        ):
+            raise ValueError("JOURNAL_ACTUAL_REPLAY_SOURCE_UNVERIFIED")
+        if not dependencies_are_current() or not calendar_authorities_are_current(
+            safe_calendar,
+            calendar_authorities,
+            require_release=release_verified,
+        ):
+            raise ValueError("ACTUAL_LEDGER_CONSTRUCTION_DEPENDENCY_UNVERIFIED")
+
+        material = (
+            safe_calendar,
+            fingerprint(safe_calendar, domain=calendar_domain),
+            safe_policy,
+            fingerprint(safe_policy, domain=policy_domain),
+            calendar_authorities,
+        )
+        state = derive_expected(source, source_candidate, material)
+        if state is None:
+            raise ValueError("ACTUAL_LEDGER_STATE_CONTENT_UNVERIFIED")
+        if not release_verified:
+            return state
+        state_seal = fingerprint(state, domain=state_domain)
+        if not semantic_rechecker(
+            state,
+            source,
+            source_candidate,
+            state_seal,
+            material,
+        ):
+            raise ValueError("ACTUAL_LEDGER_STATE_CONTENT_UNVERIFIED")
+
+        key = id(state)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with authority_lock:
+                current = registry.get(key)
+                if current is not None and current[0] is dead:
+                    registry.pop(key, None)
+
+        issued = (
+            weak_reference(state, discard),
+            state_seal,
+            weak_reference(source),
+            source_candidate,
+            semantic_rechecker,
+            material,
+        )
+        with authority_lock:
+            current = registry.get(key)
+            if current is not None:
+                raise RiskBlock("ACTUAL_LEDGER_STATE_ALREADY_ISSUED")
+            registry[key] = issued
+        return state
+
+    return semantic_rechecker, installer
+
+
 def replay_actual(
     source: JournalActualReplaySource,
     *,
@@ -2672,36 +3861,83 @@ def replay_actual(
     policy: Policy,
 ) -> ActualLedgerState:
     """Replay receipt-stable ownership with effective-time lot eligibility."""
-    state = _replay_actual_source(
+    return _install_actual_ledger_state_authority(
         source,
         plans=plans,
         calendar=calendar,
         policy=policy,
-        require_verified=True,
     )
-    if (
-        state.journal_source_digest != source.source_digest
-        or state.calendar_digest != _calendar_digest(calendar)
-        or state.policy_digest != _policy_digest(policy)
-    ):
-        raise ValueError("ACTUAL_LEDGER_STATE_PROVENANCE_MISMATCH")
-    if not calendar.release_verified:
-        return state
-    key = id(state)
 
-    def discard(dead: ReferenceType[object]) -> None:
-        with _ACTUAL_STATE_AUTHORITY_LOCK:
-            current = _ACTUAL_STATE_AUTHORITIES.get(key)
-            if current is not None and current[0] is dead:
-                _ACTUAL_STATE_AUTHORITIES.pop(key, None)
 
-    with _ACTUAL_STATE_AUTHORITY_LOCK:
-        _ACTUAL_STATE_AUTHORITIES[key] = (
-            ref(state, discard),
-            _actual_state_authority_fingerprint(state),
-            ref(source),
-        )
-    return state
+(
+    _actual_state_semantic_rechecker,
+    _install_actual_ledger_state_authority,
+) = _make_actual_ledger_state_authority_api(
+    trusted_globals=globals(),
+    issuer_code=replay_actual.__code__,
+    frame_getter=_getframe,
+    replay_builder=_replay_actual_source,
+    authority_lock=_ACTUAL_STATE_AUTHORITY_LOCK,
+    registry=_ACTUAL_STATE_AUTHORITIES,
+    state_type=ActualLedgerState,
+    position_type=ActualPositionState,
+    lot_type=ActualLot,
+    closed_trade_type=ActualClosedTrade,
+    source_type=JournalActualReplaySource,
+    resolver_protocol=SignalPlanResolver,
+    unavailable_resolver_type=UnavailableSignalPlanResolver,
+    calendar_resolver_type=SessionCalendarResolver,
+    market_calendar_type=MarketCalendar,
+    policy_type=Policy,
+    policy_validate=Policy.validate,
+    validated_calendar_registry=(
+        _market_calendar_authority_module._VALIDATED_CALENDARS
+    ),
+    release_calendar_registry=(
+        _market_calendar_authority_module._RELEASE_CALENDARS
+    ),
+    calendar_authority_lock=(
+        _market_calendar_authority_module._CALENDAR_AUTHORITY_LOCK
+    ),
+    calendar_fingerprint=(
+        _market_calendar_authority_module._calendar_fingerprint
+    ),
+    journal_fingerprints_equal=_journal_authority_module._fingerprints_equal,
+    journal_source_verifier=is_verified_journal_replay_source,
+    journal_candidate_factory=(
+        _journal_authority_module._journal_replay_source_authority_candidate
+    ),
+    journal_candidate_recheck=(
+        _journal_authority_module._is_current_journal_authority_candidate_without_callbacks
+    ),
+    seal_factory=_journal_authority_module._source_fingerprint_seal,
+    seal_equal=_journal_authority_module._source_fingerprint_seals_equal,
+    opaque_structural_mode=(
+        _journal_authority_module._MERKLE_OPAQUE_STRUCTURAL
+    ),
+)
+(
+    _actual_state_authority_fingerprint,
+    _actual_ledger_state_authority_candidate,
+    _is_current_actual_ledger_state_authority_candidate_without_callbacks,
+) = _make_actual_ledger_state_authority_candidate_api(
+    authority_lock=_ACTUAL_STATE_AUTHORITY_LOCK,
+    registry=_ACTUAL_STATE_AUTHORITIES,
+    state_type=ActualLedgerState,
+    source_type=JournalActualReplaySource,
+    seal_factory=_journal_authority_module._source_fingerprint_seal,
+    seal_equal=_journal_authority_module._source_fingerprint_seals_equal,
+    fingerprint_domain=_ACTUAL_LEDGER_STATE_FINGERPRINT_DOMAIN,
+    opaque_structural_mode=(
+        _journal_authority_module._MERKLE_OPAQUE_STRUCTURAL
+    ),
+    semantic_rechecker=_actual_state_semantic_rechecker,
+)
+del (
+    _actual_state_semantic_rechecker,
+    _make_actual_ledger_state_authority_api,
+    _make_actual_ledger_state_authority_candidate_api,
+)
 
 
 def plan_actual_transition(
@@ -2836,7 +4072,7 @@ def _stored_to_result(
     )
 
 
-def ingest_confirmation(
+def _ingest_confirmation_impl(
     journal: Journal,
     envelope: ConfirmationEnvelope,
     *,
@@ -2845,6 +4081,10 @@ def ingest_confirmation(
     policy: Policy,
     entry_authorities: ActualEntryAuthorityResolver,
     destination: str = "CODEX_TASK",
+    _trusted_replay_builder: object,
+    _trusted_private_state_builder: object,
+    _trusted_checkpoint_loader: object,
+    _trusted_checkpoint_installer: object,
 ) -> IngestionResult:
     """Persist a complete source message and its actions in one transaction."""
     if not isinstance(journal, Journal):
@@ -2874,7 +4114,7 @@ def ingest_confirmation(
         # calendar, policy, cutoff-date, or content mismatch falls back to the
         # exact full replay before the candidate raw row is inserted.
         prior_identity = transaction._incremental_ingestion_identity()
-        checkpoint = _load_incremental_ingestion_checkpoint(
+        checkpoint = _trusted_checkpoint_loader(  # type: ignore[operator]
             journal,
             identity=prior_identity,
             query_cutoff=envelope.received_at,
@@ -2886,7 +4126,7 @@ def ingest_confirmation(
                 query_cutoff=envelope.received_at,
                 through_execution_cursor=None,
             )
-            actual_state = _replay_actual_source(
+            actual_state = _trusted_replay_builder(  # type: ignore[operator]
                 prior_source,
                 plans=UnavailableSignalPlanResolver(),
                 calendar=calendar,
@@ -2922,13 +4162,13 @@ def ingest_confirmation(
                         stop_effective_at[source_action.signal_id] = (
                             source_action.event_time
                         )
-            actual_state = _private_incremental_state(
+            actual_state = _trusted_private_state_builder(  # type: ignore[operator]
                 actual_state,
                 query_cutoff=envelope.received_at,
                 through_cursor=prior_source.terminal_cursor,
             )
         else:
-            actual_state = _private_incremental_state(
+            actual_state = _trusted_private_state_builder(  # type: ignore[operator]
                 checkpoint.state,
                 query_cutoff=envelope.received_at,
                 through_cursor=checkpoint.terminal_cursor,
@@ -3329,28 +4569,125 @@ def ingest_confirmation(
         raise RuntimeError("committed confirmation could not be read back")
     terminal_cursor = stored.actions[-1].event_row_id
     if committed_identity[2] == terminal_cursor:
-        checkpoint_state = _private_incremental_state(
-            actual_state,
-            query_cutoff=envelope.received_at,
-            through_cursor=terminal_cursor,
-        )
-        _store_incremental_ingestion_checkpoint(
+        _trusted_checkpoint_installer(  # type: ignore[operator]
             journal,
-            _IncrementalIngestionCheckpoint(
-                owner=ref(journal),
-                source_generation=committed_identity[0],
-                data_version=committed_identity[1],
-                calendar_digest=_calendar_digest(calendar),
-                policy_digest=_policy_digest(policy),
-                query_cutoff=envelope.received_at,
-                terminal_cursor=terminal_cursor,
-                state=checkpoint_state,
-                cache_economic_highwater=cache_economic_highwater,
-                account_value_effective_at=account_value_effective_at,
-                stop_effective_at=tuple(sorted(stop_effective_at.items())),
-            ),
+            identity=committed_identity,
+            query_cutoff=envelope.received_at,
+            terminal_cursor=terminal_cursor,
+            actual_state=actual_state,
+            calendar=calendar,
+            policy=policy,
+            cache_economic_highwater=cache_economic_highwater,
+            account_value_effective_at=account_value_effective_at,
+            stop_effective_at=tuple(sorted(stop_effective_at.items())),
         )
     return _stored_to_result(stored, duplicate=False)
+
+
+(
+    _load_incremental_ingestion_checkpoint,
+    _install_incremental_ingestion_checkpoint,
+) = _make_incremental_ingestion_checkpoint_api(
+    trusted_globals=globals(),
+    issuer_function=_ingest_confirmation_impl,
+    frame_getter=_getframe,
+    checkpoint_type=_IncrementalIngestionCheckpoint,
+    journal_type=Journal,
+    state_type=ActualLedgerState,
+    calendar_type=SessionCalendarResolver,
+    policy_type=Policy,
+    policy_validate=Policy.validate,
+    private_state_builder=_private_incremental_state,
+    state_digest=_actual_state_digest,
+    calendar_digest=_calendar_digest,
+    policy_digest=_policy_digest,
+    journal_data_version=Journal._source_authority_data_version,
+    checkpoint_lock=_INGESTION_CHECKPOINT_LOCK,
+    registry=_INGESTION_CHECKPOINTS,
+    seal_factory=_journal_authority_module._source_fingerprint_seal,
+    seal_equal=_journal_authority_module._source_fingerprint_seals_equal,
+    opaque_structural_mode=(
+        _journal_authority_module._MERKLE_OPAQUE_STRUCTURAL
+    ),
+)
+
+
+def _make_ingest_confirmation_entrypoint(
+    *,
+    implementation: object,
+    replay_builder: object,
+    private_state_builder: object,
+    checkpoint_loader: object,
+    checkpoint_installer: object,
+    policy_type: type[Policy],
+    policy_validate: object,
+) -> object:
+    """Bind every private mutable ingestion dependency exactly once."""
+
+    if any(
+        not callable(value)
+        for value in (
+            implementation,
+            replay_builder,
+            private_state_builder,
+            checkpoint_loader,
+            checkpoint_installer,
+            policy_validate,
+        )
+    ):
+        raise TypeError("ingestion entrypoint dependency is invalid")
+
+    def entrypoint(
+        journal: Journal,
+        envelope: ConfirmationEnvelope,
+        *,
+        plans: SignalPlanResolver,
+        calendar: SessionCalendarResolver,
+        policy: Policy,
+        entry_authorities: ActualEntryAuthorityResolver,
+        destination: str = "CODEX_TASK",
+    ) -> IngestionResult:
+        if type(policy) is not policy_type:
+            raise TypeError("policy must be an exact Policy")
+        policy_validate(policy)  # type: ignore[operator]
+        return implementation(  # type: ignore[operator]
+            journal,
+            envelope,
+            plans=plans,
+            calendar=calendar,
+            policy=policy,
+            entry_authorities=entry_authorities,
+            destination=destination,
+            _trusted_replay_builder=replay_builder,
+            _trusted_private_state_builder=private_state_builder,
+            _trusted_checkpoint_loader=checkpoint_loader,
+            _trusted_checkpoint_installer=checkpoint_installer,
+        )
+
+    entrypoint.__name__ = "ingest_confirmation"
+    entrypoint.__qualname__ = "ingest_confirmation"
+    entrypoint.__doc__ = implementation.__doc__
+    return entrypoint
+
+
+ingest_confirmation = _make_ingest_confirmation_entrypoint(
+    implementation=_ingest_confirmation_impl,
+    replay_builder=_replay_actual_source,
+    private_state_builder=_private_incremental_state,
+    checkpoint_loader=_load_incremental_ingestion_checkpoint,
+    checkpoint_installer=_install_incremental_ingestion_checkpoint,
+    policy_type=Policy,
+    policy_validate=Policy.validate,
+)
+del (
+    _ingest_confirmation_impl,
+    _install_incremental_ingestion_checkpoint,
+    _make_incremental_ingestion_checkpoint_api,
+    _make_ingest_confirmation_entrypoint,
+    _journal_authority_module,
+    _market_calendar_authority_module,
+    _getframe,
+)
 
 
 __all__ = [

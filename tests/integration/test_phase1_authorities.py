@@ -7,9 +7,10 @@ import inspect
 import json
 import tempfile
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from dataclasses import fields, make_dataclass, replace
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ import stock_monitor.ledger as ledger_module
 import stock_monitor.evidence as evidence_module
 import stock_monitor.phase1 as phase1_module
 import stock_monitor.providers.alpaca as alpaca_module
+import stock_monitor.reconciliation as reconciliation_module
 import stock_monitor.risk as risk_module
 import stock_monitor.screening as screening_module
 import stock_monitor.validation as validation_module
@@ -3865,6 +3867,55 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         calendar_resolver=_calendar(),
                     )
 
+                ledger_source = journal.read_phase1_equity_mark_source(
+                    ledger_name="CANONICAL",
+                    session_date=_SESSION,
+                    query_cutoff=source.query_cutoff,
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                )
+                ledger_authority = (
+                    risk_module._issue_phase1_equity_point_from_source(
+                        ledger_source,
+                        calendar_resolver=_calendar(),
+                    )
+                )
+                lot = (
+                    ledger_source.canonical_replay.ledger_pair.canonical
+                    .open_positions[0]
+                    .lots[0]
+                )
+                object.__setattr__(lot, "shares", lot.shares + 1)
+                equity_count_before = journal.count("phase1_equity_points")
+                self.assertFalse(
+                    journal_module.is_verified_phase1_equity_mark_source(
+                        ledger_source
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RiskBlock,
+                    "PHASE1_EQUITY_MARK_SOURCE_UNVERIFIED",
+                ):
+                    risk_module._issue_phase1_equity_point_from_source(
+                        ledger_source,
+                        calendar_resolver=_calendar(),
+                    )
+                with self.assertRaisesRegex(
+                    RiskBlock,
+                    "PHASE1_EQUITY_(POINT_AUTHORITY|POINT_SOURCE|"
+                    "MARK_SOURCE)_UNVERIFIED",
+                ):
+                    journal.record_phase1_session_mark(
+                        canonical_authority=ledger_authority,
+                        actual_authority=_actual,
+                        recorded_at=_cutoff,
+                        calendar_resolver=_calendar(),
+                    )
+                self.assertEqual(
+                    journal.count("phase1_equity_points"),
+                    equity_count_before,
+                )
+
                 stale_source = journal.read_phase1_equity_mark_source(
                     ledger_name="CANONICAL",
                     session_date=_SESSION,
@@ -4037,6 +4088,254 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                     )
                 )
 
+    def test_equity_reader_cannot_bless_mutated_derived_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    prior_source,
+                    _prior_actual_source,
+                    prior_authority,
+                    _prior_actual_authority,
+                    cutoff,
+                ) = _phase1_equity_authorities(journal)
+                expected_cash = prior_authority.point.cash
+                equity_count_before = journal.count("phase1_equity_points")
+                with ledger_module._EVENT_AUTHORITY_LOCK:
+                    binding_ids_before = set(ledger_module._PHASE1_SOURCE_BINDINGS)
+
+                mutated_replay = None
+                mutated_source = None
+                trace_fired = False
+
+                def mutate_new_canonical_replay(_statement: str) -> None:
+                    nonlocal mutated_replay, mutated_source, trace_fired
+                    if trace_fired:
+                        return
+                    with ledger_module._EVENT_AUTHORITY_LOCK:
+                        new_bindings = tuple(
+                            binding
+                            for identity, binding in (
+                                ledger_module._PHASE1_SOURCE_BINDINGS.items()
+                            )
+                            if identity not in binding_ids_before
+                        )
+
+                    for binding in new_bindings:
+                        candidate = binding[0]()
+                        if type(candidate) is not (
+                            ledger_module.Phase1CanonicalLedgerReplay
+                        ):
+                            continue
+                        sources = binding[1]
+                        if len(sources) != 1 or sources[0][1] != "CANONICAL_REPLAY":
+                            continue
+                        mutated_replay = candidate
+                        mutated_source = sources[0][0]
+                        object.__setattr__(
+                            mutated_replay,
+                            "canonical_cash",
+                            Decimal("0"),
+                        )
+                        trace_fired = True
+                        return
+
+                returned_source = None
+                reader_error = None
+                journal._connection.set_trace_callback(
+                    mutate_new_canonical_replay
+                )
+                try:
+                    try:
+                        returned_source = journal.read_phase1_equity_mark_source(
+                            ledger_name="CANONICAL",
+                            session_date=_SESSION,
+                            query_cutoff=cutoff,
+                            calendar_resolver=_calendar(),
+                            policy=policy_fixture(),
+                        )
+                    except journal_module.JournalError as exc:
+                        reader_error = exc
+                finally:
+                    journal._connection.set_trace_callback(None)
+
+                self.assertTrue(trace_fired)
+                self.assertIsNotNone(mutated_replay)
+                self.assertIsNotNone(mutated_source)
+                if returned_source is not None:
+                    self.assertIs(returned_source.canonical_replay, mutated_replay)
+                    self.assertTrue(
+                        journal_module.is_verified_phase1_equity_mark_source(
+                            returned_source
+                        )
+                    )
+                    forged_authority = (
+                        risk_module._issue_phase1_equity_point_from_source(
+                            returned_source,
+                            calendar_resolver=_calendar(),
+                        )
+                    )
+                    self.assertEqual(forged_authority.point.cash, Decimal("0"))
+                    self.assertNotEqual(forged_authority.point.cash, expected_cash)
+                self.assertIsNone(
+                    returned_source,
+                    "mutated canonical replay must not earn parent authority",
+                )
+                self.assertIsInstance(reader_error, journal_module.JournalError)
+                self.assertTrue(
+                    journal_module.is_verified_phase1_canonical_replay_source(
+                        mutated_source
+                    )
+                )
+                self.assertFalse(
+                    ledger_module.is_verified_phase1_canonical_ledger_replay_for_source(
+                        mutated_replay,
+                        mutated_source,
+                    )
+                )
+                self.assertFalse(mutated_replay.source_verified)
+                self.assertEqual(
+                    journal.count("phase1_equity_points"),
+                    equity_count_before,
+                )
+
+    def test_phase1_authority_binding_cannot_be_overwritten_cross_owner(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with Journal.open(
+                Path(temporary_directory) / "first.db"
+            ) as first, Journal.open(
+                Path(temporary_directory) / "second.db"
+            ) as second:
+                first_source, _first_actual, first_authority, _actual, _cutoff = (
+                    _phase1_equity_authorities(first)
+                )
+                second_source, _second_actual, _second, _actual_two, _cutoff_two = (
+                    _phase1_equity_authorities(second)
+                )
+                self.assertTrue(
+                    risk_module.is_issued_phase1_equity_point_authority(
+                        first_authority
+                    )
+                )
+                _append_unrelated_source(first, suffix="phase1-rebind")
+                self.assertFalse(
+                    risk_module.is_issued_phase1_equity_point_authority(
+                        first_authority
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    RiskBlock,
+                    "RISK_AUTHORITY_BINDING_UNAVAILABLE",
+                ):
+                    risk_module._bind_phase1_derived_sources(
+                        first_authority,
+                        ((second_source, "EQUITY_MARK"),),
+                    )
+
+                self.assertIsNot(first_source, second_source)
+                self.assertFalse(
+                    risk_module.is_issued_phase1_equity_point_authority(
+                        first_authority
+                    )
+                )
+
+    def test_actual_replay_verifier_fingerprints_after_currentness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    canonical_source,
+                    actual_source,
+                    _canonical_authority,
+                    _actual_authority,
+                    _cutoff,
+                ) = _phase1_equity_authorities(journal)
+                standalone_state = canonical_source.actual_replay
+                standalone_replay_source = canonical_source.actual_replay_source
+                self.assertTrue(
+                    reconciliation_module.is_verified_actual_ledger_state(
+                        standalone_state
+                    )
+                )
+                standalone_trace_fired = False
+
+                def mutate_standalone_during_currentness(statement: str) -> None:
+                    nonlocal standalone_trace_fired
+                    if (
+                        not standalone_trace_fired
+                        and statement.upper().startswith("PRAGMA DATA_VERSION")
+                    ):
+                        standalone_trace_fired = True
+                        object.__setattr__(
+                            standalone_state,
+                            "strategy_settled_cash_micros",
+                            standalone_state.strategy_settled_cash_micros + 1,
+                        )
+
+                journal._connection.set_trace_callback(
+                    mutate_standalone_during_currentness
+                )
+                try:
+                    self.assertFalse(
+                        reconciliation_module.is_verified_actual_ledger_state(
+                            standalone_state
+                        )
+                    )
+                finally:
+                    journal._connection.set_trace_callback(None)
+                self.assertTrue(standalone_trace_fired)
+                self.assertFalse(
+                    reconciliation_module.is_verified_actual_ledger_state_for_source(
+                        standalone_state,
+                        standalone_replay_source,
+                    )
+                )
+                state = actual_source.actual_replay
+                replay_source = actual_source.actual_replay_source
+                self.assertTrue(
+                    reconciliation_module.is_verified_actual_ledger_state_for_source(
+                        state,
+                        replay_source,
+                    )
+                )
+                trace_fired = False
+
+                def mutate_during_currentness(statement: str) -> None:
+                    nonlocal trace_fired
+                    if (
+                        not trace_fired
+                        and statement.upper().startswith("PRAGMA DATA_VERSION")
+                    ):
+                        trace_fired = True
+                        object.__setattr__(
+                            state,
+                            "strategy_settled_cash_micros",
+                            state.strategy_settled_cash_micros + 1,
+                        )
+
+                journal._connection.set_trace_callback(
+                    mutate_during_currentness
+                )
+                try:
+                    self.assertFalse(
+                        reconciliation_module.is_verified_actual_ledger_state_for_source(
+                            state,
+                            replay_source,
+                        )
+                    )
+                finally:
+                    journal._connection.set_trace_callback(None)
+                self.assertTrue(trace_fired)
+                self.assertFalse(
+                    reconciliation_module.is_verified_actual_ledger_state_for_source(
+                        state,
+                        replay_source,
+                    )
+                )
+
     def test_breaker_history_rederives_every_nonbaseline_equity_point(
         self,
     ) -> None:
@@ -4176,16 +4475,16 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         ),
                     ),
                 )
-                self.assertTrue(
+                self.assertFalse(
                     journal_module.is_verified_phase1_breaker_history_source(
                         copied_authority_source
                     ),
-                    "compare=False derived values require the risk adapter's "
-                    "identity check",
+                    "compare=False derived authority identity is part of the "
+                    "Journal source seal",
                 )
                 with self.assertRaisesRegex(
                     RiskBlock,
-                    "PHASE1_BREAKER_EQUITY_AUTHORITY_MISMATCH",
+                    "PHASE1_BREAKER_HISTORY_SOURCE_UNVERIFIED",
                 ):
                     risk_module._issue_breaker_history_from_phase1_source(
                         copied_authority_source,
@@ -4204,9 +4503,14 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                     "equity_authorities",
                     actual_source.equity_authorities,
                 )
+                self.assertFalse(
+                    journal_module.is_verified_phase1_breaker_history_source(
+                        cross_authority_source
+                    )
+                )
                 with self.assertRaisesRegex(
                     RiskBlock,
-                    "PHASE1_BREAKER_EQUITY_AUTHORITY_MISMATCH",
+                    "PHASE1_BREAKER_HISTORY_SOURCE_UNVERIFIED",
                 ):
                     risk_module._issue_breaker_history_from_phase1_source(
                         cross_authority_source,
@@ -4231,6 +4535,229 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         missing_mark,
                         calendar_resolver=_calendar(),
                     )
+
+    def test_breaker_history_batches_equity_mark_owner_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                _signal_id, query_cutoff = (
+                    _seed_closed_primary_adherence_material(journal)
+                )
+                source = journal._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=date(2026, 8, 17),
+                    query_cutoff=query_cutoff,
+                )
+                marks = source.equity_mark_sources
+                self.assertEqual(len(marks), 2)
+
+                original_fingerprint = (
+                    journal_module._phase1_source_fingerprint
+                )
+                original_share_owner = (
+                    journal_module.phase1_sources_share_owner
+                )
+                with (
+                    mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint",
+                        wraps=original_fingerprint,
+                    ) as fingerprint_spy,
+                    mock.patch.object(
+                        journal_module,
+                        "phase1_sources_share_owner",
+                        wraps=original_share_owner,
+                    ) as owner_spy,
+                    mock.patch.object(
+                        risk_module,
+                        "is_issued_phase1_equity_point_authority",
+                        return_value=True,
+                    ),
+                ):
+                    risk_module._issue_breaker_history_from_phase1_source(
+                        source,
+                        calendar_resolver=_calendar(),
+                    )
+
+                self.assertEqual(len(owner_spy.call_args_list), 1)
+                owner_arguments = owner_spy.call_args_list[0].args
+                self.assertEqual(len(owner_arguments), 3)
+                self.assertIs(owner_arguments[0], source)
+                self.assertIs(owner_arguments[1], marks[0])
+                self.assertIs(owner_arguments[2], marks[1])
+                fingerprinted = tuple(
+                    call.args[0]
+                    for call in fingerprint_spy.call_args_list
+                )
+                self.assertEqual(
+                    sum(item is source for item in fingerprinted),
+                    4,
+                    "the root is verified, owner-resolved, rechecked after "
+                    "calendar callbacks, and sealed again by the installer",
+                )
+                for mark in marks:
+                    with self.subTest(mark=mark):
+                        self.assertEqual(
+                            sum(item is mark for item in fingerprinted),
+                            3,
+                            "each mark is owner-resolved and its bound "
+                            "authority is rechecked before materialization "
+                            "and again before installation",
+                        )
+
+                mutating_source = (
+                    journal._read_phase1_breaker_history_source(
+                        ledger_name="CANONICAL",
+                        through_session=date(2026, 8, 17),
+                        query_cutoff=query_cutoff,
+                    )
+                )
+                mutating_marks = mutating_source.equity_mark_sources
+                mutation_calls: list[tuple[object, ...]] = []
+
+                def mutate_second_mark(
+                    left: object,
+                    *rights: object,
+                ) -> bool:
+                    mutation_calls.append((left, *rights))
+                    replacement = (
+                        "0" * 64
+                        if mutating_marks[1].source_digest != "0" * 64
+                        else "1" * 64
+                    )
+                    object.__setattr__(
+                        mutating_marks[1],
+                        "source_digest",
+                        replacement,
+                    )
+                    return original_share_owner(left, *rights)
+
+                with mock.patch.object(
+                    journal_module,
+                    "phase1_sources_share_owner",
+                    side_effect=mutate_second_mark,
+                ):
+                    with self.assertRaisesRegex(
+                        RiskBlock,
+                        "PHASE1_BREAKER_EQUITY_AUTHORITY_INCOMPLETE",
+                    ):
+                        risk_module._issue_breaker_history_from_phase1_source(
+                            mutating_source,
+                            calendar_resolver=_calendar(),
+                        )
+                self.assertEqual(len(mutation_calls), 1)
+                self.assertEqual(len(mutation_calls[0]), 3)
+                self.assertIs(mutation_calls[0][2], mutating_marks[1])
+
+    def test_breaker_history_rechecks_all_equity_authorities_after_callbacks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                _signal_id, query_cutoff = (
+                    _seed_closed_primary_adherence_material(journal)
+                )
+                source = journal._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=date(2026, 8, 17),
+                    query_cutoff=query_cutoff,
+                )
+                authorities = source.equity_authorities
+                self.assertEqual(len(authorities), 2)
+                earlier = authorities[0]
+                original_equity = earlier.point.equity
+                self.assertEqual(original_equity, Decimal("5026.790000"))
+                self.assertTrue(
+                    risk_module.is_issued_phase1_equity_point_authority(
+                        earlier
+                    )
+                )
+
+                pragma_calls = 0
+                point_mutated = False
+                point_restored = False
+
+                def mutate_earlier_point_during_later_currentness(
+                    statement: str,
+                ) -> None:
+                    nonlocal pragma_calls, point_mutated
+                    if statement.upper().startswith("PRAGMA DATA_VERSION"):
+                        pragma_calls += 1
+                        if pragma_calls == 6:
+                            object.__setattr__(
+                                earlier.point,
+                                "equity",
+                                Decimal("1.00"),
+                            )
+                            point_mutated = True
+
+                class AbaCalendar(SessionCalendarResolver):
+                    def session(self, session_date: date):  # type: ignore[no-untyped-def]
+                        nonlocal point_restored
+                        resolved = super().session(session_date)
+                        if point_mutated and not point_restored:
+                            object.__setattr__(
+                                earlier.point,
+                                "equity",
+                                original_equity,
+                            )
+                            point_restored = True
+                        return resolved
+
+                returned = None
+                error = None
+                journal._connection.set_trace_callback(
+                    mutate_earlier_point_during_later_currentness
+                )
+                try:
+                    try:
+                        returned = (
+                            risk_module._issue_breaker_history_from_phase1_source(
+                                source,
+                                calendar_resolver=AbaCalendar(
+                                    _calendar().calendars
+                                ),
+                            )
+                        )
+                    except RiskBlock as exc:
+                        error = exc
+                finally:
+                    journal._connection.set_trace_callback(None)
+                if point_mutated and not point_restored:
+                    object.__setattr__(
+                        earlier.point,
+                        "equity",
+                        original_equity,
+                    )
+                self.assertGreaterEqual(pragma_calls, 6)
+                self.assertTrue(point_mutated)
+                self.assertTrue(point_restored)
+                self.assertEqual(earlier.point.equity, original_equity)
+                self.assertTrue(
+                    risk_module.is_issued_phase1_equity_point_authority(
+                        earlier
+                    )
+                )
+                self.assertTrue(
+                    journal_module.is_verified_phase1_breaker_history_source(
+                        source
+                    )
+                )
+                if returned is not None:
+                    self.assertTrue(
+                        risk_module.is_issued_breaker_history_authority(
+                            returned
+                        )
+                    )
+                    self.assertEqual(
+                        returned.equity[1].equity,
+                        original_equity,
+                    )
+                else:
+                    self.assertIsInstance(error, RiskBlock)
 
     def test_publication_manifest_accepts_one_provider_page_for_many_facts(
         self,
@@ -6123,6 +6650,7 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                 except (
                     journal_module.IdempotencyConflict,
                     journal_module.InvalidJournalValue,
+                    journal_module.JournalError,
                     RiskBlock,
                 ):
                     return "REJECTED"
@@ -7622,6 +8150,909 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                                 calendar_resolver=_calendar(),
                             )
 
+    def test_promotion_snapshot_builds_each_session_mark_once_per_ledger(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with Journal.open(Path(directory) / "journal.db") as journal:
+                _start_window(journal)
+                sessions = tuple(
+                    _calendar().add_sessions(_SESSION, offset)
+                    for offset in range(3)
+                )
+                cutoffs = tuple(
+                    _seed_session_closed_primary(
+                        journal,
+                        session_date=session_date,
+                        sequence=sequence,
+                    )[1]
+                    for sequence, session_date in enumerate(
+                        sessions,
+                        start=1,
+                    )
+                )
+                mark_factory_calls = {
+                    "CANONICAL": 0,
+                    "ACTUAL": 0,
+                }
+                phase1_root_calls: Counter[str] = Counter()
+                original = journal._read_phase1_equity_mark_source
+                original_fingerprint = journal_module._phase1_source_fingerprint
+                original_issuer = (
+                    risk_module._issue_phase1_equity_point_from_source
+                )
+
+                def counted_mark_factory(*args: object, **kwargs: object):
+                    ledger_name = kwargs["ledger_name"]
+                    assert isinstance(ledger_name, str)
+                    mark_factory_calls[ledger_name] += 1
+                    return original(*args, **kwargs)
+
+                def counted_fingerprint(source: object):
+                    phase1_root_calls[type(source).__name__] += 1
+                    return original_fingerprint(source)
+
+                with (
+                    mock.patch.object(
+                        journal,
+                        "_read_phase1_equity_mark_source",
+                        side_effect=counted_mark_factory,
+                    ),
+                    mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint",
+                        side_effect=counted_fingerprint,
+                    ),
+                    mock.patch.object(
+                        risk_module,
+                        "_issue_phase1_equity_point_from_source",
+                        wraps=original_issuer,
+                    ) as issuer,
+                ):
+                    source = journal.read_phase1_validation_window_source(
+                        _WINDOW_ID,
+                        through_session=sessions[-1],
+                        query_cutoff=cutoffs[-1],
+                        calendar_resolver=_calendar(),
+                    )
+
+                self.assertEqual(source.expected_signal_count, 3)
+                self.assertEqual(source.expected_adherence_count, 30)
+                self.assertEqual(
+                    mark_factory_calls,
+                    {"CANONICAL": 3, "ACTUAL": 3},
+                )
+                self.assertEqual(issuer.call_count, 6)
+                self.assertEqual(
+                    phase1_root_calls["Phase1EquityMarkSource"],
+                    60,
+                )
+                self.assertEqual(
+                    phase1_root_calls["Phase1CanonicalReplaySource"],
+                    121,
+                )
+                self.assertEqual(sum(phase1_root_calls.values()), 810)
+
+    def test_promotion_mark_cache_reuses_exact_equity_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    canonical_source,
+                    _actual_source,
+                    _canonical_authority,
+                    _actual_authority,
+                    query_cutoff,
+                ) = _phase1_equity_authorities(journal)
+                signal_sources = (
+                    canonical_source.canonical_replay_source.signal_sources
+                )
+                original = (
+                    journal._read_phase1_cached_promotion_equity_mark_source
+                )
+                original_fingerprint = (
+                    journal_module._phase1_source_fingerprint
+                )
+                original_issuer = (
+                    risk_module._issue_phase1_equity_point_from_source
+                )
+                phase1_root_calls: Counter[str] = Counter()
+                returned = object()
+
+                def counted_fingerprint(source: object):
+                    phase1_root_calls[type(source).__name__] += 1
+                    return original_fingerprint(source)
+
+                def inspect_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    capability = kwargs["_promotion_mark_cache"]
+                    call_options = {
+                        "validation_window_id": _WINDOW_ID,
+                        "ledger_name": "CANONICAL",
+                        "session_date": _SESSION,
+                        "point_query_cutoff": query_cutoff,
+                        "final_query_cutoff": query_cutoff,
+                        "calendar_resolver": _calendar(),
+                        "policy": policy_fixture(),
+                        "calendar_digest": canonical_source.calendar_digest,
+                        "policy_digest": signal_sources[0].policy_digest,
+                    }
+                    first_source, first_authority = original(
+                        cache=capability,
+                        **call_options,
+                    )
+                    phase1_root_calls.clear()
+                    second_source, second_authority = original(
+                        cache=capability,
+                        **call_options,
+                    )
+                    self.assertIs(second_source, first_source)
+                    self.assertIs(second_authority, first_authority)
+                    self.assertEqual(
+                        phase1_root_calls,
+                        Counter({"Phase1EquityMarkSource": 2}),
+                    )
+                    self.assertTrue(
+                        risk_module.is_issued_phase1_equity_point_authority(
+                            second_authority
+                        )
+                    )
+                    return returned
+
+                with (
+                    mock.patch.object(
+                        journal,
+                        "_read_phase1_validation_window_source_with_mark_cache",
+                        side_effect=inspect_scope,
+                    ),
+                    mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint",
+                        side_effect=counted_fingerprint,
+                    ),
+                    mock.patch.object(
+                        risk_module,
+                        "_issue_phase1_equity_point_from_source",
+                        wraps=original_issuer,
+                    ) as issuer,
+                ):
+                    result = (
+                        journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=query_cutoff,
+                            calendar_resolver=_calendar(),
+                        )
+                    )
+                self.assertIs(result, returned)
+                self.assertEqual(issuer.call_count, 1)
+
+    def test_promotion_mark_cache_rejects_caller_mapping_and_forged_horizon(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with Journal.open(Path(temporary_directory) / "journal.db") as journal:
+                (
+                    canonical_source,
+                    _actual_source,
+                    _canonical_authority,
+                    _actual_authority,
+                    query_cutoff,
+                ) = _phase1_equity_authorities(journal)
+                signal_sources = (
+                    canonical_source.canonical_replay_source.signal_sources
+                )
+                self.assertTrue(signal_sources)
+                forged_final_cutoff = query_cutoff + timedelta(days=30)
+                cache_key = (
+                    canonical_source.validation_window_id,
+                    "CANONICAL",
+                    canonical_source.session_date,
+                    query_cutoff,
+                    forged_final_cutoff,
+                    canonical_source.calendar_digest,
+                    signal_sources[0].policy_digest,
+                )
+                caller_cache = {cache_key: canonical_source}
+
+                with self.assertRaisesRegex(
+                    journal_module.JournalError,
+                    "promotion mark cache",
+                ):
+                    journal._read_phase1_cached_promotion_equity_mark_source(
+                        cache=caller_cache,
+                        validation_window_id=(
+                            canonical_source.validation_window_id
+                        ),
+                        ledger_name="CANONICAL",
+                        session_date=canonical_source.session_date,
+                        point_query_cutoff=query_cutoff,
+                        final_query_cutoff=forged_final_cutoff,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        calendar_digest=canonical_source.calendar_digest,
+                        policy_digest=signal_sources[0].policy_digest,
+                    )
+
+    def test_promotion_mark_cache_capability_is_scoped_and_context_bound(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            other_path = Path(temporary_directory) / "other.db"
+            with Journal.open(path) as journal, Journal.open(other_path) as other:
+                _authority, query_cutoff = _seed_completed_authority_fill(journal)
+                captured: list[object] = []
+                captured_options: list[dict[str, object]] = []
+                returned = object()
+                original = (
+                    journal._read_phase1_cached_promotion_equity_mark_source
+                )
+
+                def inspect_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    capability = kwargs["_promotion_mark_cache"]
+                    captured.append(capability)
+                    capability_type = (
+                        journal_module._Phase1PromotionMarkCacheCapability
+                    )
+                    self.assertIs(type(capability), capability_type)
+                    self.assertEqual(capability_type.__slots__, ("__weakref__",))
+                    self.assertFalse(hasattr(capability, "entries"))
+                    with journal_module._JOURNAL_SOURCE_LOCK:
+                        cache_authority = (
+                            journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                                id(capability)
+                            ]
+                        )
+                    call_options = {
+                        "validation_window_id": _WINDOW_ID,
+                        "ledger_name": "CANONICAL",
+                        "session_date": _SESSION,
+                        "point_query_cutoff": query_cutoff,
+                        "final_query_cutoff": cache_authority.final_query_cutoff,
+                        "calendar_resolver": _calendar(),
+                        "policy": policy_fixture(),
+                        "calendar_digest": cache_authority.calendar_digest,
+                        "policy_digest": cache_authority.policy_digest,
+                    }
+                    captured_options.append(call_options)
+
+                    class ForgedCapability(capability_type):
+                        pass
+
+                    for forged in (
+                        {},
+                        capability_type(),
+                        copy.copy(capability),
+                        ForgedCapability(),
+                    ):
+                        with self.subTest(forged=type(forged).__name__):
+                            with self.assertRaisesRegex(
+                                journal_module.JournalError,
+                                "promotion mark cache",
+                            ):
+                                original(cache=forged, **call_options)
+
+                    with self.assertRaisesRegex(
+                        journal_module.JournalError,
+                        "promotion mark cache",
+                    ):
+                        other._read_phase1_cached_promotion_equity_mark_source(
+                            cache=capability,
+                            **call_options,
+                        )
+                    with self.assertRaisesRegex(
+                        journal_module.JournalError,
+                        "promotion mark cache",
+                    ):
+                        original(
+                            cache=capability,
+                            **{
+                                **call_options,
+                                "final_query_cutoff": (
+                                    cache_authority.final_query_cutoff
+                                    + timedelta(microseconds=1)
+                                ),
+                            },
+                        )
+                    with self.assertRaisesRegex(
+                        journal_module.JournalError,
+                        "promotion mark cache",
+                    ):
+                        original(
+                            cache=capability,
+                            **{
+                                **call_options,
+                                "validation_window_id": "2" * 64,
+                            },
+                        )
+                    return returned
+
+                with mock.patch.object(
+                    journal,
+                    "_read_phase1_validation_window_source_with_mark_cache",
+                    side_effect=inspect_scope,
+                ):
+                    result = (
+                        journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=query_cutoff,
+                            calendar_resolver=_calendar(),
+                        )
+                    )
+                self.assertIs(result, returned)
+                self.assertEqual(len(captured), 1)
+                capability = captured[0]
+                call_options = captured_options[0]
+                self.assertNotIn(
+                    id(capability),
+                    journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES,
+                )
+                with self.assertRaisesRegex(
+                    journal_module.JournalError,
+                    "promotion mark cache",
+                ):
+                    original(
+                        cache=capability,
+                        **call_options,
+                    )
+
+    def test_promotion_mark_cache_denies_trace_source_and_entry_mutation(
+        self,
+    ) -> None:
+        for mutation_kind in ("SOURCE", "AUTHORITY", "ENTRY"):
+            with self.subTest(mutation_kind=mutation_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    path = Path(temporary_directory) / "journal.db"
+                    with Journal.open(path) as journal:
+                        (
+                            canonical_source,
+                            _actual_source,
+                            _canonical_authority,
+                            _actual_authority,
+                            query_cutoff,
+                        ) = _phase1_equity_authorities(journal)
+                        returned = object()
+                        captured: list[object] = []
+                        original = (
+                            journal._read_phase1_cached_promotion_equity_mark_source
+                        )
+
+                        def attack_scope(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> object:
+                            del args
+                            capability = kwargs["_promotion_mark_cache"]
+                            captured.append(capability)
+                            with journal_module._JOURNAL_SOURCE_LOCK:
+                                cache_authority = (
+                                    journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                                        id(capability)
+                                    ]
+                                )
+                            signal_sources = (
+                                canonical_source.canonical_replay_source.signal_sources
+                            )
+                            call_options = {
+                                "validation_window_id": _WINDOW_ID,
+                                "ledger_name": "CANONICAL",
+                                "session_date": _SESSION,
+                                "point_query_cutoff": query_cutoff,
+                                "final_query_cutoff": query_cutoff,
+                                "calendar_resolver": _calendar(),
+                                "policy": policy_fixture(),
+                                "calendar_digest": (
+                                    canonical_source.calendar_digest
+                                ),
+                                "policy_digest": signal_sources[0].policy_digest,
+                            }
+                            cached_source, cached_authority = original(
+                                cache=capability,
+                                **call_options,
+                            )
+                            key = (
+                                _WINDOW_ID,
+                                "CANONICAL",
+                                _SESSION,
+                                query_cutoff,
+                                query_cutoff,
+                                canonical_source.calendar_digest,
+                                signal_sources[0].policy_digest,
+                            )
+                            fired = False
+
+                            def mutate_during_currentness(sql: str) -> None:
+                                nonlocal fired
+                                if fired or not sql.upper().startswith(
+                                    "PRAGMA DATA_VERSION"
+                                ):
+                                    return
+                                fired = True
+                                if mutation_kind == "SOURCE":
+                                    object.__setattr__(
+                                        cached_source,
+                                        "source_digest",
+                                        "f" * 64,
+                                    )
+                                elif mutation_kind == "AUTHORITY":
+                                    object.__setattr__(
+                                        cached_authority.point,
+                                        "equity",
+                                        Decimal("1"),
+                                    )
+                                else:
+                                    with journal_module._JOURNAL_SOURCE_LOCK:
+                                        replacement = cache_authority._replace(
+                                            entries=(
+                                                journal_module._Phase1PromotionMarkCacheEntry(
+                                                    key,
+                                                    replace(cached_source),
+                                                    cached_authority,
+                                                ),
+                                            )
+                                        )
+                                        journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                                            id(capability)
+                                        ] = replacement
+
+                            journal._connection.set_trace_callback(
+                                mutate_during_currentness
+                            )
+                            try:
+                                with self.assertRaises(
+                                    journal_module.JournalError
+                                ):
+                                    original(
+                                        cache=capability,
+                                        **call_options,
+                                    )
+                            finally:
+                                journal._connection.set_trace_callback(None)
+                            self.assertTrue(fired)
+                            return returned
+
+                        with mock.patch.object(
+                            journal,
+                            "_read_phase1_validation_window_source_with_mark_cache",
+                            side_effect=attack_scope,
+                        ):
+                            result = journal._read_phase1_validation_window_source_uncached(
+                                _WINDOW_ID,
+                                through_session=_SESSION,
+                                query_cutoff=query_cutoff,
+                                calendar_resolver=_calendar(),
+                            )
+                        self.assertIs(result, returned)
+                        self.assertNotIn(
+                            id(captured[0]),
+                            journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES,
+                        )
+
+    def test_promotion_mark_cache_denies_retained_authority_entry_injection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    canonical_source,
+                    _actual_source,
+                    canonical_authority,
+                    _actual_authority,
+                    point_cutoff,
+                ) = _phase1_equity_authorities(journal)
+                final_cutoff = point_cutoff + timedelta(days=30)
+                returned = object()
+                original = (
+                    journal._read_phase1_cached_promotion_equity_mark_source
+                )
+
+                def inject_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    capability = kwargs["_promotion_mark_cache"]
+                    with journal_module._JOURNAL_SOURCE_LOCK:
+                        cache_authority = (
+                            journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES[
+                                id(capability)
+                            ]
+                        )
+                    signal_sources = (
+                        canonical_source.canonical_replay_source.signal_sources
+                    )
+                    key = (
+                        _WINDOW_ID,
+                        "CANONICAL",
+                        _SESSION,
+                        point_cutoff,
+                        final_cutoff,
+                        canonical_source.calendar_digest,
+                        signal_sources[0].policy_digest,
+                    )
+                    forged_entry = (
+                        journal_module._Phase1PromotionMarkCacheEntry(
+                            key,
+                            canonical_source,
+                            canonical_authority,
+                        )
+                    )
+                    with self.assertRaises(AttributeError):
+                        object.__setattr__(
+                            cache_authority,
+                            "entries",
+                            (forged_entry,),
+                        )
+                    with mock.patch.object(
+                        journal,
+                        "_read_phase1_equity_mark_source",
+                        wraps=journal._read_phase1_equity_mark_source,
+                    ) as builder:
+                        rebuilt_source, rebuilt_authority = original(
+                            cache=capability,
+                            validation_window_id=_WINDOW_ID,
+                            ledger_name="CANONICAL",
+                            session_date=_SESSION,
+                            point_query_cutoff=point_cutoff,
+                            final_query_cutoff=final_cutoff,
+                            calendar_resolver=_calendar(),
+                            policy=policy_fixture(),
+                            calendar_digest=canonical_source.calendar_digest,
+                            policy_digest=signal_sources[0].policy_digest,
+                        )
+                    self.assertIsNot(rebuilt_source, canonical_source)
+                    self.assertIsNot(rebuilt_authority, canonical_authority)
+                    self.assertTrue(
+                        risk_module.is_issued_phase1_equity_point_authority(
+                            rebuilt_authority
+                        )
+                    )
+                    self.assertEqual(builder.call_count, 1)
+                    self.assertEqual(
+                        builder.call_args.kwargs["current_query_cutoff"],
+                        final_cutoff,
+                    )
+                    return returned
+
+                with mock.patch.object(
+                    journal,
+                    "_read_phase1_validation_window_source_with_mark_cache",
+                    side_effect=inject_scope,
+                ):
+                    result = (
+                        journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=final_cutoff,
+                            calendar_resolver=_calendar(),
+                        )
+                    )
+                self.assertIs(result, returned)
+
+    def test_promotion_mark_cache_build_proves_the_final_invalidation_horizon(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    original_source,
+                    _actual_source,
+                    _canonical_authority,
+                    _actual_authority,
+                    point_cutoff,
+                ) = _phase1_equity_authorities(journal)
+                (
+                    novel_daily,
+                    _novel_execution,
+                    novel_quotes,
+                    novel_transport,
+                    _novel_retrieved_at,
+                ) = _issued_exit_review_cohorts(
+                    symbol=_signal().symbol,
+                    session_date=_SESSION,
+                    bid=Decimal("20.99"),
+                    ask=Decimal("21.00"),
+                    previous_session_low=Decimal("20.75"),
+                    execution_open=Decimal("21.00"),
+                    execution_high=Decimal("21.05"),
+                    execution_low=Decimal("20.95"),
+                    execution_close=Decimal("21.00"),
+                )
+                novel_rows = (
+                    *_pin_provider_cohort_pages(
+                        journal,
+                        novel_daily,
+                        novel_transport,
+                    ),
+                    *_pin_provider_cohort_pages(
+                        journal,
+                        novel_quotes,
+                        novel_transport,
+                    ),
+                )
+                invalidated_at = point_cutoff + timedelta(minutes=5)
+                invalidated = journal.ingest_phase1_equity_mark_cohorts(
+                    _SESSION,
+                    quote_cohort=novel_quotes,
+                    daily_bar_cohort=novel_daily,
+                    core_source_row_ids=novel_rows,
+                    calendar_resolver=_calendar(),
+                    recorded_at=invalidated_at,
+                )
+                self.assertTrue(invalidated.invalidated)
+                historical = journal.read_phase1_equity_mark_source(
+                    ledger_name="CANONICAL",
+                    session_date=_SESSION,
+                    query_cutoff=point_cutoff,
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                )
+                self.assertTrue(
+                    journal_module.is_verified_phase1_equity_mark_source(
+                        historical
+                    )
+                )
+                returned = object()
+                original = (
+                    journal._read_phase1_cached_promotion_equity_mark_source
+                )
+
+                def inspect_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    capability = kwargs["_promotion_mark_cache"]
+                    signal_sources = (
+                        original_source.canonical_replay_source.signal_sources
+                    )
+                    with self.assertRaisesRegex(
+                        journal_module.InvalidJournalValue,
+                        "PHASE1_EQUITY_MARK_LATE_EVIDENCE",
+                    ):
+                        original(
+                            cache=capability,
+                            validation_window_id=_WINDOW_ID,
+                            ledger_name="CANONICAL",
+                            session_date=_SESSION,
+                            point_query_cutoff=point_cutoff,
+                            final_query_cutoff=invalidated_at,
+                            calendar_resolver=_calendar(),
+                            policy=policy_fixture(),
+                            calendar_digest=original_source.calendar_digest,
+                            policy_digest=signal_sources[0].policy_digest,
+                        )
+                    return returned
+
+                with mock.patch.object(
+                    journal,
+                    "_read_phase1_validation_window_source_with_mark_cache",
+                    side_effect=inspect_scope,
+                ):
+                    result = (
+                        journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=invalidated_at,
+                            calendar_resolver=_calendar(),
+                        )
+                    )
+                self.assertIs(result, returned)
+
+    def test_promotion_mark_cache_denies_same_and_external_write_on_reuse(
+        self,
+    ) -> None:
+        for write_kind in ("SAME", "EXTERNAL"):
+            with self.subTest(write_kind=write_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    path = Path(temporary_directory) / "journal.db"
+                    with Journal.open(path) as journal:
+                        (
+                            canonical_source,
+                            _actual_source,
+                            _canonical_authority,
+                            _actual_authority,
+                            query_cutoff,
+                        ) = _phase1_equity_authorities(journal)
+                        returned = object()
+                        original = (
+                            journal._read_phase1_cached_promotion_equity_mark_source
+                        )
+
+                        def write_during_scope(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> object:
+                            del args
+                            capability = kwargs["_promotion_mark_cache"]
+                            signal_sources = (
+                                canonical_source.canonical_replay_source.signal_sources
+                            )
+                            call_options = {
+                                "validation_window_id": _WINDOW_ID,
+                                "ledger_name": "CANONICAL",
+                                "session_date": _SESSION,
+                                "point_query_cutoff": query_cutoff,
+                                "final_query_cutoff": query_cutoff,
+                                "calendar_resolver": _calendar(),
+                                "policy": policy_fixture(),
+                                "calendar_digest": (
+                                    canonical_source.calendar_digest
+                                ),
+                                "policy_digest": signal_sources[0].policy_digest,
+                            }
+                            original(cache=capability, **call_options)
+                            writer = journal
+                            external = None
+                            if write_kind == "EXTERNAL":
+                                external = Journal.open(path)
+                                writer = external
+                            try:
+                                writer.append_source_observation(
+                                    payload=(
+                                        b"same-write"
+                                        if write_kind == "SAME"
+                                        else b"external-write"
+                                    ),
+                                    source_uri=(
+                                        "https://example.test/cache-write/"
+                                        + write_kind.lower()
+                                    ),
+                                    source_type="TEST_CACHE_WRITE",
+                                    provider="TEST",
+                                    feed=None,
+                                    source_time=query_cutoff,
+                                    retrieved_at=query_cutoff,
+                                    provider_sequence=1,
+                                    delay_seconds=0,
+                                    health_result="OK",
+                                )
+                            finally:
+                                if external is not None:
+                                    external.close()
+                            with self.assertRaisesRegex(
+                                journal_module.JournalError,
+                                "promotion mark cache changed",
+                            ):
+                                original(cache=capability, **call_options)
+                            return returned
+
+                        with mock.patch.object(
+                            journal,
+                            "_read_phase1_validation_window_source_with_mark_cache",
+                            side_effect=write_during_scope,
+                        ):
+                            result = journal._read_phase1_validation_window_source_uncached(
+                                _WINDOW_ID,
+                                through_session=_SESSION,
+                                query_cutoff=query_cutoff,
+                                calendar_resolver=_calendar(),
+                            )
+                        self.assertIs(result, returned)
+
+    def test_promotion_mark_cache_scope_is_fresh_after_error_and_cutoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                _authority, query_cutoff = _seed_completed_authority_fill(journal)
+                captured: list[object] = []
+
+                def fail_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    captured.append(kwargs["_promotion_mark_cache"])
+                    raise RuntimeError("injected promotion reconstruction failure")
+
+                with mock.patch.object(
+                    journal,
+                    "_read_phase1_validation_window_source_with_mark_cache",
+                    side_effect=fail_scope,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=query_cutoff,
+                            calendar_resolver=_calendar(),
+                        )
+                first = captured[-1]
+                self.assertNotIn(
+                    id(first),
+                    journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES,
+                )
+
+                returned = object()
+
+                def capture_scope(*args: object, **kwargs: object) -> object:
+                    del args
+                    captured.append(kwargs["_promotion_mark_cache"])
+                    return returned
+
+                for cutoff in (
+                    query_cutoff,
+                    query_cutoff + timedelta(microseconds=1),
+                ):
+                    with mock.patch.object(
+                        journal,
+                        "_read_phase1_validation_window_source_with_mark_cache",
+                        side_effect=capture_scope,
+                    ):
+                        result = journal._read_phase1_validation_window_source_uncached(
+                            _WINDOW_ID,
+                            through_session=_SESSION,
+                            query_cutoff=cutoff,
+                            calendar_resolver=_calendar(),
+                        )
+                    self.assertIs(result, returned)
+                    self.assertNotIn(
+                        id(captured[-1]),
+                        journal_module._PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES,
+                    )
+                self.assertEqual(len({id(item) for item in captured}), 3)
+
+    def test_generic_registrar_cannot_mint_promotion_member_sources(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    canonical_mark,
+                    _actual_mark,
+                    _canonical_authority,
+                    _actual_authority,
+                    _query_cutoff,
+                ) = _phase1_equity_authorities(journal)
+                canonical_replay = canonical_mark.canonical_replay_source
+                for source in (canonical_mark, canonical_replay):
+                    registry = journal_module._phase1_source_registry(source)
+                    self.assertIsNotNone(registry)
+                    for registrar in (
+                        journal_module._register_journal_source_authority,
+                        journal_module._remember_journal_source_authority,
+                    ):
+                        forged = replace(source)
+                        with self.subTest(
+                            source_type=type(source).__name__,
+                            registrar=registrar.__name__,
+                        ):
+                            with self.assertRaisesRegex(
+                                journal_module.JournalError,
+                                "persisted Journal reader",
+                            ):
+                                registrar(registry, forged, journal)
+                            self.assertIsNone(
+                                journal_module._phase1_source_owner(forged)
+                            )
+
+                guarded_registries: set[int] = set()
+                for source_type in journal_module._PHASE1_SOURCE_TYPES:
+                    raw_source = object.__new__(source_type)
+                    registry = journal_module._phase1_source_registry(raw_source)
+                    self.assertIsNotNone(registry)
+                    assert registry is not None
+                    guarded_registries.add(id(registry))
+                    for registrar in (
+                        journal_module._register_journal_source_authority,
+                        journal_module._remember_journal_source_authority,
+                    ):
+                        with self.subTest(
+                            raw_type=source_type.__name__,
+                            registrar=registrar.__name__,
+                        ):
+                            with self.assertRaisesRegex(
+                                journal_module.JournalError,
+                                "persisted Journal reader",
+                            ):
+                                registrar(registry, raw_source, journal)
+                self.assertEqual(
+                    guarded_registries,
+                    {
+                        id(registry)
+                        for registry in journal_module._PHASE1_SOURCE_REGISTRIES
+                    },
+                )
+
     def test_promotion_authority_reissues_new_identity_after_restart(
         self,
     ) -> None:
@@ -8127,6 +9558,227 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         phase1_canonical_replay=first_replay,
                     )
 
+    def test_portfolio_rechecks_replay_after_owner_currentness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    _mark_source,
+                    _actual_mark_source,
+                    canonical_mark,
+                    actual_mark,
+                    cutoff,
+                ) = _phase1_equity_authorities(journal)
+                journal.record_phase1_session_mark(
+                    canonical_authority=canonical_mark,
+                    actual_authority=actual_mark,
+                    recorded_at=cutoff,
+                    calendar_resolver=_calendar(),
+                )
+                next_session = _calendar().add_sessions(_SESSION, 1)
+                as_of = aware_et(next_session, "08:45")
+                replay_source = journal._read_phase1_canonical_replay_source(
+                    query_cutoff=as_of,
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                )
+                replay = (
+                    ledger_module._issue_canonical_ledger_replay_from_phase1_source(
+                        replay_source
+                    )
+                )
+                history_source = journal._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=_SESSION,
+                    query_cutoff=as_of,
+                )
+                history = risk_module._issue_breaker_history_from_phase1_source(
+                    history_source,
+                    calendar_resolver=_calendar(),
+                )
+                breaker = risk_module.evaluate_authorized_breakers(history)
+                request = LongPlanRequest(
+                    entry=Decimal("100"),
+                    stop=Decimal("97.50"),
+                    tick_size=Decimal("0.01"),
+                    session_date=next_session,
+                    symbol="SPY",
+                    published_target=Decimal("105"),
+                )
+                lot = replay.ledger_pair.canonical.open_positions[0].lots[0]
+                original_shares = lot.shares
+                seen_data_version = 0
+                trace_fired = False
+
+                def mutate_after_replay_verification(statement: str) -> None:
+                    nonlocal seen_data_version, trace_fired
+                    if statement.upper().startswith("PRAGMA DATA_VERSION"):
+                        seen_data_version += 1
+                        if seen_data_version == 2:
+                            object.__setattr__(
+                                lot,
+                                "shares",
+                                original_shares + 100,
+                            )
+                            trace_fired = True
+
+                returned = None
+                error = None
+                journal._connection.set_trace_callback(
+                    mutate_after_replay_verification
+                )
+                try:
+                    try:
+                        returned = risk_module._issue_portfolio_risk_authority(
+                            request=request,
+                            ledger_pair=replay.ledger_pair,
+                            ledger_name="CANONICAL",
+                            breaker_state=breaker,
+                            calendar_resolver=_calendar(),
+                            policy=policy_fixture(),
+                            scope="CANONICAL_PUBLICATION",
+                            as_of=as_of,
+                            phase1_canonical_replay=replay,
+                        )
+                    except RiskBlock as exc:
+                        error = exc
+                finally:
+                    journal._connection.set_trace_callback(None)
+                self.assertTrue(trace_fired)
+                if returned is not None:
+                    self.assertTrue(
+                        risk_module.is_issued_portfolio_risk_authority(returned)
+                    )
+                    self.assertGreater(
+                        returned.portfolio_state.open_risk,
+                        Decimal("25"),
+                    )
+                self.assertIsNone(
+                    returned,
+                    "mutated replay must not earn portfolio authority",
+                )
+                self.assertIsInstance(error, RiskBlock)
+                self.assertFalse(
+                    ledger_module.is_verified_phase1_canonical_ledger_replay_for_source(
+                        replay,
+                        replay_source,
+                    )
+                )
+
+    def test_portfolio_verifier_fingerprints_after_all_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path) as journal:
+                (
+                    _mark_source,
+                    _actual_mark_source,
+                    canonical_mark,
+                    actual_mark,
+                    cutoff,
+                ) = _phase1_equity_authorities(journal)
+                journal.record_phase1_session_mark(
+                    canonical_authority=canonical_mark,
+                    actual_authority=actual_mark,
+                    recorded_at=cutoff,
+                    calendar_resolver=_calendar(),
+                )
+                next_session = _calendar().add_sessions(_SESSION, 1)
+                regular_as_of = aware_et(next_session, "08:45")
+                replay_source = journal._read_phase1_canonical_replay_source(
+                    query_cutoff=regular_as_of,
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                )
+                replay = (
+                    ledger_module._issue_canonical_ledger_replay_from_phase1_source(
+                        replay_source
+                    )
+                )
+                history_source = journal._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=_SESSION,
+                    query_cutoff=regular_as_of,
+                )
+                history = risk_module._issue_breaker_history_from_phase1_source(
+                    history_source,
+                    calendar_resolver=_calendar(),
+                )
+                breaker = risk_module.evaluate_authorized_breakers(history)
+                request = LongPlanRequest(
+                    entry=Decimal("100"),
+                    stop=Decimal("97.50"),
+                    tick_size=Decimal("0.01"),
+                    session_date=next_session,
+                    symbol="SPY",
+                    published_target=Decimal("105"),
+                )
+
+                target_state = None
+
+                class HookTZ(tzinfo):
+                    def __init__(self) -> None:
+                        self.armed = False
+                        self.fired = False
+                        self.calls = 0
+
+                    def utcoffset(self, value):  # type: ignore[no-untyped-def]
+                        nonlocal target_state
+                        self.calls += 1
+                        if self.armed and not self.fired and target_state is not None:
+                            object.__setattr__(
+                                target_state,
+                                "open_risk",
+                                Decimal("0"),
+                            )
+                            self.fired = True
+                        return -timedelta(hours=4)
+
+                    def dst(self, value):  # type: ignore[no-untyped-def]
+                        return timedelta(0)
+
+                    def tzname(self, value):  # type: ignore[no-untyped-def]
+                        return "EDT"
+
+                hook_timezone = HookTZ()
+                hooked_as_of = datetime(
+                    next_session.year,
+                    next_session.month,
+                    next_session.day,
+                    8,
+                    45,
+                    tzinfo=hook_timezone,
+                )
+                authority = risk_module._issue_portfolio_risk_authority(
+                    request=request,
+                    ledger_pair=replay.ledger_pair,
+                    ledger_name="CANONICAL",
+                    breaker_state=breaker,
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                    scope="CANONICAL_PUBLICATION",
+                    as_of=hooked_as_of,
+                    phase1_canonical_replay=replay,
+                )
+                target_state = authority.portfolio_state
+                expected_open_risk = Decimal("24.910000")
+                self.assertEqual(target_state.open_risk, expected_open_risk)
+                self.assertTrue(
+                    risk_module.is_issued_portfolio_risk_authority(authority)
+                )
+                baseline_calls = hook_timezone.calls
+                hook_timezone.armed = True
+                accepted_during_mutation = (
+                    risk_module.is_issued_portfolio_risk_authority(authority)
+                )
+                self.assertGreaterEqual(hook_timezone.calls, baseline_calls)
+                self.assertFalse(
+                    hook_timezone.fired,
+                    "portfolio verification must not call attacker tzinfo after "
+                    "reading the original risk scalar",
+                )
+                self.assertEqual(target_state.open_risk, expected_open_risk)
+                self.assertTrue(accepted_during_mutation)
+
     def test_publication_coordinator_rejects_empty_or_raw_cohorts(
         self,
     ) -> None:
@@ -8617,6 +10269,137 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         restarted_authority
                     )
                 )
+
+    def test_shadow_fill_reader_rejects_nested_signal_mutation_during_sql(
+        self,
+    ) -> None:
+        for mutation_kind in ("DIGEST", "SUBCLASS", "UNRELATED_CLASS"):
+            with (
+                self.subTest(mutation_kind=mutation_kind),
+                tempfile.TemporaryDirectory() as temporary_directory,
+                Journal.open(
+                    Path(temporary_directory) / "journal.db"
+                ) as journal,
+            ):
+                _start_window(journal)
+                publication_source, decision, plan, _lineage = (
+                    _issued_publication(
+                        journal,
+                        candidate_count=2,
+                    )
+                )
+                journal.publish_phase1_report(
+                    publication_source=publication_source,
+                    decision=decision,
+                    primary_plan_decision=plan,
+                    validation_window_id=_WINDOW_ID,
+                    calendar_resolver=_calendar(),
+                    received_at=aware_et(_SESSION, "08:45"),
+                )
+                initial_source = journal._read_phase1_canonical_replay_source(
+                    query_cutoff=aware_et(_SESSION, "08:45"),
+                )
+                shadow_source = initial_source.signal_sources[1]
+                trigger_id, quote_id, completed_at = (
+                    _append_completed_entry_observations(
+                        journal,
+                        shadow_source,
+                    )
+                )
+                journal.record_phase1_entry(
+                    shadow_source.signal_id,
+                    confirmation_action_source=None,
+                    trigger_observation_id=trigger_id,
+                    quote_observation_id=quote_id,
+                    calendar_resolver=_calendar(),
+                    recorded_at=completed_at,
+                )
+                current_signal = journal._read_phase1_signal_source(
+                    shadow_source.signal_id,
+                    query_cutoff=completed_at,
+                )
+
+                class SameLayoutSignal(type(current_signal)):
+                    __slots__ = ()
+
+                SameLayoutOther = make_dataclass(
+                    "SameLayoutOther",
+                    [
+                        (item.name, item.type)
+                        for item in fields(type(current_signal))
+                    ],
+                    frozen=True,
+                    slots=True,
+                    weakref_slot=True,
+                )
+
+                with journal_module._JOURNAL_SOURCE_LOCK:
+                    parent_authorities_before = set(
+                        journal_module._PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES
+                    )
+                with ledger_module._EVENT_AUTHORITY_LOCK:
+                    derived_authorities_before = set(
+                        ledger_module._SHADOW_FILL_DISPOSITION_AUTHORITIES
+                    )
+                trace_fired = False
+
+                def mutate_nested_signal(statement: str) -> None:
+                    nonlocal trace_fired
+                    normalized = " ".join(statement.upper().split())
+                    if trace_fired or (
+                        "FROM PHASE1_SIGNAL_EVENTS WHERE SIGNAL_ID"
+                        not in normalized
+                    ):
+                        return
+                    trace_fired = True
+                    if mutation_kind == "DIGEST":
+                        object.__setattr__(
+                            current_signal,
+                            "source_digest",
+                            "f" * 64,
+                        )
+                    elif mutation_kind == "SUBCLASS":
+                        object.__setattr__(
+                            current_signal,
+                            "__class__",
+                            SameLayoutSignal,
+                        )
+                    else:
+                        object.__setattr__(
+                            current_signal,
+                            "__class__",
+                            SameLayoutOther,
+                        )
+
+                journal._connection.set_trace_callback(mutate_nested_signal)
+                try:
+                    with self.assertRaises(journal_module.JournalError):
+                        journal._read_phase1_shadow_fill_source(
+                            shadow_source.signal_id,
+                            query_cutoff=completed_at,
+                            exact_signal_source=current_signal,
+                        )
+                finally:
+                    journal._connection.set_trace_callback(None)
+
+                self.assertTrue(trace_fired)
+                self.assertFalse(
+                    journal_module.is_verified_phase1_signal_source(
+                        current_signal
+                    )
+                )
+                with journal_module._JOURNAL_SOURCE_LOCK:
+                    self.assertEqual(
+                        set(
+                            journal_module._PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES
+                        ),
+                        parent_authorities_before,
+                    )
+                with ledger_module._EVENT_AUTHORITY_LOCK:
+                    self.assertEqual(
+                        set(ledger_module._SHADOW_FILL_DISPOSITION_AUTHORITIES),
+                        derived_authorities_before,
+                    )
 
     def test_raw_shadow_fill_disposition_cannot_mint_authority(self) -> None:
         self.assertTrue(
@@ -10261,6 +12044,125 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                 )
                 self.assertEqual(len(final_replay.closed_trades), 1)
 
+    def test_exit_calendar_callback_cannot_aba_provider_market_material(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            exit_session = date(2026, 8, 17)
+            with Journal.open(path) as journal:
+                _seed_completed_authority_fill(journal)
+                review_cutoff = aware_et(exit_session, "15:59") + timedelta(
+                    seconds=59
+                )
+                signal_source = journal._read_phase1_signal_source(
+                    _signal().signal_id,
+                    query_cutoff=review_cutoff,
+                )
+                source, _completed_at = _read_provider_exit_review_source(
+                    journal,
+                    signal_source=signal_source,
+                    session_date=exit_session,
+                    bid=Decimal("21.00"),
+                    ask=Decimal("21.01"),
+                    previous_session_low=Decimal("20.80"),
+                    execution_open=Decimal("21.00"),
+                    execution_high=Decimal("21.05"),
+                    execution_low=Decimal("20.95"),
+                    execution_close=Decimal("21.00"),
+                    adverse_evidence=True,
+                )
+                daily_bars = source.market_source.daily_bar_cohort[
+                    source.symbol
+                ]
+                prior_bar = daily_bars[-2]
+                original_low = prior_bar.low
+                self.assertEqual(original_low, Decimal("20.80"))
+                self.assertTrue(
+                    alpaca_module.is_issued_normalized_market_fact(prior_bar)
+                )
+                previous_session_calls = 0
+                calendar_mutated = False
+
+                class AbaCalendar(SessionCalendarResolver):
+                    def previous_session(self, start: date) -> date:
+                        nonlocal previous_session_calls, calendar_mutated
+                        previous = super().previous_session(start)
+                        previous_session_calls += 1
+                        if previous_session_calls == 13:
+                            object.__setattr__(
+                                prior_bar,
+                                "low",
+                                Decimal("1.00"),
+                            )
+                            calendar_mutated = True
+                        return previous
+
+                calendar = AbaCalendar(_calendar().calendars)
+                provider_restored = False
+
+                def restore_provider_on_next_journal_callback(
+                    statement: str,
+                ) -> None:
+                    nonlocal provider_restored
+                    if (
+                        calendar_mutated
+                        and not provider_restored
+                    ):
+                        object.__setattr__(prior_bar, "low", original_low)
+                        provider_restored = True
+
+                returned = None
+                error = None
+                journal._connection.set_trace_callback(
+                    restore_provider_on_next_journal_callback
+                )
+                try:
+                    try:
+                        returned = (
+                            risk_module._issue_phase1_position_exit_authority_from_source(
+                                source,
+                                calendar_resolver=calendar,
+                                policy=policy_fixture(),
+                            )
+                        )
+                    except RiskBlock as exc:
+                        error = exc
+                finally:
+                    journal._connection.set_trace_callback(None)
+                restored_by_trace = provider_restored
+                if not provider_restored:
+                    # The hardened path rejects the mutated provider fact
+                    # before another Journal callback is necessary.  Restore
+                    # the test fixture explicitly so the remaining authority
+                    # assertions inspect the canonical provider object.
+                    object.__setattr__(prior_bar, "low", original_low)
+                self.assertTrue(calendar_mutated)
+                self.assertEqual(prior_bar.low, original_low)
+                self.assertTrue(
+                    alpaca_module.is_issued_normalized_market_fact(prior_bar)
+                )
+                self.assertTrue(
+                    journal_module.is_verified_phase1_exit_review_source(source)
+                )
+                if returned is not None:
+                    self.assertTrue(restored_by_trace)
+                    self.assertTrue(
+                        risk_module.is_issued_phase1_position_exit_authority(
+                            returned
+                        )
+                    )
+                    self.assertEqual(
+                        returned.mark.previous_session_low,
+                        Decimal("1.000000"),
+                    )
+                    self.assertEqual(returned.mark.atr14, Decimal("1.885715"))
+                self.assertIsNone(
+                    returned,
+                    "ABA-restored provider facts must not earn exit authority",
+                )
+                self.assertIsInstance(error, RiskBlock)
+
     def test_exit_authority_rejects_copy_splice_lookahead_and_oversell(
         self,
     ) -> None:
@@ -10581,6 +12483,597 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         source,
                         calendar_resolver=diagnostic,
                     )
+
+    def test_breaker_history_verifier_fingerprints_after_calendar_callbacks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            through_session = date(2026, 8, 13)
+            cutoff = aware_et(through_session, "16:00") + timedelta(seconds=1)
+            with Journal.open(path) as journal:
+                _publish(journal)
+                source = journal._read_phase1_breaker_history_source(
+                    ledger_name="CANONICAL",
+                    through_session=through_session,
+                    query_cutoff=cutoff,
+                )
+
+                target_history = None
+                hook_armed = False
+                hook_fired = False
+                hook_calls = 0
+
+                class HookCalendar(SessionCalendarResolver):
+                    @property
+                    def release_verified(self) -> bool:
+                        nonlocal hook_calls, hook_fired
+                        hook_calls += 1
+                        verified = super().release_verified
+                        if (
+                            hook_armed
+                            and not hook_fired
+                            and target_history is not None
+                        ):
+                            object.__setattr__(
+                                target_history.equity[0],
+                                "equity",
+                                Decimal("1.00"),
+                            )
+                            hook_fired = True
+                        return verified
+
+                calendar = HookCalendar(_calendar().calendars)
+                history = risk_module._issue_breaker_history_from_phase1_source(
+                    source,
+                    calendar_resolver=calendar,
+                )
+                target_history = history
+                original_equity = history.equity[0].equity
+                self.assertEqual(original_equity, Decimal("5000.000000"))
+                self.assertTrue(
+                    risk_module.is_issued_breaker_history_authority(history)
+                )
+
+                hook_calls = 0
+                hook_armed = True
+                accepted_during_mutation = (
+                    risk_module.is_issued_breaker_history_authority(history)
+                )
+
+                self.assertGreater(hook_calls, 0)
+                self.assertTrue(hook_fired)
+                self.assertEqual(history.equity[0].equity, Decimal("1.00"))
+                self.assertFalse(
+                    accepted_during_mutation,
+                    "calendar callbacks must finish before the final history "
+                    "fingerprint and registry check",
+                )
+                self.assertFalse(
+                    risk_module.is_issued_breaker_history_authority(history)
+                )
+
+    def test_risk_authority_verifiers_finalize_after_callbacks(self) -> None:
+        def assert_callback_mutation_denied(
+            *,
+            name: str,
+            value: object,
+            verifier,
+            callback_name: str,
+            mutate,
+        ) -> None:
+            self.assertTrue(verifier(value), name)
+            callback_fired = False
+
+            def mutate_during_callback(*args, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal callback_fired
+                if not callback_fired:
+                    mutate()
+                    callback_fired = True
+                return True
+
+            with (
+                self.subTest(authority=name),
+                mock.patch.object(
+                    risk_module,
+                    callback_name,
+                    side_effect=mutate_during_callback,
+                ),
+            ):
+                accepted_during_mutation = verifier(value)
+                self.assertTrue(callback_fired)
+                self.assertFalse(
+                    accepted_during_mutation,
+                    f"{name} must fingerprint after every callback",
+                )
+            self.assertFalse(verifier(value), name)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "account-window.db"
+            with Journal.open(path) as journal:
+                def ingest(
+                    message_id: str,
+                    text: str,
+                    *,
+                    message_time: str,
+                    received_at: str,
+                ):
+                    return ingest_confirmation(
+                        journal,
+                        ConfirmationEnvelope(
+                            message_id=message_id,
+                            text=text,
+                            message_time=datetime.fromisoformat(message_time),
+                            received_at=datetime.fromisoformat(received_at),
+                            session_date=_SESSION,
+                        ),
+                        plans=UnavailableSignalPlanResolver(),
+                        calendar=_calendar(),
+                        policy=policy_fixture(),
+                        entry_authorities=(
+                            UnavailableActualEntryAuthorityResolver()
+                        ),
+                    )
+
+                check = ingest(
+                    "risk-family:account-check",
+                    "ACCOUNT CHECK settled_cash 5000 pending_orders 0 "
+                    "unlogged_positions 0 AT 10:10 ET",
+                    message_time="2026-08-14T10:10:00-04:00",
+                    received_at="2026-08-14T10:10:01-04:00",
+                )
+                terminal = ingest(
+                    "risk-family:terminal-buy",
+                    "BOUGHT SPY 5 shares @ 100.25 AT 10:14 ET; "
+                    "BID 100.24 ASK 100.25; STOP SET @ 97.50",
+                    message_time="2026-08-14T10:15:00-04:00",
+                    received_at="2026-08-14T10:15:01-04:00",
+                )
+                with journal.transaction() as transaction:
+                    source = transaction.read_account_check_window(
+                        account_check_event_id=check.actions[0].event_row_id,
+                        terminal_event_id=terminal.actions[0].event_row_id,
+                    )
+
+                _check, _action, window = (
+                    risk_module._issue_account_buy_authority(source)
+                )
+                assert_callback_mutation_denied(
+                    name="JOURNAL_EVENT_WINDOW",
+                    value=window,
+                    verifier=risk_module.is_issued_journal_event_window,
+                    callback_name="_journal_derived_source_is_current",
+                    mutate=lambda: object.__setattr__(
+                        window,
+                        "complete",
+                        False,
+                    ),
+                )
+
+                _check, action, _window = (
+                    risk_module._issue_account_buy_authority(source)
+                )
+                assert_callback_mutation_denied(
+                    name="CONFIRMED_BUY",
+                    value=action,
+                    verifier=risk_module.is_issued_confirmed_buy_action,
+                    callback_name="_journal_derived_source_is_current",
+                    mutate=lambda: object.__setattr__(
+                        action,
+                        "symbol",
+                        "QQQ",
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "portfolio-breakers.db"
+            with Journal.open(path) as journal:
+                _start_window(journal)
+                (
+                    _replay_source,
+                    _replay,
+                    _history_source,
+                    _history,
+                    breaker,
+                    portfolio,
+                ) = _empty_authority_chain(journal)
+                decision = plan_long(
+                    portfolio.request,
+                    portfolio.portfolio_state,
+                    policy_fixture(),
+                    portfolio_authority=portfolio,
+                )
+                self.assertTrue(decision.eligible)
+                assert_callback_mutation_denied(
+                    name="LONG_PLAN",
+                    value=decision,
+                    verifier=risk_module.is_issued_long_plan_decision,
+                    callback_name="is_issued_portfolio_risk_authority",
+                    mutate=lambda: object.__setattr__(
+                        decision,
+                        "eligible",
+                        False,
+                    ),
+                )
+
+                assert_callback_mutation_denied(
+                    name="BREAKER_STATE",
+                    value=breaker,
+                    verifier=risk_module.is_issued_breaker_state,
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=lambda: object.__setattr__(
+                        breaker,
+                        "consecutive_losses",
+                        99,
+                    ),
+                )
+
+                canonical_history_source = (
+                    journal._read_phase1_breaker_history_source(
+                        ledger_name="CANONICAL",
+                        through_session=date(2026, 8, 13),
+                        query_cutoff=aware_et(_SESSION, "08:45"),
+                    )
+                )
+                canonical_history = (
+                    risk_module._issue_breaker_history_from_phase1_source(
+                        canonical_history_source,
+                        calendar_resolver=_calendar(),
+                    )
+                )
+                canonical = risk_module.evaluate_authorized_breakers(
+                    canonical_history
+                )
+                actual_history_source = (
+                    journal._read_phase1_breaker_history_source(
+                        ledger_name="ACTUAL",
+                        through_session=date(2026, 8, 13),
+                        query_cutoff=aware_et(_SESSION, "08:45"),
+                    )
+                )
+                actual_history = (
+                    risk_module._issue_breaker_history_from_phase1_source(
+                        actual_history_source,
+                        calendar_resolver=_calendar(),
+                    )
+                )
+                actual = risk_module.evaluate_authorized_breakers(actual_history)
+                paired = risk_module.combine_breaker_states(
+                    canonical,
+                    actual,
+                    as_of=date(2026, 8, 13),
+                )
+                assert_callback_mutation_denied(
+                    name="PAIRED_BREAKER",
+                    value=paired,
+                    verifier=risk_module.is_issued_paired_breaker_state,
+                    callback_name="is_issued_breaker_state",
+                    mutate=lambda: object.__setattr__(
+                        paired,
+                        "reason_codes",
+                        ("FORGED",),
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "evidence.db"
+            with Journal.open(path) as journal:
+                signal_source = _published_signal_source(journal)
+                position, bundle, evidence_decision, review_at = (
+                    _reviewed_position_evidence_context(
+                        (),
+                        symbol=signal_source.symbol,
+                        subject_kind=signal_source.subject_kind,
+                        issuer_cik=signal_source.issuer_cik,
+                    )
+                )
+                signal_evidence = (
+                    risk_module._issue_phase1_signal_evidence_authority(
+                        signal_source,
+                        bundle,
+                        evidence_decision,
+                        review_at=review_at,
+                        calendar_resolver=_calendar(),
+                    )
+                )
+
+                def mutate_signal_evidence() -> None:
+                    object.__setattr__(
+                        signal_evidence,
+                        "status",
+                        "EXIT_REQUIRED",
+                    )
+                    object.__setattr__(
+                        signal_evidence,
+                        "source_digest",
+                        hashlib.sha256(
+                            risk_module._phase1_signal_evidence_bytes(
+                                signal_evidence
+                            )
+                        ).hexdigest(),
+                    )
+
+                assert_callback_mutation_denied(
+                    name="SIGNAL_EVIDENCE",
+                    value=signal_evidence,
+                    verifier=(
+                        risk_module.is_issued_phase1_signal_evidence_authority
+                    ),
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=mutate_signal_evidence,
+                )
+
+                replacement_signal_evidence = (
+                    risk_module._issue_phase1_signal_evidence_authority(
+                        signal_source,
+                        bundle,
+                        evidence_decision,
+                        review_at=review_at,
+                        calendar_resolver=_calendar(),
+                    )
+                )
+                position_evidence = (
+                    risk_module._issue_phase1_position_evidence_authority(
+                        replacement_signal_evidence,
+                        position=position,
+                    )
+                )
+                assert_callback_mutation_denied(
+                    name="POSITION_EVIDENCE",
+                    value=position_evidence,
+                    verifier=(
+                        risk_module.is_issued_phase1_position_evidence_authority
+                    ),
+                    callback_name=(
+                        "is_issued_phase1_signal_evidence_authority"
+                    ),
+                    mutate=lambda: object.__setattr__(
+                        position_evidence,
+                        "source_digest",
+                        "0" * 64,
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "equity.db"
+            with Journal.open(path) as journal:
+                (
+                    _canonical_source,
+                    _actual_source,
+                    equity_authority,
+                    _actual_authority,
+                    _cutoff,
+                ) = _phase1_equity_authorities(journal)
+                assert_callback_mutation_denied(
+                    name="EQUITY_POINT",
+                    value=equity_authority,
+                    verifier=(
+                        risk_module.is_issued_phase1_equity_point_authority
+                    ),
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=lambda: object.__setattr__(
+                        equity_authority.point,
+                        "equity",
+                        Decimal("1.00"),
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "exit.db"
+            exit_session = date(2026, 8, 17)
+            with Journal.open(path) as journal:
+                _seed_completed_authority_fill(journal)
+                review_cutoff = aware_et(exit_session, "15:59") + timedelta(
+                    seconds=59
+                )
+                signal_source = journal._read_phase1_signal_source(
+                    _signal().signal_id,
+                    query_cutoff=review_cutoff,
+                )
+                exit_source, _completed_at = _read_provider_exit_review_source(
+                    journal,
+                    signal_source=signal_source,
+                    session_date=exit_session,
+                    bid=Decimal("21.00"),
+                    ask=Decimal("21.01"),
+                    previous_session_low=Decimal("20.80"),
+                    execution_open=Decimal("21.00"),
+                    execution_high=Decimal("21.05"),
+                    execution_low=Decimal("20.95"),
+                    execution_close=Decimal("21.00"),
+                    adverse_evidence=True,
+                )
+
+                context_authority = (
+                    risk_module._issue_phase1_position_exit_authority_from_source(
+                        exit_source,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                    )
+                )
+                context = context_authority.event_context
+                assert_callback_mutation_denied(
+                    name="POSITION_EVENT_CONTEXT",
+                    value=context,
+                    verifier=risk_module.is_issued_position_event_context,
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=lambda: object.__setattr__(
+                        context,
+                        "price",
+                        Decimal("1.00"),
+                    ),
+                )
+
+                mark_authority = (
+                    risk_module._issue_phase1_position_exit_authority_from_source(
+                        exit_source,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                    )
+                )
+                mark = mark_authority.mark
+                assert_callback_mutation_denied(
+                    name="MARKET_MARK",
+                    value=mark,
+                    verifier=risk_module.is_issued_market_mark,
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=lambda: object.__setattr__(
+                        mark,
+                        "price",
+                        Decimal("1.00"),
+                    ),
+                )
+
+                exit_authority = (
+                    risk_module._issue_phase1_position_exit_authority_from_source(
+                        exit_source,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                    )
+                )
+                assert_callback_mutation_denied(
+                    name="POSITION_EXIT",
+                    value=exit_authority,
+                    verifier=(
+                        risk_module.is_issued_phase1_position_exit_authority
+                    ),
+                    callback_name="_phase1_derived_sources_are_current",
+                    mutate=lambda: object.__setattr__(
+                        exit_authority,
+                        "authority_digest",
+                        "0" * 64,
+                    ),
+                )
+
+    def test_long_plan_decision_rechecks_portfolio_after_calendar_callbacks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "long-plan-aba.db"
+            with Journal.open(path) as journal:
+                _start_window(journal)
+                (
+                    _replay_source,
+                    replay,
+                    _history_source,
+                    _history,
+                    breaker,
+                    base,
+                ) = _empty_authority_chain(journal)
+                holder = {
+                    "state": None,
+                    "armed": False,
+                    "mutated": False,
+                    "restored": False,
+                }
+
+                class AbaCalendar(SessionCalendarResolver):
+                    @property
+                    def release_verified(self) -> bool:
+                        result = super().release_verified
+                        state = holder["state"]
+                        if (
+                            holder["armed"]
+                            and not holder["mutated"]
+                            and state is not None
+                        ):
+                            object.__setattr__(
+                                state,
+                                "reconciliation_required",
+                                True,
+                            )
+                            holder["mutated"] = True
+                        return result
+
+                    def is_open(self, session_date: date) -> bool:
+                        result = super().is_open(session_date)
+                        state = holder["state"]
+                        if (
+                            holder["mutated"]
+                            and not holder["restored"]
+                            and state is not None
+                        ):
+                            object.__setattr__(
+                                state,
+                                "reconciliation_required",
+                                False,
+                            )
+                            holder["restored"] = True
+                        return result
+
+                policy = policy_fixture()
+                calendar = AbaCalendar(_calendar().calendars)
+                authority = risk_module._issue_portfolio_risk_authority(
+                    request=base.request,
+                    ledger_pair=replay.ledger_pair,
+                    ledger_name="CANONICAL",
+                    breaker_state=breaker,
+                    calendar_resolver=calendar,
+                    policy=policy,
+                    scope=base.scope,
+                    as_of=base.as_of,
+                    phase1_canonical_replay=replay,
+                )
+                state = authority.portfolio_state
+                holder["state"] = state
+                self.assertFalse(state.reconciliation_required)
+                self.assertTrue(
+                    risk_module.is_issued_portfolio_risk_authority(authority)
+                )
+
+                object.__setattr__(state, "reconciliation_required", True)
+                forged_diagnostic = risk_module.plan_long_diagnostic(
+                    authority.request,
+                    state,
+                    policy,
+                )
+                self.assertIn(
+                    "RECONCILIATION_REQUIRED",
+                    forged_diagnostic.reason_codes,
+                )
+                object.__setattr__(state, "reconciliation_required", False)
+                decision = replace(
+                    forged_diagnostic,
+                    authority_scope=authority.scope,
+                    authority_digest=risk_module._portfolio_authority_digest(
+                        authority
+                    ),
+                    as_of=authority.as_of,
+                    portfolio_authority=authority,
+                )
+
+                holder["armed"] = True
+                returned = None
+                error = None
+                try:
+                    returned = risk_module._issue_long_plan_decision(
+                        decision,
+                        authority,
+                        policy,
+                    )
+                except RiskBlock as exc:
+                    error = exc
+
+                self.assertTrue(holder["mutated"])
+                self.assertTrue(holder["restored"])
+                self.assertFalse(state.reconciliation_required)
+                self.assertTrue(
+                    risk_module.is_issued_portfolio_risk_authority(authority)
+                )
+                if returned is not None:
+                    self.assertIs(returned, decision)
+                    self.assertIn(
+                        "RECONCILIATION_REQUIRED",
+                        returned.reason_codes,
+                    )
+                    self.assertTrue(
+                        risk_module.is_issued_long_plan_decision(returned)
+                    )
+                self.assertIsNone(
+                    returned,
+                    "calendar ABA must not mint an inconsistent plan decision",
+                )
+                self.assertIsInstance(error, RiskBlock)
 
     def test_portfolio_authority_uses_phase1_cash_and_deep_fingerprint(self) -> None:
         for name in (

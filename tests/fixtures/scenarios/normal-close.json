@@ -1,0 +1,35 @@
+{
+  "now": "2026-08-14T15:30:00-04:00",
+  "account": {
+    "configuration": "READY",
+    "market": "OPEN",
+    "review_time": "15:30",
+    "universe": "READY",
+    "breaker": "CLEAR",
+    "candidates": [],
+    "close_state": "HOLD",
+    "close_positions": [
+      {
+        "symbol": "AAPL",
+        "shares": 5,
+        "mark": "232.10",
+        "estimated_unrealized_pl": "35.00",
+        "r_multiple": "1.40",
+        "recommended_stop": "225.00",
+        "user_confirmed_stop": "223.00",
+        "target": "235.25",
+        "holding_days": 3,
+        "provider": "ALPACA",
+        "feed": "SIP",
+        "observed_at": "2026-08-14T15:29:00-04:00",
+        "upcoming_events": ["Earnings after planned exit"],
+        "evidence": [
+          {"label": "Issuer calendar", "url": "https://investor.apple.com/"}
+        ]
+      }
+    ]
+  },
+  "provider_fixture": "READY",
+  "evidence_fixture": "READY",
+  "expected_outcome": "HOLD"
+}

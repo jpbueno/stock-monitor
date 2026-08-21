@@ -1,0 +1,7 @@
+{
+  "now": "2026-08-14T08:15:00-04:00",
+  "account": {"configuration": "READY", "market": "STALE", "review_time": "15:30", "universe": "READY", "breaker": "CLEAR", "candidates": [], "close_state": "HOLD"},
+  "provider_fixture": "READY",
+  "evidence_fixture": "READY",
+  "expected_outcome": "DATA_UNAVAILABLE"
+}

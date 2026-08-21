@@ -7,15 +7,20 @@ import json
 import os
 import subprocess
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from stock_monitor import unattended
 from stock_monitor.domain import money_to_micros
 from stock_monitor.journal import Journal
 from stock_monitor.reports import PremarketState, archive_report, render_premarket_report
+from stock_monitor.unattended import LiteralEnvironmentError
 
 
 ROOT = Path(__file__).parents[2]
@@ -110,6 +115,31 @@ def _archive_safe_report(reports_root: Path) -> Path:
 
 
 class SecretRedactionTests(unittest.TestCase):
+    def test_unattended_loader_error_never_prints_nested_canaries(self) -> None:
+        secret = json.dumps(
+            {"credentials": [{"secret": value} for value in CANARIES]},
+            separators=(",", ":"),
+        )
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with patch.object(
+            unattended,
+            "load_literal_environment",
+            side_effect=LiteralEnvironmentError(secret),
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            code = unattended.main(("provider", "smoke", "--json"))
+
+        self.assertEqual(code, 2)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(
+            combined,
+            "CONFIGURATION REQUIRED\nNo candidate or action was produced.\n",
+        )
+        for canary in CANARIES:
+            with self.subTest(canary=canary):
+                self.assertNotIn(canary, combined)
+
     def test_canary_secrets_never_appear_in_stdout_stderr_archive_or_csv(self) -> None:
         with TemporaryDirectory() as temporary:
             home = Path(temporary)

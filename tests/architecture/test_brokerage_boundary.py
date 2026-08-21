@@ -133,6 +133,21 @@ _REVIEWED_SHELL_LAUNCHERS: dict[Path, bytes] = {
         b"fi\n"
         b'exec python3 -m stock_monitor "$@"\n'
     ),
+    Path("scripts/run_monitor_unattended.sh"): (
+        b"#!/bin/sh\n"
+        b"set -eu\n"
+        b"set +x\n"
+        b"umask 077\n"
+        b"case $0 in\n"
+        b"  /*) script_path=$0 ;;\n"
+        b"  *) exit 2 ;;\n"
+        b"esac\n"
+        b"script_dir=${script_path%/*}\n"
+        b'repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)\n'
+        b"python=$repo_root/.venv/bin/python3\n"
+        b'[ -x "$python" ] || exit 2\n'
+        b'exec /usr/bin/env -i "$python" -I -m stock_monitor.unattended "$@"\n'
+    ),
 }
 _NON_PRODUCTION_DIRECTORIES = frozenset(
     {
@@ -1225,23 +1240,23 @@ class BrokerageBoundaryTests(unittest.TestCase):
         )
 
     def test_reviewed_launcher_is_exact_and_tamper_evident(self) -> None:
-        relative = Path("scripts/run_monitor.sh")
-        launcher = PROJECT_ROOT / relative
+        for relative in _REVIEWED_SHELL_LAUNCHERS:
+            with self.subTest(relative=relative):
+                launcher = PROJECT_ROOT / relative
+                self.assertEqual(_shell_boundary_violations(launcher, relative), [])
 
-        self.assertEqual(_shell_boundary_violations(launcher, relative), [])
+                with tempfile.TemporaryDirectory() as directory:
+                    changed = Path(directory) / relative.name
+                    changed.write_bytes(launcher.read_bytes() + b"echo unsafe\n")
+                    violations = _shell_boundary_violations(changed, relative)
 
-        with tempfile.TemporaryDirectory() as directory:
-            changed = Path(directory) / "run_monitor.sh"
-            changed.write_bytes(launcher.read_bytes() + b"echo unsafe\n")
-            violations = _shell_boundary_violations(changed, relative)
-
-        self.assertEqual(
-            violations,
-            [
-                "unreviewed executable shell:scripts/run_monitor.sh:1:"
-                "launcher shape changed"
-            ],
-        )
+                self.assertEqual(
+                    violations,
+                    [
+                        f"unreviewed executable shell:{relative}:1:"
+                        "launcher shape changed"
+                    ],
+                )
 
     def test_phase2_domain_modules_are_pure_and_paper_only(self) -> None:
         package = PROJECT_ROOT / "src" / "stock_monitor"

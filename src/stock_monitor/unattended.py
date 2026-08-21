@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 from . import cli
@@ -23,6 +23,37 @@ _MAXIMUM_ENVIRONMENT_BYTES = 16384
 
 class LiteralEnvironmentError(RuntimeError):
     """The private environment failed its closed literal-file contract."""
+
+
+class _LiteralEnvironment(Mapping[str, str]):
+    """Read-only approved values with secret-safe implicit representations."""
+
+    __slots__ = ("_entries",)
+
+    def __init__(self, values: Mapping[str, str]) -> None:
+        self._entries = tuple((key, values[key]) for key in sorted(values))
+
+    def __getitem__(self, key: str) -> str:
+        for candidate, value in self._entries:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __repr__(self) -> str:
+        keys = ", ".join(key for key, _ in self._entries)
+        return f"LiteralEnvironment(keys=[{keys}])"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+    def __format__(self, format_spec: str) -> str:
+        return format(str(self), format_spec)
 
 
 def read_bounded_descriptor(descriptor: int, *, maximum_bytes: int) -> bytes:
@@ -44,7 +75,7 @@ def parse_exact_literal_assignments(
     payload: bytes,
     *,
     approved: frozenset[str],
-) -> dict[str, str]:
+) -> Mapping[str, str]:
     """Parse one literal non-empty assignment for every approved key."""
     try:
         text = payload.decode("utf-8")
@@ -52,9 +83,15 @@ def parse_exact_literal_assignments(
         raise LiteralEnvironmentError(
             "private environment encoding is invalid"
         ) from None
+    if any(
+        character != "\n"
+        and (ord(character) < 32 or 127 <= ord(character) <= 159)
+        for character in text
+    ):
+        raise LiteralEnvironmentError("private environment control data is invalid")
 
     result: dict[str, str] = {}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line or line.startswith("#"):
             continue
         key, separator, value = line.partition("=")
@@ -69,10 +106,10 @@ def parse_exact_literal_assignments(
 
     if result.keys() != approved:
         raise LiteralEnvironmentError("private environment is incomplete")
-    return result
+    return _LiteralEnvironment(result)
 
 
-def load_literal_environment(path: Path) -> dict[str, str]:
+def load_literal_environment(path: Path) -> Mapping[str, str]:
     """Open, validate, and parse a private environment through one descriptor."""
     try:
         descriptor = os.open(

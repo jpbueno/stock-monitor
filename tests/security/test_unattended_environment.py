@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import unittest
+from collections.abc import Mapping, MutableMapping
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -13,6 +14,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from stock_monitor import unattended
+from stock_monitor.config import load_settings
 from stock_monitor.unattended import (
     APPROVED_KEYS,
     LiteralEnvironmentError,
@@ -164,6 +166,88 @@ class LiteralEnvironmentTests(unittest.TestCase):
                 with self.assertRaises(LiteralEnvironmentError):
                     load_literal_environment(path)
 
+    def test_every_non_lf_control_codepoint_is_rejected_in_comments(self) -> None:
+        prefix = self.valid_text().encode("utf-8") + b"# comment"
+        controls = (*range(0, 10), *range(11, 32), *range(127, 160))
+
+        for codepoint in controls:
+            with self.subTest(codepoint=codepoint):
+                payload = prefix + chr(codepoint).encode("utf-8") + b"hidden\n"
+                with self.assertRaises(LiteralEnvironmentError):
+                    parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+    def test_controls_in_keys_and_around_separators_are_rejected(self) -> None:
+        valid = self.valid_text().encode("utf-8")
+        cases = (
+            valid.replace(
+                b"APCA_API_KEY_ID=",
+                b"APCA_API_KEY\x00_ID=",
+                1,
+            ),
+            valid.replace(
+                b"APCA_API_KEY_ID=",
+                b"APCA_API_KEY_ID\x1f=",
+                1,
+            ),
+            valid.replace(
+                b"APCA_API_KEY_ID=",
+                b"APCA_API_KEY_ID=\x7f",
+                1,
+            ),
+        )
+
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(
+                LiteralEnvironmentError
+            ):
+                parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+    def test_splitlines_controls_and_crlf_are_rejected(self) -> None:
+        valid = self.valid_text().encode("utf-8")
+        splitline_controls = (
+            b"\x0b",
+            b"\x0c",
+            b"\x1c",
+            b"\x1d",
+            b"\x1e",
+            b"\xc2\x85",
+        )
+        cases = (
+            *(
+                valid + b"# first" + control + b"# second\n"
+                for control in splitline_controls
+            ),
+            valid.replace(b"\n", b"\r\n"),
+            valid + b"# comment\rhidden\n",
+            valid.replace(b"\n", "\N{LINE SEPARATOR}".encode("utf-8"), 1),
+            valid.replace(b"\n", "\N{PARAGRAPH SEPARATOR}".encode("utf-8"), 1),
+        )
+
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(
+                LiteralEnvironmentError
+            ):
+                parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+    def test_printable_utf8_in_comments_survives_payload_validation(self) -> None:
+        payload = (
+            "# opérateur\n".encode("utf-8")
+            + self.valid_text().encode("utf-8")
+        )
+
+        values = parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+        self.assertEqual(values["APCA_API_KEY_ID"], "literal-key-id")
+
+    def test_parser_wraps_the_explicit_approved_key_set(self) -> None:
+        values = parse_exact_literal_assignments(
+            b"SYNTHETIC=value\n",
+            approved=frozenset({"SYNTHETIC"}),
+        )
+
+        self.assertEqual(values["SYNTHETIC"], "value")
+        self.assertIn("SYNTHETIC", repr(values))
+
     def test_missing_path_and_descriptor_errors_are_secret_safe(self) -> None:
         canary = "CANARY_PATH_VALUE_MUST_NOT_ESCAPE"
 
@@ -210,6 +294,71 @@ class LiteralEnvironmentTests(unittest.TestCase):
             parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
 
         self.assertNotIn(canary, repr(raised.exception))
+
+    def test_loaded_mapping_redacts_every_implicit_representation(self) -> None:
+        canaries = (
+            "CANARY_REPR_KEY_MUST_NOT_ESCAPE",
+            "CANARY_REPR_SECRET_MUST_NOT_ESCAPE",
+            "CANARY_REPR_AGENT_MUST_NOT_ESCAPE",
+            "CANARY_REPR_HOME_MUST_NOT_ESCAPE",
+        )
+        path = self.private_file(
+            self.valid_text(
+                key_id=canaries[0],
+                secret_key=canaries[1],
+                user_agent=f"Stock Monitor {canaries[2]} operator@example.com",
+                home=str(self.root / canaries[3]),
+            )
+        )
+
+        values = load_literal_environment(path)
+        error = RuntimeError(values)
+        rendered = (
+            repr(values),
+            str(values),
+            f"{values}",
+            f"{values!r}",
+            format(values),
+            str(error),
+            repr(error),
+            f"exception={error}",
+        )
+
+        for representation in rendered:
+            for canary in canaries:
+                with self.subTest(representation=representation, canary=canary):
+                    self.assertNotIn(canary, representation)
+        for key in APPROVED_KEYS:
+            self.assertIn(key, repr(values))
+
+    def test_loaded_mapping_is_read_only_without_a_mutable_backing(self) -> None:
+        values = load_literal_environment(
+            self.private_file(self.valid_text(secret_key="trusted-secret"))
+        )
+
+        self.assertIsInstance(values, Mapping)
+        self.assertNotIsInstance(values, MutableMapping)
+        self.assertFalse(hasattr(values, "__dict__"))
+        self.assertFalse(hasattr(values, "clear"))
+        self.assertFalse(hasattr(values, "update"))
+        with self.assertRaises(TypeError):
+            values["APCA_API_SECRET_KEY"] = "replacement"  # type: ignore[index]
+        self.assertEqual(values["APCA_API_SECRET_KEY"], "trusted-secret")
+
+    def test_loaded_mapping_remains_compatible_with_configuration_loader(self) -> None:
+        path = self.private_file(
+            self.valid_text(
+                key_id="compatible-key",
+                secret_key="compatible-secret",
+                home=str(self.root / "configuration-home"),
+            )
+        )
+        values = load_literal_environment(path)
+
+        settings = load_settings(ROOT, values)
+
+        self.assertEqual(settings.alpaca_api_key_id, "compatible-key")
+        self.assertEqual(settings.alpaca_api_secret_key, "compatible-secret")
 
     def test_main_passes_only_loaded_values_to_cli(self) -> None:
         values = {

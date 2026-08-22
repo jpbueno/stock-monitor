@@ -73,10 +73,38 @@ class _RuntimeMarketTransport:
         missing_previous_symbol: str | None = None,
     ) -> None:
         templates = task5_fixtures.universe_candidate_contexts()
-        self._templates = {
-            context.record.symbol: context for context in templates
+        symbols = tuple(context.record.symbol for context in templates)
+        # Keep the fake transport's sealed dependency graph limited to the
+        # primitive values it serves. Retaining CandidateContext authorities
+        # also retains weak calendar registries whose GC cleanup is unrelated
+        # to an HTTP request and can otherwise look like transport tampering.
+        self._bar_templates = {
+            symbol: tuple(
+                (
+                    bar.close,
+                    bar.high,
+                    bar.low,
+                    bar.open,
+                    bar.volume,
+                )
+                for bar in templates[0].bars_by_symbol[symbol]
+            )
+            for symbol in symbols
         }
-        self._bar_templates = dict(templates[0].bars_by_symbol)
+        self._previous_quotes = {
+            context.record.symbol: (
+                context.previous_session_quote.bid,
+                context.previous_session_quote.ask,
+            )
+            for context in templates
+        }
+        self._latest_quotes = {
+            context.record.symbol: (
+                context.latest_iex_quote.bid,
+                context.latest_iex_quote.ask,
+            )
+            for context in templates
+        }
         self._session_date = session_date
         self._collected_at = collected_at
         self._history_sessions = history_sessions
@@ -96,14 +124,14 @@ class _RuntimeMarketTransport:
                 "bars": {
                     symbol: [
                         {
-                            "c": str(template.close * self._price_scale),
-                            "h": str(template.high * self._price_scale),
-                            "l": str(template.low * self._price_scale),
-                            "o": str(template.open * self._price_scale),
+                            "c": str(template[0] * self._price_scale),
+                            "h": str(template[1] * self._price_scale),
+                            "l": str(template[2] * self._price_scale),
+                            "o": str(template[3] * self._price_scale),
                             "t": _provider_time(
                                 datetime.combine(day, time(16), ET)
                             ),
-                            "v": template.volume,
+                            "v": template[4],
                         }
                         for day, template in zip(
                             self._history_sessions,
@@ -128,15 +156,11 @@ class _RuntimeMarketTransport:
                     else [
                         {
                             "ap": str(
-                                self._templates[
-                                    symbol
-                                ].previous_session_quote.ask
+                                self._previous_quotes[symbol][1]
                                 * self._price_scale
                             ),
                             "bp": str(
-                                self._templates[
-                                    symbol
-                                ].previous_session_quote.bid
+                                self._previous_quotes[symbol][0]
                                 * self._price_scale
                             ),
                             "i": 100,
@@ -146,11 +170,11 @@ class _RuntimeMarketTransport:
                         },
                         {
                             "ap": str(
-                                self._templates[symbol].previous_session_quote.ask
+                                self._previous_quotes[symbol][1]
                                 * self._price_scale
                             ),
                             "bp": str(
-                                self._templates[symbol].previous_session_quote.bid
+                                self._previous_quotes[symbol][0]
                                 * self._price_scale
                             ),
                             "i": 101,
@@ -167,11 +191,11 @@ class _RuntimeMarketTransport:
                 "quotes": {
                     symbol: {
                         "ap": str(
-                            self._templates[symbol].latest_iex_quote.ask
+                            self._latest_quotes[symbol][1]
                             * self._price_scale
                         ),
                         "bp": str(
-                            self._templates[symbol].latest_iex_quote.bid
+                            self._latest_quotes[symbol][0]
                             * self._price_scale
                         ),
                         "i": 202,

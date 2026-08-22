@@ -186,6 +186,10 @@ _TABLES = frozenset(
         "historical_replay_dates",
         "historical_replay_evidence",
         "historical_replay_run_seals",
+        "canonical_report_contexts",
+        "actual_close_reviews",
+        "actual_close_source_bindings",
+        "close_recommendations",
     }
 )
 
@@ -268,6 +272,53 @@ _SOURCE_OBSERVATION_COLUMNS = (
     "delay_seconds",
     "health_result",
     "details_json",
+)
+_CANONICAL_REPORT_CONTEXT_COLUMNS = (
+    "id",
+    "report_id",
+    "workflow_kind",
+    "economic_at",
+    "retrieved_at",
+    "material_digest",
+    "source_digest",
+    "record_sha256",
+)
+_ACTUAL_CLOSE_REVIEW_COLUMNS = (
+    "id",
+    "review_id",
+    "session_date",
+    "review_at",
+    "mark_cutoff",
+    "query_cutoff",
+    "retrieved_at",
+    "expected_binding_count",
+    "source_digest",
+    "record_sha256",
+)
+_ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS = (
+    "id",
+    "review_id",
+    "binding_ordinal",
+    "symbol",
+    "source_role",
+    "source_observation_id",
+    "failure_code",
+    "received_at",
+    "record_sha256",
+)
+_CLOSE_RECOMMENDATION_COLUMNS = (
+    "id",
+    "recommendation_id",
+    "review_id",
+    "session_date",
+    "symbol",
+    "position_plan_digest",
+    "recommended_stop_micros",
+    "action",
+    "reasons_json",
+    "source_digest",
+    "received_at",
+    "record_sha256",
 )
 _REPORT_CLAIM_COLUMNS = (
     "id",
@@ -1123,6 +1174,29 @@ class JournalRowReference:
     table: str
     row_id: int
     row_digest: str
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class SourceObservationReceipt:
+    """Exact payload-bearing readback for one persisted source observation."""
+
+    row_id: int
+    observation_sha256: str
+    payload_sha256: str
+    source_payload: bytes
+    source_uri: str
+    source_type: str
+    provider: str
+    feed: str | None
+    source_time: datetime
+    retrieved_at: datetime
+    provider_sequence: int | None
+    delay_seconds: int | None
+    health_result: str
+    details_json: str
+    row_reference: JournalRowReference
+    payload_row_reference: JournalRowReference
+    source_digest: str
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -3778,6 +3852,16 @@ _PHASE1_PROMOTION_MARK_CACHE_AUTHORITIES: dict[
     int,
     _Phase1PromotionMarkCacheAuthority,
 ] = {}
+_SOURCE_OBSERVATION_RECEIPT_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        object,
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
 _ACTION_SOURCE_AUTHORITIES: dict[
     int,
     tuple[
@@ -5946,6 +6030,18 @@ def _journal_action_source_authority_candidate(
     )
 
 
+def _source_observation_receipt_authority_candidate(
+    source: object,
+) -> _JournalAuthorityCandidate | None:
+    if type(source) is not SourceObservationReceipt:
+        return None
+    return _registered_journal_source_authority_candidate(
+        _SOURCE_OBSERVATION_RECEIPT_AUTHORITIES,
+        source,
+        lambda: _phase1_source_fingerprint(source),
+    )
+
+
 def _journal_window_source_authority_candidate(
     source: object,
 ) -> _JournalAuthorityCandidate | None:
@@ -5976,6 +6072,8 @@ def _journal_any_source_authority_candidate(
     candidate = _phase2_source_authority_candidate(source)
     if candidate is None:
         candidate = _phase1_source_authority_candidate(source)
+    if candidate is None:
+        candidate = _source_observation_receipt_authority_candidate(source)
     if candidate is None:
         candidate = _journal_action_source_authority_candidate(source)
     if candidate is None:
@@ -7944,6 +8042,145 @@ class Journal:
                 health_result=health_result,
                 details=details,
             )
+
+    def append_source_observation_receipt(
+        self,
+        *,
+        payload: bytes,
+        source_uri: str,
+        source_type: str,
+        provider: str,
+        feed: str | None,
+        source_time: datetime,
+        retrieved_at: datetime,
+        provider_sequence: int | None,
+        delay_seconds: int | None,
+        health_result: str,
+        details: Mapping[str, object] | None = None,
+    ) -> SourceObservationReceipt:
+        """Append and re-read one exact payload-bearing source receipt."""
+        with self.transaction() as transaction:
+            row_id, _duplicate = transaction.append_source_observation(
+                payload=payload,
+                source_uri=source_uri,
+                source_type=source_type,
+                provider=provider,
+                feed=feed,
+                source_time=source_time,
+                retrieved_at=retrieved_at,
+                provider_sequence=provider_sequence,
+                delay_seconds=delay_seconds,
+                health_result=health_result,
+                details=details,
+            )
+        return self.read_source_observation_receipt(row_id)
+
+    def read_source_observation_receipt(
+        self,
+        source_observation_id: int,
+    ) -> SourceObservationReceipt:
+        """Read one exact source observation and its retained payload."""
+        source_observation_id = _require_integer(
+            source_observation_id,
+            "source observation row ID",
+            minimum=1,
+        )
+        return self.read_source_observation_receipts(
+            (source_observation_id,)
+        )[0]
+
+    def read_source_observation_receipts(
+        self,
+        source_observation_ids: Sequence[int],
+    ) -> tuple[SourceObservationReceipt, ...]:
+        """Read a unique receipt sequence without changing caller order."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "source observation receipts require a post-commit read"
+            )
+        if isinstance(
+            source_observation_ids,
+            (str, bytes, bytearray),
+        ) or not isinstance(source_observation_ids, Sequence):
+            raise InvalidJournalValue(
+                "source observation row IDs must be an exact sequence"
+            )
+        try:
+            row_ids = tuple(
+                _require_integer(
+                    row_id,
+                    "source observation row ID",
+                    minimum=1,
+                )
+                for row_id in source_observation_ids
+            )
+        except (MemoryError, RuntimeError):
+            raise
+        except Exception as error:
+            if isinstance(error, InvalidJournalValue):
+                raise
+            raise InvalidJournalValue(
+                "source observation row IDs are malformed"
+            ) from error
+        if len(row_ids) != len(set(row_ids)):
+            raise InvalidJournalValue(
+                "source observation row IDs must be unique"
+            )
+        if not row_ids:
+            return ()
+
+        receipts = tuple(
+            self._read_source_observation_receipt(
+                source_observation_id=row_id,
+            )
+            for row_id in row_ids
+        )
+        if tuple(receipt.row_id for receipt in receipts) != row_ids:
+            raise MigrationCorruption(
+                "source observation receipt order is inconsistent"
+            )
+        for receipt in receipts:
+            _remember_journal_source_authority(
+                _SOURCE_OBSERVATION_RECEIPT_AUTHORITIES,
+                receipt,
+                self,
+            )
+        candidates = tuple(
+            _source_observation_receipt_authority_candidate(receipt)
+            for receipt in receipts
+        )
+        if any(candidate is None for candidate in candidates) or (
+            _current_journal_source_authority_owner(
+                tuple(
+                    candidate
+                    for candidate in candidates
+                    if candidate is not None
+                )
+            )
+            is not self
+        ):
+            with _JOURNAL_SOURCE_LOCK:
+                for receipt in receipts:
+                    issued = _SOURCE_OBSERVATION_RECEIPT_AUTHORITIES.get(
+                        id(receipt)
+                    )
+                    if issued is not None and issued[0]() is receipt:
+                        _SOURCE_OBSERVATION_RECEIPT_AUTHORITIES.pop(
+                            id(receipt),
+                            None,
+                        )
+            raise JournalError(
+                "source observation receipt changed during readback"
+            )
+        return receipts
+
+    def owns_source_observation_receipt(self, source: object) -> bool:
+        """Return whether this Journal owns the exact current receipt object."""
+        candidate = _source_observation_receipt_authority_candidate(source)
+        return candidate is not None and (
+            _current_journal_source_authority_owner((candidate,)) is self
+        )
 
     def start_phase2_window(
         self,
@@ -21190,6 +21427,57 @@ class Journal:
                 "Phase 1 core source observation integrity failed"
             )
         return source_row, payload_row
+
+    def _read_source_observation_receipt(
+        self,
+        *,
+        source_observation_id: int,
+    ) -> SourceObservationReceipt:
+        source_row, payload_row = self._phase1_core_source_rows(
+            source_observation_id=source_observation_id,
+        )
+        source_reference = _journal_row_reference(
+            "source_observations",
+            _SOURCE_OBSERVATION_COLUMNS,
+            source_row,
+        )
+        payload_reference = _journal_row_reference(
+            "phase1_source_payloads",
+            _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+            payload_row,
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/source-observation-receipt/v1",
+            (source_reference, payload_reference),
+            {
+                "observation_sha256": str(source_row[1]),
+                "payload_sha256": str(source_row[2]),
+                "source_observation_id": int(source_row[0]),
+            },
+        )
+        return SourceObservationReceipt(
+            row_id=int(source_row[0]),
+            observation_sha256=str(source_row[1]),
+            payload_sha256=str(source_row[2]),
+            source_payload=bytes(payload_row[3]),
+            source_uri=str(source_row[3]),
+            source_type=str(source_row[4]),
+            provider=str(source_row[5]),
+            feed=None if source_row[6] is None else str(source_row[6]),
+            source_time=_parse_canonical_timestamp(str(source_row[7])),
+            retrieved_at=_parse_canonical_timestamp(str(source_row[8])),
+            provider_sequence=(
+                None if source_row[9] is None else int(source_row[9])
+            ),
+            delay_seconds=(
+                None if source_row[10] is None else int(source_row[10])
+            ),
+            health_result=str(source_row[11]),
+            details_json=str(source_row[12]),
+            row_reference=source_reference,
+            payload_row_reference=payload_reference,
+            source_digest=source_digest,
+        )
 
     def _phase1_normalized_source_values(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import inspect
 import json
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -68,6 +70,29 @@ def _scheduled_result_envelope(
             else (report_state_sha256 or "a" * 64)
         ),
     )
+
+
+def _source_observation_receipt_values(
+    *,
+    source_uri: str = "https://example.test/quotes/SPY",
+) -> dict[str, object]:
+    return {
+        "payload": b'{"price":"100.00"}',
+        "source_uri": source_uri,
+        "source_type": "MARKET_QUOTE",
+        "provider": "fixture",
+        "feed": "SIP",
+        "source_time": datetime(
+            2026, 8, 14, 13, 59, tzinfo=timezone.utc
+        ),
+        "retrieved_at": datetime(
+            2026, 8, 14, 14, 0, tzinfo=timezone.utc
+        ),
+        "provider_sequence": 7,
+        "delay_seconds": 60,
+        "health_result": "OK",
+        "details": {"eligible": True, "symbol": "SPY"},
+    }
 
 
 class JournalTests(unittest.TestCase):
@@ -628,6 +653,256 @@ class JournalTests(unittest.TestCase):
             self.assertTrue(replay_duplicate)
             self.assertNotEqual(first_id, distinct_id)
             self.assertEqual(journal.count("source_observations"), 2)
+
+    def test_source_observation_receipt_round_trips_exact_rows_and_retry(self) -> None:
+        values = _source_observation_receipt_values()
+        with Journal.open(self.db_path) as journal:
+            first = journal.append_source_observation_receipt(
+                **values
+            )
+            retry = journal.append_source_observation_receipt(
+                **values
+            )
+            readback = journal.read_source_observation_receipt(first.row_id)
+
+            self.assertEqual(first.row_id, retry.row_id)
+            self.assertIsNot(first, retry)
+            self.assertEqual(readback, first)
+            self.assertEqual(first.source_payload, values["payload"])
+            self.assertEqual(first.source_uri, values["source_uri"])
+            self.assertEqual(first.source_type, values["source_type"])
+            self.assertEqual(first.provider, values["provider"])
+            self.assertEqual(first.feed, values["feed"])
+            self.assertEqual(first.source_time, values["source_time"])
+            self.assertEqual(first.retrieved_at, values["retrieved_at"])
+            self.assertEqual(
+                first.provider_sequence,
+                values["provider_sequence"],
+            )
+            self.assertEqual(first.delay_seconds, values["delay_seconds"])
+            self.assertEqual(first.health_result, values["health_result"])
+            self.assertEqual(
+                first.details_json,
+                '{"eligible":true,"symbol":"SPY"}',
+            )
+            self.assertEqual(
+                first.payload_sha256,
+                hashlib.sha256(values["payload"]).hexdigest(),
+            )
+            self.assertEqual(first.row_reference.table, "source_observations")
+            self.assertEqual(first.row_reference.row_id, first.row_id)
+            self.assertEqual(
+                first.payload_row_reference.table,
+                "phase1_source_payloads",
+            )
+            self.assertGreater(first.payload_row_reference.row_id, 0)
+            self.assertEqual(
+                first.source_digest,
+                journal_module._journal_bundle_digest(
+                    "stock-monitor/source-observation-receipt/v1",
+                    (first.row_reference, first.payload_row_reference),
+                    {
+                        "observation_sha256": first.observation_sha256,
+                        "payload_sha256": first.payload_sha256,
+                        "source_observation_id": first.row_id,
+                    },
+                ),
+            )
+            self.assertTrue(journal.owns_source_observation_receipt(first))
+            self.assertTrue(journal.owns_source_observation_receipt(retry))
+            self.assertTrue(journal.owns_source_observation_receipt(readback))
+            self.assertEqual(journal.count("source_observations"), 1)
+            self.assertEqual(journal.count("phase1_source_payloads"), 1)
+
+    def test_source_observation_receipt_batch_preserves_requested_order(self) -> None:
+        with Journal.open(self.db_path) as journal:
+            first = journal.append_source_observation_receipt(
+                **_source_observation_receipt_values()
+            )
+            second = journal.append_source_observation_receipt(
+                **_source_observation_receipt_values(
+                    source_uri="https://example.test/quotes/QQQ"
+                )
+            )
+
+            batch = journal.read_source_observation_receipts(
+                (second.row_id, first.row_id)
+            )
+
+            self.assertEqual(
+                tuple(receipt.row_id for receipt in batch),
+                (second.row_id, first.row_id),
+            )
+            self.assertTrue(
+                all(
+                    journal.owns_source_observation_receipt(receipt)
+                    for receipt in batch
+                )
+            )
+            self.assertEqual(journal.read_source_observation_receipts(()), ())
+
+    def test_source_observation_receipt_authority_is_exact_owner_bound_and_stale(self) -> None:
+        with Journal.open(self.db_path) as journal, Journal.open(
+            self.db_path.parent / "other.db"
+        ) as other:
+            receipt = journal.append_source_observation_receipt(
+                **_source_observation_receipt_values()
+            )
+            candidates = (
+                copy.copy(receipt),
+                copy.deepcopy(receipt),
+                replace(receipt),
+            )
+            self.assertTrue(journal.owns_source_observation_receipt(receipt))
+            self.assertFalse(other.owns_source_observation_receipt(receipt))
+            self.assertTrue(
+                all(
+                    not journal.owns_source_observation_receipt(candidate)
+                    for candidate in candidates
+                )
+            )
+            with self.assertRaises(FrozenInstanceError):
+                receipt.provider = "forged"  # type: ignore[misc]
+
+            object.__setattr__(receipt, "source_digest", "0" * 64)
+            self.assertFalse(journal.owns_source_observation_receipt(receipt))
+
+            fresh = journal.read_source_observation_receipt(receipt.row_id)
+            self.assertTrue(journal.owns_source_observation_receipt(fresh))
+            journal.append_raw_message(
+                "receipt-authority-revision",
+                datetime(2026, 8, 14, 14, 1, tzinfo=timezone.utc),
+                "SKIPPED SPY",
+            )
+            self.assertFalse(journal.owns_source_observation_receipt(fresh))
+
+        self.assertFalse(journal.owns_source_observation_receipt(fresh))
+        with Journal.open(self.db_path) as reopened:
+            restarted = reopened.read_source_observation_receipt(fresh.row_id)
+            self.assertTrue(
+                reopened.owns_source_observation_receipt(restarted)
+            )
+            self.assertFalse(
+                reopened.owns_source_observation_receipt(fresh)
+            )
+
+    def test_source_observation_receipt_readers_validate_ids_and_integrity(self) -> None:
+        values = _source_observation_receipt_values()
+        with Journal.open(self.db_path) as journal:
+            receipt = journal.append_source_observation_receipt(**values)
+            invalid_batches: tuple[object, ...] = (
+                "1",
+                b"1",
+                {receipt.row_id},
+                (receipt.row_id, receipt.row_id),
+                (True,),
+                (0,),
+                (receipt.row_id, 999),
+            )
+            for invalid in invalid_batches:
+                with self.subTest(value=invalid):
+                    with self.assertRaises(InvalidJournalValue):
+                        journal.read_source_observation_receipts(  # type: ignore[arg-type]
+                            invalid
+                        )
+            for invalid in (True, 0, 999):
+                with self.subTest(row_id=invalid):
+                    with self.assertRaises(InvalidJournalValue):
+                        journal.read_source_observation_receipt(invalid)
+
+            with journal.transaction():
+                with self.assertRaises(JournalError):
+                    journal.read_source_observation_receipt(receipt.row_id)
+
+            with closing(
+                sqlite3.connect(self.db_path, isolation_level=None)
+            ) as connection:
+                connection.execute(
+                    "DROP TRIGGER phase1_source_payloads_no_update"
+                )
+                connection.execute(
+                    "UPDATE phase1_source_payloads "
+                    "SET source_payload = ? WHERE source_observation_id = ?",
+                    (b"tampered", receipt.row_id),
+                )
+            with self.assertRaises(MigrationCorruption):
+                journal.read_source_observation_receipt(receipt.row_id)
+
+    def test_provider_monitoring_tables_are_whitelisted_with_exact_columns(self) -> None:
+        expected = {
+            "canonical_report_contexts": (
+                "id",
+                "report_id",
+                "workflow_kind",
+                "economic_at",
+                "retrieved_at",
+                "material_digest",
+                "source_digest",
+                "record_sha256",
+            ),
+            "actual_close_reviews": (
+                "id",
+                "review_id",
+                "session_date",
+                "review_at",
+                "mark_cutoff",
+                "query_cutoff",
+                "retrieved_at",
+                "expected_binding_count",
+                "source_digest",
+                "record_sha256",
+            ),
+            "actual_close_source_bindings": (
+                "id",
+                "review_id",
+                "binding_ordinal",
+                "symbol",
+                "source_role",
+                "source_observation_id",
+                "failure_code",
+                "received_at",
+                "record_sha256",
+            ),
+            "close_recommendations": (
+                "id",
+                "recommendation_id",
+                "review_id",
+                "session_date",
+                "symbol",
+                "position_plan_digest",
+                "recommended_stop_micros",
+                "action",
+                "reasons_json",
+                "source_digest",
+                "received_at",
+                "record_sha256",
+            ),
+        }
+        with Journal.open(self.db_path) as journal:
+            for table, columns in expected.items():
+                with self.subTest(table=table):
+                    self.assertEqual(journal.count(table), 0)
+                    self.assertEqual(
+                        tuple(journal.table_info(table)),
+                        columns,
+                    )
+
+        self.assertEqual(
+            journal_module._CANONICAL_REPORT_CONTEXT_COLUMNS,
+            expected["canonical_report_contexts"],
+        )
+        self.assertEqual(
+            journal_module._ACTUAL_CLOSE_REVIEW_COLUMNS,
+            expected["actual_close_reviews"],
+        )
+        self.assertEqual(
+            journal_module._ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS,
+            expected["actual_close_source_bindings"],
+        )
+        self.assertEqual(
+            journal_module._CLOSE_RECOMMENDATION_COLUMNS,
+            expected["close_recommendations"],
+        )
 
     def test_details_json_cannot_hide_money_or_accept_the_wrong_shape(self) -> None:
         now = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)

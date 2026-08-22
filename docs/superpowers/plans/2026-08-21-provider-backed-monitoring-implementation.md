@@ -35,6 +35,7 @@ Create:
 - `scripts/run_monitor_unattended.sh` — tiny exact-reviewed environment-isolating launcher.
 - `src/stock_monitor/sql/005_provider_monitoring.sql` — prior close recommendations and any required canonical publication state.
 - `data/evidence/subjects/*.json` — subject-scoped reviewed evidence bundles.
+- `data/evidence/sources/*.json` — strict base64 envelopes for exact content-addressed raw source bytes.
 - `tests/security/test_unattended_environment.py`
 - `tests/contract/test_provider_smoke.py`
 - `tests/integration/test_provider_workflows.py`
@@ -46,7 +47,7 @@ Modify:
 
 - `src/stock_monitor/cli.py` — provider smoke, Phase 1 bootstrap, and canonical dispatch.
 - `src/stock_monitor/market_calendar.py` — reviewed previous-session helper.
-- `src/stock_monitor/universe.py` and `data/universe/2026-08-14.json` — stock CIK/listing metadata.
+- `src/stock_monitor/universe.py` and `data/universe/2026-08-22.json` — newly reviewed stock CIK and all-instrument listing metadata; preserve `2026-08-14.json` as history.
 - `src/stock_monitor/evidence.py` and `data/evidence/current.json` — multi-subject reviewed release.
 - `src/stock_monitor/reports.py` — shadow and unverified-close projections.
 - `src/stock_monitor/journal.py` — typed observation receipts, lineage selectors, recommendations, and canonical publication readback.
@@ -384,9 +385,12 @@ git commit -m "feat: allow bounded scheduler dispatch latency"
 **Files:**
 - Modify: `src/stock_monitor/universe.py`
 - Modify: `src/stock_monitor/evidence.py`
-- Modify: `data/universe/2026-08-14.json`
+- Create: `data/universe/2026-08-22.json`
+- Preserve unchanged: `data/universe/2026-08-14.json`
 - Modify: `data/evidence/current.json`
+- Create: `data/evidence/legacy/subjectless.json`
 - Create: `data/evidence/subjects/*.json`
+- Create: `data/evidence/sources/*.json`
 - Modify: `tests/unit/test_universe.py`
 - Modify: `tests/unit/test_evidence.py`
 
@@ -420,6 +424,7 @@ Expected: missing fields/load function and current subjectless bundle failures.
 ```python
 @dataclass(frozen=True, slots=True)
 class ReviewedEvidenceRelease:
+    release_id: str
     release_sha256: str
     universe_sha256: str
     reviewed_at: datetime
@@ -442,12 +447,14 @@ def load_current_evidence_release(
     )
 ```
 
-The top-level JSON has exact keys `schema_version`, `kind`, `release_id`, `universe_sha256`, `reviewed_at`, `review_by`, and `subjects`. Each subject entry has `symbol`, `subject_kind`, `issuer_cik`, `path`, and `sha256`. Reject absolute/traversal/symlink paths, duplicates, extra/missing universe subjects, CIK mismatch, stale review, and child hash mismatch. Add explicit `issuer_cik` and `initial_listing_date` to stock records. Gather values only from primary official sources and record URLs/dates in the manifests.
+The top-level JSON has exact keys `schema_version`, `kind`, `release_id`, `universe_sha256`, `reviewed_at`, `review_by`, and `subjects`. Each subject entry has `symbol`, `subject_kind`, `issuer_cik`, `path`, and `sha256`. Reject absolute/traversal/symlink paths, duplicates, extra/missing universe subjects, CIK mismatch, stale review, and child hash mismatch. Canonical children are schema version 3 with explicit `coverage_start`/`coverage_end` and binding `published_at`; schema version 2 is accepted only for the empty named legacy seed and never as a current child. Add explicit `issuer_cik` plus primary-source provenance for stocks and explicit initial-listing date, date kind, and provenance for every stock and ETF. Publish those facts in a newly reviewed `2026-08-22.json` universe while preserving the historical 2026-08-14 release unchanged.
+
+When `source_documents` is omitted, load exact raw bytes from strict content-addressed `data/evidence/sources/<content_sha256>.json` envelopes with exact keys `{schema_version, kind, content_sha256, encoding, body}`, `kind="RAW_SOURCE_ARTIFACT"`, and canonical strict base64 encoding. Confined no-follow reads, decoded-size checks, and decoded SHA-256 checks are mandatory. The initial reviewed NYSE operational-status response has no primary publication timestamp and therefore binds `published_at: null`, `timestamp_source: "UNAVAILABLE"`, and only incomplete `UNKNOWN` coverage. It must never be converted to `CONFIRMED_CLEAR` or authorize unattended action.
 
 - [ ] **Step 4: Recompute release constants mechanically and run warning-strict tests**
 
 ```sh
-shasum -a 256 data/universe/2026-08-14.json data/evidence/current.json data/evidence/subjects/*.json
+shasum -a 256 data/universe/2026-08-22.json data/evidence/current.json data/evidence/legacy/subjectless.json data/evidence/subjects/*.json data/evidence/sources/*.json
 PYTHONPATH=src .venv/bin/python -W error -m unittest tests.unit.test_universe tests.unit.test_evidence tests.integration.test_phase1_authorities -v
 ```
 
@@ -458,7 +465,7 @@ Expected: PASS; an as-of time at or after `review_by` fails closed.
 ```sh
 git add src/stock_monitor/universe.py src/stock_monitor/evidence.py tests/unit/test_universe.py tests/unit/test_evidence.py
 git commit -m "feat: load reviewed subject evidence releases"
-git add data/universe/2026-08-14.json data/evidence/current.json data/evidence/subjects
+git add data/universe/2026-08-22.json data/evidence/current.json data/evidence/legacy/subjectless.json data/evidence/subjects data/evidence/sources
 git commit -m "data: pin reviewed subject evidence release"
 ```
 

@@ -223,17 +223,37 @@ Canonical non-fixture screening needs one current reviewed bundle per universe
 subject, not the current empty subjectless placeholder. A new release manifest
 at `data/evidence/current.json` pins the reviewed universe digest plus one
 relative subject-file path and SHA-256 for every eligible/support symbol.
-Subject files retain the existing subject-scoped evidence-bundle schema. A new
+Canonical subject files use evidence-bundle schema version 3. Every coverage
+attestation records explicit `coverage_start` and `coverage_end` dates, and
+every source binding records `published_at`, including an explicit `null` when
+the primary source provides no publication timestamp. A new
 `load_current_evidence_release()` verifies the top-level compiled release hash,
 path confinement, exact child hashes, unique subject identities, stock CIK
 agreement, complete universe coverage, and `reviewed_at`/`review_by` bounds,
-then returns an immutable symbol-to-bundle mapping. The single-subject loader
-remains available only for existing replay/unit seams.
+then returns an immutable symbol-to-bundle mapping. Schema version 2 remains
+only for the named empty legacy seed at
+`data/evidence/legacy/subjectless.json`; it cannot be a current release child
+or authorize scoped coverage.
+
+Offline verification does not reconstruct authority from caller-authored
+normalized JSON. Raw provider bytes are committed separately as
+content-addressed `data/evidence/sources/<content_sha256>.json` artifacts. Each
+artifact is an exact JSON envelope with keys `schema_version`, `kind`,
+`content_sha256`, `encoding`, and `body`; `kind` is
+`RAW_SOURCE_ARTIFACT`, `encoding` is canonical strict `base64`, and the decoded
+nonempty bytes must match both the filename and declared SHA-256. The loader
+uses no-follow confined regular-file reads, validates the envelope and decoded
+size/hash, and reconstructs only the source metadata already pinned by the
+child manifest. Supplying `SourceDocument` values remains an exact alternative
+with no missing, extra, or cross-subject observations.
 
 Before activation:
 
 - stock records gain an explicit normalized issuer CIK and reviewed initial
   listing date;
+- all stock and ETF records gain separately reviewed initial-listing
+  provenance and an explicit date kind; the VTI ETF share-class launch is
+  labeled as a proxy rather than a literal listing date;
 - every stock/ETF has subject-matched event coverage for the intended holding
   window;
 - stock evidence records bind official SEC or issuer-primary documents to the
@@ -244,6 +264,20 @@ Before activation:
   stale, or conflicting coverage;
 - every document and normalized evidence record carries its primary URL,
   source time, retrieval time, content digest, and review identity.
+
+The metadata refresh is published as the newly reviewed
+`data/universe/2026-08-22.json` release. The historical
+`data/universe/2026-08-14.json` artifact remains unchanged and is never
+silently relabeled with the later review date.
+
+The initial 2026-08-22 evidence package intentionally records the exact NYSE
+operational-status response available at review time with no primary
+publication timestamp. Its subject coverage is `UNKNOWN` and incomplete for
+both required coverage kinds, even though the covered date interval is
+explicit. It is provenance/readback material only: it cannot authorize
+`CONFIRMED_CLEAR`, a candidate, an unattended action, or a successful
+canonical premarket decision. A later human-reviewed, primary-source repin is
+required before activation can clear those gates.
 
 Subject evidence must be no older than the existing 24-hour policy window at
 the decision cutoff, and active-halt coverage must be no older than five

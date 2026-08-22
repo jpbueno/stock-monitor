@@ -132,6 +132,13 @@ def parse_exact_literal_assignments(
 
     if result.keys() != approved:
         raise LiteralEnvironmentError("private environment is incomplete")
+    if (
+        "STOCK_MONITOR_HOME" in approved
+        and not Path(result["STOCK_MONITOR_HOME"]).is_absolute()
+    ):
+        raise LiteralEnvironmentError(
+            "private environment operator home must be absolute"
+        )
     return _LiteralEnvironment(result)
 
 

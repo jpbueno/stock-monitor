@@ -104,6 +104,17 @@ class LiteralEnvironmentTests(unittest.TestCase):
         self.assertEqual(values.keys(), APPROVED_KEYS)
         self.assertEqual(values["APCA_API_SECRET_KEY"], "left=middle=right")
 
+    def test_relative_operator_home_is_rejected(self) -> None:
+        path = self.private_file(
+            self.valid_text(home="relative-operator-state")
+        )
+
+        with self.assertRaisesRegex(
+            LiteralEnvironmentError,
+            "private environment operator home must be absolute",
+        ):
+            load_literal_environment(path)
+
     def test_symlink_hardlink_permissive_and_non_regular_files_are_rejected(self) -> None:
         target = self.private_file(self.valid_text(), name="symlink-target.env")
         symlink = self.root / "symlink.env"

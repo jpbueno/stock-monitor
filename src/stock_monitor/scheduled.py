@@ -50,6 +50,7 @@ from .workflows import (
 
 
 _ET = ZoneInfo("America/New_York")
+_DUE_WINDOW = timedelta(minutes=15)
 
 
 class RunKind(str, Enum):
@@ -163,7 +164,7 @@ def _run_scheduled_with_authority(
     healed_matches: object,
     datetime_type: type[datetime],
     time_type: type[time],
-    timedelta_type: type[timedelta],
+    _DUE_WINDOW: timedelta,
     utc_timezone: timezone,
     execution_mode: object,
     workflow_dependencies_current: object,
@@ -273,7 +274,7 @@ def _run_scheduled_with_authority(
             "ALREADY_COMPLETED_NO_REPORT",
             stored_result.execution_mode,
         )
-    if now_et >= intended_at + timedelta_type(minutes=1):
+    if now_et >= intended_at + _DUE_WINDOW:
         missed = noop_result(
             "MISSED_RUN_NOOP",
             "MISSED_RUN",
@@ -288,7 +289,7 @@ def _run_scheduled_with_authority(
         )
         return missed
 
-    run_context = replace_value(context, now=now_et)
+    run_context = replace_value(context, now=intended_at)
     if not workflow_dependencies_current(run_context):
         abandon_run(context.scheduler, completion_authority)
         raise workflow_error_type("scheduled workflow authority was replaced")
@@ -428,7 +429,7 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     eastern_timezone = _ET
     datetime_type = datetime
     time_type = time
-    timedelta_type = timedelta
+    due_window = _DUE_WINDOW
     utc_timezone = timezone.utc
     journal_error_type = journal_module.JournalError
     read_status_method = journal_module.Journal.read_scheduled_run_status
@@ -792,7 +793,7 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             healed_matches=healed_matches,
             datetime_type=datetime_type,
             time_type=time_type,
-            timedelta_type=timedelta_type,
+            _DUE_WINDOW=due_window,
             utc_timezone=utc_timezone,
             execution_mode=execution_mode,
             workflow_dependencies_current=workflow_dependencies_current,
@@ -836,7 +837,7 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             ("healed_matches", healed_matches),
             ("datetime_type", datetime_type),
             ("time_type", time_type),
-            ("timedelta_type", timedelta_type),
+            ("_DUE_WINDOW", due_window),
             ("utc_timezone", utc_timezone),
             ("execution_mode", execution_mode),
             ("workflow_dependencies_current", workflow_dependencies_current),
@@ -858,6 +859,7 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
         "_healed_publication_matches_stored_result",
         "_execution_mode",
         "_run_key",
+        "_DUE_WINDOW",
     ):
         globals().pop(name, None)
 

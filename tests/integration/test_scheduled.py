@@ -74,6 +74,7 @@ class ScheduledTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self._isolated_context_sequence = 0
         self.journal = Journal.open(Path(self.temporary.name) / "journal.sqlite3")
         self.addCleanup(self.journal.close)
         self.journal.migrate()
@@ -612,10 +613,16 @@ class ScheduledTests(unittest.TestCase):
 
         self.assertFalse(is_issued_report(report))
 
-    def context(self, fixture: str) -> WorkflowContext:
+    def context(
+        self,
+        fixture: str,
+        *,
+        state_root: Path | None = None,
+    ) -> WorkflowContext:
         adapter = RecordedScenarioAdapter.load(SCENARIOS / fixture)
+        root = Path(self.temporary.name) if state_root is None else state_root
         fixture_root = (
-            Path(self.temporary.name)
+            root
             / ".stock-monitor"
             / "fixtures"
             / adapter.evidence.state_hash
@@ -634,6 +641,35 @@ class ScheduledTests(unittest.TestCase):
             now=adapter.now,
         )
 
+    def isolated_context(self, fixture: str) -> WorkflowContext:
+        self._isolated_context_sequence += 1
+        state_root = (
+            Path(self.temporary.name)
+            / f"scheduled-boundary-{self._isolated_context_sequence}"
+        )
+        return self.context(fixture, state_root=state_root)
+
+    def run_at(self, wall_clock: str) -> WorkflowResult:
+        return run_scheduled(
+            RunKind.PREMARKET,
+            datetime.fromisoformat(f"2026-08-14T{wall_clock}-04:00"),
+            self.isolated_context("eligible.json"),
+        )
+
+    def run_close_at(self, wall_clock: str) -> WorkflowResult:
+        return run_scheduled(
+            RunKind.CLOSE,
+            datetime.fromisoformat(f"2026-08-14T{wall_clock}-04:00"),
+            self.isolated_context("normal-close.json"),
+        )
+
+    def run_early_close_at(self, wall_clock: str) -> WorkflowResult:
+        return run_scheduled(
+            RunKind.CLOSE,
+            datetime.fromisoformat(f"2025-11-28T{wall_clock}-05:00"),
+            self.isolated_context("early-close.json"),
+        )
+
     def test_premarket_wake_is_exactly_0845_eastern_for_utc_caller(self):
         context = self.context("eligible.json")
 
@@ -647,46 +683,64 @@ class ScheduledTests(unittest.TestCase):
         self.assertEqual(self.journal.count("scheduled_runs"), 1)
         self.assertEqual(self.journal.count("reports"), 1)
 
-    def test_premarket_wake_accepts_the_entire_0845_eastern_minute(self):
+    def test_premarket_due_window_is_half_open_fifteen_minutes(self):
+        self.assertEqual(self.run_at("08:45:00").outcome, "CANDIDATES")
+        self.assertEqual(self.run_at("08:59:59").outcome, "CANDIDATES")
+        self.assertEqual(self.run_at("09:00:00").outcome, "MISSED_RUN_NOOP")
+
+    def test_premarket_due_window_has_exact_microsecond_boundaries(self):
+        before = self.run_at("08:44:59.999999")
+        self.assertEqual(before.outcome, "NOT_DUE_NOOP")
+        self.assertEqual(self.journal.count("scheduled_runs"), 0)
+
+        self.assertEqual(self.run_at("08:45:00.000000").outcome, "CANDIDATES")
+        self.assertEqual(self.run_at("08:59:59.999999").outcome, "CANDIDATES")
+        self.assertEqual(self.run_at("09:00:00.000000").outcome, "MISSED_RUN_NOOP")
+
+    def test_premarket_upper_boundary_is_missed_and_never_backfilled(self):
         context = self.context("eligible.json")
 
         result = run_scheduled(
             RunKind.PREMARKET,
-            datetime(
-                2026,
-                8,
-                14,
-                12,
-                45,
-                59,
-                999999,
-                tzinfo=timezone.utc,
-            ),
+            datetime(2026, 8, 14, 9, 0, tzinfo=ET),
             context,
         )
-
-        self.assertEqual(result.outcome, "CANDIDATES")
-        self.assertEqual(self.journal.count("scheduled_runs"), 1)
-        self.assertEqual(self.journal.count("reports"), 1)
-
-    def test_premarket_next_minute_is_missed_and_never_backfilled(self):
-        context = self.context("eligible.json")
-
-        result = run_scheduled(
+        same_day_replay = run_scheduled(
             RunKind.PREMARKET,
-            datetime(2026, 8, 14, 12, 46, tzinfo=timezone.utc),
+            datetime(2026, 8, 14, 16, 0, tzinfo=ET),
             context,
         )
-        replay = run_scheduled(
+        next_day_probe = run_scheduled(
             RunKind.PREMARKET,
-            datetime(2026, 8, 14, 12, 47, tzinfo=timezone.utc),
+            datetime(2026, 8, 15, 8, 44, 59, 999999, tzinfo=ET),
             context,
         )
 
         self.assertEqual(result.outcome, "MISSED_RUN_NOOP")
-        self.assertEqual(replay.outcome, "ALREADY_COMPLETED_NOOP")
+        self.assertEqual(same_day_replay.outcome, "ALREADY_COMPLETED_NOOP")
+        self.assertEqual(next_day_probe.outcome, "NOT_DUE_NOOP")
         self.assertEqual(self.journal.count("reports"), 0)
         self.assertEqual(self.journal.count("outbox"), 0)
+        self.assertEqual(self.journal.count("scheduled_runs"), 1)
+
+    def test_delayed_premarket_wake_retains_durable_duplicate_semantics(self):
+        context = self.context("eligible.json")
+
+        first = run_scheduled(
+            RunKind.PREMARKET,
+            datetime(2026, 8, 14, 8, 59, 59, 999999, tzinfo=ET),
+            context,
+        )
+        duplicate = run_scheduled(
+            RunKind.PREMARKET,
+            datetime(2026, 8, 14, 9, 0, tzinfo=ET),
+            context,
+        )
+
+        self.assertEqual(first.outcome, "CANDIDATES")
+        self.assertEqual(duplicate.outcome, "ALREADY_EMITTED_NOOP")
+        self.assertEqual(self.journal.count("reports"), 1)
+        self.assertEqual(self.journal.count("outbox"), 1)
         self.assertEqual(self.journal.count("scheduled_runs"), 1)
 
     def test_journal_scheduled_status_reader_reports_an_unfinished_claim(self):
@@ -931,25 +985,70 @@ class ScheduledTests(unittest.TestCase):
         self.assertEqual(self.journal.count("reports"), 1)
         self.assertEqual(self.journal.count("scheduled_runs"), 1)
 
-    def test_close_wake_accepts_the_entire_review_minute(self):
-        context = self.context("normal-close.json")
+    def test_regular_close_due_window_is_half_open_fifteen_minutes(self):
+        before = self.run_close_at("15:29:59.999999")
+        self.assertEqual(before.outcome, "NOT_DUE_NOOP")
+        self.assertEqual(self.journal.count("scheduled_runs"), 0)
 
-        result = run_scheduled(
-            RunKind.CLOSE,
-            datetime(2026, 8, 14, 15, 30, 59, 999999, tzinfo=ET),
-            context,
+        self.assertEqual(self.run_close_at("15:30:00.000000").outcome, "EMITTED")
+        self.assertEqual(self.run_close_at("15:44:59.999999").outcome, "EMITTED")
+        self.assertEqual(
+            self.run_close_at("15:45:00.000000").outcome,
+            "MISSED_RUN_NOOP",
         )
 
+    def test_early_close_due_window_is_half_open_fifteen_minutes(self):
+        before = self.run_early_close_at("12:29:59.999999")
+        self.assertEqual(before.outcome, "NOT_DUE_NOOP")
+        self.assertEqual(self.journal.count("scheduled_runs"), 0)
+
+        self.assertEqual(
+            self.run_early_close_at("12:30:00.000000").outcome,
+            "EMITTED",
+        )
+        self.assertEqual(
+            self.run_early_close_at("12:44:59.999999").outcome,
+            "EMITTED",
+        )
+        self.assertEqual(
+            self.run_early_close_at("12:45:00.000000").outcome,
+            "MISSED_RUN_NOOP",
+        )
+
+    def test_close_uses_nominal_review_time_not_dispatch_time(self):
+        result = self.run_close_at("15:44:59")
+
         self.assertEqual(result.outcome, "EMITTED")
-        self.assertEqual(self.journal.count("reports"), 1)
-        self.assertEqual(self.journal.count("scheduled_runs"), 1)
+        nominal_timestamp = "- Generated at: `2026-08-14T15:30:00-04:00`"
+        dispatch_timestamp = "2026-08-14T15:44:59-04:00"
+        self.assertIn(nominal_timestamp, result.message)
+        self.assertNotIn(dispatch_timestamp, result.message)
+        assert result.report_path is not None
+        archived = Path(result.report_path).read_text(encoding="utf-8")
+        self.assertIn(nominal_timestamp, archived)
+        self.assertNotIn(dispatch_timestamp, archived)
+
+    def test_due_windows_convert_utc_across_daylight_and_standard_time(self):
+        summer = run_scheduled(
+            RunKind.CLOSE,
+            datetime(2026, 8, 14, 19, 44, 59, 999999, tzinfo=timezone.utc),
+            self.isolated_context("normal-close.json"),
+        )
+        winter = run_scheduled(
+            RunKind.CLOSE,
+            datetime(2025, 11, 28, 17, 44, 59, 999999, tzinfo=timezone.utc),
+            self.isolated_context("early-close.json"),
+        )
+
+        self.assertEqual(summer.outcome, "EMITTED")
+        self.assertEqual(winter.outcome, "EMITTED")
 
     def test_missed_close_is_recorded_but_never_backfilled(self):
         context = self.context("normal-close.json")
 
         result = run_scheduled(
             RunKind.CLOSE,
-            datetime(2026, 8, 14, 15, 31, tzinfo=ET),
+            datetime(2026, 8, 14, 15, 45, tzinfo=ET),
             context,
         )
 
@@ -961,7 +1060,7 @@ class ScheduledTests(unittest.TestCase):
 
         replay = run_scheduled(
             RunKind.CLOSE,
-            datetime(2026, 8, 14, 15, 32, tzinfo=ET),
+            datetime(2026, 8, 14, 15, 46, tzinfo=ET),
             context,
         )
         self.assertEqual(replay.outcome, "ALREADY_COMPLETED_NOOP")
@@ -973,7 +1072,7 @@ class ScheduledTests(unittest.TestCase):
 
         result = run_scheduled(
             RunKind.CLOSE,
-            datetime(2026, 8, 14, 15, 30, tzinfo=ET),
+            datetime(2026, 8, 14, 15, 44, 59, 999999, tzinfo=ET),
             context,
         )
 
@@ -1047,12 +1146,13 @@ class ScheduledTests(unittest.TestCase):
 
         result = run_scheduled(
             RunKind.CLOSE,
-            datetime(2026, 8, 14, 15, 30, tzinfo=ET),
+            datetime(2026, 8, 14, 15, 44, 59, 999999, tzinfo=ET),
             context,
         )
 
         self.assertEqual(result.outcome, "CONFIGURATION_REQUIRED")
         self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.candidates, ())
         self.assertIsNone(result.report_id)
         self.assertEqual(self.journal.count("reports"), 0)
         self.assertEqual(self.journal.count("outbox"), 0)

@@ -7676,6 +7676,7 @@ class Journal:
         self._transaction_dirty = False
         self._projection_write_allowed = False
         self._report_claim_write_allowed = False
+        self._provider_monitoring_write_allowed = False
         self._phase2_adherence_write_allowed = False
         self._source_generation = 0
         self._phase1_publication_read_cache: (
@@ -32097,6 +32098,22 @@ class Journal:
             self._report_claim_write_allowed = False
 
     @contextmanager
+    def _provider_monitoring_write(self) -> Iterator[None]:
+        if (
+            not self._transaction_active
+            or self._provider_monitoring_write_allowed
+        ):
+            raise JournalError(
+                "provider monitoring writes require an active journal transaction"
+            )
+        self._transaction_dirty = True
+        self._provider_monitoring_write_allowed = True
+        try:
+            yield
+        finally:
+            self._provider_monitoring_write_allowed = False
+
+    @contextmanager
     def _phase2_adherence_write(self) -> Iterator[None]:
         if not self._transaction_active or self._phase2_adherence_write_allowed:
             raise JournalError(
@@ -32199,6 +32216,11 @@ class Journal:
                 "journal_report_claim_write_allowed",
                 0,
                 lambda: int(self._report_claim_write_allowed),
+            )
+            self._connection.create_function(
+                "journal_provider_monitoring_write_allowed",
+                0,
+                lambda: int(self._provider_monitoring_write_allowed),
             )
             self._connection.create_function(
                 "journal_phase2_write_allowed",
@@ -32400,6 +32422,9 @@ def _derive_expected_schema_sha256s(
     try:
         connection.create_function(
             "journal_projection_write_allowed", 0, lambda: 0
+        )
+        connection.create_function(
+            "journal_provider_monitoring_write_allowed", 0, lambda: 0
         )
         _sql(connection, "PRAGMA foreign_keys = ON")
         _sql(connection, "PRAGMA recursive_triggers = ON")

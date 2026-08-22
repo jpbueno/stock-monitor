@@ -197,6 +197,7 @@ class JournalMigrationTests(unittest.TestCase):
                 "review_id",
                 "session_date",
                 "symbol",
+                "position_plan_digest",
                 "recommended_stop_micros",
                 "action",
                 "reasons_json",
@@ -230,6 +231,143 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertIn(table, table_rows)
                 self.assertEqual(int(table_rows[table][5]), 1)
                 self.assertEqual(actual_columns[table], columns)
+
+    def test_provider_monitoring_tables_require_the_internal_journal_write_gate(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with patch.object(
+                journal_module, "_utc_now", return_value=now
+            ) as clock, Journal.open(path) as journal:
+                claim = journal.claim_report(date(2026, 8, 14), "MORNING")
+                assert claim.claim_token is not None
+                state_sha256 = "1" * 64
+                report_id = stable_report_id(
+                    "MORNING", date(2026, 8, 14), (), state_sha256
+                )
+                clock.return_value = now + timedelta(seconds=2)
+                report = journal.finalize_report(
+                    claim_id=claim.claim_id,
+                    claim_token=claim.claim_token,
+                    body="# Morning\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(),
+                    archive_relative_path=report_archive_relative_path(
+                        "MORNING", date(2026, 8, 14), report_id
+                    ),
+                    created_at=now + timedelta(seconds=2),
+                    outbox_destination="TASK",
+                    outbox_payload="morning",
+                )
+                writes = (
+                    (
+                        "canonical_report_contexts",
+                        "INSERT INTO canonical_report_contexts VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            report.report_row_id,
+                            "PREMARKET",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:45:01.000000Z",
+                            "2" * 64,
+                            "3" * 64,
+                            "4" * 64,
+                        ),
+                    ),
+                    (
+                        "actual_close_reviews",
+                        "INSERT INTO actual_close_reviews VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            "5" * 64,
+                            "2026-08-14",
+                            "2026-08-14T19:30:00.000000Z",
+                            "2026-08-14T19:14:00.000000Z",
+                            "2026-08-14T19:30:30.000000Z",
+                            "2026-08-14T19:31:00.000000Z",
+                            1,
+                            "6" * 64,
+                            "7" * 64,
+                        ),
+                    ),
+                    (
+                        "actual_close_source_bindings",
+                        "INSERT INTO actual_close_source_bindings VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            "5" * 64,
+                            1,
+                            "SPY",
+                            "SIP_QUOTE",
+                            1,
+                            None,
+                            "2026-08-14T19:31:00.000000Z",
+                            "8" * 64,
+                        ),
+                    ),
+                    (
+                        "close_recommendations",
+                        "INSERT INTO close_recommendations VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            "9" * 64,
+                            "5" * 64,
+                            "2026-08-14",
+                            "SPY",
+                            "a" * 64,
+                            100_000_000,
+                            "HOLD",
+                            '["POSITION_REVIEW_COMPLETE"]',
+                            "b" * 64,
+                            "2026-08-14T19:31:01.000000Z",
+                            "c" * 64,
+                        ),
+                    ),
+                )
+                with journal._immediate_connection() as connection:
+                    connection.execute(
+                        "INSERT INTO source_observations VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            1,
+                            "d" * 64,
+                            "e" * 64,
+                            "https://example.test/quote",
+                            "MARKET_DATA",
+                            "fixture",
+                            "SIP",
+                            "2026-08-14T19:30:00.000000Z",
+                            "2026-08-14T19:31:00.000000Z",
+                            None,
+                            0,
+                            "OK",
+                            "{}",
+                        ),
+                    )
+                    for table, statement, values in writes:
+                        with self.subTest(table=table, writer="direct"):
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                connection.execute(statement, values)
+                        with journal._provider_monitoring_write():
+                            connection.execute(statement, values)
+
+                    self.assertEqual(
+                        tuple(
+                            int(
+                                connection.execute(
+                                    f'SELECT COUNT(*) FROM "{table}"'
+                                ).fetchone()[0]
+                            )
+                            for table, _, _ in writes
+                        ),
+                        (1, 1, 1, 1),
+                    )
 
     def test_scheduled_report_kind_mapping_is_exact_with_premarket_alias(self) -> None:
         cases = (
@@ -340,6 +478,9 @@ class JournalMigrationTests(unittest.TestCase):
             with patch.object(
                 journal_module, "_utc_now", return_value=now
             ) as clock, Journal.open(path) as journal:
+                journal._connection.create_function(
+                    "journal_provider_monitoring_write_allowed", 0, lambda: 1
+                )
                 morning_claim = journal.claim_report(date(2026, 8, 14), "MORNING")
                 assert morning_claim.claim_token is not None
                 morning_report_id = stable_report_id(
@@ -463,7 +604,7 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                     )
 
-    def test_actual_close_schema_binds_complete_receipts_and_position_neutral_stops(
+    def test_actual_close_schema_binds_receipts_and_scopes_stops_to_plan_lineage(
         self,
     ) -> None:
         timestamp = "2026-08-14T19:31:00.000000Z"
@@ -474,6 +615,9 @@ class JournalMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(path, isolation_level=None)) as connection:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("PRAGMA recursive_triggers = ON")
+                connection.create_function(
+                    "journal_provider_monitoring_write_allowed", 0, lambda: 1
+                )
                 connection.execute(
                     "INSERT INTO source_observations VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -856,13 +1000,14 @@ class JournalMigrationTests(unittest.TestCase):
 
                 connection.execute(
                     "INSERT INTO close_recommendations VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         1,
                         "7" * 64,
                         "c" * 64,
                         "2026-08-14",
                         "AAPL",
+                        "6" * 64,
                         220_000_000,
                         "HOLD",
                         '["POSITION_REVIEW_COMPLETE"]',
@@ -878,6 +1023,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         "2026-08-14",
                         "MSFT",
+                        "6" * 64,
                         100_000_000,
                         "SELL_NOW",
                         '["POSITION_REVIEW_COMPLETE"]',
@@ -891,6 +1037,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         "2026-08-14",
                         "MSFT",
+                        "6" * 64,
                         100_000_000,
                         "HOLD",
                         "{}",
@@ -904,6 +1051,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         "2026-08-15",
                         "MSFT",
+                        "6" * 64,
                         100_000_000,
                         "HOLD",
                         '["POSITION_REVIEW_COMPLETE"]',
@@ -917,6 +1065,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         "2026-08-14",
                         "MSFT",
+                        "6" * 64,
                         100_000_000,
                         "HOLD",
                         '["POSITION_REVIEW_COMPLETE"]',
@@ -930,6 +1079,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         "2026-08-14",
                         "NVDA",
+                        "6" * 64,
                         100_000_000,
                         "HOLD",
                         '["POSITION_REVIEW_COMPLETE"]',
@@ -937,15 +1087,82 @@ class JournalMigrationTests(unittest.TestCase):
                         "2099-08-14T19:32:00.000000Z",
                         "0" * 64,
                     ),
+                    (
+                        8,
+                        "0" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "MSFT",
+                        "G" * 64,
+                        100_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "1" * 64,
+                        "2026-08-14T19:32:00.000000Z",
+                        "2" * 64,
+                    ),
                 )
                 for recommendation in invalid_recommendations:
                     with self.subTest(recommendation=recommendation[0]):
                         with self.assertRaises(sqlite3.IntegrityError):
                             connection.execute(
                                 "INSERT INTO close_recommendations VALUES "
-                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                 recommendation,
                             )
+                connection.execute(
+                    "INSERT INTO close_recommendations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        9,
+                        "f" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "AAPL",
+                        "f" * 64,
+                        100_000_000,
+                        "HOLD",
+                        '["NEW_POSITION_LIFECYCLE"]',
+                        "1" * 64,
+                        "2026-08-14T19:32:01.000000Z",
+                        "2" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_reviews VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        3,
+                        "2" * 64,
+                        "2026-08-13",
+                        "2026-08-13T19:30:00.000000Z",
+                        "2026-08-13T19:14:00.000000Z",
+                        "2026-08-13T19:30:30.000000Z",
+                        "2026-08-13T19:31:00.000000Z",
+                        0,
+                        "3" * 64,
+                        "4" * 64,
+                    ),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO close_recommendations VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            10,
+                            "3" * 64,
+                            "2" * 64,
+                            "2026-08-13",
+                            "AAPL",
+                            "6" * 64,
+                            220_000_000,
+                            "HOLD",
+                            '["BACKDATED_REVIEW"]',
+                            "4" * 64,
+                            "2026-08-13T19:32:00.000000Z",
+                            "5" * 64,
+                        ),
+                    )
                 connection.execute(
                     "INSERT INTO actual_close_reviews VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -968,6 +1185,7 @@ class JournalMigrationTests(unittest.TestCase):
                     "1" * 64,
                     "2026-08-15",
                     "AAPL",
+                    "6" * 64,
                     219_990_000,
                     "HOLD",
                     '["POSITION_REVIEW_COMPLETE"]',
@@ -975,18 +1193,43 @@ class JournalMigrationTests(unittest.TestCase):
                     "2026-08-15T19:32:00.000000Z",
                     "6" * 64,
                 )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO close_recommendations VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        next_recommendation,
+                    )
+                advanced_recommendation = (
+                    2,
+                    "4" * 64,
+                    "1" * 64,
+                    "2026-08-15",
+                    "AAPL",
+                    "6" * 64,
+                    220_010_000,
+                    "TIGHTEN_STOP",
+                    '["POSITION_REVIEW_COMPLETE"]',
+                    "5" * 64,
+                    "2026-08-15T19:32:00.000000Z",
+                    "6" * 64,
+                )
                 connection.execute(
                     "INSERT INTO close_recommendations VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    next_recommendation,
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    advanced_recommendation,
                 )
                 self.assertEqual(
                     connection.execute(
-                        "SELECT recommended_stop_micros "
+                        "SELECT position_plan_digest, recommended_stop_micros "
                         "FROM close_recommendations "
-                        "WHERE symbol = 'AAPL' ORDER BY session_date"
+                        "WHERE symbol = 'AAPL' "
+                        "ORDER BY session_date, position_plan_digest"
                     ).fetchall(),
-                    [(220_000_000,), (219_990_000,)],
+                    [
+                        ("6" * 64, 220_000_000),
+                        ("f" * 64, 100_000_000),
+                        ("6" * 64, 220_010_000),
+                    ],
                 )
 
     def test_migration_source_can_be_loaded_independently_of_source_tree(self) -> None:
@@ -3437,6 +3680,7 @@ class JournalMigrationTests(unittest.TestCase):
             "actual_close_source_bindings": {"record_sha256"},
             "close_recommendations": {
                 "recommendation_id",
+                "position_plan_digest",
                 "source_digest",
                 "record_sha256",
             },
@@ -3890,6 +4134,9 @@ class JournalMigrationTests(unittest.TestCase):
                 connection.create_function(
                     "journal_report_claim_write_allowed", 0, lambda: 1
                 )
+                connection.create_function(
+                    "journal_provider_monitoring_write_allowed", 0, lambda: 1
+                )
                 timestamp = "2026-08-14T14:00:00.000000Z"
                 connection.execute(
                     "INSERT INTO raw_messages VALUES (?, ?, ?, ?, ?)",
@@ -4034,13 +4281,14 @@ class JournalMigrationTests(unittest.TestCase):
                 )
                 connection.execute(
                     "INSERT INTO close_recommendations VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         1,
                         "9" * 64,
                         "5" * 64,
                         "2026-08-14",
                         "SPY",
+                        "c" * 64,
                         100_000_000,
                         "HOLD",
                         '["POSITION_REVIEW_COMPLETE"]',

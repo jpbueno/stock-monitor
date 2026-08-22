@@ -80,6 +80,13 @@ BEGIN
     SELECT RAISE(ABORT, 'canonical report context conflicts with report');
 END;
 
+CREATE TRIGGER canonical_report_contexts_require_journal_provider_monitoring_writer
+BEFORE INSERT ON canonical_report_contexts
+WHEN journal_provider_monitoring_write_allowed() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'canonical report contexts require the journal provider monitoring writer');
+END;
+
 CREATE TABLE actual_close_reviews (
     id INTEGER PRIMARY KEY
         CHECK(typeof(id) = 'integer' AND id > 0),
@@ -150,6 +157,13 @@ CREATE TABLE actual_close_reviews (
     CHECK(substr(retrieved_at, 1, 10) = session_date),
     UNIQUE(session_date, query_cutoff)
 ) STRICT;
+
+CREATE TRIGGER actual_close_reviews_require_journal_provider_monitoring_writer
+BEFORE INSERT ON actual_close_reviews
+WHEN journal_provider_monitoring_write_allowed() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'actual close reviews require the journal provider monitoring writer');
+END;
 
 CREATE TABLE actual_close_source_bindings (
     id INTEGER PRIMARY KEY
@@ -255,6 +269,13 @@ BEGIN
     SELECT RAISE(ABORT, 'actual close source binding conflicts with receipt');
 END;
 
+CREATE TRIGGER actual_close_source_bindings_require_journal_provider_monitoring_writer
+BEFORE INSERT ON actual_close_source_bindings
+WHEN journal_provider_monitoring_write_allowed() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'actual close source bindings require the journal provider monitoring writer');
+END;
+
 CREATE TABLE close_recommendations (
     id INTEGER PRIMARY KEY
         CHECK(typeof(id) = 'integer' AND id > 0),
@@ -276,6 +297,11 @@ CREATE TABLE close_recommendations (
             AND symbol = upper(symbol)
             AND symbol NOT GLOB '*[^A-Z0-9.-]*'
             AND substr(symbol, 1, 1) GLOB '[A-Z]'
+        ),
+    position_plan_digest TEXT NOT NULL COLLATE BINARY
+        CHECK(
+            length(position_plan_digest) = 64
+            AND position_plan_digest NOT GLOB '*[^0-9a-f]*'
         ),
     recommended_stop_micros INTEGER NOT NULL
         CHECK(typeof(recommended_stop_micros) = 'integer' AND recommended_stop_micros > 0),
@@ -302,7 +328,7 @@ CREATE TABLE close_recommendations (
         ),
     record_sha256 TEXT NOT NULL COLLATE BINARY
         CHECK(length(record_sha256) = 64 AND record_sha256 NOT GLOB '*[^0-9a-f]*'),
-    UNIQUE(session_date, symbol),
+    UNIQUE(session_date, symbol, position_plan_digest),
     FOREIGN KEY(review_id) REFERENCES actual_close_reviews(review_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) STRICT;
@@ -321,12 +347,33 @@ BEGIN
     SELECT RAISE(ABORT, 'close recommendation conflicts with review');
 END;
 
+CREATE TRIGGER close_recommendations_require_journal_provider_monitoring_writer
+BEFORE INSERT ON close_recommendations
+WHEN journal_provider_monitoring_write_allowed() != 1
+BEGIN
+    SELECT RAISE(ABORT, 'close recommendations require the journal provider monitoring writer');
+END;
+
+CREATE TRIGGER close_recommendations_reject_wider_stop
+BEFORE INSERT ON close_recommendations
+WHEN EXISTS (
+    SELECT 1
+    FROM close_recommendations
+    WHERE symbol = NEW.symbol COLLATE BINARY
+      AND position_plan_digest = NEW.position_plan_digest COLLATE BINARY
+      AND recommended_stop_micros > NEW.recommended_stop_micros
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close recommendation cannot widen stop for position plan');
+END;
+
 CREATE TRIGGER close_recommendations_require_chronology
 BEFORE INSERT ON close_recommendations
 WHEN EXISTS (
     SELECT 1
     FROM close_recommendations
     WHERE symbol = NEW.symbol COLLATE BINARY
+      AND position_plan_digest = NEW.position_plan_digest COLLATE BINARY
       AND (session_date >= NEW.session_date OR received_at >= NEW.received_at)
 )
 BEGIN
@@ -391,7 +438,11 @@ WHEN EXISTS (
     FROM close_recommendations
     WHERE id = NEW.id
        OR recommendation_id = NEW.recommendation_id COLLATE BINARY
-       OR (session_date = NEW.session_date AND symbol = NEW.symbol COLLATE BINARY)
+       OR (
+           session_date = NEW.session_date
+           AND symbol = NEW.symbol COLLATE BINARY
+           AND position_plan_digest = NEW.position_plan_digest COLLATE BINARY
+       )
 )
 BEGIN
     SELECT RAISE(ABORT, 'close_recommendations rejects conflicting inserts');

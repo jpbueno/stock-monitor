@@ -125,15 +125,17 @@ do not produce a live candidate.
 ## Recorded acceptance and manual runs
 
 Fixtures never grant market or brokerage authority. Run the locked six-case
-matrix from the repository root:
+matrix from the repository root through the private environment launcher. This
+avoids exporting or sourcing credentials; fixture mode still performs no
+provider request:
 
 ```sh
-./scripts/run_monitor.sh run premarket --fixture tests/fixtures/scenarios/eligible.json --json
-./scripts/run_monitor.sh run premarket --fixture tests/fixtures/scenarios/no-candidates.json --json
-./scripts/run_monitor.sh run close --fixture tests/fixtures/scenarios/early-close.json --json
-./scripts/run_monitor.sh run close --fixture tests/fixtures/scenarios/normal-close.json --json
-./scripts/run_monitor.sh run close --fixture tests/fixtures/scenarios/reconciliation.json --json
-./scripts/run_monitor.sh run premarket --fixture tests/fixtures/scenarios/provider-failure.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket --fixture tests/fixtures/scenarios/eligible.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket --fixture tests/fixtures/scenarios/no-candidates.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close --fixture tests/fixtures/scenarios/early-close.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close --fixture tests/fixtures/scenarios/normal-close.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close --fixture tests/fixtures/scenarios/reconciliation.json --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket --fixture tests/fixtures/scenarios/provider-failure.json --json
 ```
 
 The exact exit matrix is `eligible=0`, `no_trade=0`, `early_close=0`,

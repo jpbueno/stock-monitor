@@ -52,12 +52,14 @@ directory for unattended use; it owns `.stock-monitor/` and `reports/`. Keep
 
 The provider smoke must return exit `0` before any non-fixture run. An absent
 or unactivated provider adapter fails closed; that is a blocker, not permission
-to make up data. Recorded fixtures are safe for local acceptance checks:
+to make up data. Recorded fixtures are safe for local acceptance checks. Use
+the same private environment launcher so the commands work without exporting
+or sourcing credentials; fixture mode still performs no provider request:
 
 ```sh
-./scripts/run_monitor.sh run premarket \
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket \
   --fixture tests/fixtures/scenarios/eligible.json --json
-./scripts/run_monitor.sh run close \
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close \
   --fixture tests/fixtures/scenarios/normal-close.json --json
 ```
 

@@ -6,6 +6,7 @@
 !.env.example
 .stock-monitor/
 reports/
+.venv/
 *.sqlite3
 *.db
 __pycache__/

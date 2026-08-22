@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_commands = verify.add_subparsers(dest="verify_command", required=True)
     _json_flag(verify_commands.add_parser("universe"))
     _json_flag(verify_commands.add_parser("calendar"))
+    _json_flag(verify_commands.add_parser("evidence"))
 
     provider = commands.add_parser("provider")
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
@@ -229,6 +230,42 @@ def _verify(settings: Settings, kind: str, as_json: bool) -> int:
                 "status": "VERIFIED",
                 "kind": "UNIVERSE",
                 "record_count": len(universe.records),
+            }
+        elif kind == "evidence":
+            from .evidence import (
+                EvidenceRegistryError,
+                EvidenceUnavailableError,
+                load_current_evidence_release,
+            )
+            from .universe import load_current_universe
+
+            observed_at = datetime.now(timezone.utc)
+            try:
+                universe = load_current_universe(
+                    settings.project_root,
+                    as_of=observed_at.date(),
+                )
+                release = load_current_evidence_release(
+                    settings.project_root,
+                    as_of=observed_at,
+                    universe=universe,
+                )
+            except (
+                EvidenceRegistryError,
+                EvidenceUnavailableError,
+                OSError,
+                ValueError,
+            ) as error:
+                raise DataCommandError(
+                    "reviewed evidence release is unavailable"
+                ) from error
+            payload = {
+                "status": "VERIFIED",
+                "release_sha256": release.release_sha256,
+                "universe_checksum": release.universe_sha256,
+                "reviewed_at": _utc_json_timestamp(release.reviewed_at),
+                "review_by": _utc_json_timestamp(release.review_by),
+                "symbols": sorted(release.by_symbol),
             }
         else:
             raise CommandBoundaryError("unsupported verification")
@@ -515,6 +552,10 @@ def _print_message(message: str) -> None:
 
 def _json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
+
+
+def _utc_json_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _project_root() -> Path:

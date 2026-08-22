@@ -19,6 +19,13 @@ NOW = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
 CANARY = "PROVIDER_EXCEPTION_CANARY_MUST_NOT_PRINT"
 
 
+class _FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = datetime(2026, 8, 22, 13, 0, tzinfo=UTC)
+        return value if tz is None else value.astimezone(tz)
+
+
 def _environment(home: Path) -> dict[str, str]:
     return {
         "APCA_API_KEY_ID": "CANARY_KEY_MUST_NOT_PRINT",
@@ -110,6 +117,62 @@ class ProviderCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue()), result.safe_fields())
+
+    def test_verify_evidence_loads_release_without_network_or_journal(self) -> None:
+        output = io.StringIO()
+        with patch.object(cli, "datetime", _FrozenDateTime), patch.object(
+            cli,
+            "run_provider_smoke",
+            side_effect=AssertionError("provider must not be called"),
+        ), patch(
+            "stock_monitor.journal.Journal.open",
+            side_effect=AssertionError("journal must not be opened"),
+        ), redirect_stdout(output):
+            code = cli.run(
+                ("verify", "evidence", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            set(payload),
+            {
+                "status",
+                "release_sha256",
+                "universe_checksum",
+                "reviewed_at",
+                "review_by",
+                "symbols",
+            },
+        )
+        self.assertEqual(payload["status"], "VERIFIED")
+        self.assertEqual(
+            payload["symbols"],
+            ["AAPL", "AMD", "NVDA", "QQQ", "SPY", "VTI", "XLK"],
+        )
+        self.assertEqual(payload["reviewed_at"], "2026-08-22T00:40:00Z")
+        self.assertEqual(payload["review_by"], "2026-08-23T00:39:58Z")
+
+    def test_verify_evidence_failure_is_redacted_exit_three(self) -> None:
+        from stock_monitor.evidence import EvidenceRegistryError
+
+        output = io.StringIO()
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.evidence.load_current_evidence_release",
+            side_effect=EvidenceRegistryError(CANARY),
+        ), redirect_stdout(output):
+            code = cli.run(
+                ("verify", "evidence", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 3)
+        combined = output.getvalue()
+        self.assertIn("DATA UNAVAILABLE", combined)
+        self.assertNotIn(CANARY, combined)
+        self.assertNotIn(self.environment["APCA_API_KEY_ID"], combined)
+        self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
 
 
 if __name__ == "__main__":

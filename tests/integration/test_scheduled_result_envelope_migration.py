@@ -18,6 +18,10 @@ _MIGRATIONS_THROUGH_V3 = (
     "002_phase1.sql",
     "003_phase2_paper.sql",
 )
+_MIGRATIONS_THROUGH_V4 = (
+    *_MIGRATIONS_THROUGH_V3,
+    "004_scheduled_result_envelope.sql",
+)
 _STARTED_AT = "2026-08-14T14:00:00.000000Z"
 _FINISHED_AT = "2026-08-14T14:00:01.000000Z"
 _ENVELOPE_JSON = '{"outcome":"NO_TRADE"}'
@@ -44,7 +48,14 @@ class ScheduledResultEnvelopeMigrationTests(unittest.TestCase):
         return path
 
     def _migrate_to_v4(self, path: Path) -> None:
-        with Journal.open(path):
+        migration_directory = path.parent / "migrations-v4"
+        migration_directory.mkdir()
+        packaged_migrations = importlib.resources.files("stock_monitor.sql")
+        for name in _MIGRATIONS_THROUGH_V4:
+            packaged = packaged_migrations.joinpath(name)
+            (migration_directory / name).write_bytes(packaged.read_bytes())
+
+        with Journal.open(path, migration_directory=migration_directory):
             pass
         with closing(sqlite3.connect(path)) as connection:
             self.assertEqual(

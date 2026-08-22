@@ -87,6 +87,96 @@ _REFERENCE_ROLE_URLS = {
         "Nasdaq",
     ),
 }
+_SCOPED_REFERENCE_AUTHORITIES = {
+    "ISSUER_IR:AAPL": (
+        "0000320193",
+        frozenset(
+            {
+                (
+                    "https://investor.apple.com/investor-relations/faq/default.aspx",
+                    "Apple Inc.",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:AMD": (
+        "0000002488",
+        frozenset(
+            {
+                (
+                    "https://ir.amd.com/contacts-faq/faq",
+                    "Advanced Micro Devices, Inc.",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:NVDA": (
+        "0001045810",
+        frozenset(
+            {
+                (
+                    "https://investor.nvidia.com/investor-resources/faqs/default.aspx",
+                    "NVIDIA Corporation",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:QQQ": (
+        None,
+        frozenset(
+            {
+                (
+                    "https://www.invesco.com/qqq-etf/en/home.html",
+                    "Invesco",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:SPY": (
+        None,
+        frozenset(
+            {
+                (
+                    "https://www.ssga.com/us/en/intermediary/etfs/"
+                    "state-street-spdr-sp-500-etf-trust-spy",
+                    "State Street Global Advisors",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:VTI": (
+        None,
+        frozenset(
+            {
+                (
+                    "https://investor.vanguard.com/investment-products/etfs/"
+                    "profile/vti",
+                    "Vanguard",
+                ),
+                (
+                    "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+                    "Vanguard",
+                ),
+            }
+        ),
+    ),
+    "ISSUER_IR:XLK": (
+        None,
+        frozenset(
+            {
+                (
+                    "https://www.ssga.com/us/en/intermediary/etfs/"
+                    "state-street-technology-select-sector-spdr-etf-xlk",
+                    "State Street Global Advisors",
+                ),
+            }
+        ),
+    ),
+}
+_CLEAR_COVERAGE_AUTHORITIES: dict[
+    str,
+    frozenset[tuple[str, str]],
+] = {}
 _MISSING = object()
 _REVIEWED_AUTHORITY = object()
 _REVIEWED_RELEASE_AUTHORITY = object()
@@ -372,12 +462,14 @@ def _validate_source_identity(
     role = document.source_role
     if role in _REFERENCE_ROLE_URLS:
         expected_url, expected_publisher = _REFERENCE_ROLE_URLS[role]
-        timestamp_source_is_valid = document.timestamp_source == "PRIMARY_METADATA"
-        if role == "OPERATIONAL_STATUS":
-            timestamp_source_is_valid = document.timestamp_source in {
-                "PRIMARY_METADATA",
-                "UNAVAILABLE",
-            }
+        timestamp_source_is_valid = (
+            document.timestamp_source == "PRIMARY_METADATA"
+            and document.published_at is not None
+        ) or (
+            role == "OPERATIONAL_STATUS"
+            and document.timestamp_source == "UNAVAILABLE"
+            and document.published_at is None
+        )
         if (
             document.url != expected_url
             or document.publisher != expected_publisher
@@ -387,10 +479,15 @@ def _validate_source_identity(
             raise ValueError("official evidence source role identity is malformed")
         return
     scoped = _SCOPED_REFERENCE_ROLE.fullmatch(role or "")
+    scoped_authority = _SCOPED_REFERENCE_AUTHORITIES.get(role or "")
     if (
         scoped is None
         or scoped.group(1) != symbol
+        or scoped_authority is None
+        or scoped_authority[0] != issuer_cik
+        or (document.url, document.publisher) not in scoped_authority[1]
         or document.timestamp_source != "PRIMARY_METADATA"
+        or document.published_at is None
         or document.accession is not None
     ):
         raise ValueError("scoped evidence source role is not bound to its subject")
@@ -781,6 +878,30 @@ class ReviewedEvidenceBundle:
         repr=False,
         compare=False,
     )
+    _parent_release_id: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _parent_release_sha256: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _parent_universe_sha256: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _parent_release_review_by: datetime | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -917,6 +1038,11 @@ def classify_evidence(
     if not _is_reviewed_bundle(reviewed_bundle):
         raise EvidenceUnavailableError("pinned reviewed evidence authority is required")
     assert isinstance(reviewed_bundle, ReviewedEvidenceBundle)
+    if (
+        reviewed_bundle._parent_release_review_by is not None
+        and current >= reviewed_bundle._parent_release_review_by
+    ):
+        raise EvidenceUnavailableError("parent reviewed evidence release has expired")
     if (
         reviewed_bundle.subject_kind != subject_kind
         or reviewed_bundle.symbol != subject_symbol
@@ -1533,6 +1659,34 @@ def _bundle_fingerprint(value: ReviewedEvidenceBundle) -> str:
         or _SHA256.fullmatch(value.content_hash) is None
     ):
         raise TypeError("reviewed evidence bundle fields are malformed")
+    parent_fields = (
+        value._parent_release_id,
+        value._parent_release_sha256,
+        value._parent_universe_sha256,
+        value._parent_release_review_by,
+    )
+    if any(parent is not None for parent in parent_fields) and not all(
+        parent is not None for parent in parent_fields
+    ):
+        raise TypeError("reviewed evidence parent release fields are incomplete")
+    parent_release: dict[str, str] | None = None
+    if all(parent is not None for parent in parent_fields):
+        if (
+            type(value._parent_release_id) is not str
+            or _IDENTIFIER.fullmatch(value._parent_release_id) is None
+            or type(value._parent_release_sha256) is not str
+            or _SHA256.fullmatch(value._parent_release_sha256) is None
+            or type(value._parent_universe_sha256) is not str
+            or _SHA256.fullmatch(value._parent_universe_sha256) is None
+            or type(value._parent_release_review_by) is not datetime
+        ):
+            raise TypeError("reviewed evidence parent release fields are malformed")
+        parent_release = {
+            "release_id": value._parent_release_id,
+            "release_sha256": value._parent_release_sha256,
+            "review_by": _iso_timestamp(value._parent_release_review_by),
+            "universe_sha256": value._parent_universe_sha256,
+        }
     document = {
         "content_hash": value.content_hash,
         "coverage_attestations": [
@@ -1543,6 +1697,7 @@ def _bundle_fingerprint(value: ReviewedEvidenceBundle) -> str:
             {**_record_document(record), "content_hash": record.content_hash}
             for record in value.records
         ],
+        "parent_release": parent_release,
         "registry_id": value.registry_id,
         "reviewed_at": _iso_timestamp(value.reviewed_at),
         "source_bindings": [
@@ -1673,7 +1828,14 @@ def is_verified_evidence_release(value: object) -> bool:
             value._release_digest == expected_digest
             and value.release_sha256 == expected_sha
             and _release_fingerprint(value) == expected_digest
-            and all(_is_reviewed_bundle(bundle) for bundle in value.by_symbol.values())
+            and all(
+                _is_reviewed_bundle(bundle)
+                and bundle._parent_release_id == value.release_id
+                and bundle._parent_release_sha256 == value.release_sha256
+                and bundle._parent_universe_sha256 == value.universe_sha256
+                and bundle._parent_release_review_by == value.review_by
+                for bundle in value.by_symbol.values()
+            )
         )
     except (TypeError, ValueError):
         return False
@@ -1771,12 +1933,31 @@ def _verify_coverage_source_roles(
     for attestation in coverage:
         for identifier in attestation.source_observation_ids:
             document = bindings[identifier].document
+            scoped = _SCOPED_REFERENCE_ROLE.fullmatch(document.source_role or "")
             if (
                 document.source_type != "OFFICIAL_REFERENCE"
-                or document.source_role not in _REFERENCE_ROLE_URLS
+                or (
+                    document.source_role not in _REFERENCE_ROLE_URLS
+                    and scoped is None
+                )
             ):
                 raise EvidenceRegistryError(
                     "event coverage does not use a reviewed coverage-only role"
+                )
+            if (
+                attestation.complete
+                and attestation.coverage == "CONFIRMED_CLEAR"
+                and (
+                    scoped is None
+                    or (document.url, document.publisher)
+                    not in _CLEAR_COVERAGE_AUTHORITIES.get(
+                        document.source_role or "",
+                        frozenset(),
+                    )
+                )
+            ):
+                raise EvidenceRegistryError(
+                    "source authority cannot confirm clear event coverage"
                 )
             if document.timestamp_source == "UNAVAILABLE":
                 relevant = (attestation.subject_kind, attestation.coverage_kind) in {
@@ -2028,10 +2209,16 @@ def _read_regular_path(
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | os.O_NOFOLLOW
         | os.O_DIRECTORY
     )
-    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | os.O_NOFOLLOW
+    )
     parent_descriptor: int | None = None
     descriptor: int | None = None
     try:
@@ -2084,10 +2271,16 @@ def _read_confined_regular_file(
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
         | os.O_NOFOLLOW
         | os.O_DIRECTORY
     )
-    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | os.O_NOFOLLOW
+    )
     descriptors: list[int] = []
     try:
         current = os.open(root, directory_flags)
@@ -2480,6 +2673,10 @@ def load_evidence_release(
         by_symbol[symbol] = _issue_reviewed_evidence_bundle(
             registry,
             release_pin=child_sha,
+            parent_release_id=document["release_id"],
+            parent_release_sha256=digest,
+            parent_universe_sha256=universe_sha,
+            parent_release_review_by=review_by,
         )
     if supplied_documents is not None and set(supplied_documents) != used_observation_ids:
         raise EvidenceRegistryError(
@@ -2522,6 +2719,10 @@ def _issue_reviewed_evidence_bundle(
     *,
     release_pin: str,
     phase1_source: object | None = None,
+    parent_release_id: str | None = None,
+    parent_release_sha256: str | None = None,
+    parent_universe_sha256: str | None = None,
+    parent_release_review_by: datetime | None = None,
 ) -> ReviewedEvidenceBundle:
     if (
         not isinstance(registry, EvidenceRegistry)
@@ -2530,6 +2731,35 @@ def _issue_reviewed_evidence_bundle(
         or registry.content_hash != release_pin
     ):
         raise EvidenceRegistryError("reviewed evidence release pin is invalid")
+    parent_fields = (
+        parent_release_id,
+        parent_release_sha256,
+        parent_universe_sha256,
+        parent_release_review_by,
+    )
+    if any(parent is not None for parent in parent_fields) and not all(
+        parent is not None for parent in parent_fields
+    ):
+        raise EvidenceRegistryError(
+            "reviewed evidence parent release authority is incomplete"
+        )
+    if all(parent is not None for parent in parent_fields):
+        if (
+            type(parent_release_id) is not str
+            or _IDENTIFIER.fullmatch(parent_release_id) is None
+            or type(parent_release_sha256) is not str
+            or _SHA256.fullmatch(parent_release_sha256) is None
+            or type(parent_universe_sha256) is not str
+            or _SHA256.fullmatch(parent_universe_sha256) is None
+            or type(parent_release_review_by) is not datetime
+        ):
+            raise EvidenceRegistryError(
+                "reviewed evidence parent release authority is malformed"
+            )
+        parent_release_review_by = _utc(
+            parent_release_review_by,
+            "reviewed evidence parent release review_by",
+        )
     bundle = ReviewedEvidenceBundle(
         registry_id=registry.registry_id,
         reviewed_at=registry.reviewed_at,
@@ -2540,6 +2770,14 @@ def _issue_reviewed_evidence_bundle(
         source_bindings=registry.source_bindings,
         coverage_attestations=registry.coverage_attestations,
         content_hash=registry.content_hash,
+    )
+    object.__setattr__(bundle, "_parent_release_id", parent_release_id)
+    object.__setattr__(bundle, "_parent_release_sha256", parent_release_sha256)
+    object.__setattr__(bundle, "_parent_universe_sha256", parent_universe_sha256)
+    object.__setattr__(
+        bundle,
+        "_parent_release_review_by",
+        parent_release_review_by,
     )
     bundle_digest = _bundle_fingerprint(bundle)
     object.__setattr__(bundle, "_authority", _REVIEWED_AUTHORITY)

@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import pickle
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -42,6 +45,11 @@ RELEASE_REVIEWED = datetime(2026, 8, 22, 0, 40, tzinfo=UTC)
 RELEASE_AS_OF = datetime(2026, 8, 22, 0, 45, tzinfo=UTC)
 RELEASE_REVIEW_BY = datetime(2026, 8, 23, 0, 39, 58, tzinfo=UTC)
 RELEASE_HOLD = DateRange(date(2026, 8, 22), date(2026, 9, 4))
+_TEST_COVERAGE_PUBLISHER = "Reviewed Test Coverage Authority"
+
+
+def _test_coverage_url(symbol: str) -> str:
+    return f"https://reviewed.test.invalid/coverage/{symbol.lower()}"
 
 
 def iso(value: datetime) -> str:
@@ -126,8 +134,8 @@ def record(**overrides: object) -> EvidenceRecord:
     if "issuer_cik" in overrides and "primary_url" not in overrides:
         if values["issuer_cik"] is None:
             values["primary_url"] = (
-                "https://www.ssga.com/us/en/intermediary/etfs/funds/"
-                "spdr-sp-500-etf-trust-spy"
+                "https://www.ssga.com/us/en/intermediary/etfs/"
+                "state-street-spdr-sp-500-etf-trust-spy"
             )
             values["publisher"] = "State Street Global Advisors"
         else:
@@ -243,16 +251,16 @@ def coverage_binding(
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     document = SourceDocument(
-        url="https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+        url=_test_coverage_url(symbol),
         published_at=PUBLISHED,
         retrieved_at=RETRIEVED,
         content_hash=hashlib.sha256(body).hexdigest(),
         body=body,
         source_observation_id=identifier,
-        publisher="Nasdaq",
+        publisher=_TEST_COVERAGE_PUBLISHER,
         source_type="OFFICIAL_REFERENCE",
         timestamp_source="PRIMARY_METADATA",
-        source_role="CROSS_CHECK_CALENDAR",
+        source_role=f"CORPORATE_ACTION:{symbol}",
     )
     binding = evidence_module.EvidenceSourceBinding.from_document(
         document,
@@ -825,6 +833,8 @@ class ReviewedEvidenceReleaseTests(unittest.TestCase):
             "child CIK",
             "child v2",
             "timestamp unavailable clear",
+            "primary metadata without publication clear",
+            "generic primary source clear",
             "duplicate observation",
             "missing published_at",
         )
@@ -869,6 +879,29 @@ class ReviewedEvidenceReleaseTests(unittest.TestCase):
                             "AAPL",
                             claim_clear,
                         )
+                    elif case in {
+                        "primary metadata without publication clear",
+                        "generic primary source clear",
+                    }:
+                        def claim_generic_clear(value: object) -> None:
+                            for binding in value["source_bindings"]:  # type: ignore[index,union-attr]
+                                binding["timestamp_source"] = "PRIMARY_METADATA"
+                                binding["published_at"] = (
+                                    iso(RELEASE_RETRIEVED - timedelta(minutes=1))
+                                    if case == "generic primary source clear"
+                                    else None
+                                )
+                            for attestation in value["coverage_attestations"]:  # type: ignore[index,union-attr]
+                                if attestation["coverage"] == "UNKNOWN":
+                                    attestation["coverage"] = "CONFIRMED_CLEAR"
+                                    attestation["complete"] = True
+
+                        update_child(
+                            manifest,
+                            children,
+                            "AAPL",
+                            claim_generic_clear,
+                        )
                     elif case == "duplicate observation":
                         def reuse_observation(value: object) -> None:
                             value["source_bindings"][0][  # type: ignore[index]
@@ -904,6 +937,138 @@ class ReviewedEvidenceReleaseTests(unittest.TestCase):
                             as_of=RELEASE_AS_OF,
                             universe=universe,
                         )
+
+    def test_detached_bundle_expires_with_its_parent_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with verified_release_universe(root) as (universe, _):
+                manifest, children, artifacts, _ = release_material(universe)
+                parent_review_by = RELEASE_REVIEWED + timedelta(hours=1)
+                manifest["review_by"] = iso(parent_review_by)
+                path, digest = write_release(root, manifest, children, artifacts)
+                release = evidence_module.load_evidence_release(
+                    path,
+                    expected_sha256=digest,
+                    as_of=RELEASE_AS_OF,
+                    universe=universe,
+                )
+                bundle = release.by_symbol["AAPL"]
+
+                self.assertEqual(bundle._parent_release_id, release.release_id)
+                self.assertEqual(bundle._parent_release_sha256, digest)
+                self.assertEqual(
+                    bundle._parent_universe_sha256,
+                    release.universe_sha256,
+                )
+                self.assertEqual(
+                    bundle._parent_release_review_by,
+                    parent_review_by,
+                )
+                before_expiry = evidence_module.classify_evidence(
+                    bundle.records,
+                    RELEASE_HOLD,
+                    symbol=bundle.symbol,
+                    issuer_cik=bundle.issuer_cik,
+                    source_bindings=bundle.source_bindings,
+                    as_of=parent_review_by - timedelta(microseconds=1),
+                    subject_kind=bundle.subject_kind,
+                    coverage_attestations=bundle.coverage_attestations,
+                    reviewed_bundle=bundle,
+                )
+                self.assertEqual(
+                    before_expiry.block_reason,
+                    "BINARY_EVENT_STATUS_UNKNOWN",
+                )
+                with self.assertRaises(evidence_module.EvidenceUnavailableError):
+                    evidence_module.classify_evidence(
+                        bundle.records,
+                        RELEASE_HOLD,
+                        symbol=bundle.symbol,
+                        issuer_cik=bundle.issuer_cik,
+                        source_bindings=bundle.source_bindings,
+                        as_of=parent_review_by,
+                        subject_kind=bundle.subject_kind,
+                        coverage_attestations=bundle.coverage_attestations,
+                        reviewed_bundle=bundle,
+                    )
+
+                original_digest = bundle._bundle_digest
+                for field_name in (
+                    "_parent_release_sha256",
+                    "_parent_universe_sha256",
+                ):
+                    with self.subTest(tampered_parent_field=field_name):
+                        original = getattr(bundle, field_name)
+                        object.__setattr__(bundle, field_name, "0" * 64)
+                        object.__setattr__(
+                            bundle,
+                            "_bundle_digest",
+                            evidence_module._bundle_fingerprint(bundle),
+                        )
+                        self.assertFalse(
+                            evidence_module._is_reviewed_bundle(bundle)
+                        )
+                        object.__setattr__(bundle, field_name, original)
+                        object.__setattr__(bundle, "_bundle_digest", original_digest)
+                        self.assertTrue(evidence_module._is_reviewed_bundle(bundle))
+
+    def test_secure_release_readers_reject_fifos_without_blocking(self) -> None:
+        script = """
+import sys
+from pathlib import Path
+from stock_monitor.evidence import (
+    EvidenceRegistryError,
+    _read_confined_regular_file,
+    _read_regular_path,
+)
+try:
+    if sys.argv[1] == "manifest":
+        _read_regular_path(
+            Path(sys.argv[2]),
+            maximum_bytes=1024,
+            name="reviewed evidence release",
+        )
+    else:
+        _read_confined_regular_file(
+            Path(sys.argv[2]),
+            sys.argv[3],
+            maximum_bytes=1024,
+            name=sys.argv[1],
+        )
+except EvidenceRegistryError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "subjects").mkdir()
+            (root / "sources").mkdir()
+            manifest = root / "current.json"
+            child = root / "subjects" / "AAPL.json"
+            artifact = root / "sources" / f"{'0' * 64}.json"
+            for path in (manifest, child, artifact):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.unlink(missing_ok=True)
+                os.mkfifo(path)
+
+            cases = (
+                ("manifest", str(manifest)),
+                ("reviewed evidence child", str(root), "subjects/AAPL.json"),
+                (
+                    "reviewed evidence source artifact",
+                    str(root),
+                    f"sources/{'0' * 64}.json",
+                ),
+            )
+            for arguments in cases:
+                with self.subTest(kind=arguments[0]):
+                    completed = subprocess.run(
+                        [sys.executable, "-c", script, *arguments],
+                        check=False,
+                        capture_output=True,
+                        timeout=2,
+                    )
+                    self.assertEqual(completed.returncode, 0)
 
     def test_release_rejects_invalid_review_windows_and_expired_child(self) -> None:
         cases = (
@@ -1108,6 +1273,45 @@ class ReviewedEvidenceReleaseTests(unittest.TestCase):
 
 
 class EvidenceClassificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        spy_pair = (
+            "https://www.ssga.com/us/en/intermediary/etfs/"
+            "state-street-spdr-sp-500-etf-trust-spy",
+            "State Street Global Advisors",
+        )
+        coverage_pairs = {
+            symbol: (_test_coverage_url(symbol), _TEST_COVERAGE_PUBLISHER)
+            for symbol in ("EXM", "SPY")
+        }
+        cls._scoped_authority_patch = mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {
+                "CORPORATE_ACTION:EXM": (
+                    "0000000001",
+                    frozenset({coverage_pairs["EXM"]}),
+                ),
+                "CORPORATE_ACTION:SPY": (
+                    None,
+                    frozenset({coverage_pairs["SPY"], spy_pair}),
+                ),
+            },
+        )
+        cls._clear_authority_patch = mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {
+                "CORPORATE_ACTION:EXM": frozenset({coverage_pairs["EXM"]}),
+                "CORPORATE_ACTION:SPY": frozenset({coverage_pairs["SPY"]}),
+            },
+        )
+        cls._scoped_authority_patch.start()
+        cls._clear_authority_patch.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._clear_authority_patch.stop()
+        cls._scoped_authority_patch.stop()
+
     def test_taxonomy_is_exact_and_closed(self) -> None:
         self.assertEqual(
             POSITIVE_EVENT_TYPES,
@@ -1882,6 +2086,70 @@ class EvidenceClassificationTests(unittest.TestCase):
                 wrong_role,
                 symbol="EXM",
                 issuer_cik="0000000001",
+                checked_at=RETRIEVED,
+                valid_until=AS_OF + timedelta(hours=1),
+                healthy=True,
+            )
+
+        attacker_body = b'{"reviewed":"self-asserted issuer authority"}'
+        attacker = SourceDocument(
+            url="https://attacker.example/aapl",
+            published_at=PUBLISHED,
+            retrieved_at=RETRIEVED,
+            content_hash=hashlib.sha256(attacker_body).hexdigest(),
+            body=attacker_body,
+            source_observation_id="issuer-ir-attacker",
+            publisher="Attacker",
+            source_type="OFFICIAL_REFERENCE",
+            timestamp_source="PRIMARY_METADATA",
+            source_role="ISSUER_IR:AAPL",
+        )
+        with self.assertRaises(ValueError):
+            evidence_module.EvidenceSourceBinding.from_document(
+                attacker,
+                symbol="AAPL",
+                issuer_cik="0000320193",
+                checked_at=RETRIEVED,
+                valid_until=AS_OF + timedelta(hours=1),
+                healthy=True,
+            )
+
+        apple_body = b'{"reviewed":"official issuer authority"}'
+        apple = SourceDocument(
+            url="https://investor.apple.com/investor-relations/faq/default.aspx",
+            published_at=PUBLISHED,
+            retrieved_at=RETRIEVED,
+            content_hash=hashlib.sha256(apple_body).hexdigest(),
+            body=apple_body,
+            source_observation_id="issuer-ir-aapl",
+            publisher="Apple Inc.",
+            source_type="OFFICIAL_REFERENCE",
+            timestamp_source="PRIMARY_METADATA",
+            source_role="ISSUER_IR:AAPL",
+        )
+        binding = evidence_module.EvidenceSourceBinding.from_document(
+            apple,
+            symbol="AAPL",
+            issuer_cik="0000320193",
+            checked_at=RETRIEVED,
+            valid_until=AS_OF + timedelta(hours=1),
+            healthy=True,
+        )
+        self.assertEqual(binding.document, apple)
+        with self.assertRaises(ValueError):
+            evidence_module.EvidenceSourceBinding.from_document(
+                replace(apple, source_role="CORPORATE_ACTION:AAPL"),
+                symbol="AAPL",
+                issuer_cik="0000320193",
+                checked_at=RETRIEVED,
+                valid_until=AS_OF + timedelta(hours=1),
+                healthy=True,
+            )
+        with self.assertRaises(ValueError):
+            evidence_module.EvidenceSourceBinding.from_document(
+                apple,
+                symbol="AAPL",
+                issuer_cik="0000002488",
                 checked_at=RETRIEVED,
                 valid_until=AS_OF + timedelta(hours=1),
                 healthy=True,

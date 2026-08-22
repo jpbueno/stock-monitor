@@ -489,14 +489,22 @@ def release_material(universe: object) -> tuple[
                 symbol=record_value.symbol,
                 issuer_cik=record_value.issuer_cik,
                 coverage_kind=kind,
-                coverage="UNKNOWN",
+                coverage=(
+                    "UNKNOWN"
+                    if (subject_kind, kind)
+                    in {("STOCK", "BINARY_EVENT"), ("ETF", "ETF_ACTION")}
+                    else "NOT_APPLICABLE"
+                ),
                 coverage_start=RELEASE_HOLD.start,
                 coverage_end=RELEASE_HOLD.end,
                 source_observation_ids=(identifier,),
                 checked_at=RELEASE_REVIEWED,
                 valid_until=RELEASE_REVIEW_BY,
                 healthy=True,
-                complete=False,
+                complete=(
+                    (subject_kind, kind)
+                    not in {("STOCK", "BINARY_EVENT"), ("ETF", "ETF_ACTION")}
+                ),
                 conflicts=(),
             )
             for kind in ("BINARY_EVENT", "ETF_ACTION")
@@ -706,6 +714,20 @@ class ReviewedEvidenceReleaseTests(unittest.TestCase):
                     },
                     {b"[]"},
                 )
+                for symbol, bundle in release.by_symbol.items():
+                    expected = (
+                        ("UNKNOWN", "NOT_APPLICABLE")
+                        if bundle.subject_kind == "STOCK"
+                        else ("NOT_APPLICABLE", "UNKNOWN")
+                    )
+                    self.assertEqual(
+                        tuple(
+                            value.coverage
+                            for value in bundle.coverage_attestations
+                        ),
+                        expected,
+                        symbol,
+                    )
                 with self.assertRaises(TypeError):
                     release.by_symbol["AAPL"] = release.by_symbol["AAPL"]  # type: ignore[index]
                 with self.assertRaises(FrozenInstanceError):

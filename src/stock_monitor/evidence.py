@@ -1778,14 +1778,27 @@ def _verify_coverage_source_roles(
                 raise EvidenceRegistryError(
                     "event coverage does not use a reviewed coverage-only role"
                 )
-            if document.timestamp_source == "UNAVAILABLE" and (
-                document.source_role != "OPERATIONAL_STATUS"
-                or attestation.complete
-                or attestation.coverage != "UNKNOWN"
-            ):
-                raise EvidenceRegistryError(
-                    "timestamp-unavailable coverage must remain incomplete and unknown"
+            if document.timestamp_source == "UNAVAILABLE":
+                relevant = (attestation.subject_kind, attestation.coverage_kind) in {
+                    ("STOCK", "BINARY_EVENT"),
+                    ("ETF", "ETF_ACTION"),
+                }
+                safe_relevant = (
+                    relevant
+                    and not attestation.complete
+                    and attestation.coverage == "UNKNOWN"
                 )
+                safe_opposite = (
+                    not relevant
+                    and attestation.complete
+                    and attestation.coverage == "NOT_APPLICABLE"
+                )
+                if document.source_role != "OPERATIONAL_STATUS" or not (
+                    safe_relevant or safe_opposite
+                ):
+                    raise EvidenceRegistryError(
+                        "timestamp-unavailable coverage has an unsafe state"
+                    )
 
 
 def _load_evidence_registry_payload(

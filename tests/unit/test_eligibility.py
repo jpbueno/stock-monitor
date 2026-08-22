@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 from stock_monitor.evidence import EvidenceDecision
 from stock_monitor.market_calendar import (
@@ -20,6 +21,7 @@ from stock_monitor.screening import (
     build_market_session_attestation,
     evaluate_eligibility,
 )
+from tests.unit import _task5_fixtures as task5_fixtures
 from tests.unit._task5_fixtures import (
     RUN_AT,
     SESSION_DATE,
@@ -477,6 +479,132 @@ class EligibilityTests(unittest.TestCase):
             "EVIDENCE_SOURCE_STALE",
             evaluate_eligibility(stale_evidence).reason_codes,
         )
+
+    def test_operational_clock_accepts_post_cutoff_iex_and_halt_facts(self) -> None:
+        operational_as_of = RUN_AT + timedelta(minutes=7)
+        with mock.patch.object(task5_fixtures, "RUN_AT", operational_as_of):
+            status = task5_fixtures.reviewed_instrument_status(
+                PRIMARY_SYMBOL,
+                "NASDAQ",
+            )
+        context = replace(
+            candidate_context(),
+            operational_as_of=operational_as_of,
+            latest_iex_quote=replace(
+                latest_iex_quote(),
+                timestamp=operational_as_of - timedelta(seconds=30),
+            ),
+            instrument_status=status,
+        )
+
+        decision = evaluate_eligibility(context)
+
+        self.assertGreater(context.latest_iex_quote.timestamp, context.as_of)
+        self.assertGreater(context.instrument_status.as_of, context.as_of)
+        self.assertTrue(decision.eligible)
+        self.assertNotIn("IEX_QUOTE_FROM_FUTURE", decision.reason_codes)
+        self.assertNotIn("HALT_STATUS_STALE", decision.reason_codes)
+
+    def test_operational_clock_rejects_stale_and_future_facts(self) -> None:
+        operational_as_of = RUN_AT + timedelta(minutes=7)
+        with mock.patch.object(task5_fixtures, "RUN_AT", operational_as_of):
+            current_status = task5_fixtures.reviewed_instrument_status(
+                PRIMARY_SYMBOL,
+                "NASDAQ",
+            )
+        with mock.patch.object(
+            task5_fixtures,
+            "RUN_AT",
+            operational_as_of + timedelta(seconds=1),
+        ):
+            future_status = task5_fixtures.reviewed_instrument_status(
+                PRIMARY_SYMBOL,
+                "NASDAQ",
+            )
+        economic_context = candidate_context()
+        base = replace(
+            economic_context,
+            operational_as_of=operational_as_of,
+            latest_iex_quote=replace(
+                latest_iex_quote(),
+                timestamp=operational_as_of - timedelta(seconds=30),
+            ),
+            instrument_status=current_status,
+        )
+        cases = (
+            (
+                replace(
+                    base,
+                    latest_iex_quote=replace(
+                        latest_iex_quote(),
+                        timestamp=operational_as_of - timedelta(seconds=301),
+                    ),
+                ),
+                "IEX_QUOTE_STALE",
+            ),
+            (
+                replace(
+                    base,
+                    latest_iex_quote=replace(
+                        latest_iex_quote(),
+                        timestamp=operational_as_of + timedelta(microseconds=1),
+                    ),
+                ),
+                "IEX_QUOTE_FROM_FUTURE",
+            ),
+            (
+                replace(
+                    base,
+                    instrument_status=economic_context.instrument_status,
+                ),
+                "HALT_STATUS_STALE",
+            ),
+            (
+                replace(base, instrument_status=future_status),
+                "HALT_STATUS_STALE",
+            ),
+        )
+
+        for context, reason in cases:
+            with self.subTest(reason=reason):
+                decision = evaluate_eligibility(context)
+                self.assertEqual(decision.status, "DATA_UNAVAILABLE")
+                self.assertIn(reason, decision.reason_codes)
+
+    def test_explicit_operational_clock_must_be_aware_and_not_precede_cutoff(
+        self,
+    ) -> None:
+        earlier = RUN_AT - timedelta(minutes=1)
+        with mock.patch.object(task5_fixtures, "RUN_AT", earlier):
+            earlier_status = task5_fixtures.reviewed_instrument_status(
+                PRIMARY_SYMBOL,
+                "NASDAQ",
+            )
+        economic_context = candidate_context()
+        cases = (
+            replace(
+                economic_context,
+                operational_as_of=earlier,
+                latest_iex_quote=replace(
+                    latest_iex_quote(),
+                    timestamp=earlier - timedelta(seconds=30),
+                ),
+                instrument_status=earlier_status,
+            ),
+            replace(
+                economic_context,
+                operational_as_of=RUN_AT.replace(tzinfo=None),
+            ),
+        )
+
+        for context in cases:
+            with self.subTest(operational_as_of=context.operational_as_of):
+                decision = evaluate_eligibility(context)
+                self.assertEqual(decision.status, "DATA_UNAVAILABLE")
+                self.assertIn(
+                    "OPERATIONAL_AS_OF_INVALID",
+                    decision.reason_codes,
+                )
 
     def test_stock_binary_and_etf_action_cover_the_inclusive_ten_session_hold(self) -> None:
         base = candidate_context()

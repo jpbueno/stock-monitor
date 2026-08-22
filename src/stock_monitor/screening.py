@@ -423,6 +423,7 @@ class CandidateContext:
     market_calendar: MarketCalendar
     rumor_dependent: bool = False
     relative_strength_cohort: RelativeStrengthCohort | None = None
+    operational_as_of: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.bars_by_symbol, Mapping):
@@ -1324,6 +1325,20 @@ def _aware(value: object) -> datetime | None:
     return value
 
 
+def _operational_as_of(context: CandidateContext) -> datetime | None:
+    economic = _aware(context.as_of)
+    value = context.operational_as_of
+    operational = economic if value is None else _aware(value)
+    if economic is None or operational is None:
+        return None
+    try:
+        if operational.astimezone(UTC) < economic.astimezone(UTC):
+            return None
+    except (OverflowError, ValueError):
+        return None
+    return operational
+
+
 def _elapsed_seconds(later: datetime, earlier: datetime) -> Decimal:
     delta = later.astimezone(UTC) - earlier.astimezone(UTC)
     with localcontext() as context:
@@ -1477,7 +1492,7 @@ def _validate_iex(context: CandidateContext, data_reasons: list[str]) -> None:
         _append(data_reasons, "IEX_QUOTE_MISSING")
         return
     timestamp = _aware(getattr(quote, "timestamp", None))
-    as_of = _aware(context.as_of)
+    as_of = _operational_as_of(context)
     symbol = getattr(context.record, "symbol", "").upper()
     if getattr(quote, "symbol", "").upper() != symbol:
         _append(data_reasons, "IEX_QUOTE_SYMBOL_MISMATCH")
@@ -1793,7 +1808,7 @@ def _validate_instrument_status(
         or any(not isinstance(value, str) or not value for value in source_ids)
     ):
         _append(data_reasons, "HALT_STATUS_PROVENANCE_MISSING")
-    current = _aware(context.as_of)
+    current = _operational_as_of(context)
     currently_valid = (
         status_as_of is not None
         and current is not None
@@ -1818,6 +1833,8 @@ def evaluate_eligibility(context: CandidateContext) -> EligibilityDecision:
     policy_reasons: list[str] = []
     pause_reasons: list[str] = []
     record = context.record
+    if _operational_as_of(context) is None:
+        _append(data_reasons, "OPERATIONAL_AS_OF_INVALID")
 
     latest_completed = _validate_bar_cohort(context, data_reasons)
     bars = context.bars_by_symbol.get(str(getattr(record, "symbol", "")).upper())

@@ -350,6 +350,26 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(score.catalyst_context, 0)
         self.assertEqual(score.status, "DATA_UNAVAILABLE")
 
+    def test_later_operational_clock_cannot_improve_economic_score(self) -> None:
+        early = candidate_context(
+            evidence=evidence(age_days=31),
+            operational_as_of=RUN_AT,
+        )
+        later = candidate_context(
+            evidence=evidence(age_days=31),
+            operational_as_of=RUN_AT + timedelta(minutes=1),
+        )
+
+        early_score = score_candidate(early)
+        later_score = score_candidate(later)
+
+        self.assertEqual(later_score.total, early_score.total)
+        self.assertEqual(
+            later_score.catalyst_context,
+            early_score.catalyst_context,
+        )
+        self.assertLessEqual(later_score.total, early_score.total)
+
     def test_qualifying_fact_must_match_subject_and_decision_provenance(self) -> None:
         base = candidate_context(evidence=evidence(age_days=1))
         fact = base.evidence.qualifying_records[0]

@@ -3823,6 +3823,97 @@ def _phase1_recompute_alpaca_page_metadata(
         ) from error
 
 
+class _Phase1ReplayTransport:
+    """Serve immutable stored provider pages during authority rederivation."""
+
+    __slots__ = ("_page_values",)
+
+    def __init__(
+        self,
+        page_values: Mapping[str, tuple[bytes, datetime]],
+    ) -> None:
+        self._page_values = dict(page_values)
+
+    def get(self, url: str, headers: object) -> object:
+        from .providers.http import HttpResponse
+
+        del headers
+        value = self._page_values.get(url)
+        if value is None:
+            raise InvalidJournalValue(
+                "Phase 1 provider replay requested an unknown page"
+            )
+        payload, _retrieved_at = value
+        return HttpResponse(
+            status=200,
+            headers=(("Content-Type", "application/json"),),
+            body=payload,
+            url=url,
+        )
+
+
+class _Phase1ReplayClock:
+    """Replay exact validation/page receipt times without transport mutation."""
+
+    __slots__ = ("_index", "_schedule")
+
+    def __init__(self, schedule: tuple[datetime, ...]) -> None:
+        if not schedule:
+            raise InvalidJournalValue(
+                "Phase 1 provider replay clock has no receipt times"
+            )
+        self._schedule = schedule
+        self._index = 0
+
+    def now(self) -> datetime:
+        if self._index >= len(self._schedule):
+            raise InvalidJournalValue(
+                "Phase 1 provider replay clock was read too many times"
+            )
+        value = self._schedule[self._index]
+        self._index += 1
+        return value
+
+    def require_consumed(self) -> None:
+        if self._index != len(self._schedule):
+            raise InvalidJournalValue(
+                "Phase 1 provider replay clock was not fully consumed"
+            )
+
+
+def _phase1_replay_clock_schedule(
+    role_pages: Mapping[
+        str,
+        Sequence[tuple[str, bytes, datetime]],
+    ],
+    role_order: tuple[str, ...],
+) -> tuple[datetime, ...]:
+    all_receipts = tuple(
+        retrieved_at
+        for pages in role_pages.values()
+        for _url, _payload, retrieved_at in pages
+    )
+    if not all_receipts:
+        raise InvalidJournalValue(
+            "Phase 1 provider replay has no stored receipt times"
+        )
+    current = max(all_receipts)
+    schedule: list[datetime] = []
+    for role in role_order:
+        pages = role_pages.get(role)
+        if not pages:
+            raise InvalidJournalValue(
+                "Phase 1 provider replay role has no stored pages"
+            )
+        # Every historical provider call reads the clock once to validate its
+        # completed window, then once for each page at durable receipt time.
+        schedule.append(current)
+        for _url, _payload, retrieved_at in pages:
+            current = retrieved_at
+            schedule.append(current)
+    return tuple(schedule)
+
+
 def _phase1_reissue_exit_provider_cohorts(
     source: object,
 ) -> tuple[object, object, object]:
@@ -3833,8 +3924,6 @@ def _phase1_reissue_exit_provider_cohorts(
         TimeWindow,
         _mark_provider_fetch_cohort_replay_only,
     )
-    from .providers.http import HttpResponse
-
     if not isinstance(source, _Phase1ExitProviderReplaySource) or (
         _phase1_source_owner(source) is None
     ):
@@ -3853,41 +3942,17 @@ def _phase1_reissue_exit_provider_cohorts(
         for url, payload, retrieved_at in values
     }
 
-    class StoredTransport:
-        def __init__(self) -> None:
-            self.current_retrieved_at: datetime | None = max(
-                (retrieved_at for _payload, retrieved_at in page_values.values()),
-                default=None,
-            )
-
-        def get(self, url: str, headers: object) -> HttpResponse:
-            del headers
-            value = page_values.get(url)
-            if value is None:
-                raise InvalidJournalValue(
-                    "Phase 1 exit provider replay requested an unknown page"
-                )
-            payload, retrieved_at = value
-            self.current_retrieved_at = retrieved_at
-            return HttpResponse(
-                status=200,
-                headers=(("Content-Type", "application/json"),),
-                body=payload,
-                url=url,
-            )
-
-        def now(self) -> datetime:
-            if self.current_retrieved_at is None:
-                raise InvalidJournalValue(
-                    "Phase 1 exit provider replay has no current page"
-                )
-            return self.current_retrieved_at
-
-    transport = StoredTransport()
+    transport = _Phase1ReplayTransport(page_values)
+    clock = _Phase1ReplayClock(
+        _phase1_replay_clock_schedule(
+            role_pages,
+            ("DAILY_BAR", "EXECUTION_BAR", "QUOTE"),
+        )
+    )
     client = AlpacaMarketData(
         transport,
         AlpacaCredentials("phase1-replay", "phase1-replay"),
-        now=transport.now,
+        now=clock.now,
     )
 
     def window(purpose: str) -> TimeWindow:
@@ -3900,6 +3965,7 @@ def _phase1_reissue_exit_provider_cohorts(
         window("EXECUTION_BAR"),
     )
     quotes = client.historical_quotes((symbol,), window("QUOTE"))
+    clock.require_consumed()
     for cohort in (daily, execution, quotes):
         _mark_provider_fetch_cohort_replay_only(cohort)
     return daily, execution, quotes
@@ -3915,8 +3981,6 @@ def _phase1_reissue_equity_provider_cohorts(
         TimeWindow,
         _mark_provider_fetch_cohort_replay_only,
     )
-    from .providers.http import HttpResponse
-
     if not isinstance(source, _Phase1EquityProviderReplaySource) or (
         _phase1_source_owner(source) is None
     ):
@@ -3935,41 +3999,17 @@ def _phase1_reissue_equity_provider_cohorts(
         for url, payload, retrieved_at in values
     }
 
-    class StoredTransport:
-        def __init__(self) -> None:
-            self.current_retrieved_at: datetime | None = max(
-                (value[1] for value in page_values.values()),
-                default=None,
-            )
-
-        def get(self, url: str, headers: object) -> HttpResponse:
-            del headers
-            value = page_values.get(url)
-            if value is None:
-                raise InvalidJournalValue(
-                    "Phase 1 equity provider replay requested an unknown page"
-                )
-            payload, retrieved_at = value
-            self.current_retrieved_at = retrieved_at
-            return HttpResponse(
-                status=200,
-                headers=(("Content-Type", "application/json"),),
-                body=payload,
-                url=url,
-            )
-
-        def now(self) -> datetime:
-            if self.current_retrieved_at is None:
-                raise InvalidJournalValue(
-                    "Phase 1 equity provider replay has no current page"
-                )
-            return self.current_retrieved_at
-
-    transport = StoredTransport()
+    transport = _Phase1ReplayTransport(page_values)
+    clock = _Phase1ReplayClock(
+        _phase1_replay_clock_schedule(
+            role_pages,
+            ("QUOTE", "DAILY_BAR"),
+        )
+    )
     client = AlpacaMarketData(
         transport,
         AlpacaCredentials("phase1-equity-replay", "phase1-equity-replay"),
-        now=transport.now,
+        now=clock.now,
     )
 
     def window(purpose: str) -> TimeWindow:
@@ -3978,6 +4018,7 @@ def _phase1_reissue_equity_provider_cohorts(
 
     quotes = client.historical_quotes(symbols, window("QUOTE"))
     daily = client.daily_bars(symbols, window("DAILY_BAR"))
+    clock.require_consumed()
     for cohort in (quotes, daily):
         _mark_provider_fetch_cohort_replay_only(cohort)
     return quotes, daily

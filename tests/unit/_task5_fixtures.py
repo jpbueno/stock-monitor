@@ -874,7 +874,7 @@ def universe_candidate_contexts() -> tuple[Any, ...]:
     return tuple(_raw_candidate_context(record.symbol) for record in _UNIVERSE_RECORDS)
 
 
-def candidate_context(**overrides: Any):
+def candidate_context_for(symbol: str, **overrides: Any):
     from stock_monitor.screening import build_base_eligible_cohort
 
     contexts = list(universe_candidate_contexts())
@@ -882,7 +882,7 @@ def candidate_context(**overrides: Any):
         candidate_index = next(
             index
             for index, item in enumerate(contexts)
-            if item.record.symbol == PRIMARY_SYMBOL
+            if item.record.symbol == symbol
         )
         contexts[candidate_index] = replace(contexts[candidate_index], **overrides)
     decision = build_base_eligible_cohort(
@@ -892,8 +892,12 @@ def candidate_context(**overrides: Any):
     if decision.status != "READY":
         raise AssertionError(f"Task 5 cohort fixture is invalid: {decision.reason_codes}")
     return next(
-        item for item in decision.contexts if item.record.symbol == PRIMARY_SYMBOL
+        item for item in decision.contexts if item.record.symbol == symbol
     )
+
+
+def candidate_context(**overrides: Any):
+    return candidate_context_for(PRIMARY_SYMBOL, **overrides)
 
 
 def with_record(context: Any, **overrides: Any):

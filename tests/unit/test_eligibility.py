@@ -225,12 +225,11 @@ class EligibilityTests(unittest.TestCase):
         self.assertIn("IPO_DATE_UNVERIFIED", unknown.reason_codes)
 
     def test_etf_is_exempt_from_corporate_free_float(self) -> None:
-        context = with_record(
-            candidate_context(),
-            product_type="etf",
-            sector_etf=None,
-            free_float=None,
-        )
+        context = task5_fixtures.candidate_context_for("QQQ")
+
+        self.assertEqual(context.record.product_type, "etf")
+        self.assertIsNone(context.record.free_float)
+        self.assertEqual(context.evidence.symbol, "QQQ")
         self.assertTrue(evaluate_eligibility(context).eligible)
 
     def test_halt_status_must_be_exactly_clear(self) -> None:
@@ -627,11 +626,12 @@ class EligibilityTests(unittest.TestCase):
             base,
             evidence=evidence(binary_events=((last + timedelta(days=1), "earnings"),)),
         )
-        etf = with_record(base, product_type="etf", sector_etf=None, free_float=None)
+        etf = task5_fixtures.candidate_context_for("QQQ")
         etf = replace(
             etf,
             evidence=evidence(
                 subject_kind="ETF",
+                symbol=etf.record.symbol,
                 issuer_cik=None,
                 event_type="fund sponsor notice",
                 etf_actions=((last, "fund reorganization"),),
@@ -658,13 +658,12 @@ class EligibilityTests(unittest.TestCase):
             candidate_context(),
             evidence=evidence(binary_event_coverage="UNKNOWN"),
         )
-        etf = with_record(
-            candidate_context(), product_type="etf", sector_etf=None, free_float=None
-        )
+        etf = task5_fixtures.candidate_context_for("QQQ")
         etf = replace(
             etf,
             evidence=evidence(
                 subject_kind="ETF",
+                symbol=etf.record.symbol,
                 issuer_cik=None,
                 event_type="fund sponsor notice",
                 binary_event_coverage="NOT_APPLICABLE",
@@ -719,17 +718,12 @@ class EligibilityTests(unittest.TestCase):
 
     def test_evidence_subject_kind_and_raw_adverse_ambiguity_conflict_fail_closed(self) -> None:
         base = candidate_context()
+        reviewed_etf_evidence = task5_fixtures.candidate_context_for("QQQ").evidence
         cases = (
             (
                 replace(
                     base,
-                    evidence=evidence(
-                        subject_kind="ETF",
-                        issuer_cik=None,
-                        event_type="fund sponsor notice",
-                        binary_event_coverage="NOT_APPLICABLE",
-                        etf_action_coverage="CONFIRMED_CLEAR",
-                    ),
+                    evidence=reviewed_etf_evidence,
                 ),
                 "DATA_UNAVAILABLE",
                 "EVIDENCE_SUBJECT_KIND_MISMATCH",

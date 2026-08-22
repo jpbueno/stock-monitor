@@ -270,10 +270,13 @@ class ProviderWorkflowAdapter:
             )
         except (_market_calendar.CalendarError, _risk.RiskBlock) as error:
             raise _workflows.WorkflowDataError("STALE_CALENDAR") from error
+        plans = self.__journal.phase1_signal_plan_resolver()
         collector = ActualCloseRuntimeCollector(
             alpaca_market_data=self.__alpaca_market_data,
             reference_client=self.__reference_client,
             calendar_resolver=calendar_resolver,
+            policy=self.__policy,
+            plans=plans,
             clock=self.__clock,
         )
         coordinator = ActualCloseWorkflowCoordinator(
@@ -282,7 +285,7 @@ class ProviderWorkflowAdapter:
             source_collector=collector,
             calendar_resolver=calendar_resolver,
             policy=self.__policy,
-            plans=self.__journal.phase1_signal_plan_resolver(),
+            plans=plans,
         )
         return coordinator.close_material(
             session_date,

@@ -467,19 +467,27 @@ class ProviderWorkflowAdapterTests(unittest.TestCase):
         self.assertIs(type(resolver), SessionCalendarResolver)
         self.assertTrue(resolver.release_verified)
         self.assertEqual(tuple(calendar.year for calendar in resolver.calendars), (2026,))
+        plans = collector.kwargs["plans"]
+        self.assertIs(type(plans), Phase1SignalPlanResolver)
+        self.assertIs(plans.journal, self.journal)
+        self.assertIs(collector.kwargs["policy"], self.settings.policy)
         self.assertEqual(
             collector.kwargs,
             {
                 "alpaca_market_data": self._private(adapter, "alpaca_market_data"),
                 "reference_client": self._private(adapter, "reference_client"),
                 "calendar_resolver": resolver,
+                "policy": self.settings.policy,
+                "plans": plans,
                 "clock": self._private(adapter, "clock"),
             },
         )
         coordinator = _ActualCloseCoordinator.instances[-1]
-        plans = coordinator.kwargs["plans"]
-        self.assertIs(type(plans), Phase1SignalPlanResolver)
-        self.assertIs(plans.journal, self.journal)
+        self.assertIs(coordinator.kwargs["plans"], plans)
+        self.assertIs(
+            coordinator.kwargs["policy"],
+            collector.kwargs["policy"],
+        )
         self.assertEqual(
             coordinator.kwargs,
             {

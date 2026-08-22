@@ -139,6 +139,41 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(journal.count("phase1_validation_windows"), 1)
             self.assertEqual(journal.count("phase1_equity_points"), 2)
 
+    def test_active_phase1_window_selector_is_cutoff_bound_and_never_bootstraps(self) -> None:
+        from stock_monitor.phase1_bootstrap import bootstrap_phase1
+
+        resolver = self._phase1_calendar_resolver()
+        received_at = datetime(2026, 8, 21, 20, 1, tzinfo=timezone.utc)
+
+        with Journal.open(self.db_path) as journal:
+            with self.assertRaisesRegex(
+                InvalidJournalValue,
+                "exactly one active validation window",
+            ):
+                journal.read_active_phase1_validation_window_id(received_at)
+            self.assertEqual(journal.count("phase1_validation_windows"), 0)
+
+            stored = bootstrap_phase1(
+                journal,
+                session_date=date(2026, 8, 21),
+                calendar_resolver=resolver,
+                received_at=received_at,
+            )
+
+            with self.assertRaisesRegex(
+                InvalidJournalValue,
+                "exactly one active validation window",
+            ):
+                journal.read_active_phase1_validation_window_id(
+                    received_at - timedelta(microseconds=1)
+                )
+            self.assertEqual(
+                journal.read_active_phase1_validation_window_id(received_at),
+                stored.validation_window_id,
+            )
+            self.assertEqual(journal.count("phase1_validation_windows"), 1)
+            self.assertEqual(journal.count("phase1_equity_points"), 2)
+
     def test_phase1_start_or_read_is_atomic_across_journal_connections(self) -> None:
         from stock_monitor.phase1_bootstrap import bootstrap_phase1
 

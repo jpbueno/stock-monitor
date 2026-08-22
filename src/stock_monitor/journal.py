@@ -16163,6 +16163,34 @@ class Journal:
                 calendar_resolver=calendar_resolver,
             )
 
+    def read_active_phase1_validation_window_id(
+        self,
+        query_cutoff: datetime,
+    ) -> str:
+        """Select the one pre-existing Phase 1 window visible at a cutoff."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "Phase 1 validation-window selection requires a post-commit read"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        rows = _sql(
+            self._connection,
+            "SELECT window_id FROM phase1_validation_windows "
+            "WHERE received_at <= ? ORDER BY id",
+            (_canonical_timestamp(normalized_cutoff),),
+        ).fetchall()
+        if len(rows) != 1:
+            raise InvalidJournalValue(
+                "Phase 1 selection requires exactly one active validation window"
+            )
+        return _require_sha256(
+            str(rows[0][0]),
+            "Phase 1 validation window id",
+        )
+
     def start_or_read_phase1_validation_window(
         self,
         *,

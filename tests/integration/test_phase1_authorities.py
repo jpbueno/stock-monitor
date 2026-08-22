@@ -147,6 +147,8 @@ def _session_reviewed_evidence(
         etf_action_coverage=(
             "CONFIRMED_CLEAR" if is_etf else "NOT_APPLICABLE"
         ),
+        coverage_start=_session_hold_sessions(session_date)[0],
+        coverage_end=_session_hold_sessions(session_date)[-1],
         checked_at=retrieved_at,
         healthy=True,
     )
@@ -215,7 +217,7 @@ def _session_reviewed_evidence(
         "reviewed_at": task5_fixture_module._iso_timestamp(
             as_of - timedelta(minutes=5)
         ),
-        "schema_version": 2,
+        "schema_version": 3,
         "source_bindings": [
             task5_fixture_module._binding_document(value)
             for value in bindings
@@ -235,9 +237,9 @@ def _session_reviewed_evidence(
     release_sha256 = hashlib.sha256(registry_payload).hexdigest()
     with tempfile.TemporaryDirectory() as directory:
         project_root = Path(directory)
-        registry_path = project_root / "data" / "evidence"
+        registry_path = project_root / "data" / "evidence" / "legacy"
         registry_path.mkdir(parents=True)
-        (registry_path / "current.json").write_bytes(registry_payload)
+        (registry_path / "subjectless.json").write_bytes(registry_payload)
         with mock.patch.object(
             evidence_module,
             "CURRENT_EVIDENCE_REGISTRY_SHA256",
@@ -1313,7 +1315,7 @@ def _reviewed_registry_payload(reviewed_bundle: object) -> bytes:
         ],
         "registry_id": reviewed_bundle.registry_id,
         "reviewed_at": reviewed_evidence_iso(reviewed_bundle.reviewed_at),
-        "schema_version": 2,
+        "schema_version": 3,
         "source_bindings": [
             reviewed_binding_document(value)
             for value in reviewed_bundle.source_bindings

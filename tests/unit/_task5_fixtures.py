@@ -472,6 +472,8 @@ def _coverage_attestations(
     issuer_cik: str | None,
     binary_event_coverage: str,
     etf_action_coverage: str,
+    coverage_start: date,
+    coverage_end: date,
     checked_at: datetime,
     healthy: bool,
 ) -> tuple[EvidenceCoverageAttestation, ...]:
@@ -482,6 +484,8 @@ def _coverage_attestations(
             issuer_cik=issuer_cik,
             coverage_kind=kind,
             coverage=coverage,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
             source_observation_ids=(identifier,),
             checked_at=checked_at,
             valid_until=checked_at + timedelta(hours=24),
@@ -502,7 +506,9 @@ def _coverage_document(value: EvidenceCoverageAttestation) -> dict[str, object]:
         "complete": value.complete,
         "conflicts": list(value.conflicts),
         "coverage": value.coverage,
+        "coverage_end": value.coverage_end.isoformat(),
         "coverage_kind": value.coverage_kind,
+        "coverage_start": value.coverage_start.isoformat(),
         "healthy": value.healthy,
         "issuer_cik": value.issuer_cik,
         "source_observation_ids": list(value.source_observation_ids),
@@ -519,6 +525,8 @@ def _coverage_binding(
     issuer_cik: str | None,
     binary_event_coverage: str,
     etf_action_coverage: str,
+    coverage_start: date,
+    coverage_end: date,
     checked_at: datetime,
     healthy: bool,
 ) -> tuple[EvidenceSourceBinding, tuple[EvidenceCoverageAttestation, ...]]:
@@ -530,6 +538,8 @@ def _coverage_binding(
         issuer_cik=issuer_cik,
         binary_event_coverage=binary_event_coverage,
         etf_action_coverage=etf_action_coverage,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
         checked_at=checked_at,
         healthy=healthy,
     )
@@ -577,6 +587,11 @@ def _binding_document(value: EvidenceSourceBinding) -> dict[str, object]:
         "healthy": value.healthy,
         "issuer_cik": value.issuer_cik,
         "primary_url": document.url,
+        "published_at": (
+            _iso_timestamp(document.published_at)
+            if document.published_at is not None
+            else None
+        ),
         "publisher": document.publisher,
         "retrieved_at": _iso_timestamp(document.retrieved_at),
         "source_observation_id": document.source_observation_id,
@@ -655,6 +670,8 @@ def evidence(
         issuer_cik=issuer_cik,
         binary_event_coverage=binary_event_coverage,
         etf_action_coverage=etf_action_coverage,
+        coverage_start=hold_sessions()[0],
+        coverage_end=hold_sessions()[-1],
         checked_at=observed_at,
         healthy=healthy,
     )
@@ -673,7 +690,7 @@ def evidence(
         ],
         "registry_id": f"task5-{subject_kind.lower()}-{symbol.lower()}",
         "reviewed_at": _iso_timestamp(RUN_AT),
-        "schema_version": 2,
+        "schema_version": 3,
         "source_bindings": [
             _binding_document(value) for value in ordered_bindings
         ],
@@ -691,9 +708,9 @@ def evidence(
     digest = hashlib.sha256(payload).hexdigest()
     with tempfile.TemporaryDirectory() as directory:
         project_root = Path(directory)
-        registry_path = project_root / "data" / "evidence"
+        registry_path = project_root / "data" / "evidence" / "legacy"
         registry_path.mkdir(parents=True)
-        (registry_path / "current.json").write_bytes(payload)
+        (registry_path / "subjectless.json").write_bytes(payload)
         with mock.patch.object(
             evidence_module,
             "CURRENT_EVIDENCE_REGISTRY_SHA256",

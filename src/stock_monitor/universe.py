@@ -46,6 +46,10 @@ _TICK_SOURCE_URLS = {
 }
 _ALLOWED_HOSTS = frozenset(
     {
+        "data.sec.gov",
+        "investor.apple.com",
+        "investor.nvidia.com",
+        "ir.amd.com",
         "www.spglobal.com",
         "www.nasdaq.com",
         "www.sec.gov",
@@ -57,6 +61,55 @@ _ALLOWED_HOSTS = frozenset(
         "www.nyse.com",
     }
 )
+_STOCK_INITIAL_LISTING_SOURCE_URLS = {
+    "AAPL": "https://investor.apple.com/investor-relations/faq/default.aspx",
+    "AMD": "https://ir.amd.com/contacts-faq/faq",
+    "NVDA": "https://investor.nvidia.com/investor-resources/faqs/default.aspx",
+}
+_STOCK_ISSUER_CIKS = {
+    "AAPL": "0000320193",
+    "AMD": "0000002488",
+    "NVDA": "0001045810",
+}
+_ETF_INITIAL_LISTING_SOURCE_URLS = {
+    "QQQ": (
+        "https://www.sec.gov/Archives/edgar/data/1067839/"
+        "000110465910002985/a09-28465_1485bpos.htm"
+    ),
+    "SPY": (
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-spdr-sp-500-etf-trust-spy"
+    ),
+    "VTI": "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+    "XLK": (
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-technology-select-sector-spdr-etf-xlk"
+    ),
+}
+_STOCK_INITIAL_LISTING_DATE_KINDS = frozenset(
+    {"first_exchange_listing_date", "initial_public_trading_date"}
+)
+_ETF_INITIAL_LISTING_DATE_KINDS = frozenset(
+    {"etf_share_class_launch_proxy", "exchange_listing_date"}
+)
+_INITIAL_LISTING_DATES = {
+    "AAPL": date(1980, 12, 12),
+    "AMD": date(1979, 10, 15),
+    "NVDA": date(1999, 1, 22),
+    "QQQ": date(1999, 3, 10),
+    "SPY": date(1993, 1, 22),
+    "VTI": date(2001, 5, 24),
+    "XLK": date(1998, 12, 22),
+}
+_INITIAL_LISTING_DATE_KINDS = {
+    "AAPL": "initial_public_trading_date",
+    "AMD": "first_exchange_listing_date",
+    "NVDA": "initial_public_trading_date",
+    "QQQ": "exchange_listing_date",
+    "SPY": "exchange_listing_date",
+    "VTI": "etf_share_class_launch_proxy",
+    "XLK": "exchange_listing_date",
+}
 _SPONSOR_HOSTS = frozenset(
     {
         "www.ssga.com",
@@ -66,13 +119,14 @@ _SPONSOR_HOSTS = frozenset(
     }
 )
 _SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9]{0,5}")
+_CIK_PATTERN = re.compile(r"[0-9]{10}\Z")
 _DECIMAL_PATTERN = re.compile(r"(?:0|[1-9]\d*)(?:\.\d+)?")
 _CHECKSUM_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _SHA256_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MINIMUM_FREE_FLOAT = 50_000_000
 _VERIFIED_UNIVERSE_AUTHORITY = object()
 _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
-_CURRENT_UNIVERSE_RELATIVE_PATH = Path("data/universe/2026-08-14.json")
+_CURRENT_UNIVERSE_RELATIVE_PATH = Path("data/universe/2026-08-22.json")
 _MAXIMUM_UNIVERSE_BYTES = 1_048_576
 CURRENT_UNIVERSE_SHA256 = (
     "e277048b6c0580dc7f82d062f04ac2898f51ff81cb3673e4d79b54f320fba753"
@@ -138,6 +192,11 @@ class UniverseRecord:
     tick_classification: str
     source_url: str
     source_as_of: date
+    issuer_cik: str | None
+    issuer_cik_source: SourceEvidence | None
+    initial_listing_date: date
+    initial_listing_date_kind: str
+    initial_listing_source: SourceEvidence
     membership_sources: tuple[MembershipEvidence, ...] = ()
     free_float: int | None = None
     float_derivation: FloatDerivation | None = None
@@ -516,6 +575,13 @@ def _universe_record_document(value: object) -> dict[str, object]:
         or type(value.leveraged) is not bool
         or type(value.inverse) is not bool
         or type(value.tick_source) is not SourceEvidence
+        or (value.issuer_cik is not None and type(value.issuer_cik) is not str)
+        or (
+            value.issuer_cik_source is not None
+            and type(value.issuer_cik_source) is not SourceEvidence
+        )
+        or type(value.initial_listing_date_kind) is not str
+        or type(value.initial_listing_source) is not SourceEvidence
         or type(value.membership_sources) is not tuple
         or any(
             type(item) is not MembershipEvidence
@@ -536,6 +602,20 @@ def _universe_record_document(value: object) -> dict[str, object]:
         "float_derivation": _float_derivation_document(value.float_derivation),
         "free_float": value.free_float,
         "inverse": value.inverse,
+        "initial_listing_date": _date_document(
+            value.initial_listing_date,
+            "initial listing date",
+        ),
+        "initial_listing_date_kind": value.initial_listing_date_kind,
+        "initial_listing_source": _source_evidence_document(
+            value.initial_listing_source
+        ),
+        "issuer_cik": value.issuer_cik,
+        "issuer_cik_source": (
+            _source_evidence_document(value.issuer_cik_source)
+            if value.issuer_cik_source is not None
+            else None
+        ),
         "leveraged": value.leveraged,
         "listing_venue": value.listing_venue,
         "membership_sources": [
@@ -661,6 +741,13 @@ def _universe_record(
         "tick_classification",
         "source_url",
         "source_as_of",
+        "issuer_cik",
+        "issuer_cik_source_url",
+        "issuer_cik_source_as_of",
+        "initial_listing_date",
+        "initial_listing_date_kind",
+        "initial_listing_source_url",
+        "initial_listing_source_as_of",
     }
     if product_type == "common_stock":
         _exact_keys(
@@ -741,6 +828,82 @@ def _universe_record(
         "source_as_of",
         reviewed_at,
     )
+    issuer_cik: str | None
+    issuer_cik_source: SourceEvidence | None
+    if product_type == "common_stock":
+        raw_cik = table["issuer_cik"]
+        if not isinstance(raw_cik, str) or _CIK_PATTERN.fullmatch(raw_cik) is None:
+            raise UniverseError("stock issuer CIK must be ten decimal digits")
+        issuer_cik = raw_cik
+        if issuer_cik != _STOCK_ISSUER_CIKS.get(symbol):
+            raise UniverseError("stock issuer CIK conflicts with the symbol")
+        issuer_cik_url = _source_url(
+            table["issuer_cik_source_url"],
+            "issuer_cik_source_url",
+        )
+        if issuer_cik_url != (
+            f"https://data.sec.gov/submissions/CIK{issuer_cik}.json"
+        ):
+            raise UniverseError("stock issuer CIK source conflicts with the CIK")
+        issuer_cik_source = SourceEvidence(
+            url=issuer_cik_url,
+            source_as_of=_evidence_date(
+                table["issuer_cik_source_as_of"],
+                "issuer_cik_source_as_of",
+                reviewed_at,
+            ),
+            scope="issuer_cik",
+        )
+    else:
+        if any(
+            table[name] is not None
+            for name in (
+                "issuer_cik",
+                "issuer_cik_source_url",
+                "issuer_cik_source_as_of",
+            )
+        ):
+            raise UniverseError("ETF issuer CIK metadata must be explicit null")
+        issuer_cik = None
+        issuer_cik_source = None
+
+    initial_listing_date = _iso_date(
+        table["initial_listing_date"],
+        "initial_listing_date",
+    )
+    if initial_listing_date > reviewed_at:
+        raise UniverseError("initial listing date is after the snapshot review")
+    initial_listing_date_kind = _string(
+        table["initial_listing_date_kind"],
+        "initial_listing_date_kind",
+    )
+    allowed_listing_kinds = (
+        _STOCK_INITIAL_LISTING_DATE_KINDS
+        if product_type == "common_stock"
+        else _ETF_INITIAL_LISTING_DATE_KINDS
+    )
+    if initial_listing_date_kind not in allowed_listing_kinds:
+        raise UniverseError("initial listing date kind conflicts with product type")
+    initial_listing_source = SourceEvidence(
+        url=_source_url(
+            table["initial_listing_source_url"],
+            "initial_listing_source_url",
+        ),
+        source_as_of=_evidence_date(
+            table["initial_listing_source_as_of"],
+            "initial_listing_source_as_of",
+            reviewed_at,
+        ),
+        scope="initial_listing_date",
+    )
+    if initial_listing_source.source_as_of < initial_listing_date:
+        raise UniverseError("initial listing provenance predates the listing")
+    if (
+        initial_listing_date != _INITIAL_LISTING_DATES.get(symbol)
+        or initial_listing_date_kind
+        != _INITIAL_LISTING_DATE_KINDS.get(symbol)
+    ):
+        raise UniverseError("initial listing metadata conflicts with the symbol")
     sector_value = table["sector_etf"]
 
     if product_type == "common_stock":
@@ -752,6 +915,21 @@ def _universe_record(
             raise UniverseError("stock sector ETF conflicts with benchmark policy")
         if market_benchmark != benchmark["stock_market_benchmark"]:
             raise UniverseError("stock market benchmark conflicts with policy")
+        parsed_source_url = urlsplit(source_url)
+        source_parts = parsed_source_url.path.split("/")
+        if (
+            parsed_source_url.hostname != "www.sec.gov"
+            or parsed_source_url.query
+            or len(source_parts) < 6
+            or source_parts[:5]
+            != ["", "Archives", "edgar", "data", str(int(issuer_cik))]
+        ):
+            raise UniverseError("stock primary filing conflicts with issuer CIK")
+        expected_listing_url = _STOCK_INITIAL_LISTING_SOURCE_URLS.get(symbol)
+        if initial_listing_source.url != expected_listing_url:
+            raise UniverseError(
+                "stock initial listing source conflicts with the issuer"
+            )
         memberships = _membership_sources(
             table["membership_sources"],
             reviewed_at=reviewed_at,
@@ -782,6 +960,11 @@ def _universe_record(
             tick_classification=_TICK_CLASSIFICATION,
             source_url=source_url,
             source_as_of=source_as_of,
+            issuer_cik=issuer_cik,
+            issuer_cik_source=issuer_cik_source,
+            initial_listing_date=initial_listing_date,
+            initial_listing_date_kind=initial_listing_date_kind,
+            initial_listing_source=initial_listing_source,
             membership_sources=memberships,
             free_float=free_float,
             float_derivation=float_derivation,
@@ -804,6 +987,8 @@ def _universe_record(
         (source.url, source.source_as_of) for source in sponsor_sources
     }:
         raise UniverseError("ETF primary source conflicts with sponsor evidence")
+    if initial_listing_source.url != _ETF_INITIAL_LISTING_SOURCE_URLS.get(symbol):
+        raise UniverseError("ETF listing source conflicts with reviewed evidence")
     if table["objective_classification_method"] != _ETF_CLASSIFICATION:
         raise UniverseError("ETF objective classification method is missing")
     return UniverseRecord(
@@ -822,6 +1007,11 @@ def _universe_record(
         tick_classification=_TICK_CLASSIFICATION,
         source_url=source_url,
         source_as_of=source_as_of,
+        issuer_cik=None,
+        issuer_cik_source=None,
+        initial_listing_date=initial_listing_date,
+        initial_listing_date_kind=initial_listing_date_kind,
+        initial_listing_source=initial_listing_source,
         sponsor_sources=sponsor_sources,
         objective_classification_method=_ETF_CLASSIFICATION,
     )

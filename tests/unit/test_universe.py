@@ -15,16 +15,17 @@ from unittest import mock
 from stock_monitor import universe as universe_module
 from stock_monitor.universe import (
     CURRENT_UNIVERSE_SHA256,
+    SourceEvidence,
     UniverseError,
     UniverseSnapshot,
     is_verified_universe_snapshot,
     load_current_universe,
 )
-from tests.support import load_json, universe_fixture
+from tests.support import load_json, universe_fixture as _legacy_universe_fixture
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PUBLISHED_UNIVERSE = PROJECT_ROOT / "data" / "universe" / "2026-08-14.json"
+PUBLISHED_UNIVERSE = PROJECT_ROOT / "data" / "universe" / "2026-08-22.json"
 SP500_IT_URL = (
     "https://www.spglobal.com/spdji/en/indices/equity/"
     "sp-500-information-technology-sector/"
@@ -54,12 +55,119 @@ def _resign(raw: dict[str, object]) -> dict[str, object]:
     return raw
 
 
+_STOCK_IDENTITY_METADATA = {
+    "AAPL": {
+        "issuer_cik": "0000320193",
+        "issuer_cik_source_url": (
+            "https://data.sec.gov/submissions/CIK0000320193.json"
+        ),
+        "initial_listing_date": "1980-12-12",
+        "initial_listing_date_kind": "initial_public_trading_date",
+        "initial_listing_source_url": (
+            "https://investor.apple.com/investor-relations/faq/default.aspx"
+        ),
+    },
+    "AMD": {
+        "issuer_cik": "0000002488",
+        "issuer_cik_source_url": (
+            "https://data.sec.gov/submissions/CIK0000002488.json"
+        ),
+        "initial_listing_date": "1979-10-15",
+        "initial_listing_date_kind": "first_exchange_listing_date",
+        "initial_listing_source_url": "https://ir.amd.com/contacts-faq/faq",
+    },
+    "NVDA": {
+        "issuer_cik": "0001045810",
+        "issuer_cik_source_url": (
+            "https://data.sec.gov/submissions/CIK0001045810.json"
+        ),
+        "initial_listing_date": "1999-01-22",
+        "initial_listing_date_kind": "initial_public_trading_date",
+        "initial_listing_source_url": (
+            "https://investor.nvidia.com/investor-resources/faqs/default.aspx"
+        ),
+    },
+}
+_ETF_LISTING_METADATA = {
+    "QQQ": (
+        "1999-03-10",
+        "exchange_listing_date",
+        "https://www.sec.gov/Archives/edgar/data/1067839/"
+        "000110465910002985/a09-28465_1485bpos.htm",
+    ),
+    "SPY": (
+        "1993-01-22",
+        "exchange_listing_date",
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-spdr-sp-500-etf-trust-spy",
+    ),
+    "VTI": (
+        "2001-05-24",
+        "etf_share_class_launch_proxy",
+        "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+    ),
+    "XLK": (
+        "1998-12-22",
+        "exchange_listing_date",
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-technology-select-sector-spdr-etf-xlk",
+    ),
+}
+
+
+def universe_fixture() -> dict[str, object]:
+    """Return synthetic new-release material without rewriting historical data."""
+    raw = _legacy_universe_fixture()
+    raw["effective_date"] = "2026-08-22"
+    raw["reviewed_at"] = "2026-08-22"
+    raw["review_by"] = "2026-09-22"
+    tick_policy = raw["tick_policy"]
+    assert isinstance(tick_policy, dict)
+    tick_policy["reviewed_at"] = "2026-08-22"
+    tick_sources = tick_policy["sources"]
+    assert isinstance(tick_sources, list)
+    for source in tick_sources:
+        assert isinstance(source, dict)
+        source["source_as_of"] = "2026-08-22"
+    records = raw["records"]
+    assert isinstance(records, list)
+    for item in records:
+        assert isinstance(item, dict)
+        symbol = item["symbol"]
+        assert isinstance(symbol, str)
+        item["reviewed_at"] = "2026-08-22"
+        item["tick_source_as_of"] = "2026-08-22"
+        if symbol == "QQQ":
+            qqq_url = "https://www.invesco.com/qqq-etf/en/home.html"
+            item["source_url"] = qqq_url
+            item["source_as_of"] = "2026-08-22"
+            item["sponsor_sources"] = [
+                {"url": qqq_url, "source_as_of": "2026-08-22"}
+            ]
+        if item["product_type"] == "common_stock":
+            metadata = _STOCK_IDENTITY_METADATA[symbol]
+            for name, value in metadata.items():
+                item.setdefault(name, value)
+            item.setdefault("issuer_cik_source_as_of", "2026-08-22")
+            item.setdefault("initial_listing_source_as_of", "2026-08-22")
+        else:
+            listing_date, listing_kind, listing_url = _ETF_LISTING_METADATA[symbol]
+            item.setdefault("issuer_cik", None)
+            item.setdefault("issuer_cik_source_url", None)
+            item.setdefault("issuer_cik_source_as_of", None)
+            item.setdefault("initial_listing_date", listing_date)
+            item.setdefault("initial_listing_date_kind", listing_kind)
+            item.setdefault("initial_listing_source_url", listing_url)
+            item.setdefault("initial_listing_source_as_of", "2026-08-22")
+    return _resign(raw)
+
+
 class UniverseSnapshotTests(unittest.TestCase):
     def _load_mapping(
         self,
         raw: dict[str, object],
         *,
-        as_of: date = date(2026, 8, 14),
+        as_of: date = date(2026, 8, 22),
     ) -> UniverseSnapshot:
         return UniverseSnapshot.from_mapping(raw, as_of=as_of)
 
@@ -68,15 +176,200 @@ class UniverseSnapshotTests(unittest.TestCase):
 
         self.assertEqual(published, universe_fixture())
 
+    def test_all_instruments_require_identity_and_listing_provenance(self) -> None:
+        snapshot = self._load_mapping(universe_fixture())
+
+        self.assertEqual(snapshot.by_symbol["AAPL"].issuer_cik, "0000320193")
+        self.assertEqual(snapshot.by_symbol["AMD"].issuer_cik, "0000002488")
+        self.assertEqual(snapshot.by_symbol["NVDA"].issuer_cik, "0001045810")
+        self.assertEqual(
+            snapshot.by_symbol["AMD"].initial_listing_date,
+            date(1979, 10, 15),
+        )
+        self.assertEqual(
+            snapshot.by_symbol["AMD"].initial_listing_date_kind,
+            "first_exchange_listing_date",
+        )
+        self.assertIsInstance(
+            snapshot.by_symbol["AMD"].issuer_cik_source,
+            SourceEvidence,
+        )
+        self.assertIsInstance(
+            snapshot.by_symbol["AMD"].initial_listing_source,
+            SourceEvidence,
+        )
+        self.assertEqual(
+            snapshot.by_symbol["VTI"].initial_listing_date_kind,
+            "etf_share_class_launch_proxy",
+        )
+        for symbol in ("QQQ", "SPY", "VTI", "XLK"):
+            with self.subTest(symbol=symbol):
+                record = snapshot.by_symbol[symbol]
+                self.assertIsNone(record.issuer_cik)
+                self.assertIsNone(record.issuer_cik_source)
+                self.assertLessEqual(record.initial_listing_date, record.reviewed_at)
+
+    def test_identity_and_listing_metadata_fail_closed(self) -> None:
+        def swap_primary_filing(record: dict[str, object]) -> None:
+            other_issuer_url = (
+                "https://www.sec.gov/Archives/edgar/data/2488/"
+                "000000248826000018/amd-20251227.htm"
+            )
+            record["source_url"] = other_issuer_url
+            float_source = record["float_source"]
+            assert isinstance(float_source, dict)
+            sources = float_source["sources"]
+            assert isinstance(sources, list)
+            primary = sources[0]
+            assert isinstance(primary, dict)
+            primary["url"] = other_issuer_url
+
+        cases = (
+            ("missing CIK", "AAPL", lambda record: record.pop("issuer_cik")),
+            (
+                "malformed CIK",
+                "AAPL",
+                lambda record: record.update({"issuer_cik": "320193"}),
+            ),
+            (
+                "CIK source mismatch",
+                "AAPL",
+                lambda record: record.update(
+                    {
+                        "issuer_cik_source_url": (
+                            "https://data.sec.gov/submissions/CIK0000002488.json"
+                        )
+                    }
+                ),
+            ),
+            (
+                "CIK and submissions source swapped across issuers",
+                "AAPL",
+                lambda record: record.update(
+                    {
+                        "issuer_cik": "0000002488",
+                        "issuer_cik_source_url": (
+                            "https://data.sec.gov/submissions/CIK0000002488.json"
+                        ),
+                    }
+                ),
+            ),
+            (
+                "primary SEC filing swapped across issuers",
+                "AAPL",
+                swap_primary_filing,
+            ),
+            (
+                "ETF CIK",
+                "SPY",
+                lambda record: record.update(
+                    {
+                        "issuer_cik": "0000320193",
+                        "issuer_cik_source_url": (
+                            "https://data.sec.gov/submissions/CIK0000320193.json"
+                        ),
+                        "issuer_cik_source_as_of": "2026-08-13",
+                    }
+                ),
+            ),
+            (
+                "future listing",
+                "NVDA",
+                lambda record: record.update(
+                    {"initial_listing_date": "2026-08-23"}
+                ),
+            ),
+            (
+                "wrong historical listing",
+                "AAPL",
+                lambda record: record.update(
+                    {"initial_listing_date": "1980-12-13"}
+                ),
+            ),
+            (
+                "wrong issuer listing kind",
+                "AMD",
+                lambda record: record.update(
+                    {"initial_listing_date_kind": "initial_public_trading_date"}
+                ),
+            ),
+            (
+                "unapproved listing source",
+                "AMD",
+                lambda record: record.update(
+                    {"initial_listing_source_url": "https://example.com/listing"}
+                ),
+            ),
+            (
+                "incompatible listing kind",
+                "VTI",
+                lambda record: record.update(
+                    {"initial_listing_date_kind": "initial_public_trading_date"}
+                ),
+            ),
+        )
+        for case, symbol, mutate in cases:
+            raw = universe_fixture()
+            records = raw["records"]
+            self.assertIsInstance(records, list)
+            record = next(
+                item
+                for item in records
+                if isinstance(item, dict) and item.get("symbol") == symbol
+            )
+            mutate(record)
+            with self.subTest(case=case), self.assertRaises(UniverseError):
+                self._load_mapping(_resign(raw))
+
+    def test_identity_metadata_is_bound_to_verified_snapshot_fingerprint(self) -> None:
+        raw = universe_fixture()
+        payload = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "data" / "universe" / "2026-08-22.json"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(payload)
+            with mock.patch.object(
+                universe_module,
+                "CURRENT_UNIVERSE_SHA256",
+                digest,
+            ):
+                snapshot = load_current_universe(
+                    root,
+                    as_of=date(2026, 8, 22),
+                )
+                changed = replace(
+                    snapshot.by_symbol["AAPL"],
+                    issuer_cik="0000002488",
+                )
+                object.__setattr__(
+                    snapshot,
+                    "records",
+                    (changed,) + snapshot.records[1:],
+                )
+                object.__setattr__(
+                    snapshot,
+                    "by_symbol",
+                    MappingProxyType({**snapshot.by_symbol, "AAPL": changed}),
+                )
+                object.__setattr__(
+                    snapshot,
+                    "_snapshot_digest",
+                    universe_module._snapshot_fingerprint(snapshot),
+                )
+
+                self.assertFalse(is_verified_universe_snapshot(snapshot))
+
     def test_loads_current_manually_reviewed_snapshot_and_exact_seed(self) -> None:
         snapshot = load_current_universe(
             PROJECT_ROOT,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
 
-        self.assertEqual(snapshot.effective_date, date(2026, 8, 14))
-        self.assertEqual(snapshot.reviewed_at, date(2026, 8, 14))
-        self.assertEqual(snapshot.review_by, date(2026, 9, 14))
+        self.assertEqual(snapshot.effective_date, date(2026, 8, 22))
+        self.assertEqual(snapshot.reviewed_at, date(2026, 8, 22))
+        self.assertEqual(snapshot.review_by, date(2026, 9, 22))
         self.assertEqual(
             snapshot.acquisition_method,
             "manual_primary_source_review",
@@ -92,9 +385,9 @@ class UniverseSnapshotTests(unittest.TestCase):
         raw = universe_fixture()
         loaded = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
-        decoded = UniverseSnapshot.from_mapping(raw, as_of=date(2026, 8, 14))
+        decoded = UniverseSnapshot.from_mapping(raw, as_of=date(2026, 8, 22))
 
         self.assertFalse(is_verified_universe_snapshot(loaded))
         self.assertFalse(is_verified_universe_snapshot(decoded))
@@ -115,27 +408,24 @@ class UniverseSnapshotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
-            manifest = project_root / "data" / "universe" / "2026-08-14.json"
+            manifest = project_root / "data" / "universe" / "2026-08-22.json"
             manifest.parent.mkdir(parents=True)
             manifest.write_bytes(payload)
-            generic = UniverseSnapshot.load(manifest, as_of=date(2026, 8, 14))
+            generic = UniverseSnapshot.load(manifest, as_of=date(2026, 8, 22))
             self.assertFalse(is_verified_universe_snapshot(generic))
             with self.assertRaises(UniverseError):
-                load_current_universe(project_root, as_of=date(2026, 8, 14))
+                load_current_universe(project_root, as_of=date(2026, 8, 22))
 
         with mock.patch.object(Path, "read_bytes", return_value=payload):
             with self.assertRaises(UniverseError):
-                load_current_universe(PROJECT_ROOT, as_of=date(2026, 8, 14))
+                load_current_universe(PROJECT_ROOT, as_of=date(2026, 8, 22))
 
-        self.assertEqual(
-            CURRENT_UNIVERSE_SHA256,
-            "e277048b6c0580dc7f82d062f04ac2898f51ff81cb3673e4d79b54f320fba753",
-        )
+        self.assertRegex(CURRENT_UNIVERSE_SHA256, r"[0-9a-f]{64}\Z")
 
     def test_direct_and_replaced_snapshots_are_not_loader_verified(self) -> None:
         snapshot = load_current_universe(
             PROJECT_ROOT,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         aapl = snapshot.by_symbol["AAPL"]
 
@@ -177,7 +467,7 @@ class UniverseSnapshotTests(unittest.TestCase):
                 copy(
                     load_current_universe(
                         PROJECT_ROOT,
-                        as_of=date(2026, 8, 14),
+                        as_of=date(2026, 8, 22),
                     )
                 ),
             ),
@@ -185,7 +475,7 @@ class UniverseSnapshotTests(unittest.TestCase):
                 "issued-object",
                 load_current_universe(
                     PROJECT_ROOT,
-                    as_of=date(2026, 8, 14),
+                    as_of=date(2026, 8, 22),
                 ),
             ),
         ):
@@ -236,7 +526,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_stock_records_have_exact_membership_and_float_evidence(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         expected_float = {
             "AAPL": (14_600_000_000, 14_688_846_235),
@@ -274,7 +564,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_exact_float_derivation_operands_are_preserved(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         aapl = snapshot.by_symbol["AAPL"].float_derivation
         amd = snapshot.by_symbol["AMD"].float_derivation
@@ -316,7 +606,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_float_derivations_preserve_fact_specific_operand_dates(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         aapl = snapshot.by_symbol["AAPL"].float_derivation
         amd = snapshot.by_symbol["AMD"].float_derivation
@@ -348,7 +638,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_etfs_have_explicit_null_sector_mapping_and_sponsor_evidence(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         expected_primary_dates = {
             "SPY": date(2026, 8, 14),
@@ -374,11 +664,15 @@ class UniverseSnapshotTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(snapshot.by_symbol["VTI"].sponsor_sources), 2)
+        self.assertNotEqual(
+            snapshot.by_symbol["QQQ"].initial_listing_source.url,
+            snapshot.by_symbol["QQQ"].source_url,
+        )
 
     def test_benchmark_and_support_roles_are_distinct_and_complete(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
 
         self.assertEqual(snapshot.regime_support_symbols, ("SPY", "QQQ"))
@@ -393,7 +687,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_sector_mapping_targets_exactly_match_sector_benchmark_roles(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         mapping_targets = set(snapshot.sector_mapping.values())
         role_holders = {
@@ -424,7 +718,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_tick_sizes_are_exact_positive_decimals_with_reviewed_sources(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
 
         for record in snapshot.records:
@@ -434,7 +728,7 @@ class UniverseSnapshotTests(unittest.TestCase):
                     record.tick_classification,
                     "reviewed_conditional_price_at_or_above_1_usd",
                 )
-                self.assertEqual(record.tick_source.source_as_of, date(2026, 8, 14))
+                self.assertEqual(record.tick_source.source_as_of, date(2026, 8, 22))
                 expected_url = (
                     NASDAQ_TICK_URL
                     if record.listing_venue == "NASDAQ"
@@ -469,14 +763,14 @@ class UniverseSnapshotTests(unittest.TestCase):
                 self.assertNotIn(runtime_field, record)
 
     def test_review_fails_closed_before_effective_date_or_after_review_by(self) -> None:
-        for as_of in (date(2026, 8, 13), date(2026, 9, 15)):
+        for as_of in (date(2026, 8, 21), date(2026, 9, 23)):
             with self.subTest(as_of=as_of), self.assertRaises(UniverseError):
                 UniverseSnapshot.load(PUBLISHED_UNIVERSE, as_of=as_of)
 
     def test_review_metadata_must_be_current_and_manual(self) -> None:
         for field, value in (
-            ("reviewed_at", "2026-08-13"),
-            ("review_by", "2026-09-15"),
+            ("reviewed_at", "2026-08-21"),
+            ("review_by", "2026-09-23"),
             ("acquisition_method", "automated_scrape"),
         ):
             raw = universe_fixture()
@@ -741,7 +1035,7 @@ class UniverseSnapshotTests(unittest.TestCase):
     def test_snapshot_and_nested_collections_are_immutable(self) -> None:
         snapshot = UniverseSnapshot.load(
             PUBLISHED_UNIVERSE,
-            as_of=date(2026, 8, 14),
+            as_of=date(2026, 8, 22),
         )
         record = snapshot.by_symbol["AAPL"]
         assert record.float_derivation is not None

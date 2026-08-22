@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import hmac
 import json
+import os
 import re
+import stat
 import threading
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from urllib.parse import parse_qsl, urlsplit
 
 from stock_monitor.domain import require_aware_timestamp
 from stock_monitor.providers.cache import SourceDocument
+from stock_monitor.universe import UniverseSnapshot, is_verified_universe_snapshot
 
 
 POSITIVE_EVENT_TYPES = (
@@ -41,6 +48,7 @@ ADVERSE_TAGS = (
 CURRENT_EVIDENCE_REGISTRY_SHA256 = (
     "5c97d3c09117b2618944e8934896564abef0310f35b9ca31bdf8d0694f7714e4"
 )
+CURRENT_EVIDENCE_RELEASE_SHA256 = CURRENT_EVIDENCE_REGISTRY_SHA256
 _EVENT_KINDS = frozenset({"BINARY_EVENT", "ETF_ACTION"})
 _BINARY_COVERAGE = frozenset(
     {"CONFIRMED_CLEAR", "NOT_APPLICABLE", "OVERLAP", "UNKNOWN", "CONFLICT"}
@@ -57,6 +65,9 @@ _SCOPED_REFERENCE_ROLE = re.compile(
     r"(?:ISSUER_IR|CORPORATE_ACTION):([A-Z][A-Z0-9.-]{0,14})\Z"
 )
 _MAX_REGISTRY_BYTES = 1_048_576
+_MAX_RELEASE_BYTES = 1_048_576
+_MAX_SOURCE_BODY_BYTES = 67_108_864
+_MAX_SOURCE_ARTIFACT_BYTES = 90_000_000
 _SEC_PUBLISHER = "U.S. Securities and Exchange Commission"
 _REFERENCE_ROLE_URLS = {
     "CROSS_CHECK_CALENDAR": (
@@ -78,10 +89,16 @@ _REFERENCE_ROLE_URLS = {
 }
 _MISSING = object()
 _REVIEWED_AUTHORITY = object()
+_REVIEWED_RELEASE_AUTHORITY = object()
 _REVIEWED_ISSUANCE_LOCK = threading.Lock()
 _REVIEWED_ISSUANCES: dict[
     int,
     tuple[weakref.ReferenceType[object], str, str, str, str],
+] = {}
+_REVIEWED_RELEASE_ISSUANCE_LOCK = threading.Lock()
+_REVIEWED_RELEASE_ISSUANCES: dict[
+    int,
+    tuple[weakref.ReferenceType[object], str, str],
 ] = {}
 _SENSITIVE_QUERY_PARTS = (
     "authorization",
@@ -123,6 +140,12 @@ def _parse_timestamp(value: object, name: str) -> datetime:
         return _utc(parsed, name)
     except (TypeError, ValueError):
         raise EvidenceRegistryError(f"registry {name} is malformed") from None
+
+
+def _parse_optional_timestamp(value: object, name: str) -> datetime | None:
+    if value is None:
+        return None
+    return _parse_timestamp(value, name)
 
 
 def _parse_date(value: object, name: str) -> date | None:
@@ -349,10 +372,16 @@ def _validate_source_identity(
     role = document.source_role
     if role in _REFERENCE_ROLE_URLS:
         expected_url, expected_publisher = _REFERENCE_ROLE_URLS[role]
+        timestamp_source_is_valid = document.timestamp_source == "PRIMARY_METADATA"
+        if role == "OPERATIONAL_STATUS":
+            timestamp_source_is_valid = document.timestamp_source in {
+                "PRIMARY_METADATA",
+                "UNAVAILABLE",
+            }
         if (
             document.url != expected_url
             or document.publisher != expected_publisher
-            or document.timestamp_source != "PRIMARY_METADATA"
+            or not timestamp_source_is_valid
             or document.accession is not None
         ):
             raise ValueError("official evidence source role identity is malformed")
@@ -450,6 +479,8 @@ class EvidenceCoverageAttestation:
     issuer_cik: str | None
     coverage_kind: str
     coverage: str
+    coverage_start: date
+    coverage_end: date
     source_observation_ids: tuple[str, ...]
     checked_at: datetime
     valid_until: datetime
@@ -476,6 +507,12 @@ class EvidenceCoverageAttestation:
         )
         if self.coverage not in allowed:
             raise ValueError("evidence coverage state is unsupported")
+        if (
+            type(self.coverage_start) is not date
+            or type(self.coverage_end) is not date
+            or self.coverage_start > self.coverage_end
+        ):
+            raise ValueError("evidence coverage date range is malformed")
         identifiers = tuple(self.source_observation_ids)
         if (
             not identifiers
@@ -739,6 +776,30 @@ class ReviewedEvidenceBundle:
         compare=False,
     )
     _phase1_source: object | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ReviewedEvidenceRelease:
+    """One externally pinned, universe-complete reviewed evidence release."""
+
+    release_id: str
+    release_sha256: str
+    universe_sha256: str
+    reviewed_at: datetime
+    review_by: datetime
+    by_symbol: Mapping[str, ReviewedEvidenceBundle]
+    _authority: object = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _release_digest: str | None = field(
         default=None,
         init=False,
         repr=False,
@@ -1045,6 +1106,11 @@ def classify_evidence(
         "OVERLAP" if etf_overlap else attested_coverage("ETF_ACTION")
     )
     coverage_missing = set(coverage_by_kind) != _EVENT_KINDS
+    coverage_window_incomplete = any(
+        attestation.coverage_start > hold.start
+        or attestation.coverage_end < hold.end
+        for attestation in coverage_by_kind.values()
+    )
     product_coverage_invalid = (
         subject_kind == "STOCK"
         and (
@@ -1066,6 +1132,8 @@ def classify_evidence(
         block_reason = "EVIDENCE_SOURCE_UNAVAILABLE"
     elif coverage_missing:
         block_reason = "EVIDENCE_COVERAGE_ATTESTATION_MISSING"
+    elif coverage_window_incomplete:
+        block_reason = "EVIDENCE_HOLD_COVERAGE_INCOMPLETE"
     elif product_coverage_invalid:
         block_reason = "EVIDENCE_PRODUCT_COVERAGE_INVALID"
     elif ambiguities:
@@ -1232,12 +1300,7 @@ def _decode_record(value: object) -> EvidenceRecord:
         raise EvidenceRegistryError("registry evidence record is malformed") from None
 
 
-def _decode_binding(
-    value: object,
-    source_documents: Mapping[str, SourceDocument] | None,
-) -> EvidenceSourceBinding:
-    if not isinstance(value, Mapping):
-        raise EvidenceRegistryError("registry source binding is malformed")
+def _binding_fields(schema_version: int) -> set[str]:
     expected = {
         "accession",
         "content_hash",
@@ -1254,6 +1317,20 @@ def _decode_binding(
         "timestamp_source",
         "valid_until",
     }
+    if schema_version == 3:
+        expected.add("published_at")
+    return expected
+
+
+def _decode_binding(
+    value: object,
+    source_documents: Mapping[str, SourceDocument] | None,
+    *,
+    schema_version: int,
+) -> EvidenceSourceBinding:
+    if not isinstance(value, Mapping):
+        raise EvidenceRegistryError("registry source binding is malformed")
+    expected = _binding_fields(schema_version)
     if set(value) != expected:
         raise EvidenceRegistryError("registry source binding fields are malformed")
     try:
@@ -1268,12 +1345,18 @@ def _decode_binding(
                 "registry source document is missing or unverified"
             )
         retrieved_at = _parse_timestamp(value["retrieved_at"], "retrieved_at")
+        published_at = (
+            _parse_optional_timestamp(value["published_at"], "published_at")
+            if schema_version == 3
+            else document.published_at
+        )
         if (
             document.source_observation_id != identifier
             or document.url != value["primary_url"]
             or document.publisher != value["publisher"]
             or document.content_hash != value["content_hash"]
             or document.retrieved_at != retrieved_at
+            or document.published_at != published_at
             or document.source_type != value["source_type"]
             or document.timestamp_source != value["timestamp_source"]
             or document.accession != value["accession"]
@@ -1292,8 +1375,12 @@ def _decode_binding(
         raise EvidenceRegistryError("registry source binding is malformed") from None
 
 
-def _decode_coverage(value: object) -> EvidenceCoverageAttestation:
-    if not isinstance(value, Mapping) or set(value) != {
+def _decode_coverage(
+    value: object,
+    *,
+    schema_version: int,
+) -> EvidenceCoverageAttestation:
+    expected = {
         "checked_at",
         "complete",
         "conflicts",
@@ -1305,8 +1392,15 @@ def _decode_coverage(value: object) -> EvidenceCoverageAttestation:
         "subject_kind",
         "symbol",
         "valid_until",
-    }:
+    }
+    if schema_version == 3:
+        expected.update({"coverage_end", "coverage_start"})
+    if not isinstance(value, Mapping) or set(value) != expected:
         raise EvidenceRegistryError("registry evidence coverage is malformed")
+    if schema_version != 3:
+        raise EvidenceRegistryError(
+            "legacy scoped coverage has no reviewed date range"
+        )
     try:
         return EvidenceCoverageAttestation(
             subject_kind=value["subject_kind"],
@@ -1314,6 +1408,14 @@ def _decode_coverage(value: object) -> EvidenceCoverageAttestation:
             issuer_cik=value["issuer_cik"],
             coverage_kind=value["coverage_kind"],
             coverage=value["coverage"],
+            coverage_start=_parse_date(
+                value["coverage_start"],
+                "coverage_start",
+            ),  # type: ignore[arg-type]
+            coverage_end=_parse_date(
+                value["coverage_end"],
+                "coverage_end",
+            ),  # type: ignore[arg-type]
             source_observation_ids=_tuple_strings(
                 value["source_observation_ids"],
                 "coverage source_observation_ids",
@@ -1358,7 +1460,9 @@ def _coverage_document(value: EvidenceCoverageAttestation) -> dict[str, object]:
         "complete": value.complete,
         "conflicts": list(value.conflicts),
         "coverage": value.coverage,
+        "coverage_end": value.coverage_end.isoformat(),
         "coverage_kind": value.coverage_kind,
+        "coverage_start": value.coverage_start.isoformat(),
         "healthy": value.healthy,
         "issuer_cik": value.issuer_cik,
         "source_observation_ids": list(value.source_observation_ids),
@@ -1495,14 +1599,84 @@ def _is_reviewed_bundle(value: object) -> bool:
         return False
 
 
-def _decode_reviewed_source_body(document: SourceDocument) -> dict[str, object]:
+def _release_fingerprint(value: ReviewedEvidenceRelease) -> str:
+    if (
+        type(value) is not ReviewedEvidenceRelease
+        or type(value.release_id) is not str
+        or _IDENTIFIER.fullmatch(value.release_id) is None
+        or type(value.release_sha256) is not str
+        or _SHA256.fullmatch(value.release_sha256) is None
+        or type(value.universe_sha256) is not str
+        or _SHA256.fullmatch(value.universe_sha256) is None
+        or type(value.reviewed_at) is not datetime
+        or type(value.review_by) is not datetime
+        or type(value.by_symbol) is not type(MappingProxyType({}))
+        or any(
+            type(symbol) is not str
+            or type(bundle) is not ReviewedEvidenceBundle
+            for symbol, bundle in value.by_symbol.items()
+        )
+    ):
+        raise TypeError("reviewed evidence release fields are malformed")
+    document = {
+        "by_symbol": {
+            symbol: _bundle_fingerprint(bundle)
+            for symbol, bundle in value.by_symbol.items()
+        },
+        "release_id": value.release_id,
+        "release_sha256": value.release_sha256,
+        "review_by": _iso_timestamp(value.review_by),
+        "reviewed_at": _iso_timestamp(value.reviewed_at),
+        "universe_sha256": value.universe_sha256,
+    }
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _remember_reviewed_release(
+    release: ReviewedEvidenceRelease,
+    digest: str,
+) -> None:
+    identity = id(release)
+
+    def discard(dead_reference: weakref.ReferenceType[object]) -> None:
+        with _REVIEWED_RELEASE_ISSUANCE_LOCK:
+            current = _REVIEWED_RELEASE_ISSUANCES.get(identity)
+            if current is not None and current[0] is dead_reference:
+                del _REVIEWED_RELEASE_ISSUANCES[identity]
+
+    reference = weakref.ref(release, discard)
+    with _REVIEWED_RELEASE_ISSUANCE_LOCK:
+        _REVIEWED_RELEASE_ISSUANCES[identity] = (
+            reference,
+            digest,
+            release.release_sha256,
+        )
+
+
+def is_verified_evidence_release(value: object) -> bool:
+    """Return true only for an untampered release issued by its pinned loader."""
+    if (
+        type(value) is not ReviewedEvidenceRelease
+        or value._authority is not _REVIEWED_RELEASE_AUTHORITY
+        or type(value._release_digest) is not str
+        or _SHA256.fullmatch(value._release_digest) is None
+    ):
+        return False
+    with _REVIEWED_RELEASE_ISSUANCE_LOCK:
+        issued = _REVIEWED_RELEASE_ISSUANCES.get(id(value))
+        if issued is None or issued[0]() is not value:
+            return False
+        expected_digest, expected_sha = issued[1:]
     try:
-        payload = json.loads(document.body, object_pairs_hook=_strict_object)
-    except (UnicodeError, json.JSONDecodeError):
-        raise EvidenceRegistryError("reviewed evidence source body is malformed") from None
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        raise EvidenceRegistryError("reviewed evidence source schema is invalid")
-    return payload
+        return (
+            value._release_digest == expected_digest
+            and value.release_sha256 == expected_sha
+            and _release_fingerprint(value) == expected_digest
+            and all(_is_reviewed_bundle(bundle) for bundle in value.by_symbol.values())
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _verify_reviewed_source_bodies(
@@ -1514,57 +1688,37 @@ def _verify_reviewed_source_bodies(
     symbol: str,
     issuer_cik: str | None,
 ) -> None:
-    expected_subject = _subject_document(subject_kind, symbol, issuer_cik)
-    records_by_source: dict[str, list[EvidenceRecord]] = {}
-    coverage_by_source: dict[str, list[EvidenceCoverageAttestation]] = {}
-    for record in records:
-        for identifier in record.source_observation_ids:
-            records_by_source.setdefault(identifier, []).append(record)
-    for attestation in coverage:
-        for identifier in attestation.source_observation_ids:
-            coverage_by_source.setdefault(identifier, []).append(attestation)
-    if set(records_by_source) & set(coverage_by_source):
+    del subject_kind, symbol, issuer_cik
+    record_sources = {
+        identifier
+        for record in records
+        for identifier in record.source_observation_ids
+    }
+    coverage_sources = {
+        identifier
+        for attestation in coverage
+        for identifier in attestation.source_observation_ids
+    }
+    if record_sources & coverage_sources:
         raise EvidenceRegistryError(
             "reviewed evidence facts and coverage require distinct observations"
         )
     for identifier, binding in bindings.items():
-        payload = _decode_reviewed_source_body(binding.document)
-        common = {
-            "schema_version": 1,
-            "source_observation_id": identifier,
-            "subject": expected_subject,
-        }
-        if identifier in records_by_source:
-            expected = {
-                **common,
-                "kind": "REVIEWED_PRIMARY_EVIDENCE",
-                "records": [
-                    _record_document(record)
-                    for record in sorted(
-                        records_by_source[identifier],
-                        key=lambda item: item.record_id,
-                    )
-                ],
-            }
-        elif identifier in coverage_by_source:
-            expected = {
-                **common,
-                "attestations": [
-                    _coverage_document(attestation)
-                    for attestation in sorted(
-                        coverage_by_source[identifier],
-                        key=lambda item: item.coverage_kind,
-                    )
-                ],
-                "kind": "REVIEWED_EVIDENCE_COVERAGE",
-            }
-        else:
+        document = binding.document
+        if identifier not in record_sources | coverage_sources:
             raise EvidenceRegistryError(
                 "reviewed evidence source observation is unreferenced"
             )
-        if payload != expected:
+        if (
+            type(document.body) is not bytes
+            or not document.body
+            or not hmac.compare_digest(
+                hashlib.sha256(document.body).hexdigest(),
+                document.content_hash,
+            )
+        ):
             raise EvidenceRegistryError(
-                "reviewed evidence source bytes contradict the registry"
+                "reviewed evidence raw source bytes are corrupt"
             )
 
 
@@ -1624,6 +1778,14 @@ def _verify_coverage_source_roles(
                 raise EvidenceRegistryError(
                     "event coverage does not use a reviewed coverage-only role"
                 )
+            if document.timestamp_source == "UNAVAILABLE" and (
+                document.source_role != "OPERATIONAL_STATUS"
+                or attestation.complete
+                or attestation.coverage != "UNKNOWN"
+            ):
+                raise EvidenceRegistryError(
+                    "timestamp-unavailable coverage must remain incomplete and unknown"
+                )
 
 
 def _load_evidence_registry_payload(
@@ -1659,7 +1821,8 @@ def _load_evidence_registry_payload(
     if (
         not isinstance(document, dict)
         or set(document) != expected
-        or document["schema_version"] != 2
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] not in {2, 3}
         or document["kind"] != "REVIEWED_EVIDENCE_BUNDLE"
         or not isinstance(document["registry_id"], str)
         or not _IDENTIFIER.fullmatch(document["registry_id"])
@@ -1668,17 +1831,32 @@ def _load_evidence_registry_payload(
         or not isinstance(document["coverage_attestations"], list)
     ):
         raise EvidenceRegistryError("reviewed evidence registry schema is invalid")
+    schema_version = document["schema_version"]
+    if schema_version == 2 and (
+        document["subject"] is not None
+        or document["records"]
+        or document["source_bindings"]
+        or document["coverage_attestations"]
+    ):
+        raise EvidenceRegistryError(
+            "legacy schema-v2 registry must be an unscoped empty seed"
+        )
     reviewed_at = _parse_timestamp(document["reviewed_at"], "reviewed_at")
     if reviewed_at > current:
         raise EvidenceRegistryError("reviewed evidence registry is from the future")
     subject_kind, symbol, issuer_cik = _decode_subject(document["subject"])
     records = tuple(_decode_record(value) for value in document["records"])
     bindings = tuple(
-        _decode_binding(value, source_documents)
+        _decode_binding(
+            value,
+            source_documents,
+            schema_version=schema_version,
+        )
         for value in document["source_bindings"]
     )
     coverage = tuple(
-        _decode_coverage(value) for value in document["coverage_attestations"]
+        _decode_coverage(value, schema_version=schema_version)
+        for value in document["coverage_attestations"]
     )
     observation_times = tuple(value.retrieved_at for value in records) + tuple(
         timestamp
@@ -1781,6 +1959,547 @@ def load_evidence_registry(
         payload,
         expected_sha256=expected_sha256,
         as_of=as_of,
+        source_documents=source_documents,
+    )
+
+
+def _read_open_regular_file(
+    descriptor: int,
+    *,
+    maximum_bytes: int,
+    name: str,
+) -> bytes:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > maximum_bytes
+    ):
+        raise EvidenceRegistryError(f"{name} is not a confined regular file")
+    chunks: list[bytes] = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1_048_576))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    after = os.fstat(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        remaining
+        or any(getattr(before, field) != getattr(after, field) for field in stable_fields)
+    ):
+        raise EvidenceRegistryError(f"{name} changed while it was read")
+    return b"".join(chunks)
+
+
+def _read_regular_path(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    name: str,
+) -> bytes:
+    candidate = Path(path)
+    if candidate.name in {"", ".", ".."}:
+        raise EvidenceRegistryError(f"{name} could not be read securely")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+        | os.O_DIRECTORY
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        try:
+            parent_descriptor = os.open(candidate.parent, directory_flags)
+            descriptor = os.open(
+                candidate.name,
+                file_flags,
+                dir_fd=parent_descriptor,
+            )
+            return _read_open_regular_file(
+                descriptor,
+                maximum_bytes=maximum_bytes,
+                name=name,
+            )
+        except OSError:
+            raise EvidenceRegistryError(
+                f"{name} could not be read securely"
+            ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _confined_parts(value: object, name: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or value.startswith("/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise EvidenceRegistryError(f"{name} is not a confined relative path")
+    normalized = PurePosixPath(value)
+    if normalized.is_absolute() or normalized.as_posix() != value:
+        raise EvidenceRegistryError(f"{name} is not a canonical relative path")
+    return normalized.parts
+
+
+def _read_confined_regular_file(
+    root: Path,
+    relative: str,
+    *,
+    maximum_bytes: int,
+    name: str,
+) -> bytes:
+    parts = _confined_parts(relative, name)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | os.O_NOFOLLOW
+        | os.O_DIRECTORY
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        for component in parts[:-1]:
+            current = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        descriptor = os.open(parts[-1], file_flags, dir_fd=current)
+        descriptors.append(descriptor)
+        return _read_open_regular_file(
+            descriptor,
+            maximum_bytes=maximum_bytes,
+            name=name,
+        )
+    except EvidenceRegistryError:
+        raise
+    except OSError:
+        raise EvidenceRegistryError(f"{name} could not be read securely") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _release_child_document(payload: bytes) -> dict[str, object]:
+    try:
+        document = json.loads(payload, object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError):
+        raise EvidenceRegistryError("reviewed evidence child JSON is malformed") from None
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 3
+        or not isinstance(document.get("source_bindings"), list)
+    ):
+        raise EvidenceRegistryError(
+            "current evidence release requires schema-v3 subject children"
+        )
+    return document
+
+
+def _release_binding_metadata(
+    payload: bytes,
+) -> tuple[Mapping[str, object], ...]:
+    document = _release_child_document(payload)
+    values: list[Mapping[str, object]] = []
+    identifiers: set[str] = set()
+    for value in document["source_bindings"]:  # type: ignore[union-attr]
+        if not isinstance(value, Mapping) or set(value) != _binding_fields(3):
+            raise EvidenceRegistryError("release child source binding is malformed")
+        identifier = value.get("source_observation_id")
+        if (
+            not isinstance(identifier, str)
+            or _IDENTIFIER.fullmatch(identifier) is None
+            or identifier in identifiers
+        ):
+            raise EvidenceRegistryError(
+                "release child source observation IDs are malformed"
+            )
+        identifiers.add(identifier)
+        values.append(value)
+    return tuple(values)
+
+
+def _decode_source_artifact(
+    payload: bytes,
+    *,
+    expected_sha256: str,
+) -> bytes:
+    try:
+        envelope = json.loads(payload, object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError):
+        raise EvidenceRegistryError(
+            "reviewed evidence source artifact JSON is malformed"
+        ) from None
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope)
+        != {
+            "body",
+            "content_sha256",
+            "encoding",
+            "kind",
+            "schema_version",
+        }
+        or type(envelope["schema_version"]) is not int
+        or envelope["schema_version"] != 1
+        or envelope["kind"] != "RAW_SOURCE_ARTIFACT"
+        or envelope["encoding"] != "base64"
+        or envelope["content_sha256"] != expected_sha256
+        or not isinstance(envelope["body"], str)
+        or not envelope["body"].isascii()
+    ):
+        raise EvidenceRegistryError(
+            "reviewed evidence source artifact schema is invalid"
+        )
+    encoded = envelope["body"]
+    try:
+        body = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise EvidenceRegistryError(
+            "reviewed evidence source artifact encoding is invalid"
+        ) from None
+    if (
+        not body
+        or len(body) > _MAX_SOURCE_BODY_BYTES
+        or base64.b64encode(body).decode("ascii") != encoded
+        or not hmac.compare_digest(
+            hashlib.sha256(body).hexdigest(),
+            expected_sha256,
+        )
+    ):
+        raise EvidenceRegistryError(
+            "reviewed evidence source artifact bytes are invalid"
+        )
+    return body
+
+
+def _artifact_source_documents(
+    evidence_root: Path,
+    metadata: Sequence[Mapping[str, object]],
+) -> Mapping[str, SourceDocument]:
+    documents: dict[str, SourceDocument] = {}
+    for value in metadata:
+        identifier = value["source_observation_id"]
+        content_hash = value["content_hash"]
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(content_hash, str)
+            or _SHA256.fullmatch(content_hash) is None
+        ):
+            raise EvidenceRegistryError("release source artifact metadata is malformed")
+        artifact_payload = _read_confined_regular_file(
+            evidence_root,
+            f"sources/{content_hash}.json",
+            maximum_bytes=_MAX_SOURCE_ARTIFACT_BYTES,
+            name="reviewed evidence source artifact",
+        )
+        body = _decode_source_artifact(
+            artifact_payload,
+            expected_sha256=content_hash,
+        )
+        try:
+            document = SourceDocument(
+                url=value["primary_url"],  # type: ignore[arg-type]
+                published_at=_parse_optional_timestamp(
+                    value["published_at"],
+                    "published_at",
+                ),
+                retrieved_at=_parse_timestamp(
+                    value["retrieved_at"],
+                    "retrieved_at",
+                ),
+                content_hash=content_hash,
+                body=body,
+                source_observation_id=identifier,
+                publisher=value["publisher"],  # type: ignore[arg-type]
+                source_type=value["source_type"],  # type: ignore[arg-type]
+                timestamp_source=value["timestamp_source"],  # type: ignore[arg-type]
+                accession=value["accession"],  # type: ignore[arg-type]
+                source_role=value["source_role"],  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError, KeyError):
+            raise EvidenceRegistryError(
+                "release source artifact metadata is malformed"
+            ) from None
+        documents[identifier] = document
+    return MappingProxyType(documents)
+
+
+def _verify_release_child_freshness(
+    registry: EvidenceRegistry,
+    *,
+    reviewed_at: datetime,
+    review_by: datetime,
+    as_of: datetime,
+) -> None:
+    if (
+        registry.reviewed_at > reviewed_at
+        or reviewed_at - registry.reviewed_at > timedelta(hours=24)
+        or as_of - registry.reviewed_at > timedelta(hours=24)
+        or any(
+            binding.retrieved_at > as_of
+            or as_of - binding.retrieved_at > timedelta(hours=24)
+            or review_by - binding.retrieved_at > timedelta(hours=24)
+            or binding.checked_at > as_of
+            or as_of > binding.valid_until
+            or review_by > binding.valid_until
+            for binding in registry.source_bindings
+        )
+        or any(
+            attestation.checked_at > as_of
+            or as_of - attestation.checked_at > timedelta(hours=24)
+            or review_by - attestation.checked_at > timedelta(hours=24)
+            or as_of > attestation.valid_until
+            or review_by > attestation.valid_until
+            for attestation in registry.coverage_attestations
+        )
+    ):
+        raise EvidenceRegistryError(
+            "reviewed evidence child is stale, expired, or from the future"
+        )
+
+
+def load_evidence_release(
+    path: Path,
+    *,
+    expected_sha256: str,
+    as_of: datetime,
+    universe: UniverseSnapshot,
+    source_documents: Mapping[str, SourceDocument] | None = None,
+) -> ReviewedEvidenceRelease:
+    """Load an exact universe-complete release and issue its reviewed bundles."""
+    if (
+        not isinstance(expected_sha256, str)
+        or _SHA256.fullmatch(expected_sha256) is None
+    ):
+        raise EvidenceRegistryError("evidence release expected checksum is malformed")
+    current = _utc(as_of, "evidence release as_of")
+    if not is_verified_universe_snapshot(universe):
+        raise EvidenceRegistryError("verified universe authority is required")
+    if not (universe.effective_date <= current.date() <= universe.review_by):
+        raise EvidenceRegistryError("evidence release as_of conflicts with universe")
+    manifest_path = Path(path)
+    payload = _read_regular_path(
+        manifest_path,
+        maximum_bytes=_MAX_RELEASE_BYTES,
+        name="reviewed evidence release",
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(digest, expected_sha256):
+        raise EvidenceRegistryError("reviewed evidence release checksum mismatch")
+    try:
+        document = json.loads(payload, object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError):
+        raise EvidenceRegistryError("reviewed evidence release JSON is malformed") from None
+    expected_fields = {
+        "kind",
+        "release_id",
+        "review_by",
+        "reviewed_at",
+        "schema_version",
+        "subjects",
+        "universe_sha256",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected_fields
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["kind"] != "REVIEWED_EVIDENCE_RELEASE"
+        or not isinstance(document["release_id"], str)
+        or _IDENTIFIER.fullmatch(document["release_id"]) is None
+        or not isinstance(document["subjects"], list)
+        or not document["subjects"]
+    ):
+        raise EvidenceRegistryError("reviewed evidence release schema is invalid")
+    reviewed_at = _parse_timestamp(document["reviewed_at"], "reviewed_at")
+    review_by = _parse_timestamp(document["review_by"], "review_by")
+    review_interval = review_by - reviewed_at
+    if (
+        not reviewed_at <= current < review_by
+        or not timedelta(0) < review_interval <= timedelta(hours=24)
+    ):
+        raise EvidenceRegistryError("reviewed evidence release window is invalid")
+    universe_sha = document["universe_sha256"]
+    release_pin = universe._release_pin
+    if (
+        not isinstance(universe_sha, str)
+        or _SHA256.fullmatch(universe_sha) is None
+        or not isinstance(release_pin, str)
+        or not hmac.compare_digest(universe_sha, release_pin)
+    ):
+        raise EvidenceRegistryError("evidence release universe checksum mismatch")
+    supplied_documents: Mapping[str, SourceDocument] | None = source_documents
+    if supplied_documents is not None and not isinstance(
+        supplied_documents,
+        Mapping,
+    ):
+        raise EvidenceRegistryError("release source documents are malformed")
+
+    eligible = universe.eligible_records()
+    expected_symbols = tuple(record.symbol for record in eligible)
+    raw_subjects = document["subjects"]
+    subjects: list[Mapping[str, object]] = []
+    symbols: list[str] = []
+    for raw_subject in raw_subjects:
+        if not isinstance(raw_subject, Mapping) or set(raw_subject) != {
+            "issuer_cik",
+            "path",
+            "sha256",
+            "subject_kind",
+            "symbol",
+        }:
+            raise EvidenceRegistryError("evidence release subject is malformed")
+        symbol = raw_subject["symbol"]
+        if not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None:
+            raise EvidenceRegistryError("evidence release subject symbol is malformed")
+        if raw_subject["path"] != f"subjects/{symbol}.json":
+            raise EvidenceRegistryError("evidence release child path is not canonical")
+        _confined_parts(raw_subject["path"], "evidence release child path")
+        if (
+            not isinstance(raw_subject["sha256"], str)
+            or _SHA256.fullmatch(raw_subject["sha256"]) is None
+        ):
+            raise EvidenceRegistryError("evidence release child checksum is malformed")
+        symbols.append(symbol)
+        subjects.append(raw_subject)
+    if tuple(symbols) != expected_symbols or len(set(symbols)) != len(symbols):
+        raise EvidenceRegistryError(
+            "evidence release does not exactly cover the eligible universe"
+        )
+
+    by_symbol: dict[str, ReviewedEvidenceBundle] = {}
+    used_observation_ids: set[str] = set()
+    evidence_root = manifest_path.parent
+    records_by_symbol = {record.symbol: record for record in eligible}
+    for subject in subjects:
+        symbol = subject["symbol"]
+        assert isinstance(symbol, str)
+        universe_record = records_by_symbol[symbol]
+        expected_kind = (
+            "STOCK" if universe_record.product_type == "common_stock" else "ETF"
+        )
+        if (
+            subject["subject_kind"] != expected_kind
+            or subject["issuer_cik"] != universe_record.issuer_cik
+        ):
+            raise EvidenceRegistryError(
+                "evidence release subject conflicts with the universe"
+            )
+        child_path = subject["path"]
+        child_sha = subject["sha256"]
+        assert isinstance(child_path, str) and isinstance(child_sha, str)
+        child_payload = _read_confined_regular_file(
+            evidence_root,
+            child_path,
+            maximum_bytes=_MAX_REGISTRY_BYTES,
+            name="reviewed evidence child",
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(child_payload).hexdigest(),
+            child_sha,
+        ):
+            raise EvidenceRegistryError("reviewed evidence child checksum mismatch")
+        metadata = _release_binding_metadata(child_payload)
+        identifiers = {
+            value["source_observation_id"]
+            for value in metadata
+            if isinstance(value["source_observation_id"], str)
+        }
+        if used_observation_ids & identifiers:
+            raise EvidenceRegistryError(
+                "source observation ID is reused across release subjects"
+            )
+        used_observation_ids.update(identifiers)
+        if supplied_documents is None:
+            child_documents = _artifact_source_documents(
+                evidence_root,
+                metadata,
+            )
+        else:
+            child_documents = {
+                identifier: supplied_documents[identifier]
+                for identifier in identifiers
+                if identifier in supplied_documents
+            }
+        registry = _load_evidence_registry_payload(
+            child_payload,
+            expected_sha256=child_sha,
+            as_of=current,
+            source_documents=child_documents,
+        )
+        if (
+            registry.subject_kind != expected_kind
+            or registry.symbol != symbol
+            or registry.issuer_cik != universe_record.issuer_cik
+        ):
+            raise EvidenceRegistryError(
+                "reviewed evidence child subject conflicts with its manifest"
+            )
+        _verify_release_child_freshness(
+            registry,
+            reviewed_at=reviewed_at,
+            review_by=review_by,
+            as_of=current,
+        )
+        by_symbol[symbol] = _issue_reviewed_evidence_bundle(
+            registry,
+            release_pin=child_sha,
+        )
+    if supplied_documents is not None and set(supplied_documents) != used_observation_ids:
+        raise EvidenceRegistryError(
+            "release source documents do not exactly partition across subjects"
+        )
+    release = ReviewedEvidenceRelease(
+        release_id=document["release_id"],
+        release_sha256=digest,
+        universe_sha256=universe_sha,
+        reviewed_at=reviewed_at,
+        review_by=review_by,
+        by_symbol=MappingProxyType(by_symbol),
+    )
+    release_digest = _release_fingerprint(release)
+    object.__setattr__(release, "_authority", _REVIEWED_RELEASE_AUTHORITY)
+    object.__setattr__(release, "_release_digest", release_digest)
+    _remember_reviewed_release(release, release_digest)
+    return release
+
+
+def load_current_evidence_release(
+    project_root: Path,
+    *,
+    as_of: datetime,
+    universe: UniverseSnapshot,
+    source_documents: Mapping[str, SourceDocument] | None = None,
+) -> ReviewedEvidenceRelease:
+    """Resolve only the externally pinned current multi-subject release."""
+    return load_evidence_release(
+        Path(project_root) / "data" / "evidence" / "current.json",
+        expected_sha256=CURRENT_EVIDENCE_RELEASE_SHA256,
+        as_of=as_of,
+        universe=universe,
         source_documents=source_documents,
     )
 
@@ -1908,10 +2627,10 @@ def load_current_evidence_bundle(
     as_of: datetime,
     source_documents: Mapping[str, SourceDocument] | None = None,
 ) -> ReviewedEvidenceBundle:
-    """Resolve only the release-pinned current reviewed evidence registry."""
+    """Resolve the pinned legacy subjectless seed for replay compatibility."""
     root = Path(project_root)
     registry = load_evidence_registry(
-        root / "data" / "evidence" / "current.json",
+        root / "data" / "evidence" / "legacy" / "subjectless.json",
         expected_sha256=CURRENT_EVIDENCE_REGISTRY_SHA256,
         as_of=as_of,
         source_documents=source_documents,
@@ -1924,6 +2643,7 @@ def load_current_evidence_bundle(
 
 __all__ = [
     "ADVERSE_TAGS",
+    "CURRENT_EVIDENCE_RELEASE_SHA256",
     "CURRENT_EVIDENCE_REGISTRY_SHA256",
     "ETF_POSITIVE_EVENT_TYPES",
     "POSITIVE_EVENT_TYPES",
@@ -1936,8 +2656,12 @@ __all__ = [
     "EvidenceSourceBinding",
     "EvidenceUnavailableError",
     "ReviewedEvidenceBundle",
+    "ReviewedEvidenceRelease",
     "classify_evidence",
     "is_reviewed_evidence_decision",
+    "is_verified_evidence_release",
     "load_current_evidence_bundle",
+    "load_current_evidence_release",
+    "load_evidence_release",
     "load_evidence_registry",
 ]

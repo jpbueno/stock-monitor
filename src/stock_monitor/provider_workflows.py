@@ -192,6 +192,11 @@ _REVIEWED_REGISTRY_URI = re.compile(
     r"urn:stock-monitor:reviewed-evidence-registry:"
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z"
 )
+_REVIEWED_ARTIFACT_URI = re.compile(
+    r"stock-monitor://reviewed/"
+    r"(?P<role>[a-z0-9][a-z0-9-]{0,63})/"
+    r"(?P<digest>[0-9a-f]{64})\Z"
+)
 _UTC_QUERY_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{6})?Z\Z"
@@ -201,6 +206,86 @@ _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-F]{2})")
 
 class CanonicalMaterialError(ValueError):
     """Canonical workflow material is malformed or lacks current authority."""
+
+
+@dataclass(frozen=True, slots=True)
+class PremarketSourceBinding:
+    """Requested decision role for one exact receipt/source-object pair.
+
+    This caller-authored value is only a request.  It gains authority only
+    through :func:`issue_canonical_premarket_source_binding_authority`.
+    """
+
+    receipt: object
+    source: object
+    decision_basis: str
+    disclosure: object | None = None
+
+    def __post_init__(self) -> None:
+        from .journal import SourceObservationReceipt
+
+        if type(self.receipt) is not SourceObservationReceipt:
+            raise CanonicalMaterialError(
+                "premarket source binding requires an exact receipt"
+            )
+        if self.source is None:
+            raise CanonicalMaterialError(
+                "premarket source binding requires an exact source object"
+            )
+        if self.decision_basis not in {
+            "ECONOMIC_INPUT",
+            "OPERATIONAL_HEALTH_ONLY",
+        }:
+            raise CanonicalMaterialError(
+                "premarket source binding decision basis is invalid"
+            )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class CanonicalPremarketSourceBindingAuthority:
+    """Journal-owner-bound capability for exact premarket source objects."""
+
+    decision_at: datetime
+    retrieved_at: datetime
+    receipt_manifest: tuple[tuple[int, str, str, str], ...]
+    decision_basis: tuple[tuple[int, str, str], ...]
+    binding_digest: str
+
+    def __post_init__(self) -> None:
+        decision_at = _require_time(self.decision_at, "premarket decision time")
+        retrieved_at = _require_time(self.retrieved_at, "premarket retrieval time")
+        _validate_premarket_times(
+            decision_at.astimezone(_NEW_YORK).date(),
+            decision_at,
+            retrieved_at,
+        )
+        _require_receipt_manifest(self.receipt_manifest)
+        _require_premarket_decision_basis(self.decision_basis)
+        if tuple(item[0] for item in self.decision_basis) != tuple(
+            item[0] for item in self.receipt_manifest
+        ):
+            raise CanonicalMaterialError(
+                "premarket decision basis conflicts with its receipt manifest"
+            )
+        _require_digest(self.binding_digest, "premarket source binding digest")
+
+
+@dataclass(frozen=True, slots=True)
+class _PremarketSourceBindingCandidate:
+    authority_reference: ReferenceType[object]
+    authority_fingerprint: object
+    journal_reference: ReferenceType[object]
+    journal_generation: int
+    receipt_candidates: tuple[object, ...]
+    bindings: tuple[PremarketSourceBinding, ...]
+    binding_manifest: tuple[object, ...]
+
+
+_PREMARKET_SOURCE_BINDING_LOCK = threading.Lock()
+_ISSUED_PREMARKET_SOURCE_BINDINGS: dict[
+    int,
+    _PremarketSourceBindingCandidate,
+] = {}
 
 
 def _freeze_scoped_reference_sources() -> frozenset[
@@ -654,6 +739,16 @@ def _validate_canonical_receipt_source(
         ):
             _invalid_receipt_source()
         return
+    if source_type == "REVIEWED_ARTIFACT":
+        if (
+            type(source_uri) is not str
+            or _REVIEWED_ARTIFACT_URI.fullmatch(source_uri) is None
+            or provider != "operator-reviewed"
+            or feed is not None
+            or health_result != "REVIEWED"
+        ):
+            _invalid_receipt_source()
+        return
     _invalid_receipt_source()
 
 
@@ -731,17 +826,32 @@ def _validate_receipt_envelope(
     economic_at: datetime,
     retrieved_at: datetime,
     query_cutoff: datetime | None = None,
+    decision_basis: tuple[tuple[int, str, str], ...] = (),
 ) -> None:
+    basis_by_row = {
+        row_id: (role, basis)
+        for row_id, role, basis in decision_basis
+    }
     for receipt in receipts:
         if receipt.retrieved_at > retrieved_at:
             raise CanonicalMaterialError(
                 f"canonical {kind.lower()} receipt exceeds its retrieval envelope"
             )
         if kind == "PREMARKET":
-            # Task 10 may grant later health-only observations a narrower role.
-            # The foundation has no such composition authority, so it uses the
-            # conservative economic cutoff for every source.
-            if receipt.source_time > economic_at:
+            role_basis = basis_by_row.get(receipt.row_id)
+            is_operational = role_basis is not None and role_basis[1] == (
+                "OPERATIONAL_HEALTH_ONLY"
+            )
+            if is_operational and role_basis[0] not in {
+                "ALPACA_LATEST_QUOTES",
+                "PRIMARY_HALT_FEED",
+                "TRADER_ALERT_HALT",
+                "OPERATIONAL_STATUS",
+            }:
+                raise CanonicalMaterialError(
+                    "canonical premarket operational role is invalid"
+                )
+            if not is_operational and receipt.source_time > economic_at:
                 raise CanonicalMaterialError(
                     "canonical premarket receipt exceeds its economic cutoff"
                 )
@@ -756,6 +866,608 @@ def _validate_receipt_envelope(
             raise CanonicalMaterialError(
                 "canonical close receipt exceeds its query cutoff"
             )
+
+
+def _require_premarket_decision_basis(
+    value: object,
+) -> tuple[tuple[int, str, str], ...]:
+    if type(value) is not tuple or not value:
+        raise CanonicalMaterialError("premarket decision basis is invalid")
+    row_ids: set[int] = set()
+    for item in value:
+        if (
+            type(item) is not tuple
+            or len(item) != 3
+            or type(item[0]) is not int
+            or item[0] < 1
+            or item[0] in row_ids
+            or type(item[1]) is not str
+            or not item[1]
+            or item[2] not in {
+                "ECONOMIC_INPUT",
+                "OPERATIONAL_HEALTH_ONLY",
+            }
+        ):
+            raise CanonicalMaterialError("premarket decision basis is invalid")
+        row_ids.add(item[0])
+    return value
+
+
+def _is_issued_provider_fetch_page_bundle(value: object) -> bool:
+    """Use the public Alpaca page capability when that provider slice is present."""
+    from .providers import alpaca as alpaca_module
+
+    predicate = getattr(
+        alpaca_module,
+        "is_issued_provider_fetch_page_bundle",
+        None,
+    )
+    return bool(callable(predicate) and predicate(value))
+
+
+def _reviewed_binding_identity(
+    source: object,
+    *,
+    invoke_owner_predicate: bool = True,
+) -> tuple[str, str, date | datetime] | None:
+    from . import evidence as evidence_module
+    from . import market_calendar as calendar_module
+    from . import universe as universe_module
+
+    if type(source) is calendar_module.MarketCalendar:
+        if invoke_owner_predicate and not (
+            calendar_module.is_release_verified_market_calendar(source)
+        ):
+            raise CanonicalMaterialError(
+                "premarket reviewed calendar authority is unavailable"
+            )
+        pin = calendar_module._RELEASE_MANIFEST_SHA256.get(source.year)
+        if type(pin) is not str:
+            raise CanonicalMaterialError("premarket reviewed calendar pin is missing")
+        return "calendar", pin, source.reviewed_at
+    if type(source) is universe_module.UniverseSnapshot:
+        if invoke_owner_predicate and not (
+            universe_module.is_verified_universe_snapshot(source)
+        ):
+            raise CanonicalMaterialError(
+                "premarket reviewed universe authority is unavailable"
+            )
+        pin = source._release_pin
+        if type(pin) is not str:
+            raise CanonicalMaterialError("premarket reviewed universe pin is missing")
+        return "universe", pin, source.reviewed_at
+    if type(source) is evidence_module.ReviewedEvidenceRelease:
+        if invoke_owner_predicate and not (
+            evidence_module.is_verified_evidence_release(source)
+        ):
+            raise CanonicalMaterialError(
+                "premarket reviewed evidence release authority is unavailable"
+            )
+        return "evidence-release", source.release_sha256, source.reviewed_at
+    if type(source) is evidence_module.ReviewedEvidenceBundle:
+        if invoke_owner_predicate and not evidence_module._is_reviewed_bundle(
+            source
+        ):
+            raise CanonicalMaterialError(
+                "premarket reviewed evidence child authority is unavailable"
+            )
+        if type(source.symbol) is not str:
+            raise CanonicalMaterialError(
+                "premarket reviewed evidence child subject is unavailable"
+            )
+        return (
+            f"evidence-{source.symbol.lower()}",
+            source.content_hash,
+            source.reviewed_at,
+        )
+    return None
+
+
+def _document_disclosure_is_current(disclosure: object, document: object) -> bool:
+    from .providers.cache import SourceDocument
+    from .providers.reference import ReferenceClient
+    from .providers.sec import SecClient
+
+    if type(document) is not SourceDocument:
+        return False
+    if type(disclosure) is SecClient:
+        return bool(
+            disclosure._documents.get(document.source_observation_id) is document
+        )
+    if type(disclosure) is ReferenceClient:
+        issued = disclosure._documents.get(document.source_observation_id)
+        if issued is None or issued[0] is not document:
+            return False
+        try:
+            from .providers import reference as reference_module
+
+            current = reference_module._canonical_digest(
+                reference_module._document_fingerprint(document)
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(current == issued[1])
+    return False
+
+
+def _binding_source_role(
+    source: object,
+    *,
+    invoke_owner_predicate: bool,
+) -> str:
+    from .providers.alpaca import ProviderFetchPageBundle
+    from .providers.cache import SourceDocument
+
+    reviewed = _reviewed_binding_identity(
+        source,
+        invoke_owner_predicate=invoke_owner_predicate,
+    )
+    if reviewed is not None:
+        return reviewed[0]
+    if type(source) is ProviderFetchPageBundle:
+        return source.page.source_type
+    if type(source) is SourceDocument:
+        return source.source_role or source.source_type
+    raise CanonicalMaterialError("premarket source binding type is unsupported")
+
+
+def _binding_is_operational_only(source: object) -> bool:
+    from .providers.alpaca import ProviderFetchPageBundle
+    from .providers.cache import SourceDocument
+
+    if type(source) is ProviderFetchPageBundle:
+        return source.page.source_type == "ALPACA_LATEST_QUOTES"
+    if type(source) is SourceDocument:
+        return source.source_role in {
+            "PRIMARY_HALT_FEED",
+            "TRADER_ALERT_HALT",
+            "OPERATIONAL_STATUS",
+        }
+    return False
+
+
+def _verify_premarket_binding_source(
+    binding: PremarketSourceBinding,
+    *,
+    reviewed_documents: tuple[object, ...],
+    invoke_provider_predicate: bool,
+) -> tuple[str, object]:
+    from .providers.alpaca import ProviderFetchPageBundle
+    from .providers.cache import SourceDocument
+
+    receipt = binding.receipt
+    source = binding.source
+    reviewed = _reviewed_binding_identity(
+        source,
+        invoke_owner_predicate=invoke_provider_predicate,
+    )
+    if reviewed is not None:
+        role, expected_pin, expected_source_time = reviewed
+        match = _REVIEWED_ARTIFACT_URI.fullmatch(receipt.source_uri)
+        source_time_matches = (
+            receipt.source_time == expected_source_time
+            if type(expected_source_time) is datetime
+            else receipt.source_time.astimezone(_NEW_YORK).date()
+            == expected_source_time
+        )
+        if (
+            receipt.source_type != "REVIEWED_ARTIFACT"
+            or receipt.provider != "operator-reviewed"
+            or receipt.feed is not None
+            or receipt.health_result != "REVIEWED"
+            or match is None
+            or match.group("role") != role
+            or match.group("digest") != expected_pin
+            or receipt.payload_sha256 != expected_pin
+            or hashlib.sha256(receipt.source_payload).hexdigest() != expected_pin
+            or not source_time_matches
+            or binding.decision_basis != "ECONOMIC_INPUT"
+            or receipt.delay_seconds
+            != int((receipt.retrieved_at - receipt.source_time).total_seconds())
+        ):
+            raise CanonicalMaterialError(
+                "premarket reviewed artifact bytes or pin are inconsistent"
+            )
+        return role, (
+            "REVIEWED_ARTIFACT",
+            role,
+            expected_pin,
+            type(source).__qualname__,
+        )
+
+    if type(source) is ProviderFetchPageBundle:
+        if (
+            binding.disclosure is not None
+            or (invoke_provider_predicate and not _is_issued_provider_fetch_page_bundle(source))
+        ):
+            raise CanonicalMaterialError(
+                "premarket provider page authority is unavailable; "
+                "caller-authored disclosures cannot authorize completeness"
+            )
+        observation = source.observation
+        page = source.page
+        if (
+            receipt.source_payload != source.payload
+            or receipt.payload_sha256 != page.payload_sha256
+            or hashlib.sha256(source.payload).hexdigest() != page.payload_sha256
+            or page.source_observation_id != observation.observation_id
+            or page.request_url != observation.url
+            or page.source_type != observation.source_type
+            or receipt.source_uri != page.request_url
+            or receipt.source_type != page.source_type
+            or receipt.provider != "alpaca"
+            or receipt.feed != observation.feed
+            or receipt.source_time != observation.source_timestamp
+            or receipt.retrieved_at != observation.retrieved_at
+            or receipt.provider_sequence != page.page_ordinal
+            or receipt.delay_seconds != observation.delay_seconds
+            or receipt.health_result != "OK"
+        ):
+            raise CanonicalMaterialError(
+                "premarket provider receipt does not bind its exact page"
+            )
+        return page.source_type, (
+            "PROVIDER_PAGE",
+            _canonical_digest_value(page),
+            hashlib.sha256(source.payload).hexdigest(),
+            _canonical_digest_value(observation),
+        )
+
+    if type(source) is SourceDocument:
+        if not any(document is source for document in reviewed_documents) and not (
+            _document_disclosure_is_current(binding.disclosure, source)
+        ):
+            raise CanonicalMaterialError(
+                "premarket source document authority is unavailable"
+            )
+        expected_source_time = source.published_at or source.retrieved_at
+        if (
+            receipt.source_payload != source.body
+            or receipt.payload_sha256 != source.content_hash
+            or hashlib.sha256(source.body).hexdigest() != source.content_hash
+            or receipt.source_uri != source.url
+            or receipt.source_type != source.source_type
+            or receipt.provider != source.publisher
+            or receipt.feed != source.timestamp_source
+            or receipt.source_time != expected_source_time
+            or receipt.retrieved_at != source.retrieved_at
+            or receipt.delay_seconds
+            != int((source.retrieved_at - expected_source_time).total_seconds())
+            or receipt.health_result not in {"OK", "UNHEALTHY"}
+        ):
+            raise CanonicalMaterialError(
+                "premarket source receipt does not bind its exact document"
+            )
+        return source.source_role or source.source_type, (
+            "SOURCE_DOCUMENT",
+            _canonical_digest_value(source),
+        )
+    raise CanonicalMaterialError("premarket source binding type is unsupported")
+
+
+def _ordered_premarket_bindings(
+    value: object,
+) -> tuple[PremarketSourceBinding, ...]:
+    if type(value) is not tuple or not value or any(
+        type(binding) is not PremarketSourceBinding for binding in value
+    ):
+        raise CanonicalMaterialError(
+            "premarket source bindings must be a nonempty exact tuple"
+        )
+    bindings = value
+    receipts = canonical_source_receipts(
+        tuple(binding.receipt for binding in bindings)
+    )
+    by_receipt = {id(binding.receipt): binding for binding in bindings}
+    if len(by_receipt) != len(bindings):
+        raise CanonicalMaterialError("premarket source receipts must be unique")
+    return tuple(by_receipt[id(receipt)] for receipt in receipts)
+
+
+def _premarket_binding_manifest(
+    bindings: tuple[PremarketSourceBinding, ...],
+    *,
+    invoke_provider_predicate: bool,
+) -> tuple[tuple[object, ...], ...]:
+    from . import evidence as evidence_module
+    from .providers.cache import SourceDocument
+
+    releases = tuple(
+        binding.source
+        for binding in bindings
+        if type(binding.source) is evidence_module.ReviewedEvidenceRelease
+    )
+    if len(releases) > 1:
+        raise CanonicalMaterialError("premarket evidence release is duplicated")
+    expected_bundles: tuple[object, ...] = ()
+    reviewed_documents: tuple[object, ...] = ()
+    if releases:
+        release = releases[0]
+        expected_bundles = tuple(release.by_symbol.values())
+        reviewed_documents = tuple(
+            source_binding.document
+            for bundle in expected_bundles
+            for source_binding in bundle.source_bindings
+        )
+        supplied_bundles = tuple(
+            binding.source
+            for binding in bindings
+            if type(binding.source) is evidence_module.ReviewedEvidenceBundle
+        )
+        if (
+            len(supplied_bundles) != len(expected_bundles)
+            or any(
+                sum(supplied is expected for supplied in supplied_bundles) != 1
+                for expected in expected_bundles
+            )
+        ):
+            raise CanonicalMaterialError(
+                "premarket evidence release children are incomplete"
+            )
+        supplied_documents = tuple(
+            binding.source
+            for binding in bindings
+            if type(binding.source) is SourceDocument
+        )
+        if (
+            len(supplied_documents) != len(reviewed_documents)
+            or any(
+                sum(supplied is expected for supplied in supplied_documents) != 1
+                for expected in reviewed_documents
+            )
+        ):
+            raise CanonicalMaterialError(
+                "premarket evidence source documents are incomplete"
+            )
+
+    manifest: list[tuple[object, ...]] = []
+    for binding in bindings:
+        role, source_fingerprint = _verify_premarket_binding_source(
+            binding,
+            reviewed_documents=reviewed_documents,
+            invoke_provider_predicate=invoke_provider_predicate,
+        )
+        manifest.append(
+            (
+                binding.receipt.row_id,
+                binding.receipt.observation_sha256,
+                role,
+                binding.decision_basis,
+                source_fingerprint,
+            )
+        )
+    return tuple(manifest)
+
+
+def _validate_premarket_binding_chronology(
+    bindings: tuple[PremarketSourceBinding, ...],
+    *,
+    decision_at: datetime,
+    retrieved_at: datetime,
+) -> None:
+    for binding in bindings:
+        receipt = binding.receipt
+        if receipt.retrieved_at > retrieved_at or receipt.source_time > receipt.retrieved_at:
+            raise CanonicalMaterialError(
+                "premarket source receipt exceeds its retrieval envelope"
+            )
+        operational = _binding_is_operational_only(binding.source)
+        if operational != (
+            binding.decision_basis == "OPERATIONAL_HEALTH_ONLY"
+        ):
+            raise CanonicalMaterialError(
+                "premarket operational source must be health-only"
+            )
+        if (
+            binding.decision_basis == "ECONOMIC_INPUT"
+            and receipt.source_time > decision_at
+        ):
+            raise CanonicalMaterialError(
+                "premarket economic input exceeds its economic cutoff"
+            )
+
+
+def _premarket_decision_basis(
+    bindings: tuple[PremarketSourceBinding, ...],
+) -> tuple[tuple[int, str, str], ...]:
+    return tuple(
+        (
+            binding.receipt.row_id,
+            _binding_source_role(
+                binding.source,
+                invoke_owner_predicate=False,
+            ),
+            binding.decision_basis,
+        )
+        for binding in bindings
+    )
+
+
+def _is_current_premarket_source_binding_without_callbacks(
+    authority: object,
+    candidate: _PremarketSourceBindingCandidate | None = None,
+) -> bool:
+    from . import journal as journal_module
+
+    if type(authority) is not CanonicalPremarketSourceBindingAuthority:
+        return False
+    if candidate is None:
+        with _PREMARKET_SOURCE_BINDING_LOCK:
+            candidate = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(id(authority))
+    journal = None if candidate is None else candidate.journal_reference()
+    try:
+        fingerprint = _value_fingerprint(authority)
+        binding_manifest = _premarket_binding_manifest(
+            candidate.bindings if candidate is not None else (),
+            invoke_provider_predicate=False,
+        )
+    except Exception:
+        return False
+    return bool(
+        candidate is not None
+        and candidate.authority_reference() is authority
+        and journal is not None
+        and not getattr(journal, "_closed", True)
+        and getattr(journal, "_source_generation", None)
+        == candidate.journal_generation
+        and candidate.authority_fingerprint == fingerprint
+        and candidate.binding_manifest == binding_manifest
+        and _canonical_receipt_manifest(
+            tuple(binding.receipt for binding in candidate.bindings)
+        )
+        == authority.receipt_manifest
+        and _premarket_decision_basis(candidate.bindings)
+        == authority.decision_basis
+        and _canonical_sha256(
+            "stock-monitor/premarket-source-bindings/v1",
+            binding_manifest,
+        )
+        == authority.binding_digest
+        and all(
+            journal_module._is_current_journal_authority_candidate_without_callbacks(
+                receipt_candidate
+            )
+            for receipt_candidate in candidate.receipt_candidates
+        )
+    )
+
+
+def issue_canonical_premarket_source_binding_authority(
+    *,
+    journal: object,
+    decision_at: datetime,
+    retrieved_at: datetime,
+    bindings: tuple[PremarketSourceBinding, ...],
+) -> CanonicalPremarketSourceBindingAuthority:
+    """Bind exact source objects to exact current receipts from one Journal."""
+    from .journal import Journal
+
+    if type(journal) is not Journal or getattr(journal, "_closed", True):
+        raise CanonicalMaterialError(
+            "premarket source binding requires an open Journal owner"
+        )
+    decision_at = _require_time(decision_at, "premarket decision time")
+    retrieved_at = _require_time(retrieved_at, "premarket retrieval time")
+    _validate_premarket_times(
+        decision_at.astimezone(_NEW_YORK).date(),
+        decision_at,
+        retrieved_at,
+    )
+    ordered = _ordered_premarket_bindings(bindings)
+    _validate_premarket_binding_chronology(
+        ordered,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+    )
+    # Provider/document verification may consult mutable owners.  Exhaust it
+    # before capturing Journal candidates for the callback-free final seal.
+    _premarket_binding_manifest(ordered, invoke_provider_predicate=True)
+    receipt_candidates = _current_receipt_candidates(
+        journal,
+        tuple(binding.receipt for binding in ordered),
+    )
+    if receipt_candidates is None:
+        raise CanonicalMaterialError(
+            "premarket source receipts lack one current Journal owner"
+        )
+    binding_manifest = _premarket_binding_manifest(
+        ordered,
+        invoke_provider_predicate=False,
+    )
+    decision_basis = _premarket_decision_basis(ordered)
+    authority = CanonicalPremarketSourceBindingAuthority(
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        receipt_manifest=_canonical_receipt_manifest(
+            tuple(binding.receipt for binding in ordered)
+        ),
+        decision_basis=decision_basis,
+        binding_digest=_canonical_sha256(
+            "stock-monitor/premarket-source-bindings/v1",
+            binding_manifest,
+        ),
+    )
+    generation = getattr(journal, "_source_generation", None)
+    if type(generation) is not int or generation < 0:
+        raise CanonicalMaterialError("premarket Journal generation is invalid")
+    identity = id(authority)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _PREMARKET_SOURCE_BINDING_LOCK:
+            current = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(identity)
+            if current is not None and current.authority_reference is dead:
+                _ISSUED_PREMARKET_SOURCE_BINDINGS.pop(identity, None)
+
+    candidate = _PremarketSourceBindingCandidate(
+        authority_reference=ref(authority, discard),
+        authority_fingerprint=_value_fingerprint(authority),
+        journal_reference=ref(journal),
+        journal_generation=generation,
+        receipt_candidates=receipt_candidates,
+        bindings=ordered,
+        binding_manifest=binding_manifest,
+    )
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        _ISSUED_PREMARKET_SOURCE_BINDINGS[identity] = candidate
+    if not _is_current_premarket_source_binding_without_callbacks(
+        authority,
+        candidate,
+    ):
+        with _PREMARKET_SOURCE_BINDING_LOCK:
+            if _ISSUED_PREMARKET_SOURCE_BINDINGS.get(identity) is candidate:
+                _ISSUED_PREMARKET_SOURCE_BINDINGS.pop(identity, None)
+        raise CanonicalMaterialError(
+            "premarket source binding changed during issuance"
+        )
+    return authority
+
+
+def is_issued_canonical_premarket_source_binding_authority(
+    authority: object,
+    *,
+    journal: object,
+) -> bool:
+    """Return whether an exact source binding remains current for one owner."""
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        candidate = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(id(authority))
+    if candidate is None or candidate.journal_reference() is not journal:
+        return False
+    try:
+        _premarket_binding_manifest(
+            candidate.bindings,
+            invoke_provider_predicate=True,
+        )
+    except Exception:
+        return False
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        refreshed = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(id(authority))
+    return bool(
+        refreshed is candidate
+        and _is_current_premarket_source_binding_without_callbacks(
+            authority,
+            candidate,
+        )
+    )
+
+
+def _premarket_reviewed_bindings(
+    authority: object,
+) -> tuple[PremarketSourceBinding, ...]:
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        candidate = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(id(authority))
+    if not _is_current_premarket_source_binding_without_callbacks(
+        authority,
+        candidate,
+    ):
+        raise CanonicalMaterialError(
+            "premarket source binding authority is unavailable"
+        )
+    assert candidate is not None
+    return tuple(
+        binding
+        for binding in candidate.bindings
+        if binding.receipt.health_result == "REVIEWED"
+    )
 
 
 def _validate_report(
@@ -1149,6 +1861,12 @@ class _PremarketCompositionEnvelope:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    source_binding_digest: str | None = None
+    decision_basis: tuple[tuple[int, str, str], ...] = ()
+    calendar_release_sha256: str | None = None
+    universe_release_sha256: str | None = None
+    evidence_release_sha256: str | None = None
+    phase1_replay_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1157,6 +1875,10 @@ class _CompositionAuthorityCandidate:
     authority_fingerprint: object
     envelope: object
     identity_children: tuple[object, ...]
+    journal_reference: ReferenceType[object] | None = None
+    journal_generation: int | None = None
+    source_binding_candidate: object | None = None
+    phase1_candidates: tuple[object, ...] = ()
 
 
 _PREMARKET_COMPOSITION_LOCK = threading.Lock()
@@ -1197,6 +1919,12 @@ def _premarket_composition_envelope(
     primary_plan: object | None,
     outcome: str,
     reason_codes: tuple[str, ...],
+    source_binding_digest: str | None = None,
+    decision_basis: tuple[tuple[int, str, str], ...] = (),
+    calendar_release_sha256: str | None = None,
+    universe_release_sha256: str | None = None,
+    evidence_release_sha256: str | None = None,
+    phase1_replay_digest: str | None = None,
 ) -> _PremarketCompositionEnvelope:
     from .workflows import PremarketSnapshot
 
@@ -1214,6 +1942,7 @@ def _premarket_composition_envelope(
         kind="PREMARKET",
         economic_at=decision_at,
         retrieved_at=retrieved_at,
+        decision_basis=decision_basis,
     )
     has_candidates = bool(snapshot.candidates)
     if has_candidates != (
@@ -1236,6 +1965,41 @@ def _premarket_composition_envelope(
     snapshot_digest = _snapshot_digest(snapshot)
     decision_digest = _publication_decision_digest(publication_decision)
     plan_digest = _long_plan_digest(primary_plan)
+    extended_values = (
+        source_binding_digest,
+        calendar_release_sha256,
+        universe_release_sha256,
+        evidence_release_sha256,
+        phase1_replay_digest,
+    )
+    if any(value is not None for value in extended_values):
+        if any(value is None for value in extended_values):
+            raise CanonicalMaterialError(
+                "premarket composition source authority is incomplete"
+            )
+        for value, label in zip(
+            extended_values,
+            (
+                "premarket source binding digest",
+                "premarket calendar release digest",
+                "premarket universe release digest",
+                "premarket evidence release digest",
+                "premarket Phase 1 replay digest",
+            ),
+            strict=True,
+        ):
+            _require_digest(value, label)
+        _require_premarket_decision_basis(decision_basis)
+        if tuple(item[0] for item in decision_basis) != tuple(
+            item[0] for item in receipt_manifest
+        ):
+            raise CanonicalMaterialError(
+                "premarket composition decision basis conflicts with receipts"
+            )
+    elif decision_basis:
+        raise CanonicalMaterialError(
+            "premarket composition decision basis lacks source authority"
+        )
     values: dict[str, object] = {
         "version": 1,
         "session_date": session_date.isoformat(),
@@ -1249,6 +2013,12 @@ def _premarket_composition_envelope(
         "primary_plan_digest": plan_digest,
         "outcome": outcome,
         "reason_codes": reasons,
+        "source_binding_digest": source_binding_digest,
+        "decision_basis": decision_basis,
+        "calendar_release_sha256": calendar_release_sha256,
+        "universe_release_sha256": universe_release_sha256,
+        "evidence_release_sha256": evidence_release_sha256,
+        "phase1_replay_digest": phase1_replay_digest,
     }
     return _PremarketCompositionEnvelope(
         session_date=session_date,
@@ -1266,6 +2036,12 @@ def _premarket_composition_envelope(
             "stock-monitor/canonical-premarket-composition/v1",
             values,
         ),
+        source_binding_digest=source_binding_digest,
+        decision_basis=decision_basis,
+        calendar_release_sha256=calendar_release_sha256,
+        universe_release_sha256=universe_release_sha256,
+        evidence_release_sha256=evidence_release_sha256,
+        phase1_replay_digest=phase1_replay_digest,
     )
 
 
@@ -1273,9 +2049,9 @@ def _premarket_composition_envelope(
 class CanonicalPremarketCompositionAuthority:
     """Task 10 hook for a complete premarket composition capability.
 
-    This value is intentionally not self-authenticating.  The foundation has
-    no public issuer, and a syntactically valid caller-built copy never passes
-    ``_is_issued_premarket_composition_authority``.
+    This value is intentionally not self-authenticating.  Only the public
+    issuer registers one exact owner-bound capability; a syntactically valid
+    caller-built copy never passes its issuance predicate.
     """
 
     session_date: date
@@ -1290,6 +2066,12 @@ class CanonicalPremarketCompositionAuthority:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    source_binding_digest: str | None = None
+    decision_basis: tuple[tuple[int, str, str], ...] = ()
+    calendar_release_sha256: str | None = None
+    universe_release_sha256: str | None = None
+    evidence_release_sha256: str | None = None
+    phase1_replay_digest: str | None = None
 
     def __post_init__(self) -> None:
         session_date = _require_session(self.session_date)
@@ -1334,6 +2116,35 @@ class CanonicalPremarketCompositionAuthority:
             raise CanonicalMaterialError(
                 "premarket breaker composition is inconsistent"
             )
+        extended_values = (
+            self.source_binding_digest,
+            self.calendar_release_sha256,
+            self.universe_release_sha256,
+            self.evidence_release_sha256,
+            self.phase1_replay_digest,
+        )
+        if any(value is not None for value in extended_values):
+            if any(value is None for value in extended_values):
+                raise CanonicalMaterialError(
+                    "premarket composition source authority is incomplete"
+                )
+            for value, label in zip(
+                extended_values,
+                (
+                    "premarket source binding digest",
+                    "premarket calendar release digest",
+                    "premarket universe release digest",
+                    "premarket evidence release digest",
+                    "premarket Phase 1 replay digest",
+                ),
+                strict=True,
+            ):
+                _require_digest(value, label)
+            _require_premarket_decision_basis(self.decision_basis)
+        elif self.decision_basis:
+            raise CanonicalMaterialError(
+                "premarket composition decision basis lacks source authority"
+            )
 
 
 def _is_issued_premarket_composition_authority(
@@ -1342,7 +2153,7 @@ def _is_issued_premarket_composition_authority(
     envelope: _PremarketCompositionEnvelope,
     identity_children: tuple[object, ...],
 ) -> bool:
-    """Verify a complete Task 10 envelope; the registry is empty for now."""
+    """Verify one exact registered Task 10 composition envelope."""
     if (
         type(authority) is not CanonicalPremarketCompositionAuthority
         or type(envelope) is not _PremarketCompositionEnvelope
@@ -1368,6 +2179,15 @@ def _is_issued_premarket_composition_authority(
         or authority.outcome != envelope.outcome
         or authority.reason_codes != envelope.reason_codes
         or authority.composition_digest != envelope.composition_digest
+        or authority.source_binding_digest != envelope.source_binding_digest
+        or authority.decision_basis != envelope.decision_basis
+        or authority.calendar_release_sha256
+        != envelope.calendar_release_sha256
+        or authority.universe_release_sha256
+        != envelope.universe_release_sha256
+        or authority.evidence_release_sha256
+        != envelope.evidence_release_sha256
+        or authority.phase1_replay_digest != envelope.phase1_replay_digest
     ):
         return False
     with _PREMARKET_COMPOSITION_LOCK:
@@ -1378,13 +2198,17 @@ def _is_issued_premarket_composition_authority(
             or candidate.authority_reference() is not authority
             or type(candidate.envelope) is not _PremarketCompositionEnvelope
             or type(candidate.identity_children) is not tuple
-            or len(candidate.identity_children) != len(identity_children)
+            or (
+                authority.source_binding_digest is None
+                and len(candidate.identity_children) != len(identity_children)
+            )
+            or len(candidate.identity_children) < len(identity_children)
             or any(
                 current is not expected
                 for current, expected in zip(
                     identity_children,
                     candidate.identity_children,
-                    strict=True,
+                    strict=False,
                 )
             )
         ):
@@ -1395,11 +2219,357 @@ def _is_issued_premarket_composition_authority(
             )
         except Exception:
             return False
+        extended_current = True
+        if authority.source_binding_digest is not None:
+            journal = (
+                None
+                if candidate.journal_reference is None
+                else candidate.journal_reference()
+            )
+            source_candidate = candidate.source_binding_candidate
+            source_authority_index = len(identity_children)
+            source_authority = (
+                None
+                if source_authority_index >= len(candidate.identity_children)
+                else candidate.identity_children[source_authority_index]
+            )
+            from . import journal as journal_module
+
+            extended_current = bool(
+                journal is not None
+                and not getattr(journal, "_closed", True)
+                and getattr(journal, "_source_generation", None)
+                == candidate.journal_generation
+                and type(source_candidate) is _PremarketSourceBindingCandidate
+                and _is_current_premarket_source_binding_without_callbacks(
+                    source_authority,
+                    source_candidate,
+                )
+                and all(
+                    journal_module._is_current_journal_authority_candidate_without_callbacks(
+                        phase1_candidate
+                    )
+                    for phase1_candidate in candidate.phase1_candidates
+                )
+            )
         return bool(
             candidate.authority_fingerprint == authority_fingerprint
             and candidate_envelope_fingerprint == envelope_fingerprint
+            and extended_current
             and _ISSUED_PREMARKET_COMPOSITIONS.get(id(authority)) is candidate
         )
+
+
+def _premarket_composition_extended_values(
+    authority: object,
+) -> dict[str, object]:
+    if (
+        type(authority) is not CanonicalPremarketCompositionAuthority
+        or authority.source_binding_digest is None
+    ):
+        return {}
+    return {
+        "source_binding_digest": authority.source_binding_digest,
+        "decision_basis": authority.decision_basis,
+        "calendar_release_sha256": authority.calendar_release_sha256,
+        "universe_release_sha256": authority.universe_release_sha256,
+        "evidence_release_sha256": authority.evidence_release_sha256,
+        "phase1_replay_digest": authority.phase1_replay_digest,
+    }
+
+
+def issue_canonical_premarket_composition_authority(
+    *,
+    journal: object,
+    session_date: date,
+    decision_at: datetime,
+    retrieved_at: datetime,
+    validation_window_id: str,
+    source_binding_authority: object,
+    snapshot: object,
+    publication_decision: object | None,
+    primary_plan: object | None,
+    outcome: str,
+    reason_codes: tuple[str, ...],
+    calendar: object,
+    universe: object,
+    evidence_release: object,
+    phase1_replay_children: tuple[object, ...],
+) -> CanonicalPremarketCompositionAuthority:
+    """Seal reviewed releases, receipt bindings, and replay children together."""
+    from . import evidence as evidence_module
+    from . import journal as journal_module
+    from . import market_calendar as calendar_module
+    from . import universe as universe_module
+    from .journal import Journal
+
+    if type(journal) is not Journal or getattr(journal, "_closed", True):
+        raise CanonicalMaterialError(
+            "premarket composition requires an open Journal owner"
+        )
+    session_date = _require_session(session_date)
+    decision_at = _require_time(decision_at, "premarket decision time")
+    retrieved_at = _require_time(retrieved_at, "premarket retrieval time")
+    _validate_premarket_times(session_date, decision_at, retrieved_at)
+    if (
+        type(phase1_replay_children) is not tuple
+        or len({id(child) for child in phase1_replay_children})
+        != len(phase1_replay_children)
+    ):
+        raise CanonicalMaterialError(
+            "premarket Phase 1 replay children are invalid"
+        )
+
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        source_candidate = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(
+            id(source_binding_authority)
+        )
+    if (
+        type(source_binding_authority)
+        is not CanonicalPremarketSourceBindingAuthority
+        or type(source_candidate) is not _PremarketSourceBindingCandidate
+        or source_candidate.journal_reference() is not journal
+        or source_binding_authority.decision_at != decision_at
+        or source_binding_authority.retrieved_at != retrieved_at
+        or not _is_current_premarket_source_binding_without_callbacks(
+            source_binding_authority,
+            source_candidate,
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket source binding authority has the wrong owner or is not current"
+        )
+
+    # Exhaust provider predicates and reviewed-release validators before the
+    # final Journal generation/candidate capture.
+    _premarket_binding_manifest(
+        source_candidate.bindings,
+        invoke_provider_predicate=True,
+    )
+    calendar_identity = _reviewed_binding_identity(calendar)
+    universe_identity = _reviewed_binding_identity(universe)
+    evidence_identity = _reviewed_binding_identity(evidence_release)
+    if (
+        type(calendar) is not calendar_module.MarketCalendar
+        or type(universe) is not universe_module.UniverseSnapshot
+        or type(evidence_release) is not evidence_module.ReviewedEvidenceRelease
+        or calendar_identity is None
+        or universe_identity is None
+        or evidence_identity is None
+        or calendar.year != session_date.year
+        or evidence_release.universe_sha256 != universe_identity[1]
+    ):
+        raise CanonicalMaterialError(
+            "premarket reviewed calendar, universe, or evidence release is inconsistent"
+        )
+    bound_sources = tuple(binding.source for binding in source_candidate.bindings)
+    required_reviewed_children = (
+        calendar,
+        universe,
+        evidence_release,
+        *tuple(evidence_release.by_symbol.values()),
+    )
+    if any(
+        sum(source is child for source in bound_sources) != 1
+        for child in required_reviewed_children
+    ):
+        raise CanonicalMaterialError(
+            "premarket reviewed release binding is incomplete"
+        )
+
+    expected_phase1_children = tuple(
+        bundle._phase1_source
+        for bundle in evidence_release.by_symbol.values()
+        if bundle._phase1_source is not None
+    )
+    if (
+        len(phase1_replay_children) != len(expected_phase1_children)
+        or any(
+            supplied is not expected
+            for supplied, expected in zip(
+                phase1_replay_children,
+                expected_phase1_children,
+                strict=True,
+            )
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket Phase 1 replay children conflict with reviewed evidence"
+        )
+
+    phase1_candidates = tuple(
+        journal_module._journal_any_source_authority_candidate(child)
+        for child in phase1_replay_children
+    )
+    if any(candidate is None for candidate in phase1_candidates):
+        raise CanonicalMaterialError(
+            "premarket Phase 1 replay authority is unavailable"
+        )
+    exact_phase1_candidates = tuple(
+        candidate for candidate in phase1_candidates if candidate is not None
+    )
+    if exact_phase1_candidates and (
+        journal_module._current_journal_source_authority_owner(
+            exact_phase1_candidates
+        )
+        is not journal
+    ):
+        raise CanonicalMaterialError(
+            "premarket Phase 1 replay children cross Journal owners"
+        )
+
+    # Reacquire the source candidate after every authority callback/check.
+    with _PREMARKET_SOURCE_BINDING_LOCK:
+        refreshed_source_candidate = _ISSUED_PREMARKET_SOURCE_BINDINGS.get(
+            id(source_binding_authority)
+        )
+    if (
+        refreshed_source_candidate is not source_candidate
+        or not _is_current_premarket_source_binding_without_callbacks(
+            source_binding_authority,
+            source_candidate,
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket source binding changed during composition"
+        )
+
+    receipts = tuple(binding.receipt for binding in source_candidate.bindings)
+    phase1_digest = _canonical_sha256(
+        "stock-monitor/premarket-phase1-replay/v1",
+        tuple(_value_fingerprint(child) for child in phase1_replay_children),
+    )
+    envelope = _premarket_composition_envelope(
+        session_date=session_date,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        validation_window_id=validation_window_id,
+        source_receipts=receipts,
+        snapshot=snapshot,
+        publication_decision=publication_decision,
+        primary_plan=primary_plan,
+        outcome=outcome,
+        reason_codes=reason_codes,
+        source_binding_digest=source_binding_authority.binding_digest,
+        decision_basis=source_binding_authority.decision_basis,
+        calendar_release_sha256=calendar_identity[1],
+        universe_release_sha256=universe_identity[1],
+        evidence_release_sha256=evidence_identity[1],
+        phase1_replay_digest=phase1_digest,
+    )
+    authority = CanonicalPremarketCompositionAuthority(
+        session_date=envelope.session_date,
+        decision_at=envelope.decision_at,
+        retrieved_at=envelope.retrieved_at,
+        validation_window_id=envelope.validation_window_id,
+        receipt_manifest=envelope.receipt_manifest,
+        source_digest=envelope.source_digest,
+        snapshot_digest=envelope.snapshot_digest,
+        publication_decision_digest=envelope.publication_decision_digest,
+        primary_plan_digest=envelope.primary_plan_digest,
+        outcome=envelope.outcome,
+        reason_codes=envelope.reason_codes,
+        composition_digest=envelope.composition_digest,
+        source_binding_digest=envelope.source_binding_digest,
+        decision_basis=envelope.decision_basis,
+        calendar_release_sha256=envelope.calendar_release_sha256,
+        universe_release_sha256=envelope.universe_release_sha256,
+        evidence_release_sha256=envelope.evidence_release_sha256,
+        phase1_replay_digest=envelope.phase1_replay_digest,
+    )
+    base_children = _premarket_composition_identity_children(
+        snapshot=snapshot,
+        source_receipts=receipts,
+        publication_decision=publication_decision,
+        primary_plan=primary_plan,
+    )
+    identity_children = (
+        *base_children,
+        source_binding_authority,
+        calendar,
+        universe,
+        evidence_release,
+        *tuple(evidence_release.by_symbol.values()),
+        *phase1_replay_children,
+    )
+    generation = getattr(journal, "_source_generation", None)
+    if type(generation) is not int or generation < 0:
+        raise CanonicalMaterialError("premarket Journal generation is invalid")
+    identity = id(authority)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _PREMARKET_COMPOSITION_LOCK:
+            current = _ISSUED_PREMARKET_COMPOSITIONS.get(identity)
+            if current is not None and current.authority_reference is dead:
+                _ISSUED_PREMARKET_COMPOSITIONS.pop(identity, None)
+
+    candidate = _CompositionAuthorityCandidate(
+        authority_reference=ref(authority, discard),
+        authority_fingerprint=_value_fingerprint(authority),
+        envelope=envelope,
+        identity_children=identity_children,
+        journal_reference=ref(journal),
+        journal_generation=generation,
+        source_binding_candidate=source_candidate,
+        phase1_candidates=exact_phase1_candidates,
+    )
+    with _PREMARKET_COMPOSITION_LOCK:
+        _ISSUED_PREMARKET_COMPOSITIONS[identity] = candidate
+    if not _is_issued_premarket_composition_authority(
+        authority,
+        envelope=envelope,
+        identity_children=base_children,
+    ):
+        with _PREMARKET_COMPOSITION_LOCK:
+            if _ISSUED_PREMARKET_COMPOSITIONS.get(identity) is candidate:
+                _ISSUED_PREMARKET_COMPOSITIONS.pop(identity, None)
+        raise CanonicalMaterialError(
+            "premarket composition changed during issuance"
+        )
+    return authority
+
+
+def is_issued_canonical_premarket_composition_authority(
+    authority: object,
+) -> bool:
+    """Return whether one exact Task 10 composition capability is current."""
+    with _PREMARKET_COMPOSITION_LOCK:
+        candidate = _ISSUED_PREMARKET_COMPOSITIONS.get(id(authority))
+    if (
+        type(authority) is not CanonicalPremarketCompositionAuthority
+        or type(candidate) is not _CompositionAuthorityCandidate
+        or type(candidate.envelope) is not _PremarketCompositionEnvelope
+    ):
+        return False
+    base_length = 1 + len(candidate.envelope.receipt_manifest) + 2
+    if authority.source_binding_digest is None:
+        return _is_issued_premarket_composition_authority(
+            authority,
+            envelope=candidate.envelope,
+            identity_children=candidate.identity_children,
+        )
+    source_authority = candidate.identity_children[base_length]
+    journal = (
+        None
+        if candidate.journal_reference is None
+        else candidate.journal_reference()
+    )
+    if journal is None or not (
+        is_issued_canonical_premarket_source_binding_authority(
+            source_authority,
+            journal=journal,
+        )
+    ):
+        return False
+    with _PREMARKET_COMPOSITION_LOCK:
+        refreshed = _ISSUED_PREMARKET_COMPOSITIONS.get(id(authority))
+    if refreshed is not candidate:
+        return False
+    return _is_issued_premarket_composition_authority(
+        authority,
+        envelope=candidate.envelope,
+        identity_children=candidate.identity_children[:base_length],
+    )
 
 
 def canonical_premarket_state_hash(
@@ -1424,6 +2594,7 @@ def canonical_premarket_state_hash(
             "premarket state hash requires an exact normalized snapshot"
         )
     receipts = _receipt_set(source_receipts)
+    extended = _premarket_composition_extended_values(composition_authority)
     envelope = _premarket_composition_envelope(
         session_date=session_date,
         decision_at=decision_at,
@@ -1435,6 +2606,7 @@ def canonical_premarket_state_hash(
         primary_plan=primary_plan,
         outcome=outcome,
         reason_codes=reason_codes,
+        **extended,
     )
     if not _is_issued_premarket_composition_authority(
         composition_authority,
@@ -1463,6 +2635,12 @@ def canonical_premarket_state_hash(
         "outcome": envelope.outcome,
         "reason_codes": envelope.reason_codes,
         "composition_digest": envelope.composition_digest,
+        "source_binding_digest": envelope.source_binding_digest,
+        "decision_basis": envelope.decision_basis,
+        "calendar_release_sha256": envelope.calendar_release_sha256,
+        "universe_release_sha256": envelope.universe_release_sha256,
+        "evidence_release_sha256": envelope.evidence_release_sha256,
+        "phase1_replay_digest": envelope.phase1_replay_digest,
     }
     return _canonical_sha256(
         "stock-monitor/canonical-premarket-state/v1",
@@ -1837,6 +3015,7 @@ class CanonicalPremarketMaterial:
             kind="PREMARKET",
             economic_at=decision_at,
             retrieved_at=retrieved_at,
+            decision_basis=self.composition_authority.decision_basis,
         )
         state_hash = _require_digest(self.state_hash, "premarket state hash")
         _require_digest(self.source_digest, "premarket source digest")
@@ -1992,6 +3171,9 @@ def _composition_envelope_for_material(
             primary_plan=material.primary_plan,
             outcome=material.report.outcome,
             reason_codes=reasons,
+            **_premarket_composition_extended_values(
+                material.composition_authority
+            ),
         )
     if type(material) is CanonicalCloseMaterial:
         return _close_composition_envelope(
@@ -2469,6 +3651,41 @@ def _current_receipt_candidates(
     return exact_candidates
 
 
+def _premarket_economic_external_source_ids(
+    composition_authority: object,
+) -> tuple[str, ...]:
+    """Read exact external identities from bound objects, never Journal details."""
+    from .providers.alpaca import ProviderFetchPageBundle
+    from .providers.cache import SourceDocument
+
+    with _PREMARKET_COMPOSITION_LOCK:
+        composition_candidate = _ISSUED_PREMARKET_COMPOSITIONS.get(
+            id(composition_authority)
+        )
+    source_candidate = (
+        None
+        if composition_candidate is None
+        else composition_candidate.source_binding_candidate
+    )
+    if type(source_candidate) is not _PremarketSourceBindingCandidate:
+        raise CanonicalMaterialError(
+            "canonical premarket source binding authority is unavailable"
+        )
+    identifiers: list[str] = []
+    for binding in source_candidate.bindings:
+        if binding.decision_basis != "ECONOMIC_INPUT":
+            continue
+        if type(binding.source) is ProviderFetchPageBundle:
+            identifiers.append(binding.source.page.source_observation_id)
+        elif type(binding.source) is SourceDocument:
+            identifiers.append(binding.source.source_observation_id)
+    if len(identifiers) != len(set(identifiers)):
+        raise CanonicalMaterialError(
+            "canonical premarket external source identity is duplicated"
+        )
+    return tuple(identifiers)
+
+
 def _capture_premarket_domain_authority(
     material: CanonicalPremarketMaterial,
     journal: object,
@@ -2526,25 +3743,9 @@ def _capture_premarket_domain_authority(
     observation_manifest = screening_module._publication_observation_manifest(
         decision
     )
-    external_source_ids: list[str] = []
-    for receipt in material.source_receipts:
-        try:
-            details = json.loads(receipt.details_json)
-        except (TypeError, ValueError):
-            raise CanonicalMaterialError(
-                "canonical source receipt details are malformed"
-            ) from None
-        if type(details) is not dict:
-            raise CanonicalMaterialError(
-                "canonical source receipt details are malformed"
-            )
-        external_id = details.get("source_observation_id")
-        if external_id is not None:
-            if type(external_id) is not str or not external_id:
-                raise CanonicalMaterialError(
-                    "canonical external source identity is malformed"
-                )
-            external_source_ids.append(external_id)
+    external_source_ids = _premarket_economic_external_source_ids(
+        material.composition_authority
+    )
     manifest_source_ids = observation_manifest.source_observation_ids
     if any(
         external_source_ids.count(source_id) != 1
@@ -3153,13 +4354,19 @@ __all__ = [
     "CanonicalMaterialError",
     "CanonicalPremarketCompositionAuthority",
     "CanonicalPremarketMaterial",
+    "CanonicalPremarketSourceBindingAuthority",
     "CanonicalWorkflowAdapter",
+    "PremarketSourceBinding",
     "canonical_close_state_hash",
     "canonical_material_digest",
     "canonical_premarket_state_hash",
     "canonical_source_digest",
     "canonical_source_receipts",
     "is_issued_canonical_material",
+    "is_issued_canonical_premarket_composition_authority",
+    "is_issued_canonical_premarket_source_binding_authority",
     "issue_canonical_close_material",
     "issue_canonical_premarket_material",
+    "issue_canonical_premarket_composition_authority",
+    "issue_canonical_premarket_source_binding_authority",
 ]

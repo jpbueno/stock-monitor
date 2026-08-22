@@ -271,6 +271,75 @@ class CanonicalPremarketSourceBindingAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class PremarketProviderCollection:
+    """Exact injectable output of one bounded premarket collection pass."""
+
+    provider_cohorts: tuple[object, ...] = ()
+    reference_sources: tuple[object, ...] = ()
+    contexts: tuple[object, ...] = ()
+    persisted_bindings: tuple[PremarketSourceBinding, ...] = ()
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.provider_cohorts,
+            self.reference_sources,
+            self.contexts,
+            self.persisted_bindings,
+        ):
+            if type(value) is not tuple:
+                raise CanonicalMaterialError(
+                    "premarket collection values must be exact tuples"
+                )
+        if self.failure_reason not in {
+            None,
+            "DATA_UNAVAILABLE",
+            "PROVIDER_CHECK_FAILED",
+            "SOURCE_CHECK_FAILED",
+        }:
+            raise CanonicalMaterialError(
+                "premarket collection failure reason is unsupported"
+            )
+        if any(
+            type(binding) is not PremarketSourceBinding
+            for binding in self.persisted_bindings
+        ):
+            raise CanonicalMaterialError(
+                "premarket persisted bindings are malformed"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PremarketRiskResolution:
+    """Exact risk authority selected after the final source reread."""
+
+    breaker_state: object
+    primary_plan: object | None = None
+    publication_decision: object | None = None
+
+    def __post_init__(self) -> None:
+        if (self.primary_plan is None) != (self.publication_decision is None):
+            raise CanonicalMaterialError(
+                "premarket plan and publication decision must be paired"
+            )
+
+
+class PremarketCollectionError(RuntimeError):
+    """Provider failure carrying every page already durably persisted."""
+
+    def __init__(self, collection: PremarketProviderCollection) -> None:
+        if (
+            type(collection) is not PremarketProviderCollection
+            or collection.failure_reason is None
+        ):
+            raise CanonicalMaterialError(
+                "premarket collection error requires a failed handoff"
+            )
+        self.collection = collection
+        super().__init__(collection.failure_reason)
+
+
+@dataclass(frozen=True, slots=True)
 class _PremarketSourceBindingCandidate:
     authority_reference: ReferenceType[object]
     authority_fingerprint: object
@@ -360,6 +429,351 @@ class CanonicalWorkflowAdapter(Protocol):
         review_at: datetime,
         retrieved_at: datetime,
     ) -> CanonicalCloseMaterial: ...
+
+
+class PremarketWorkflowCoordinator:
+    """Injectable canonical premarket collection and composition boundary."""
+
+    __slots__ = (
+        "_collector",
+        "_journal",
+        "_project_root",
+        "_report_archive_root",
+        "_risk_resolver",
+        "_validation_window_id",
+    )
+
+    def __init__(
+        self,
+        *,
+        journal: object,
+        project_root: Path,
+        report_archive_root: Path,
+        collector: object,
+        risk_resolver: object | None,
+        validation_window_id: str,
+    ) -> None:
+        from .journal import Journal
+
+        if type(journal) is not Journal or getattr(journal, "_closed", True):
+            raise CanonicalMaterialError(
+                "premarket coordinator requires an open Journal"
+            )
+        for value, label in (
+            (project_root, "project root"),
+            (report_archive_root, "report archive root"),
+        ):
+            if type(value) is not type(Path()) or not value.is_absolute():
+                raise CanonicalMaterialError(
+                    f"premarket coordinator {label} must be an absolute path"
+                )
+        if not project_root.is_dir() or project_root.is_symlink():
+            raise CanonicalMaterialError(
+                "premarket coordinator project root is unavailable"
+            )
+        _canonical_archive_root(report_archive_root)
+        if not callable(getattr(collector, "collect", None)):
+            raise CanonicalMaterialError(
+                "premarket coordinator collector is unavailable"
+            )
+        if risk_resolver is not None and not callable(
+            getattr(risk_resolver, "resolve", None)
+        ):
+            raise CanonicalMaterialError(
+                "premarket coordinator risk resolver is unavailable"
+            )
+        self._journal = journal
+        self._project_root = project_root
+        self._report_archive_root = report_archive_root
+        self._collector = collector
+        self._risk_resolver = risk_resolver
+        self._validation_window_id = _validation_window_id(
+            validation_window_id
+        )
+
+    def premarket_material(
+        self,
+        session_date: date,
+        *,
+        decision_at: datetime,
+        retrieved_at: datetime,
+    ) -> CanonicalPremarketMaterial:
+        """Compose one canonical premarket material from stable Journal inputs."""
+        from .evidence import EvidenceRegistryError, EvidenceUnavailableError
+        from .market_calendar import CalendarError, load_current_market_calendar
+        from .universe import UniverseError, load_current_universe
+        from .workflows import WorkflowDataError
+
+        session_date = _require_session(session_date)
+        decision_at = _require_time(decision_at, "premarket decision time")
+        retrieved_at = _require_time(retrieved_at, "premarket retrieval time")
+        _validate_premarket_times(session_date, decision_at, retrieved_at)
+        try:
+            calendar = load_current_market_calendar(
+                project_root=self._project_root,
+                as_of=session_date,
+            )
+        except (CalendarError, OSError) as error:
+            raise WorkflowDataError("STALE_CALENDAR") from error
+        try:
+            universe = load_current_universe(
+                self._project_root,
+                as_of=session_date,
+            )
+        except (UniverseError, OSError) as error:
+            raise WorkflowDataError("STALE_UNIVERSE") from error
+        try:
+            evidence_release, evidence_failure = (
+                _load_coordinator_evidence_release(
+                    project_root=self._project_root,
+                    decision_at=decision_at,
+                    universe=universe,
+                )
+            )
+            bindings = _persist_premarket_reviewed_bindings(
+                journal=self._journal,
+                project_root=self._project_root,
+                calendar=calendar,
+                universe=universe,
+                evidence_release=evidence_release,
+                retrieved_at=retrieved_at,
+            )
+        except (EvidenceRegistryError, EvidenceUnavailableError, OSError) as error:
+            raise WorkflowDataError("SOURCE_CHECK_FAILED") from error
+        if calendar.is_open(session_date):
+            if evidence_failure is not None:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO NEW TRADE - DATA UNAVAILABLE",
+                    reason_codes=(evidence_failure,),
+                    phase1_replay_children=_evidence_phase1_children(
+                        evidence_release
+                    ),
+                )
+            required_symbols = tuple(
+                record.symbol for record in universe.records if record.enabled
+            )
+            try:
+                collection = self._collector.collect(
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    required_symbols=required_symbols,
+                )
+            except PremarketCollectionError as error:
+                collection = error.collection
+            except Exception as error:
+                from .providers.http import (
+                    NetworkPolicyError,
+                    ProviderResponseError,
+                )
+
+                if isinstance(error, (NetworkPolicyError, ProviderResponseError)):
+                    raise WorkflowDataError("PROVIDER_CHECK_FAILED") from error
+                raise
+            if type(collection) is not PremarketProviderCollection:
+                raise CanonicalMaterialError(
+                    "premarket collector returned an invalid result"
+                )
+            bindings = _reread_premarket_bindings(
+                self._journal,
+                (*bindings, *collection.persisted_bindings),
+            )
+            if collection.failure_reason is not None:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO NEW TRADE - DATA UNAVAILABLE",
+                    reason_codes=(collection.failure_reason,),
+                    phase1_replay_children=_evidence_phase1_children(
+                        evidence_release
+                    ),
+                )
+            _require_complete_premarket_provider_handoff(
+                collection,
+                required_symbols,
+            )
+            _require_complete_premarket_reference_handoff(collection)
+            ranked = _rank_premarket_contexts(
+                collection.contexts,
+                session_date=session_date,
+                decision_at=decision_at,
+                retrieved_at=retrieved_at,
+                calendar=calendar,
+                universe=universe,
+                evidence_release=evidence_release,
+                bindings=bindings,
+            )
+            cohort_data_unavailable = ranked is None
+            ranked_candidates = () if ranked is None else ranked
+            if self._risk_resolver is None:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO NEW TRADE - DATA UNAVAILABLE",
+                    reason_codes=("PROVIDER_CHECK_FAILED",),
+                    phase1_replay_children=_evidence_phase1_children(
+                        evidence_release
+                    ),
+                )
+            resolution = self._risk_resolver.resolve(
+                journal=self._journal,
+                session_date=session_date,
+                decision_at=decision_at,
+                retrieved_at=retrieved_at,
+                calendar=calendar,
+                universe=universe,
+                evidence_release=evidence_release,
+                ranked_candidates=ranked_candidates,
+            )
+            breaker_active = _validate_premarket_risk_resolution(
+                resolution,
+                session_date=session_date,
+                ranked_candidates=ranked_candidates,
+            )
+            phase1_children = _premarket_phase1_children(
+                evidence_release,
+                resolution,
+            )
+            if breaker_active:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(True),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO TRADE",
+                    reason_codes=("ACTIVE_BREAKER",),
+                    phase1_replay_children=phase1_children,
+                    breaker_state=resolution.breaker_state,
+                )
+            if cohort_data_unavailable:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO NEW TRADE - DATA UNAVAILABLE",
+                    reason_codes=("DATA_UNAVAILABLE",),
+                    phase1_replay_children=phase1_children,
+                    breaker_state=resolution.breaker_state,
+                )
+            if not ranked_candidates:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation_window_id=self._validation_window_id,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    outcome="NO TRADE",
+                    reason_codes=("NO_CANDIDATES",),
+                    phase1_replay_children=phase1_children,
+                    breaker_state=resolution.breaker_state,
+                )
+            return _issue_coordinator_premarket_branch(
+                journal=self._journal,
+                report_archive_root=self._report_archive_root,
+                session_date=session_date,
+                decision_at=decision_at,
+                retrieved_at=retrieved_at,
+                validation_window_id=self._validation_window_id,
+                bindings=bindings,
+                calendar=calendar,
+                universe=universe,
+                evidence_release=evidence_release,
+                snapshot=_premarket_candidate_snapshot(resolution),
+                publication_decision=resolution.publication_decision,
+                primary_plan=resolution.primary_plan,
+                outcome="CANDIDATES",
+                reason_codes=(
+                    "PAPER_PLAN_ONLY",
+                    "MANUAL_EXECUTION_REQUIRED",
+                ),
+                phase1_replay_children=phase1_children,
+                breaker_state=resolution.breaker_state,
+            )
+        return _issue_coordinator_premarket_branch(
+            journal=self._journal,
+            report_archive_root=self._report_archive_root,
+            session_date=session_date,
+            decision_at=decision_at,
+            retrieved_at=retrieved_at,
+            validation_window_id=self._validation_window_id,
+            bindings=bindings,
+            calendar=calendar,
+            universe=universe,
+            evidence_release=evidence_release,
+            snapshot=_empty_premarket_snapshot(False),
+            publication_decision=None,
+            primary_plan=None,
+            outcome="NO TRADE",
+            reason_codes=("MARKET_CLOSED",),
+            phase1_replay_children=_evidence_phase1_children(
+                evidence_release
+            ),
+        )
 
 
 def _require_digest(value: object, label: str) -> str:
@@ -1208,6 +1622,10 @@ def _premarket_binding_manifest(
             binding.source
             for binding in bindings
             if type(binding.source) is SourceDocument
+            and any(
+                binding.source is expected
+                for expected in reviewed_documents
+            )
         )
         if (
             len(supplied_documents) != len(reviewed_documents)
@@ -1245,13 +1663,24 @@ def _validate_premarket_binding_chronology(
     decision_at: datetime,
     retrieved_at: datetime,
 ) -> None:
+    from . import evidence as evidence_module
+
+    reviewed_documents = tuple(
+        source_binding.document
+        for binding in bindings
+        if type(binding.source) is evidence_module.ReviewedEvidenceRelease
+        for bundle in binding.source.by_symbol.values()
+        for source_binding in bundle.source_bindings
+    )
     for binding in bindings:
         receipt = binding.receipt
         if receipt.retrieved_at > retrieved_at or receipt.source_time > receipt.retrieved_at:
             raise CanonicalMaterialError(
                 "premarket source receipt exceeds its retrieval envelope"
             )
-        operational = _binding_is_operational_only(binding.source)
+        operational = _binding_is_operational_only(binding.source) and not any(
+            binding.source is document for document in reviewed_documents
+        )
         if operational != (
             binding.decision_basis == "OPERATIONAL_HEALTH_ONLY"
         ):
@@ -1467,6 +1896,932 @@ def _premarket_reviewed_bindings(
         binding
         for binding in candidate.bindings
         if binding.receipt.health_result == "REVIEWED"
+    )
+
+
+def _empty_premarket_snapshot(breaker_active: bool) -> object:
+    from .workflows import PremarketSnapshot
+
+    return PremarketSnapshot((), breaker_active)
+
+
+def _bound_premarket_external_ids(
+    bindings: tuple[PremarketSourceBinding, ...],
+) -> tuple[str, ...]:
+    from .providers.alpaca import ProviderFetchPageBundle
+    from .providers.cache import SourceDocument
+
+    identifiers: list[str] = []
+    for binding in bindings:
+        if type(binding.source) is ProviderFetchPageBundle:
+            identifiers.append(binding.source.page.source_observation_id)
+        elif type(binding.source) is SourceDocument:
+            identifiers.append(binding.source.source_observation_id)
+    if len(identifiers) != len(set(identifiers)):
+        raise CanonicalMaterialError(
+            "premarket bound external source identity is duplicated"
+        )
+    return tuple(identifiers)
+
+
+def _rank_premarket_contexts(
+    contexts: tuple[object, ...],
+    *,
+    session_date: date,
+    decision_at: datetime,
+    retrieved_at: datetime,
+    calendar: object,
+    universe: object,
+    evidence_release: object,
+    bindings: tuple[PremarketSourceBinding, ...],
+) -> tuple[object, ...] | None:
+    """Validate one complete release cohort and issue its ranked candidates."""
+    from . import evidence as evidence_module
+    from . import screening as screening_module
+    from .providers import reference as reference_module
+
+    expected_records = tuple(record for record in universe.records if record.enabled)
+    if (
+        type(contexts) is not tuple
+        or len(contexts) != len(expected_records)
+        or any(type(context) is not screening_module.CandidateContext for context in contexts)
+    ):
+        raise CanonicalMaterialError(
+            "premarket candidate context cohort is incomplete"
+        )
+    by_symbol = {context.record.symbol: context for context in contexts}
+    if tuple(sorted(by_symbol)) != tuple(sorted(record.symbol for record in expected_records)):
+        raise CanonicalMaterialError(
+            "premarket candidate context symbols are incomplete"
+        )
+    bound_ids = _bound_premarket_external_ids(bindings)
+    for record in expected_records:
+        context = by_symbol[record.symbol]
+        bundle = evidence_release.by_symbol.get(record.symbol)
+        decision = context.evidence
+        status = context.instrument_status
+        if (
+            context.record is not record
+            or context.session_date != session_date
+            or context.as_of != decision_at
+            or context.operational_as_of != retrieved_at
+            or context.market_calendar is not calendar
+            or bundle is None
+            or not evidence_module.is_reviewed_evidence_decision(decision)
+            or decision._reviewed_bundle is not bundle
+            or not reference_module.is_reviewed_instrument_status_decision(status)
+            or status.symbol != record.symbol
+            or status.as_of > retrieved_at
+            or any(bound_ids.count(source_id) != 1 for source_id in decision.source_observation_ids)
+            or any(bound_ids.count(source_id) != 1 for source_id in status.source_observation_ids)
+        ):
+            raise CanonicalMaterialError(
+                "premarket candidate context authority is inconsistent"
+            )
+        try:
+            facts = screening_module._candidate_market_facts(context)
+        except Exception as error:
+            raise CanonicalMaterialError(
+                "premarket candidate market facts are incomplete"
+            ) from error
+        for fact in facts:
+            source_id = getattr(fact, "source_observation_id", None)
+            if (
+                bound_ids.count(source_id) != 1
+                or not screening_module.is_issued_normalized_market_fact(fact)
+            ):
+                raise CanonicalMaterialError(
+                    "premarket candidate market-fact authority is unavailable"
+                )
+        if any(
+            bar.timestamp > decision_at
+            for values in context.bars_by_symbol.values()
+            for bar in values
+        ) or (
+            context.previous_session_quote is not None
+            and context.previous_session_quote.timestamp > decision_at
+        ):
+            raise CanonicalMaterialError(
+                "premarket economic market fact exceeds the decision cutoff"
+            )
+        if (
+            context.latest_iex_quote is not None
+            and context.latest_iex_quote.timestamp > retrieved_at
+        ):
+            raise CanonicalMaterialError(
+                "premarket operational quote exceeds retrieval"
+            )
+
+    cohort = screening_module.build_base_eligible_cohort(
+        contexts,
+        universe=universe,
+    )
+    return _rank_premarket_cohort(cohort)
+
+
+def _rank_premarket_cohort(cohort: object) -> tuple[object, ...] | None:
+    from . import screening as screening_module
+
+    if type(cohort) is not screening_module.CohortDecision:
+        raise CanonicalMaterialError("premarket cohort decision is malformed")
+    if cohort.status == "DATA_UNAVAILABLE":
+        return None
+    if cohort.status == "NO_TRADE":
+        return ()
+    if cohort.status != "READY":
+        raise CanonicalMaterialError("premarket cohort decision is unsupported")
+    candidates = tuple(
+        screening_module.to_scored_candidate(context)
+        for context in cohort.contexts
+        if screening_module.score_candidate(context).publishable
+        and screening_module.detect_setup(context).eligible
+    )
+    return screening_module.rank_candidates(candidates)
+
+
+def _validate_premarket_risk_resolution(
+    resolution: object,
+    *,
+    session_date: date,
+    ranked_candidates: tuple[object, ...],
+) -> bool:
+    from . import risk as risk_module
+    from . import screening as screening_module
+
+    if type(resolution) is not PremarketRiskResolution:
+        raise CanonicalMaterialError(
+            "premarket risk resolver returned an invalid result"
+        )
+    breaker = resolution.breaker_state
+    if not (
+        risk_module.is_issued_breaker_state(breaker)
+        or risk_module.is_issued_paired_breaker_state(breaker)
+    ):
+        raise CanonicalMaterialError(
+            "premarket breaker authority is unavailable"
+        )
+    breaker_active = risk_module.breaker_pauses_entry(
+        breaker,
+        session_date,
+    )
+    decision = resolution.publication_decision
+    plan = resolution.primary_plan
+    if breaker_active or not ranked_candidates:
+        if decision is not None or plan is not None:
+            raise CanonicalMaterialError(
+                "premarket blocked cohort cannot carry a sized plan"
+            )
+        return breaker_active
+    if (
+        not risk_module.is_issued_long_plan_decision(plan)
+        or not screening_module.is_issued_publication_decision_for_plan(
+            decision,
+            plan,
+        )
+        or tuple(item.candidate for item in decision.candidates)
+        != ranked_candidates[:3]
+    ):
+        raise CanonicalMaterialError(
+            "premarket candidate risk authority is inconsistent"
+        )
+    return False
+
+
+def _premarket_candidate_snapshot(
+    resolution: PremarketRiskResolution,
+) -> object:
+    """Project one sized primary and at most two unsized ranked shadows."""
+    from .reports import (
+        PremarketCandidate,
+        PremarketShadow,
+        ReportSource,
+        ScoreComponent,
+    )
+    from . import screening as screening_module
+    from .workflows import CandidateSummary, PremarketSnapshot
+
+    decision = resolution.publication_decision
+    plan = resolution.primary_plan
+    if decision is None or plan is None or plan.plan is None:
+        raise CanonicalMaterialError(
+            "premarket candidate projection lacks a primary plan"
+        )
+    summaries: list[CandidateSummary] = []
+    for publication in decision.candidates:
+        candidate = publication.candidate
+        setup = candidate.setup
+        score = candidate.score_card
+        if setup is None or setup.setup_type is None or score is None:
+            raise CanonicalMaterialError(
+                "premarket candidate projection is incomplete"
+            )
+        if publication.role == "PRIMARY":
+            issued = screening_module._issued_scored_candidate_authority(
+                candidate
+            )
+            if issued is None:
+                raise CanonicalMaterialError(
+                    "premarket primary candidate authority is unavailable"
+                )
+            context = issued.context
+            evidence = context.evidence
+            reviewed_bundle = evidence._reviewed_bundle
+            links = tuple(
+                dict.fromkeys(
+                    record.primary_url
+                    for record in evidence.qualifying_records
+                )
+            )
+            if not links:
+                links = tuple(
+                    dict.fromkeys(
+                        binding.primary_url
+                        for binding in reviewed_bundle.source_bindings
+                    )
+                )
+            sources = tuple(
+                ReportSource(label="Reviewed evidence", url=url)
+                for url in links
+            )
+            material = PremarketCandidate(
+                symbol=candidate.symbol,
+                role="PRIMARY",
+                setup=setup.setup_type,
+                score_components=(
+                    ScoreComponent(
+                        "Trend and market regime",
+                        score.trend_and_regime,
+                        25,
+                    ),
+                    ScoreComponent(
+                        "Relative strength",
+                        score.relative_strength,
+                        20,
+                    ),
+                    ScoreComponent(
+                        "Setup quality",
+                        score.setup_quality,
+                        20,
+                    ),
+                    ScoreComponent(
+                        "Volume confirmation",
+                        score.volume_confirmation,
+                        15,
+                    ),
+                    ScoreComponent(
+                        "Verified catalyst/context",
+                        score.catalyst_context,
+                        10,
+                    ),
+                    ScoreComponent(
+                        "Liquidity and execution",
+                        score.liquidity_execution,
+                        10,
+                    ),
+                ),
+                trigger=candidate.trigger_price,
+                maximum_entry=candidate.maximum_permitted_entry,
+                recommended_stop=candidate.recommended_stop,
+                target=candidate.target_price,
+                shares=plan.plan.quantity,
+                planned_risk=plan.plan.planned_risk,
+                provider="ALPACA",
+                feed="SIP",
+                observed_at=context.previous_session_quote.timestamp,
+                invalidations=(
+                    "Do not enter above the maximum permitted entry.",
+                    "Cancel if reviewed evidence or market-status checks block entry.",
+                ),
+                sources=sources,
+            )
+        elif publication.role == "WATCHLIST_SHADOW":
+            material = PremarketShadow(
+                symbol=candidate.symbol,
+                role="WATCHLIST_SHADOW",
+                score=Decimal(candidate.total_score),
+                setup=setup.setup_type,
+                trigger=candidate.trigger_price,
+            )
+        else:
+            raise CanonicalMaterialError(
+                "premarket publication role is unsupported"
+            )
+        summaries.append(
+            CandidateSummary(
+                symbol=candidate.symbol,
+                role=publication.role,
+                material=material,
+            )
+        )
+    return PremarketSnapshot(tuple(summaries), False)
+
+
+def _evidence_phase1_children(evidence_release: object) -> tuple[object, ...]:
+    return tuple(
+        bundle._phase1_source
+        for bundle in evidence_release.by_symbol.values()
+        if bundle._phase1_source is not None
+    )
+
+
+def _premarket_phase1_children(
+    evidence_release: object,
+    resolution: PremarketRiskResolution,
+) -> tuple[object, ...]:
+    from . import risk as risk_module
+
+    values = list(_evidence_phase1_children(evidence_release))
+    values.extend(
+        source
+        for source, _kind in risk_module._phase1_bound_sources(
+            resolution.breaker_state
+        )
+    )
+    if resolution.primary_plan is not None:
+        values.extend(
+            source
+            for source, _kind in risk_module._phase1_bound_sources(
+                resolution.primary_plan.portfolio_authority
+            )
+        )
+    unique: list[object] = []
+    for value in values:
+        if not any(value is present for present in unique):
+            unique.append(value)
+    return tuple(unique)
+
+
+def _load_coordinator_evidence_release(
+    *,
+    project_root: Path,
+    decision_at: datetime,
+    universe: object,
+) -> tuple[object, str | None]:
+    """Load current evidence or bind the exact stale release for a safe branch."""
+    from .evidence import (
+        EvidenceRegistryError,
+        load_current_evidence_release,
+    )
+
+    try:
+        return (
+            load_current_evidence_release(
+                project_root,
+                as_of=decision_at,
+                universe=universe,
+            ),
+            None,
+        )
+    except EvidenceRegistryError as current_error:
+        try:
+            payload = (
+                project_root / "data" / "evidence" / "current.json"
+            ).read_bytes()
+            document = json.loads(payload)
+            reviewed_text = document["reviewed_at"]
+            if type(reviewed_text) is not str or not reviewed_text.endswith("Z"):
+                raise ValueError
+            reviewed_at = datetime.fromisoformat(
+                reviewed_text[:-1] + "+00:00"
+            )
+            release = load_current_evidence_release(
+                project_root,
+                as_of=reviewed_at,
+                universe=universe,
+            )
+        except (OSError, KeyError, TypeError, ValueError, EvidenceRegistryError):
+            raise current_error
+        if not (
+            release.reviewed_at <= decision_at < release.review_by
+        ):
+            return release, "SOURCE_CHECK_FAILED"
+        raise current_error
+
+
+def _reviewed_artifact_binding(
+    *,
+    journal: object,
+    role: str,
+    payload: bytes,
+    source_time: datetime,
+    retrieved_at: datetime,
+    source: object,
+) -> PremarketSourceBinding:
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt = journal.append_source_observation_receipt(
+        payload=payload,
+        source_uri=f"stock-monitor://reviewed/{role}/{digest}",
+        source_type="REVIEWED_ARTIFACT",
+        provider="operator-reviewed",
+        feed=None,
+        source_time=source_time,
+        retrieved_at=retrieved_at,
+        provider_sequence=None,
+        delay_seconds=int((retrieved_at - source_time).total_seconds()),
+        health_result="REVIEWED",
+        details={"role": role},
+    )
+    return PremarketSourceBinding(
+        receipt=receipt,
+        source=source,
+        decision_basis="ECONOMIC_INPUT",
+    )
+
+
+def _evidence_document_details(
+    document: object,
+    bundle: object,
+) -> dict[str, object]:
+    source_role = document.source_role
+    scoped = (
+        None
+        if source_role is None
+        else _SCOPED_REFERENCE_ROLE.fullmatch(source_role)
+    )
+    return {
+        "accession": document.accession,
+        "issuer_cik": bundle.issuer_cik if scoped is not None else None,
+        "source_observation_id": document.source_observation_id,
+        "source_role": source_role,
+        "symbol": bundle.symbol if scoped is not None else None,
+        "timestamp_source": document.timestamp_source,
+    }
+
+
+def _reviewed_document_binding(
+    *,
+    journal: object,
+    document: object,
+    bundle: object,
+) -> PremarketSourceBinding:
+    source_time = document.published_at or document.retrieved_at
+    receipt = journal.append_source_observation_receipt(
+        payload=document.body,
+        source_uri=document.url,
+        source_type=document.source_type,
+        provider=document.publisher,
+        feed=document.timestamp_source,
+        source_time=source_time,
+        retrieved_at=document.retrieved_at,
+        provider_sequence=None,
+        delay_seconds=int((document.retrieved_at - source_time).total_seconds()),
+        health_result="OK",
+        details=_evidence_document_details(document, bundle),
+    )
+    return PremarketSourceBinding(
+        receipt=receipt,
+        source=document,
+        # These exact bytes are frozen into the reviewed release before the
+        # economic cutoff.  Their original source role does not turn the
+        # reviewed decision into a late operational input.
+        decision_basis="ECONOMIC_INPUT",
+    )
+
+
+def _persist_premarket_reviewed_bindings(
+    *,
+    journal: object,
+    project_root: Path,
+    calendar: object,
+    universe: object,
+    evidence_release: object,
+    retrieved_at: datetime,
+) -> tuple[PremarketSourceBinding, ...]:
+    """Persist exact local release bytes and reread every resulting receipt."""
+    reviewed: list[PremarketSourceBinding] = []
+    reviewed.append(
+        _reviewed_artifact_binding(
+            journal=journal,
+            role="calendar",
+            payload=(
+                project_root / "data" / "calendars" / f"{calendar.year:04d}.json"
+            ).read_bytes(),
+            source_time=datetime.combine(
+                calendar.reviewed_at,
+                time.min,
+                _NEW_YORK,
+            ),
+            retrieved_at=retrieved_at,
+            source=calendar,
+        )
+    )
+    reviewed.append(
+        _reviewed_artifact_binding(
+            journal=journal,
+            role="universe",
+            payload=(
+                project_root
+                / "data"
+                / "universe"
+                / f"{universe.effective_date.isoformat()}.json"
+            ).read_bytes(),
+            source_time=datetime.combine(
+                universe.reviewed_at,
+                time.min,
+                _NEW_YORK,
+            ),
+            retrieved_at=retrieved_at,
+            source=universe,
+        )
+    )
+    reviewed.append(
+        _reviewed_artifact_binding(
+            journal=journal,
+            role="evidence-release",
+            payload=(project_root / "data" / "evidence" / "current.json").read_bytes(),
+            source_time=evidence_release.reviewed_at,
+            retrieved_at=retrieved_at,
+            source=evidence_release,
+        )
+    )
+    for symbol, bundle in evidence_release.by_symbol.items():
+        reviewed.append(
+            _reviewed_artifact_binding(
+                journal=journal,
+                role=f"evidence-{symbol.lower()}",
+                payload=(
+                    project_root
+                    / "data"
+                    / "evidence"
+                    / "subjects"
+                    / f"{symbol}.json"
+                ).read_bytes(),
+                source_time=bundle.reviewed_at,
+                retrieved_at=retrieved_at,
+                source=bundle,
+            )
+        )
+        reviewed.extend(
+            _reviewed_document_binding(
+                journal=journal,
+                document=source_binding.document,
+                bundle=bundle,
+            )
+            for source_binding in bundle.source_bindings
+        )
+    return _reread_premarket_bindings(journal, tuple(reviewed))
+
+
+def _reread_premarket_bindings(
+    journal: object,
+    bindings: tuple[PremarketSourceBinding, ...],
+) -> tuple[PremarketSourceBinding, ...]:
+    reread = journal.read_source_observation_receipts(
+        tuple(binding.receipt.row_id for binding in bindings)
+    )
+    return _ordered_premarket_bindings(
+        tuple(
+            replace(binding, receipt=receipt)
+            for binding, receipt in zip(bindings, reread, strict=True)
+        )
+    )
+
+
+def _terminal_premarket_provider_pages(
+    cohorts: tuple[object, ...],
+    required_symbols: tuple[str, ...],
+) -> tuple[object, ...]:
+    """Return every page from one exact complete three-role provider owner."""
+    from .providers import alpaca as alpaca_module
+
+    if (
+        type(cohorts) is not tuple
+        or len(cohorts) != 3
+        or any(
+            type(cohort) is not alpaca_module.ProviderFetchCohort
+            or not alpaca_module.is_issued_provider_fetch_cohort(cohort)
+            for cohort in cohorts
+        )
+        or not alpaca_module.provider_fetch_cohorts_share_owner(*cohorts)
+    ):
+        raise CanonicalMaterialError(
+            "premarket provider cohorts lack one exact current owner"
+        )
+    expected_symbols = tuple(sorted(set(required_symbols)))
+    if expected_symbols != required_symbols:
+        raise CanonicalMaterialError(
+            "premarket required-symbol cohort is not canonical"
+        )
+    bundles = tuple(
+        alpaca_module.read_provider_fetch_bundle(cohort) for cohort in cohorts
+    )
+    by_source_type: dict[str, object] = {}
+    for bundle in bundles:
+        if type(bundle) is not alpaca_module.ProviderFetchBundle:
+            raise CanonicalMaterialError(
+                "premarket provider disclosure is malformed"
+            )
+        manifest = bundle.manifest
+        pages = bundle.pages
+        if (
+            type(manifest) is not alpaca_module.ProviderFetchManifest
+            or manifest.terminal is not True
+            or manifest.requested_symbols != expected_symbols
+            or type(pages) is not tuple
+            or len(pages) != len(manifest.pages)
+            or any(
+                type(page_bundle) is not alpaca_module.ProviderFetchPageBundle
+                or page_bundle.page is not manifest_page
+                or not _is_issued_provider_fetch_page_bundle(page_bundle)
+                for page_bundle, manifest_page in zip(
+                    pages,
+                    manifest.pages,
+                    strict=True,
+                )
+            )
+        ):
+            raise CanonicalMaterialError(
+                "premarket provider disclosure is incomplete or unissued"
+            )
+        source_types = {page.page.source_type for page in pages}
+        if len(source_types) != 1:
+            raise CanonicalMaterialError(
+                "premarket provider disclosure mixes source roles"
+            )
+        source_type = next(iter(source_types))
+        if source_type in by_source_type:
+            raise CanonicalMaterialError(
+                "premarket provider cohort role is duplicated"
+            )
+        by_source_type[source_type] = bundle
+    if set(by_source_type) != {
+        "ALPACA_DAILY_BARS",
+        "ALPACA_HISTORICAL_QUOTES",
+        "ALPACA_LATEST_QUOTES",
+    }:
+        raise CanonicalMaterialError(
+            "premarket provider cohort roles are incomplete"
+        )
+    return tuple(
+        page
+        for source_type in (
+            "ALPACA_DAILY_BARS",
+            "ALPACA_HISTORICAL_QUOTES",
+            "ALPACA_LATEST_QUOTES",
+        )
+        for page in by_source_type[source_type].pages
+    )
+
+
+def _persist_premarket_provider_bindings(
+    *,
+    journal: object,
+    cohorts: tuple[object, ...],
+    required_symbols: tuple[str, ...],
+) -> tuple[PremarketSourceBinding, ...]:
+    """Test/support sink that persists every exact terminal provider page."""
+    page_bundles = _terminal_premarket_provider_pages(
+        cohorts,
+        required_symbols,
+    )
+
+    bindings: list[PremarketSourceBinding] = []
+    for page_bundle in page_bundles:
+        page = page_bundle.page
+        observation = page_bundle.observation
+        receipt = journal.append_source_observation_receipt(
+            payload=page_bundle.payload,
+            source_uri=page.request_url,
+            source_type=page.source_type,
+            provider="alpaca",
+            feed=observation.feed,
+            source_time=observation.source_timestamp,
+            retrieved_at=observation.retrieved_at,
+            provider_sequence=page.page_ordinal,
+            delay_seconds=observation.delay_seconds,
+            health_result="OK",
+            details={
+                "source_observation_id": page.source_observation_id,
+            },
+        )
+        bindings.append(
+            PremarketSourceBinding(
+                receipt=receipt,
+                source=page_bundle,
+                decision_basis=(
+                    "OPERATIONAL_HEALTH_ONLY"
+                    if page.source_type == "ALPACA_LATEST_QUOTES"
+                    else "ECONOMIC_INPUT"
+                ),
+            )
+        )
+    return tuple(bindings)
+
+
+def _require_complete_premarket_provider_handoff(
+    collection: PremarketProviderCollection,
+    required_symbols: tuple[str, ...],
+) -> None:
+    """Bind terminal disclosures to exactly the pages durably handed off."""
+    pages = _terminal_premarket_provider_pages(
+        collection.provider_cohorts,
+        required_symbols,
+    )
+    handed_pages = tuple(
+        binding.source
+        for binding in collection.persisted_bindings
+        if _binding_source_role(
+            binding.source,
+            invoke_owner_predicate=False,
+        ).startswith("ALPACA_")
+    )
+    if (
+        len(handed_pages) != len(pages)
+        or any(
+            sum(handed is page for handed in handed_pages) != 1
+            for page in pages
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket persisted provider pages are incomplete"
+        )
+
+
+def _require_complete_premarket_reference_handoff(
+    collection: PremarketProviderCollection,
+) -> None:
+    """Require the three operational documents from one exact client owner."""
+    from .providers.cache import SourceDocument
+    from .providers.reference import ReferenceClient
+
+    bindings = tuple(
+        binding
+        for binding in collection.persisted_bindings
+        if type(binding.source) is SourceDocument
+        and binding.source.source_role
+        in {"PRIMARY_HALT_FEED", "TRADER_ALERT_HALT", "OPERATIONAL_STATUS"}
+    )
+    documents = tuple(binding.source for binding in bindings)
+    owners = tuple(binding.disclosure for binding in bindings)
+    expected_roles = {
+        "PRIMARY_HALT_FEED",
+        "TRADER_ALERT_HALT",
+        "OPERATIONAL_STATUS",
+    }
+    if (
+        len(bindings) != 3
+        or set(document.source_role for document in documents) != expected_roles
+        or len({id(owner) for owner in owners}) != 1
+        or type(owners[0]) is not ReferenceClient
+        or any(
+            binding.decision_basis != "OPERATIONAL_HEALTH_ONLY"
+            or not _document_disclosure_is_current(
+                binding.disclosure,
+                binding.source,
+            )
+            for binding in bindings
+        )
+        or len(collection.reference_sources) != len(documents)
+        or any(
+            sum(supplied is document for supplied in collection.reference_sources)
+            != 1
+            for document in documents
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket operational reference handoff is incomplete"
+        )
+
+
+def _persist_premarket_reference_bindings(
+    *,
+    journal: object,
+    owner: object,
+    documents: tuple[object, ...],
+) -> tuple[PremarketSourceBinding, ...]:
+    """Test/concrete sink helper for already-fetched operational documents."""
+    from .providers.cache import SourceDocument
+    from .providers.reference import ReferenceClient
+
+    if (
+        type(owner) is not ReferenceClient
+        or type(documents) is not tuple
+        or any(
+            type(document) is not SourceDocument
+            or not _document_disclosure_is_current(owner, document)
+            for document in documents
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket operational reference owner is unavailable"
+        )
+    bindings: list[PremarketSourceBinding] = []
+    for document in documents:
+        source_time = document.published_at or document.retrieved_at
+        receipt = journal.append_source_observation_receipt(
+            payload=document.body,
+            source_uri=document.url,
+            source_type=document.source_type,
+            provider=document.publisher,
+            feed=document.timestamp_source,
+            source_time=source_time,
+            retrieved_at=document.retrieved_at,
+            provider_sequence=None,
+            delay_seconds=int(
+                (document.retrieved_at - source_time).total_seconds()
+            ),
+            health_result="OK",
+            details={},
+        )
+        bindings.append(
+            PremarketSourceBinding(
+                receipt=receipt,
+                source=document,
+                disclosure=owner,
+                decision_basis="OPERATIONAL_HEALTH_ONLY",
+            )
+        )
+    return tuple(bindings)
+
+
+def _issue_coordinator_premarket_branch(
+    *,
+    journal: object,
+    report_archive_root: Path,
+    session_date: date,
+    decision_at: datetime,
+    retrieved_at: datetime,
+    validation_window_id: str,
+    bindings: tuple[PremarketSourceBinding, ...],
+    calendar: object,
+    universe: object,
+    evidence_release: object,
+    snapshot: object,
+    publication_decision: object | None,
+    primary_plan: object | None,
+    outcome: str,
+    reason_codes: tuple[str, ...],
+    phase1_replay_children: tuple[object, ...],
+    breaker_state: object | None = None,
+) -> object:
+    from .reports import PremarketState, render_premarket_report
+
+    source_authority = issue_canonical_premarket_source_binding_authority(
+        journal=journal,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        bindings=bindings,
+    )
+    receipts = tuple(binding.receipt for binding in bindings)
+    composition = issue_canonical_premarket_composition_authority(
+        journal=journal,
+        session_date=session_date,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        validation_window_id=validation_window_id,
+        source_binding_authority=source_authority,
+        snapshot=snapshot,
+        publication_decision=publication_decision,
+        primary_plan=primary_plan,
+        outcome=outcome,
+        reason_codes=reason_codes,
+        calendar=calendar,
+        universe=universe,
+        evidence_release=evidence_release,
+        phase1_replay_children=phase1_replay_children,
+        breaker_state=breaker_state,
+    )
+    state_hash = canonical_premarket_state_hash(
+        session_date=session_date,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        snapshot=snapshot,
+        source_receipts=receipts,
+        publication_decision=publication_decision,
+        primary_plan=primary_plan,
+        validation_window_id=validation_window_id,
+        outcome=outcome,
+        reason_codes=reason_codes,
+        composition_authority=composition,
+    )
+    report = render_premarket_report(
+        PremarketState(
+            session_date=session_date,
+            generated_at=retrieved_at,
+            outcome=outcome,
+            reason_codes=reason_codes,
+            observation_ids=tuple(
+                receipt.observation_sha256 for receipt in receipts
+            ),
+            state_hash=state_hash,
+            candidates=tuple(
+                candidate.material for candidate in snapshot.candidates
+            ),
+        )
+    )
+    return issue_canonical_premarket_material(
+        journal=journal,
+        report_archive_root=report_archive_root,
+        session_date=session_date,
+        decision_at=decision_at,
+        retrieved_at=retrieved_at,
+        snapshot=snapshot,
+        report=report,
+        source_receipts=receipts,
+        publication_decision=publication_decision,
+        primary_plan=primary_plan,
+        validation_window_id=validation_window_id,
+        composition_authority=composition,
     )
 
 
@@ -2295,11 +3650,13 @@ def issue_canonical_premarket_composition_authority(
     universe: object,
     evidence_release: object,
     phase1_replay_children: tuple[object, ...],
+    breaker_state: object | None = None,
 ) -> CanonicalPremarketCompositionAuthority:
     """Seal reviewed releases, receipt bindings, and replay children together."""
     from . import evidence as evidence_module
     from . import journal as journal_module
     from . import market_calendar as calendar_module
+    from . import risk as risk_module
     from . import universe as universe_module
     from .journal import Journal
 
@@ -2377,11 +3734,47 @@ def issue_canonical_premarket_composition_authority(
             "premarket reviewed release binding is incomplete"
         )
 
-    expected_phase1_children = tuple(
+    expected_phase1_values = list(
         bundle._phase1_source
         for bundle in evidence_release.by_symbol.values()
         if bundle._phase1_source is not None
     )
+    if breaker_state is not None:
+        if not (
+            risk_module.is_issued_breaker_state(breaker_state)
+            or risk_module.is_issued_paired_breaker_state(breaker_state)
+        ):
+            raise CanonicalMaterialError(
+                "premarket breaker authority is unavailable"
+            )
+        if snapshot.breaker_active != risk_module.breaker_pauses_entry(
+            breaker_state,
+            session_date,
+        ):
+            raise CanonicalMaterialError(
+                "premarket snapshot conflicts with breaker authority"
+            )
+        expected_phase1_values.extend(
+            source
+            for source, _kind in risk_module._phase1_bound_sources(
+                breaker_state
+            )
+        )
+        if primary_plan is not None:
+            expected_phase1_values.extend(
+                source
+                for source, _kind in risk_module._phase1_bound_sources(
+                    primary_plan.portfolio_authority
+                )
+            )
+    elif primary_plan is not None or snapshot.breaker_active:
+        raise CanonicalMaterialError(
+            "premarket risk-bearing composition lacks breaker authority"
+        )
+    expected_phase1_children: list[object] = []
+    for child in expected_phase1_values:
+        if not any(child is current for current in expected_phase1_children):
+            expected_phase1_children.append(child)
     if (
         len(phase1_replay_children) != len(expected_phase1_children)
         or any(
@@ -2490,6 +3883,7 @@ def issue_canonical_premarket_composition_authority(
         universe,
         evidence_release,
         *tuple(evidence_release.by_symbol.values()),
+        breaker_state,
         *phase1_replay_children,
     )
     generation = getattr(journal, "_source_generation", None)
@@ -3651,9 +5045,9 @@ def _current_receipt_candidates(
     return exact_candidates
 
 
-def _premarket_economic_external_source_ids(
+def _premarket_external_source_basis(
     composition_authority: object,
-) -> tuple[str, ...]:
+) -> dict[str, str]:
     """Read exact external identities from bound objects, never Journal details."""
     from .providers.alpaca import ProviderFetchPageBundle
     from .providers.cache import SourceDocument
@@ -3671,19 +5065,20 @@ def _premarket_economic_external_source_ids(
         raise CanonicalMaterialError(
             "canonical premarket source binding authority is unavailable"
         )
-    identifiers: list[str] = []
+    identifiers: dict[str, str] = {}
     for binding in source_candidate.bindings:
-        if binding.decision_basis != "ECONOMIC_INPUT":
-            continue
         if type(binding.source) is ProviderFetchPageBundle:
-            identifiers.append(binding.source.page.source_observation_id)
+            source_id = binding.source.page.source_observation_id
         elif type(binding.source) is SourceDocument:
-            identifiers.append(binding.source.source_observation_id)
-    if len(identifiers) != len(set(identifiers)):
-        raise CanonicalMaterialError(
-            "canonical premarket external source identity is duplicated"
-        )
-    return tuple(identifiers)
+            source_id = binding.source.source_observation_id
+        else:
+            continue
+        if source_id in identifiers:
+            raise CanonicalMaterialError(
+                "canonical premarket external source identity is duplicated"
+            )
+        identifiers[source_id] = binding.decision_basis
+    return identifiers
 
 
 def _capture_premarket_domain_authority(
@@ -3743,17 +5138,42 @@ def _capture_premarket_domain_authority(
     observation_manifest = screening_module._publication_observation_manifest(
         decision
     )
-    external_source_ids = _premarket_economic_external_source_ids(
+    external_source_basis = _premarket_external_source_basis(
         material.composition_authority
     )
     manifest_source_ids = observation_manifest.source_observation_ids
     if any(
-        external_source_ids.count(source_id) != 1
+        source_id not in external_source_basis
         for source_id in manifest_source_ids
     ):
         raise CanonicalMaterialError(
             "canonical source receipts do not cover the publication manifest"
         )
+    for publication in decision.candidates:
+        candidate_authority = screening_module._issued_scored_candidate_authority(
+            publication.candidate
+        )
+        if candidate_authority is None:
+            raise CanonicalMaterialError(
+                "canonical candidate source authority is unavailable"
+            )
+        context = candidate_authority.context
+        operational_ids = {
+            context.latest_iex_quote.source_observation_id,
+            *context.instrument_status.source_observation_ids,
+        }
+        if any(
+            external_source_basis.get(source_id)
+            != (
+                "OPERATIONAL_HEALTH_ONLY"
+                if source_id in operational_ids
+                else "ECONOMIC_INPUT"
+            )
+            for source_id in candidate_authority.source_observation_ids
+        ):
+            raise CanonicalMaterialError(
+                "canonical source decision basis conflicts with candidate use"
+            )
     with screening_module._ISSUED_PUBLICATION_DECISIONS_LOCK:
         decision_record = screening_module._ISSUED_PUBLICATION_DECISIONS.get(
             id(decision)
@@ -4356,6 +5776,10 @@ __all__ = [
     "CanonicalPremarketMaterial",
     "CanonicalPremarketSourceBindingAuthority",
     "CanonicalWorkflowAdapter",
+    "PremarketCollectionError",
+    "PremarketProviderCollection",
+    "PremarketRiskResolution",
+    "PremarketWorkflowCoordinator",
     "PremarketSourceBinding",
     "canonical_close_state_hash",
     "canonical_material_digest",

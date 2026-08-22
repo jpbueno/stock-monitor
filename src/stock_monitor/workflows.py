@@ -815,13 +815,27 @@ def _run_canonical(
         return _canonical_data_unavailable(
             _safe_reason(error, "DATA_UNAVAILABLE")
         )
+    terminal_retrieved_at = getattr(material, "retrieved_at", None)
+    try:
+        require_aware_timestamp(
+            terminal_retrieved_at,
+            "canonical terminal retrieval time",
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkflowError(
+            "canonical terminal retrieval time is invalid"
+        ) from error
+    if terminal_retrieved_at < context.now:
+        raise WorkflowError(
+            "canonical terminal retrieval precedes command start"
+        )
     result = context.publisher.issue_result(material=material)
     if type(result) is not WorkflowResult or result.execution_mode != "CANONICAL":
         raise WorkflowError("canonical workflow result is unverified")
     published = context.publisher.publish(
         kind=kind,
         session_date=session.session_date,
-        generated_at=context.now,
+        generated_at=terminal_retrieved_at,
         result=result,
         material=material,
     )

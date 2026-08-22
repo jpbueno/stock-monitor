@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from stock_monitor.workflows import (
     CanonicalWorkflowContext,
     PublishedWorkflow,
     SessionWindow,
+    WorkflowError,
     WorkflowResult,
     run_canonical_close,
     run_canonical_premarket,
@@ -27,8 +29,8 @@ class _RecordingAdapter:
         self.review_time = review_time
         self.open_day = open_day
         self.calls: list[tuple[object, ...]] = []
-        self.premarket = object()
-        self.close = object()
+        self.premarket: object | None = None
+        self.close: object | None = None
 
     def market_session(self, day: date) -> SessionWindow | None:
         self.calls.append(("SESSION", day))
@@ -46,6 +48,7 @@ class _RecordingAdapter:
         self.calls.append(
             ("PREMARKET", session_date, decision_at, retrieved_at)
         )
+        self.premarket = SimpleNamespace(retrieved_at=retrieved_at)
         return self.premarket
 
     def close_material(
@@ -56,6 +59,7 @@ class _RecordingAdapter:
         retrieved_at: datetime,
     ) -> object:
         self.calls.append(("CLOSE", session_date, review_at, retrieved_at))
+        self.close = SimpleNamespace(retrieved_at=retrieved_at)
         return self.close
 
 
@@ -132,6 +136,59 @@ class CanonicalDispatchTests(unittest.TestCase):
         self.assertEqual(result.report_path, "/tmp/canonical-report.md")
         self.assertEqual(publisher.calls[0], ("ISSUE", adapter.premarket))
         self.assertEqual(publisher.calls[1][1:4], ("PREMARKET", DAY, now))
+
+    def test_publication_uses_terminal_material_retrieval_not_command_start(self):
+        class CompletingAdapter(_RecordingAdapter):
+            def premarket_material(
+                self,
+                session_date: date,
+                *,
+                decision_at: datetime,
+                retrieved_at: datetime,
+            ) -> object:
+                self.calls.append(
+                    ("PREMARKET", session_date, decision_at, retrieved_at)
+                )
+                self.premarket = SimpleNamespace(
+                    retrieved_at=retrieved_at + timedelta(seconds=7)
+                )
+                return self.premarket
+
+        started_at = datetime(2026, 8, 24, 8, 52, 31, tzinfo=ET)
+        adapter = CompletingAdapter()
+        publisher = _RecordingPublisher()
+
+        run_canonical_premarket(
+            self._context(started_at, adapter=adapter, publisher=publisher)
+        )
+
+        self.assertEqual(
+            publisher.calls[1][3],
+            started_at + timedelta(seconds=7),
+        )
+
+    def test_terminal_material_cannot_predate_command_start(self):
+        class RewindingAdapter(_RecordingAdapter):
+            def premarket_material(
+                self,
+                session_date: date,
+                *,
+                decision_at: datetime,
+                retrieved_at: datetime,
+            ) -> object:
+                del session_date, decision_at
+                return SimpleNamespace(
+                    retrieved_at=retrieved_at - timedelta(microseconds=1)
+                )
+
+        started_at = datetime(2026, 8, 24, 8, 52, 31, tzinfo=ET)
+        with self.assertRaisesRegex(
+            WorkflowError,
+            "terminal retrieval precedes command start",
+        ):
+            run_canonical_premarket(
+                self._context(started_at, adapter=RewindingAdapter())
+            )
 
     def test_early_close_uses_review_time_and_actual_retrieval(self):
         now = datetime(2026, 11, 27, 12, 38, tzinfo=ET)

@@ -4302,14 +4302,38 @@ class AlpacaMarketData:
             source_observation_id=observation_id,
         )
 
-    def latest_iex_quotes(self, symbols: Sequence[str]) -> Mapping[str, Quote]:
+    def latest_iex_quote_cohort(
+        self,
+        symbols: Sequence[str],
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
+    ) -> ProviderFetchCohort:
+        """Return one issued one-quote-per-symbol IEX freshness cohort."""
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        request_dispatch = request_dependencies.request_dispatch
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         requested = _symbols(symbols)
         query = [("symbols", ",".join(requested)), ("feed", "iex")]
         url = (
-            f"{self._base_url}/v2/stocks/quotes/latest?"
+            f"{request_dependencies.base_url}/v2/stocks/quotes/latest?"
             + urllib.parse.urlencode(query)
         )
-        document, payload = self._get_json(url)
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
+        document, payload = request_dispatch(
+            self,
+            url,
+            request_dependencies,
+        )
         if "quotes" not in document or not isinstance(document["quotes"], dict):
             raise ProviderIncompleteError("provider latest quotes collection is missing")
         if document.get("next_page_token", None) is not None:
@@ -4330,6 +4354,7 @@ class AlpacaMarketData:
             source_type="ALPACA_LATEST_QUOTES",
             feed="iex",
             source_timestamp=max(item[1] for item in parsed),
+            request_dependencies=request_dependencies,
         )
         now = self._observations[observation_id].retrieved_at
         result: dict[str, Quote] = {}
@@ -4358,6 +4383,22 @@ class AlpacaMarketData:
             )
         manifest_document = dict(document)
         manifest_document.setdefault("next_page_token", None)
+        page_bundle = issue_page_function(
+            self,
+            page_ordinal=1,
+            url=url,
+            document=manifest_document,
+            payload=payload,
+            observation_id=observation_id,
+            source_type="ALPACA_LATEST_QUOTES",
+            page_sink=page_sink,
+            request_dependencies=request_dependencies,
+        )
+        require_pages_function(
+            self,
+            (page_bundle,),
+            request_dependencies,
+        )
         fetch_manifest = _provider_fetch_manifest(
             owner=self,
             collection="quotes",
@@ -4371,8 +4412,9 @@ class AlpacaMarketData:
                     "ALPACA_LATEST_QUOTES",
                 ),
             ),
+            page_bundles=(page_bundle,),
         )
-        issued_result: dict[str, Quote] = {}
+        issued_result: dict[str, tuple[Quote, ...]] = {}
         for page_ordinal, item_ordinal, item_path in pending_sources:
             fact = _issue_market_fact_from_fetch(
                 owner=self,
@@ -4383,8 +4425,20 @@ class AlpacaMarketData:
             )
             if not isinstance(fact, Quote):
                 raise ProviderMalformedError("provider QUOTE authority is malformed")
-            issued_result[fact.symbol] = fact
-        return issued_result
+            issued_result[fact.symbol] = (fact,)
+        return _issue_provider_fetch_cohort(
+            owner=self,
+            manifest=fetch_manifest,
+            values=issued_result,
+        )
+
+    def latest_iex_quotes(self, symbols: Sequence[str]) -> Mapping[str, Quote]:
+        """Preserve the public latest-quote mapping without a duplicate GET."""
+        cohort = self.latest_iex_quote_cohort(symbols)
+        return {
+            symbol: cohort[symbol][0]
+            for symbol in cohort
+        }
 
     def option_chain(
         self,

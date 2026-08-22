@@ -1627,6 +1627,29 @@ class AlpacaContractTests(unittest.TestCase):
         query = parse_qs(urlsplit(transport.requested_urls[0]).query)
         self.assertEqual(query["feed"], ["iex"])
 
+    def test_latest_iex_cohort_discloses_one_exact_terminal_page(self) -> None:
+        transport = FixtureTransport("providers/alpaca/latest-iex.json")
+        pages = []
+        cohort = AlpacaMarketData(
+            transport, credentials(), now=lambda: NOW
+        ).latest_iex_quote_cohort(
+            ["SPY", "QQQ"],
+            page_sink=pages.append,
+        )
+
+        self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+        self.assertEqual(tuple(cohort), ("QQQ", "SPY"))
+        self.assertTrue(
+            all(len(cohort[symbol]) == 1 for symbol in cohort)
+        )
+        bundle = read_provider_fetch_bundle(cohort)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(tuple(pages), bundle.pages)
+        self.assertEqual(len(pages), 1)
+        self.assertIs(pages[0].page, bundle.manifest.pages[0])
+        self.assertTrue(is_issued_provider_fetch_page_bundle(pages[0]))
+        self.assertEqual(pages[0].page.source_type, "ALPACA_LATEST_QUOTES")
+
     def test_stale_or_wrong_feed_latest_quote_blocks_entire_result(self) -> None:
         bodies = (
             '{"quotes":{"SPY":{"t":"2026-08-14T12:54:59Z","bp":"651.9","ap":"652.1"}},"next_page_token":null}',

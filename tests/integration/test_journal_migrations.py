@@ -120,15 +120,15 @@ class JournalMigrationTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 4)
+                self.assertEqual(journal.count("schema_migrations"), 5)
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 4)
+                self.assertEqual(journal.count("schema_migrations"), 5)
 
-    def test_result_envelope_migration_is_packaged_hashed_and_applied_fourth(self) -> None:
+    def test_provider_monitoring_migration_is_packaged_hashed_and_applied_fifth(self) -> None:
         packaged = importlib.resources.files("stock_monitor.sql").joinpath(
-            "004_scheduled_result_envelope.sql"
+            "005_provider_monitoring.sql"
         )
-        self.assertTrue(packaged.is_file(), "packaged migration 004 is missing")
+        self.assertTrue(packaged.is_file(), "packaged migration 005 is missing")
         expected_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -150,10 +150,608 @@ class JournalMigrationTests(unittest.TestCase):
                 (2, "002_phase1.sql"),
                 (3, "003_phase2_paper.sql"),
                 (4, "004_scheduled_result_envelope.sql"),
+                (5, "005_provider_monitoring.sql"),
             ],
         )
-        self.assertEqual(str(rows[3][2]), expected_sha256)
-        self.assertEqual(user_version, 4)
+        self.assertEqual(str(rows[4][2]), expected_sha256)
+        self.assertEqual(user_version, 5)
+
+    def test_provider_monitoring_tables_are_strict_and_have_exact_columns(self) -> None:
+        expected_columns = {
+            "canonical_report_contexts": (
+                "id",
+                "report_id",
+                "workflow_kind",
+                "economic_at",
+                "retrieved_at",
+                "material_digest",
+                "source_digest",
+                "record_sha256",
+            ),
+            "actual_close_reviews": (
+                "id",
+                "review_id",
+                "session_date",
+                "review_at",
+                "mark_cutoff",
+                "query_cutoff",
+                "retrieved_at",
+                "expected_binding_count",
+                "source_digest",
+                "record_sha256",
+            ),
+            "actual_close_source_bindings": (
+                "id",
+                "review_id",
+                "binding_ordinal",
+                "symbol",
+                "source_role",
+                "source_observation_id",
+                "failure_code",
+                "received_at",
+                "record_sha256",
+            ),
+            "close_recommendations": (
+                "id",
+                "recommendation_id",
+                "review_id",
+                "session_date",
+                "symbol",
+                "recommended_stop_micros",
+                "action",
+                "reasons_json",
+                "source_digest",
+                "received_at",
+                "record_sha256",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+
+            with closing(sqlite3.connect(path)) as connection:
+                table_rows = {
+                    str(row[1]): row
+                    for row in connection.execute("PRAGMA table_list")
+                }
+                actual_columns = {
+                    table: tuple(
+                        str(row[1])
+                        for row in connection.execute(
+                            f'PRAGMA table_info("{table}")'
+                        )
+                    )
+                    for table in expected_columns
+                }
+
+        for table, columns in expected_columns.items():
+            with self.subTest(table=table):
+                self.assertIn(table, table_rows)
+                self.assertEqual(int(table_rows[table][5]), 1)
+                self.assertEqual(actual_columns[table], columns)
+
+    def test_scheduled_report_kind_mapping_is_exact_with_premarket_alias(self) -> None:
+        cases = (
+            ("PREMARKET", "MORNING", True),
+            ("PREMARKET", "CLOSE", False),
+            ("CLOSE", "MORNING", False),
+            ("CLOSE", "CLOSE", True),
+        )
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        finished_at = now + timedelta(seconds=2)
+        envelope_json = "{}"
+        envelope_sha256 = hashlib.sha256(envelope_json.encode("utf-8")).hexdigest()
+
+        for run_kind, report_kind, allowed in cases:
+            with self.subTest(run_kind=run_kind, report_kind=report_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    path = Path(temporary_directory) / "journal.db"
+                    with patch.object(
+                        journal_module, "_utc_now", return_value=now
+                    ) as clock, Journal.open(path) as journal:
+                        claim = journal.claim_report(date(2026, 8, 14), report_kind)
+                        assert claim.claim_token is not None
+                        state_sha256 = "a" * 64
+                        report_id = stable_report_id(
+                            report_kind,
+                            date(2026, 8, 14),
+                            (),
+                            state_sha256,
+                        )
+                        archive_path = report_archive_relative_path(
+                            report_kind,
+                            date(2026, 8, 14),
+                            report_id,
+                        )
+                        clock.return_value = now + timedelta(seconds=1)
+                        report = journal.finalize_report(
+                            claim_id=claim.claim_id,
+                            claim_token=claim.claim_token,
+                            body=f"# {report_kind}\n",
+                            state_sha256=state_sha256,
+                            observation_ids=(),
+                            archive_relative_path=archive_path,
+                            created_at=now + timedelta(seconds=1),
+                            outbox_destination="TASK",
+                            outbox_payload=report_kind,
+                        )
+                        run_id = int(
+                            journal._connection.execute(
+                                "INSERT INTO scheduled_runs("
+                                "run_key, run_kind, session_date, intended_run_at, "
+                                "started_at) VALUES (?, ?, ?, ?, ?)",
+                                (
+                                    f"{run_kind.lower()}-2026-08-14",
+                                    run_kind,
+                                    "2026-08-14",
+                                    "2026-08-14T12:45:00.000000Z",
+                                    "2026-08-14T12:45:00.000000Z",
+                                ),
+                            ).lastrowid
+                        )
+                        values = (
+                            "2026-08-14T12:45:02.000000Z",
+                            report.report_row_id,
+                            archive_path,
+                            envelope_json,
+                            envelope_sha256,
+                            run_id,
+                        )
+                        statement = (
+                            "UPDATE scheduled_runs SET finished_at = ?, "
+                            "market_session_decision = 'DUE_WAKE', report_id = ?, "
+                            "report_path = ?, outcome = 'REPORT_EMITTED', "
+                            "result_envelope_json = ?, result_envelope_sha256 = ? "
+                            "WHERE id = ?"
+                        )
+                        if allowed:
+                            journal._connection.execute(statement, values)
+                            self.assertEqual(
+                                journal._connection.execute(
+                                    "SELECT finished_at FROM scheduled_runs WHERE id = ?",
+                                    (run_id,),
+                                ).fetchone(),
+                                (
+                                    finished_at.strftime(
+                                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                                    ),
+                                ),
+                            )
+                        else:
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                journal._connection.execute(statement, values)
+                            self.assertEqual(
+                                journal._connection.execute(
+                                    "SELECT finished_at FROM scheduled_runs WHERE id = ?",
+                                    (run_id,),
+                                ).fetchone(),
+                                (None,),
+                            )
+
+    def test_canonical_report_context_keeps_distinct_hash_domains(self) -> None:
+        now = datetime(2026, 8, 14, 12, 45, tzinfo=timezone.utc)
+        state_sha256 = "a" * 64
+        material_digest = "b" * 64
+        source_digest = "c" * 64
+        record_sha256 = "d" * 64
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with patch.object(
+                journal_module, "_utc_now", return_value=now
+            ) as clock, Journal.open(path) as journal:
+                morning_claim = journal.claim_report(date(2026, 8, 14), "MORNING")
+                assert morning_claim.claim_token is not None
+                morning_report_id = stable_report_id(
+                    "MORNING",
+                    date(2026, 8, 14),
+                    (),
+                    state_sha256,
+                )
+                clock.return_value = now + timedelta(seconds=2)
+                morning_report = journal.finalize_report(
+                    claim_id=morning_claim.claim_id,
+                    claim_token=morning_claim.claim_token,
+                    body="# Morning\n",
+                    state_sha256=state_sha256,
+                    observation_ids=(),
+                    archive_relative_path=report_archive_relative_path(
+                        "MORNING",
+                        date(2026, 8, 14),
+                        morning_report_id,
+                    ),
+                    created_at=now + timedelta(seconds=2),
+                    outbox_destination="TASK",
+                    outbox_payload="morning",
+                )
+                journal._connection.execute(
+                    "INSERT INTO canonical_report_contexts VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        morning_report.report_row_id,
+                        "PREMARKET",
+                        "2026-08-14T12:45:00.000000Z",
+                        "2026-08-14T12:45:01.000000Z",
+                        material_digest,
+                        source_digest,
+                        record_sha256,
+                    ),
+                )
+                self.assertEqual(
+                    journal._connection.execute(
+                        "SELECT report.state_sha256, context.material_digest, "
+                        "context.source_digest, context.record_sha256 "
+                        "FROM canonical_report_contexts AS context "
+                        "JOIN reports AS report ON report.id = context.report_id"
+                    ).fetchone(),
+                    (
+                        state_sha256,
+                        material_digest,
+                        source_digest,
+                        record_sha256,
+                    ),
+                )
+
+                clock.return_value = now + timedelta(seconds=3)
+                close_claim = journal.claim_report(date(2026, 8, 14), "CLOSE")
+                assert close_claim.claim_token is not None
+                close_report_id = stable_report_id(
+                    "CLOSE",
+                    date(2026, 8, 14),
+                    (),
+                    "e" * 64,
+                )
+                close_report = journal.finalize_report(
+                    claim_id=close_claim.claim_id,
+                    claim_token=close_claim.claim_token,
+                    body="# Close\n",
+                    state_sha256="e" * 64,
+                    observation_ids=(),
+                    archive_relative_path=report_archive_relative_path(
+                        "CLOSE",
+                        date(2026, 8, 14),
+                        close_report_id,
+                    ),
+                    created_at=now + timedelta(seconds=3),
+                    outbox_destination="TASK",
+                    outbox_payload="close",
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    journal._connection.execute(
+                        "INSERT INTO canonical_report_contexts VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            2,
+                            close_report.report_row_id,
+                            "PREMARKET",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:45:01.000000Z",
+                            "f" * 64,
+                            "1" * 64,
+                            "2" * 64,
+                        ),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    journal._connection.execute(
+                        "INSERT INTO canonical_report_contexts VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            2,
+                            close_report.report_row_id,
+                            "CLOSE",
+                            "2026-08-14T12:45:00.000000Z",
+                            "2026-08-14T12:45:04.000000Z",
+                            "f" * 64,
+                            "1" * 64,
+                            "2" * 64,
+                        ),
+                    )
+
+    def test_actual_close_schema_binds_receipts_failures_and_nonwidening_stops(
+        self,
+    ) -> None:
+        timestamp = "2026-08-14T19:31:00.000000Z"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA recursive_triggers = ON")
+                connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "a" * 64,
+                        "b" * 64,
+                        "https://data.alpaca.markets/v2/stocks/quotes",
+                        "ALPACA_HISTORICAL_QUOTES",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-14T19:14:00.000000Z",
+                        timestamp,
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_reviews VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "c" * 64,
+                        "2026-08-14",
+                        "2026-08-14T19:30:00.000000Z",
+                        "2026-08-14T19:14:00.000000Z",
+                        "2026-08-14T19:30:30.000000Z",
+                        timestamp,
+                        2,
+                        "d" * 64,
+                        "e" * 64,
+                    ),
+                )
+                invalid_reviews = (
+                    (
+                        3,
+                        "a" * 64,
+                        "2026-08-16",
+                        "2026-08-16T19:30:00.000000Z",
+                        "2026-08-16T19:31:00.000000Z",
+                        "2026-08-16T19:32:00.000000Z",
+                        "2026-08-16T19:33:00.000000Z",
+                        0,
+                        "b" * 64,
+                        "c" * 64,
+                    ),
+                    (
+                        4,
+                        "b" * 64,
+                        "2026-08-17",
+                        "2026-08-17T19:30:00.000000Z",
+                        "2026-08-17T19:14:00.000000Z",
+                        "2026-08-17T19:32:00.000000Z",
+                        "2026-08-17T19:33:00.000000Z",
+                        -1,
+                        "c" * 64,
+                        "d" * 64,
+                    ),
+                )
+                for review in invalid_reviews:
+                    with self.subTest(review=review[0]):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            connection.execute(
+                                "INSERT INTO actual_close_reviews VALUES "
+                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                review,
+                            )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "c" * 64,
+                        1,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        1,
+                        None,
+                        timestamp,
+                        "f" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        2,
+                        "c" * 64,
+                        2,
+                        None,
+                        "OPERATIONAL_STATUS",
+                        None,
+                        "REFERENCE_UNAVAILABLE",
+                        "2026-08-14T19:32:00.000000Z",
+                        "1" * 64,
+                    ),
+                )
+
+                invalid_bindings = (
+                    (
+                        3,
+                        "c" * 64,
+                        3,
+                        "AAPL",
+                        "SIP_SESSION_BAR",
+                        1,
+                        "ALSO_FAILED",
+                        timestamp,
+                        "2" * 64,
+                    ),
+                    (
+                        4,
+                        "c" * 64,
+                        4,
+                        "AAPL",
+                        "EVENT_EVIDENCE",
+                        None,
+                        None,
+                        timestamp,
+                        "3" * 64,
+                    ),
+                    (
+                        5,
+                        "c" * 64,
+                        5,
+                        "AAPL",
+                        "ATTACKER_ASSERTED_ROLE",
+                        None,
+                        "UNAVAILABLE",
+                        timestamp,
+                        "4" * 64,
+                    ),
+                    (
+                        6,
+                        "c" * 64,
+                        6,
+                        "AAPL",
+                        "IEX_FRESHNESS",
+                        1,
+                        None,
+                        "2026-08-14T19:31:01.000000Z",
+                        "5" * 64,
+                    ),
+                    (
+                        7,
+                        "c" * 64,
+                        7,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        None,
+                        "DUPLICATE_ROLE",
+                        "2026-08-14T19:32:00.000000Z",
+                        "6" * 64,
+                    ),
+                )
+                for binding in invalid_bindings:
+                    with self.subTest(binding=binding[0]):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            connection.execute(
+                                "INSERT INTO actual_close_source_bindings VALUES "
+                                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                binding,
+                            )
+
+                connection.execute(
+                    "INSERT INTO close_recommendations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "7" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "AAPL",
+                        220_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "8" * 64,
+                        "2026-08-14T19:32:00.000000Z",
+                        "9" * 64,
+                    ),
+                )
+                invalid_recommendations = (
+                    (
+                        3,
+                        "a" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "MSFT",
+                        100_000_000,
+                        "SELL_NOW",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "b" * 64,
+                        "2026-08-14T19:32:00.000000Z",
+                        "c" * 64,
+                    ),
+                    (
+                        4,
+                        "b" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "MSFT",
+                        100_000_000,
+                        "HOLD",
+                        "{}",
+                        "c" * 64,
+                        "2026-08-14T19:32:00.000000Z",
+                        "d" * 64,
+                    ),
+                    (
+                        5,
+                        "c" * 64,
+                        "c" * 64,
+                        "2026-08-15",
+                        "MSFT",
+                        100_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "d" * 64,
+                        "2026-08-15T19:32:00.000000Z",
+                        "e" * 64,
+                    ),
+                    (
+                        6,
+                        "d" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "MSFT",
+                        100_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "e" * 64,
+                        "2026-08-14T19:30:59.999999Z",
+                        "f" * 64,
+                    ),
+                )
+                for recommendation in invalid_recommendations:
+                    with self.subTest(recommendation=recommendation[0]):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            connection.execute(
+                                "INSERT INTO close_recommendations VALUES "
+                                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                recommendation,
+                            )
+                connection.execute(
+                    "INSERT INTO actual_close_reviews VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        2,
+                        "1" * 64,
+                        "2026-08-15",
+                        "2026-08-15T19:30:00.000000Z",
+                        "2026-08-15T19:14:00.000000Z",
+                        "2026-08-15T19:30:30.000000Z",
+                        "2026-08-15T19:31:00.000000Z",
+                        0,
+                        "2" * 64,
+                        "3" * 64,
+                    ),
+                )
+                next_recommendation = (
+                    2,
+                    "4" * 64,
+                    "1" * 64,
+                    "2026-08-15",
+                    "AAPL",
+                    219_990_000,
+                    "HOLD",
+                    '["POSITION_REVIEW_COMPLETE"]',
+                    "5" * 64,
+                    "2026-08-15T19:32:00.000000Z",
+                    "6" * 64,
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO close_recommendations VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        next_recommendation,
+                    )
+                connection.execute(
+                    "INSERT INTO close_recommendations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*next_recommendation[:5], 220_010_000, *next_recommendation[6:]),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT recommended_stop_micros "
+                        "FROM close_recommendations "
+                        "WHERE symbol = 'AAPL' ORDER BY session_date"
+                    ).fetchall(),
+                    [(220_000_000,), (220_010_000,)],
+                )
 
     def test_migration_source_can_be_loaded_independently_of_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -300,7 +898,7 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA application_id").fetchone()[0], 0)
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 4)
+                self.assertEqual(journal.count("schema_migrations"), 5)
 
     def test_migration_transaction_control_cannot_escape_atomic_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -566,7 +1164,7 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(wrong_version_path):
                 pass
             with closing(sqlite3.connect(wrong_version_path)) as connection:
-                connection.execute("PRAGMA user_version = 5")
+                connection.execute("PRAGMA user_version = 6")
             with self.assertRaises(MigrationCorruption):
                 Journal.open(wrong_version_path)
 
@@ -606,9 +1204,9 @@ class JournalMigrationTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 counts = tuple(executor.map(lambda _: open_and_count(), range(2)))
 
-            self.assertEqual(counts, (4, 4))
+            self.assertEqual(counts, (5, 5))
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 4)
+                self.assertEqual(journal.count("schema_migrations"), 5)
 
     def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -651,10 +1249,10 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertTrue(application_id_read.wait(timeout=10))
                 try:
                     with Journal.open(path) as journal:
-                        self.assertEqual(journal.count("schema_migrations"), 4)
+                        self.assertEqual(journal.count("schema_migrations"), 5)
                 finally:
                     release_preflight.set()
-                self.assertEqual(victim.result(timeout=10), 4)
+                self.assertEqual(victim.result(timeout=10), 5)
 
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -706,6 +1304,10 @@ class JournalMigrationTests(unittest.TestCase):
                 "report_claims",
                 "reports",
                 "report_observations",
+                "canonical_report_contexts",
+                "actual_close_reviews",
+                "actual_close_source_bindings",
+                "close_recommendations",
                 "outbox",
                 "outbox_delivery_attempts",
                 "scheduled_runs",
@@ -2586,6 +3188,22 @@ class JournalMigrationTests(unittest.TestCase):
             },
             "outbox": {"payload_sha256"},
             "scheduled_runs": {"result_envelope_sha256"},
+            "canonical_report_contexts": {
+                "material_digest",
+                "source_digest",
+                "record_sha256",
+            },
+            "actual_close_reviews": {
+                "review_id",
+                "source_digest",
+                "record_sha256",
+            },
+            "actual_close_source_bindings": {"record_sha256"},
+            "close_recommendations": {
+                "recommendation_id",
+                "source_digest",
+                "record_sha256",
+            },
             "phase1_signals": {
                 "publication_source_digest",
                 "publication_state_digest",
@@ -2965,6 +3583,10 @@ class JournalMigrationTests(unittest.TestCase):
             "account_checks",
             "reports",
             "report_observations",
+            "canonical_report_contexts",
+            "actual_close_reviews",
+            "actual_close_source_bindings",
+            "close_recommendations",
             "outbox",
             "outbox_delivery_attempts",
             "ledger_postings",
@@ -3201,6 +3823,14 @@ class JournalMigrationTests(unittest.TestCase):
             "report_observations": {
                 ("report_id", "reports"),
                 ("source_observation_id", "source_observations"),
+            },
+            "canonical_report_contexts": {("report_id", "reports")},
+            "actual_close_source_bindings": {
+                ("review_id", "actual_close_reviews"),
+                ("source_observation_id", "source_observations"),
+            },
+            "close_recommendations": {
+                ("review_id", "actual_close_reviews"),
             },
             "outbox": {
                 ("origin_report_id", "reports"),
@@ -3859,6 +4489,15 @@ class JournalMigrationTests(unittest.TestCase):
             "outbox": {"created_at"},
             "outbox_delivery_attempts": {"attempted_at"},
             "scheduled_runs": {"intended_run_at", "started_at", "finished_at"},
+            "canonical_report_contexts": {"economic_at", "retrieved_at"},
+            "actual_close_reviews": {
+                "review_at",
+                "mark_cutoff",
+                "query_cutoff",
+                "retrieved_at",
+            },
+            "actual_close_source_bindings": {"received_at"},
+            "close_recommendations": {"received_at"},
             "ledger_postings": {"occurred_at"},
             "actual_positions": {"updated_at"},
             "actual_cash_projection": {"updated_at"},
@@ -3915,6 +4554,8 @@ class JournalMigrationTests(unittest.TestCase):
             "report_claims": {"session_date"},
             "reports": {"session_date"},
             "scheduled_runs": {"session_date"},
+            "actual_close_reviews": {"session_date"},
+            "close_recommendations": {"session_date"},
             "phase1_validation_windows": {"started_session"},
             "phase1_signals": {"publication_session"},
             "phase1_observation_fetch_manifests": {"session_date"},

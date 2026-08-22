@@ -26,10 +26,12 @@ from .reports import (
     ClosePosition,
     CloseState,
     PremarketCandidate,
+    PremarketShadow,
     PremarketState,
     Report,
     ReportSource,
     ScoreComponent,
+    UnverifiedClosePosition,
     _issued_report_snapshot,
     archive_report,
     render_close_report,
@@ -102,7 +104,17 @@ _CLOSE_STATES = frozenset(
         "RECONCILIATION_REQUIRED",
         "POSITION_UNVERIFIED",
         "STOP_UNVERIFIED",
+        "DATA_UNAVAILABLE",
     }
+)
+_CLOSE_PRECEDENCE = (
+    "RECONCILIATION_REQUIRED",
+    "POSITION_UNVERIFIED",
+    "STOP_UNVERIFIED",
+    "DATA_UNAVAILABLE",
+    "EXIT",
+    "TIGHTEN_STOP",
+    "HOLD",
 )
 _SAFE_DATA_REASON_CODES = frozenset(
     {
@@ -178,18 +190,49 @@ class CandidateSummary:
 
     symbol: str
     role: str
-    material: PremarketCandidate | None = None
+    material: PremarketCandidate | PremarketShadow | None = None
 
     def __post_init__(self) -> None:
         if _SYMBOL.fullmatch(self.symbol) is None:
             raise ValueError("candidate symbol must be canonical")
-        if _TOKEN.fullmatch(self.role) is None:
-            raise ValueError("candidate role must be canonical")
+        if self.role not in {"PRIMARY", "WATCHLIST_SHADOW"}:
+            raise ValueError("candidate role must be PRIMARY or WATCHLIST_SHADOW")
         if self.material is not None:
-            if not isinstance(self.material, PremarketCandidate):
-                raise TypeError("candidate material must be a PremarketCandidate")
+            if type(self.material) not in {PremarketCandidate, PremarketShadow}:
+                raise TypeError("candidate material must be an exact report projection")
             if (self.material.symbol, self.material.role) != (self.symbol, self.role):
                 raise ValueError("candidate material identity conflicts with summary")
+            expected_type = (
+                PremarketCandidate if self.role == "PRIMARY" else PremarketShadow
+            )
+            if type(self.material) is not expected_type:
+                raise ValueError("candidate material type conflicts with its role")
+
+
+def _validate_candidate_summary_composition(
+    candidates: tuple[CandidateSummary, ...],
+    *,
+    required: bool,
+) -> None:
+    if type(candidates) is not tuple or any(
+        type(candidate) is not CandidateSummary for candidate in candidates
+    ):
+        raise TypeError("candidates must be an exact CandidateSummary tuple")
+    if not candidates:
+        if required:
+            raise ValueError("candidate outcome requires one primary candidate")
+        return
+    primary_count = sum(candidate.role == "PRIMARY" for candidate in candidates)
+    shadow_count = sum(
+        candidate.role == "WATCHLIST_SHADOW" for candidate in candidates
+    )
+    if primary_count != 1 or shadow_count > 2:
+        raise ValueError("candidates require one primary and at most two shadows")
+    symbols = tuple(candidate.symbol for candidate in candidates)
+    if len(symbols) != len(set(symbols)):
+        raise ValueError("candidate symbols must be unique")
+    if candidates[0].role != "PRIMARY":
+        raise ValueError("primary candidate must be first")
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,17 +257,38 @@ class PremarketSnapshot:
     candidates: tuple[CandidateSummary, ...]
     breaker_active: bool
 
+    def __post_init__(self) -> None:
+        _validate_candidate_summary_composition(
+            self.candidates,
+            required=False,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class CloseSnapshot:
     """Normalized close decision with manual-verification precedence applied."""
 
     state: str
-    positions: tuple[ClosePosition, ...] = ()
+    positions: tuple[ClosePosition | UnverifiedClosePosition, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state not in _CLOSE_STATES:
             raise ValueError("unsupported close state")
+        if type(self.positions) is not tuple or any(
+            type(position) not in {ClosePosition, UnverifiedClosePosition}
+            for position in self.positions
+        ):
+            raise TypeError("close positions must contain exact report projections")
+
+
+def _effective_close_state(snapshot: CloseSnapshot) -> str:
+    states = {snapshot.state}
+    for position in snapshot.positions:
+        if type(position) is UnverifiedClosePosition:
+            states.add(position.status)
+        elif position.action != "HOLD":
+            states.add(position.action)
+    return next(state for state in _CLOSE_PRECEDENCE if state in states)
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +340,10 @@ class WorkflowResult:
             raise ValueError("unsupported workflow exit code")
         if any(_TOKEN.fullmatch(code) is None for code in self.reason_codes):
             raise ValueError("workflow reason codes must be canonical")
+        _validate_candidate_summary_composition(
+            self.candidates,
+            required=self.outcome == "CANDIDATES",
+        )
         if self.exit_code != 0 and self.candidates:
             raise ValueError("nonzero workflow results cannot contain candidates")
         if self.outcome != "CANDIDATES" and self.candidates:
@@ -525,7 +593,8 @@ def run_close(context: WorkflowContext) -> WorkflowResult:
             ),
         )
 
-    if snapshot.state == "RECONCILIATION_REQUIRED":
+    effective_state = _effective_close_state(snapshot)
+    if effective_state == "RECONCILIATION_REQUIRED":
         result = _close_result(
             context,
             session.session_date,
@@ -534,20 +603,29 @@ def run_close(context: WorkflowContext) -> WorkflowResult:
             ("RECONCILIATION_REQUIRED",),
             snapshot.positions,
         )
-    elif snapshot.state in {"POSITION_UNVERIFIED", "STOP_UNVERIFIED"}:
+    elif effective_state in {"POSITION_UNVERIFIED", "STOP_UNVERIFIED"}:
         result = _close_result(
             context,
             session.session_date,
-            snapshot.state,
+            effective_state,
             4,
-            (snapshot.state,),
+            (effective_state,),
+            snapshot.positions,
+        )
+    elif effective_state == "DATA_UNAVAILABLE":
+        result = _close_result(
+            context,
+            session.session_date,
+            effective_state,
+            3,
+            (effective_state,),
             snapshot.positions,
         )
     else:
         result = _close_result(
             context,
             session.session_date,
-            snapshot.state,
+            effective_state,
             0,
             ("MANUAL_VERIFICATION_REQUIRED",),
             snapshot.positions,
@@ -798,7 +876,7 @@ class RecordedScenarioAdapter:
     breaker: str
     candidates: tuple[CandidateSummary, ...]
     close_state: str
-    close_positions: tuple[ClosePosition, ...]
+    close_positions: tuple[ClosePosition | UnverifiedClosePosition, ...]
     expected_outcome: str
     evidence: ReportEvidence
     fixture_payload: bytes
@@ -1141,6 +1219,15 @@ def _structural_fingerprint(
             "invalidations",
             "sources",
         )
+    elif value_type is PremarketShadow:
+        tag = "PREMARKET_SHADOW"
+        field_names = (
+            "symbol",
+            "role",
+            "score",
+            "setup",
+            "trigger",
+        )
     elif value_type is ScoreComponent:
         tag = "SCORE_COMPONENT"
         field_names = ("label", "earned", "available")
@@ -1164,6 +1251,17 @@ def _structural_fingerprint(
             "observed_at",
             "upcoming_events",
             "evidence",
+            "action",
+            "reason_codes",
+        )
+    elif value_type is UnverifiedClosePosition:
+        tag = "UNVERIFIED_CLOSE_POSITION"
+        field_names = (
+            "symbol",
+            "shares",
+            "exact_cost_basis",
+            "status",
+            "reason_codes",
         )
     elif value_type is ReportEvidence:
         tag = "REPORT_EVIDENCE"
@@ -1632,7 +1730,7 @@ def _close_result(
     outcome: str,
     exit_code: int,
     reasons: tuple[str, ...],
-    positions: tuple[ClosePosition, ...] = (),
+    positions: tuple[ClosePosition | UnverifiedClosePosition, ...] = (),
 ) -> WorkflowResult:
     evidence = context.adapter.report_evidence()
     execution_mode = getattr(context.adapter, "execution_mode", "CANONICAL")
@@ -1648,12 +1746,9 @@ def _close_result(
             observation_ids=evidence.observation_ids,
             state_hash=evidence.state_hash,
             reconciliation_required=outcome == "RECONCILIATION_REQUIRED",
-            position_verified=outcome not in {
-                "POSITION_UNVERIFIED",
-                "DATA_UNAVAILABLE",
-                "NO_TRADE",
-            },
+            position_verified=outcome != "POSITION_UNVERIFIED",
             stop_verified=outcome != "STOP_UNVERIFIED",
+            data_available=outcome != "DATA_UNAVAILABLE",
             exit_due=outcome == "EXIT",
             tighten_stop_due=outcome == "TIGHTEN_STOP",
         )

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 from urllib.parse import parse_qsl, urlsplit
 from weakref import ReferenceType, ref
 
@@ -87,9 +88,19 @@ _CLOSE_OUTCOMES = (
     "RECONCILIATION REQUIRED",
     "POSITION UNVERIFIED",
     "STOP UNVERIFIED",
+    "DATA UNAVAILABLE",
     "PROVISIONAL EXIT - VERIFY CURRENT ROBINHOOD PRICE",
     "PROVISIONAL TIGHTEN STOP - VERIFY CURRENT ROBINHOOD PRICE",
     "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE",
+)
+_CLOSE_ACTIONS = frozenset({"HOLD", "EXIT", "TIGHTEN_STOP"})
+_UNVERIFIED_CLOSE_STATUSES = frozenset(
+    {
+        "POSITION_UNVERIFIED",
+        "STOP_UNVERIFIED",
+        "DATA_UNAVAILABLE",
+        "RECONCILIATION_REQUIRED",
+    }
 )
 
 
@@ -126,7 +137,7 @@ class PremarketCandidate:
     """Report-only projection of one already-qualified candidate."""
 
     symbol: str
-    role: str
+    role: Literal["PRIMARY"]
     setup: str
     score_components: tuple[ScoreComponent, ...]
     trigger: Decimal
@@ -144,6 +155,8 @@ class PremarketCandidate:
     def __post_init__(self) -> None:
         _canonical_token(self.symbol, "candidate symbol")
         _canonical_token(self.role, "candidate role")
+        if self.role != "PRIMARY":
+            raise ValueError("sized candidate role must be PRIMARY")
         _canonical_token(self.setup, "candidate setup")
         if tuple(component.label for component in self.score_components) != (
             _SCORE_COMPONENTS
@@ -178,6 +191,28 @@ class PremarketCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class PremarketShadow:
+    """Watchlist-only candidate projection with no sizing or plan authority."""
+
+    symbol: str
+    role: Literal["WATCHLIST_SHADOW"]
+    score: Decimal
+    setup: str
+    trigger: Decimal
+
+    def __post_init__(self) -> None:
+        _canonical_token(self.symbol, "shadow symbol")
+        _canonical_token(self.role, "shadow role")
+        if self.role != "WATCHLIST_SHADOW":
+            raise ValueError("shadow candidate role must be WATCHLIST_SHADOW")
+        score = _finite_decimal(self.score, "shadow score")
+        if not Decimal("0") <= score <= Decimal("100"):
+            raise ValueError("shadow score must be between zero and 100")
+        _canonical_token(self.setup, "shadow setup")
+        require_positive_decimal(self.trigger, "shadow trigger")
+
+
+@dataclass(frozen=True, slots=True)
 class PremarketState:
     """Audited inputs required to render one premarket report."""
 
@@ -187,7 +222,7 @@ class PremarketState:
     reason_codes: tuple[str, ...]
     observation_ids: tuple[str, ...]
     state_hash: str
-    candidates: tuple[PremarketCandidate, ...] = ()
+    candidates: tuple[PremarketCandidate | PremarketShadow, ...] = ()
 
     def __post_init__(self) -> None:
         _session_date(self.session_date)
@@ -197,8 +232,29 @@ class PremarketState:
         _reason_codes(self.reason_codes)
         _observation_ids(self.observation_ids)
         _sha256(self.state_hash, "state hash")
+        if type(self.candidates) is not tuple or any(
+            type(candidate) not in {PremarketCandidate, PremarketShadow}
+            for candidate in self.candidates
+        ):
+            raise TypeError("candidates must contain exact report projection types")
         if self.outcome == "CANDIDATES" and not self.candidates:
             raise ValueError("candidate outcome requires at least one candidate")
+        if self.outcome == "CANDIDATES":
+            primary_count = sum(
+                type(candidate) is PremarketCandidate for candidate in self.candidates
+            )
+            shadow_count = sum(
+                type(candidate) is PremarketShadow for candidate in self.candidates
+            )
+            if primary_count != 1 or shadow_count > 2:
+                raise ValueError(
+                    "candidate outcome requires one primary and at most two shadows"
+                )
+            symbols = tuple(candidate.symbol for candidate in self.candidates)
+            if len(symbols) != len(set(symbols)):
+                raise ValueError("candidate symbols must be unique")
+            if type(self.candidates[0]) is not PremarketCandidate:
+                raise ValueError("primary candidate must be first")
         if self.outcome != "CANDIDATES" and self.candidates:
             raise ValueError("non-candidate outcome cannot contain candidates")
 
@@ -259,6 +315,8 @@ class ClosePosition:
     observed_at: datetime
     upcoming_events: tuple[str, ...]
     evidence: tuple[ReportSource, ...]
+    action: Literal["HOLD", "EXIT", "TIGHTEN_STOP"] = "HOLD"
+    reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _canonical_token(self.symbol, "position symbol")
@@ -277,6 +335,39 @@ class ClosePosition:
         require_aware_timestamp(self.observed_at, "position observation time")
         for event in self.upcoming_events:
             _single_line(event, "upcoming event")
+        if type(self.action) is not str or self.action not in _CLOSE_ACTIONS:
+            raise ValueError("verified position action is unsupported")
+        _projection_reason_codes(self.reason_codes, required=False)
+
+
+@dataclass(frozen=True, slots=True)
+class UnverifiedClosePosition:
+    """Known actual exposure without invented market or plan values."""
+
+    symbol: str
+    shares: int
+    exact_cost_basis: Decimal
+    status: Literal[
+        "POSITION_UNVERIFIED",
+        "STOP_UNVERIFIED",
+        "DATA_UNAVAILABLE",
+        "RECONCILIATION_REQUIRED",
+    ]
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _canonical_token(self.symbol, "unverified position symbol")
+        require_positive_int(self.shares, "unverified position shares")
+        require_positive_decimal(
+            self.exact_cost_basis,
+            "unverified position exact cost basis",
+        )
+        if (
+            type(self.status) is not str
+            or self.status not in _UNVERIFIED_CLOSE_STATUSES
+        ):
+            raise ValueError("unverified position status is unsupported")
+        _projection_reason_codes(self.reason_codes, required=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,12 +377,13 @@ class CloseState:
     session_date: date
     generated_at: datetime
     reason_codes: tuple[str, ...]
-    positions: tuple[ClosePosition, ...]
+    positions: tuple[ClosePosition | UnverifiedClosePosition, ...]
     observation_ids: tuple[str, ...]
     state_hash: str
     reconciliation_required: bool = False
     position_verified: bool = True
     stop_verified: bool = True
+    data_available: bool = True
     exit_due: bool = False
     tighten_stop_due: bool = False
 
@@ -305,13 +397,20 @@ class CloseState:
             "reconciliation_required",
             "position_verified",
             "stop_verified",
+            "data_available",
             "exit_due",
             "tighten_stop_due",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
+        if type(self.positions) is not tuple or any(
+            type(position) not in {ClosePosition, UnverifiedClosePosition}
+            for position in self.positions
+        ):
+            raise TypeError("positions must contain exact report projection types")
         if self.stop_verified and any(
             position.user_confirmed_stop is None for position in self.positions
+            if type(position) is ClosePosition
         ):
             raise ValueError("verified stop state requires every stop confirmation")
 
@@ -617,7 +716,21 @@ def archive_report(report: Report, root: Path) -> ArchivedReport:
     )
 
 
-def _render_candidate(candidate: PremarketCandidate, ordinal: int) -> list[str]:
+def _render_candidate(
+    candidate: PremarketCandidate | PremarketShadow,
+    ordinal: int,
+) -> list[str]:
+    if type(candidate) is PremarketCandidate:
+        return _render_primary_candidate(candidate, ordinal)
+    if type(candidate) is PremarketShadow:
+        return _render_shadow_candidate(candidate, ordinal)
+    raise TypeError("candidate must be an exact report projection")
+
+
+def _render_primary_candidate(
+    candidate: PremarketCandidate,
+    ordinal: int,
+) -> list[str]:
     lines = [
         f"### {ordinal}. {candidate.symbol} - {candidate.role}",
         "",
@@ -646,7 +759,40 @@ def _render_candidate(candidate: PremarketCandidate, ordinal: int) -> list[str]:
     return lines
 
 
-def _render_close_position(position: ClosePosition, ordinal: int) -> list[str]:
+def _render_shadow_candidate(
+    candidate: PremarketShadow,
+    ordinal: int,
+) -> list[str]:
+    unavailable = "N/A - WATCHLIST ONLY"
+    return [
+        f"### {ordinal}. {candidate.symbol} - {candidate.role}",
+        "",
+        f"- Setup: `{candidate.setup}`",
+        f"- Total score: `{_plain_decimal(candidate.score)}/100`",
+        f"- Entry trigger: `{_money(candidate.trigger)}`",
+        f"- Maximum permitted entry: `{unavailable}`",
+        f"- Recommended initial stop: `{unavailable}`",
+        f"- First target: `{unavailable}`",
+        f"- Whole shares: `{unavailable}`",
+        f"- Planned risk: `{unavailable}`",
+    ]
+
+
+def _render_close_position(
+    position: ClosePosition | UnverifiedClosePosition,
+    ordinal: int,
+) -> list[str]:
+    if type(position) is ClosePosition:
+        return _render_verified_close_position(position, ordinal)
+    if type(position) is UnverifiedClosePosition:
+        return _render_unverified_close_position(position, ordinal)
+    raise TypeError("position must be an exact report projection")
+
+
+def _render_verified_close_position(
+    position: ClosePosition,
+    ordinal: int,
+) -> list[str]:
     confirmed_stop = (
         "NOT CONFIRMED"
         if position.user_confirmed_stop is None
@@ -667,10 +813,29 @@ def _render_close_position(position: ClosePosition, ordinal: int) -> list[str]:
         f"- First target: `{_money(position.target)}`",
         f"- Holding age: `{position.holding_days} trading days`",
         f"- Upcoming events: {upcoming_events}",
-        f"- Data: provider `{position.provider}`, feed `{position.feed}`, "
-        f"observed `{position.observed_at.isoformat(timespec='seconds')}`",
-        "- Evidence:",
     ]
+    if position.action != "HOLD" or position.reason_codes:
+        lines.extend(
+            [
+                f"- Action: `{position.action}`",
+                "- Position reasons:",
+                *(
+                    [
+                        f"  - `{_human_token(reason)}`"
+                        for reason in position.reason_codes
+                    ]
+                    if position.reason_codes
+                    else ["  - None."]
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            f"- Data: provider `{position.provider}`, feed `{position.feed}`, "
+            f"observed `{position.observed_at.isoformat(timespec='seconds')}`",
+            "- Evidence:",
+        ]
+    )
     if position.evidence:
         lines.extend(
             f"  - [{source.label}]({source.url})" for source in position.evidence
@@ -680,18 +845,51 @@ def _render_close_position(position: ClosePosition, ordinal: int) -> list[str]:
     return lines
 
 
+def _render_unverified_close_position(
+    position: UnverifiedClosePosition,
+    ordinal: int,
+) -> list[str]:
+    return [
+        f"### {ordinal}. {position.symbol}",
+        "",
+        f"- Shares: `{position.shares}`",
+        f"- Exact cost basis: `{_money(position.exact_cost_basis)}`",
+        f"- Status: `{_human_token(position.status)}`",
+        "- Position reasons:",
+        *[f"  - `{_human_token(reason)}`" for reason in position.reason_codes],
+    ]
+
+
 def _close_outcome(state: CloseState) -> str:
-    if state.reconciliation_required:
+    unverified_statuses = {
+        position.status
+        for position in state.positions
+        if type(position) is UnverifiedClosePosition
+    }
+    verified_actions = {
+        position.action
+        for position in state.positions
+        if type(position) is ClosePosition
+    }
+    if (
+        state.reconciliation_required
+        or "RECONCILIATION_REQUIRED" in unverified_statuses
+    ):
         return _CLOSE_OUTCOMES[0]
-    if not state.position_verified:
+    if (
+        not state.position_verified
+        or "POSITION_UNVERIFIED" in unverified_statuses
+    ):
         return _CLOSE_OUTCOMES[1]
-    if not state.stop_verified:
+    if not state.stop_verified or "STOP_UNVERIFIED" in unverified_statuses:
         return _CLOSE_OUTCOMES[2]
-    if state.exit_due:
+    if not state.data_available or "DATA_UNAVAILABLE" in unverified_statuses:
         return _CLOSE_OUTCOMES[3]
-    if state.tighten_stop_due:
+    if state.exit_due or "EXIT" in verified_actions:
         return _CLOSE_OUTCOMES[4]
-    return _CLOSE_OUTCOMES[5]
+    if state.tighten_stop_due or "TIGHTEN_STOP" in verified_actions:
+        return _CLOSE_OUTCOMES[5]
+    return _CLOSE_OUTCOMES[6]
 
 
 def _verify_existing_archive(
@@ -851,6 +1049,15 @@ def _decimal(value: Decimal) -> str:
     return f"{whole}.{fraction}" if separator or fraction else f"{whole}.00"
 
 
+def _plain_decimal(value: Decimal) -> str:
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _human_token(value: str) -> str:
+    return value.replace("_", " ")
+
+
 def _finite_decimal(value: object, name: str) -> Decimal:
     if not isinstance(value, Decimal) or not value.is_finite():
         raise ValueError(f"{name} must be a finite Decimal")
@@ -893,6 +1100,21 @@ def _reason_codes(values: tuple[str, ...]) -> None:
         raise ValueError("report requires at least one reason code")
     for value in values:
         _canonical_token(value, "reason code")
+
+
+def _projection_reason_codes(
+    values: tuple[str, ...],
+    *,
+    required: bool,
+) -> None:
+    if type(values) is not tuple:
+        raise TypeError("position reason codes must be a tuple")
+    if required and not values:
+        raise ValueError("unverified position requires at least one reason code")
+    if len(values) != len(set(values)):
+        raise ValueError("position reason codes must not contain duplicates")
+    for value in values:
+        _canonical_token(value, "position reason code")
 
 
 def _observation_ids(values: tuple[str, ...]) -> None:

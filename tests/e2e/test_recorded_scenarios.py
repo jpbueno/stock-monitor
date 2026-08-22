@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -174,6 +175,21 @@ class RecordedScenarioTests(unittest.TestCase):
         self.assertIn("`FIXTURE`", result.message)
         self.assertEqual(result.execution_mode, "FIXTURE")
         self.assertEqual(len(publisher.results), 1)
+
+    def test_legacy_verified_hold_fixture_keeps_its_original_report_bytes(self):
+        result, _ = _run("normal-close.json", close=True)
+
+        assert result.report is not None
+        expected_sha256 = (
+            "099110826146583330d9c3ae43729ac215a42e18e96a0d866cb974fb81338317"
+        )
+        self.assertNotIn("- Action:", result.message)
+        self.assertNotIn("- Position reasons:", result.message)
+        self.assertEqual(
+            hashlib.sha256(result.message.encode("utf-8")).hexdigest(),
+            expected_sha256,
+        )
+        self.assertEqual(result.report.content_sha256, expected_sha256)
 
     def test_unverified_close_fails_closed(self):
         result, _ = _run("unverified-position.json", close=True)

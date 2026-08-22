@@ -10,12 +10,16 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stock_monitor.reports import (
+    CloseState,
     PremarketCandidate,
+    PremarketShadow,
     PremarketState,
     ReportMetric,
     ReportSource,
     ScoreComponent,
+    UnverifiedClosePosition,
     ValidationState,
+    render_close_report,
     render_premarket_report,
     render_validation_report,
 )
@@ -23,6 +27,45 @@ from stock_monitor.reports import (
 
 GOLDEN_ROOT = Path(__file__).parents[1] / "fixtures" / "golden_reports"
 ET = ZoneInfo("America/New_York")
+
+
+def _primary_projection() -> PremarketCandidate:
+    return PremarketCandidate(
+        symbol="NVDA",
+        role="PRIMARY",
+        setup="PULLBACK_RECLAIM",
+        score_components=(
+            ScoreComponent("Trend and market regime", 25, 25),
+            ScoreComponent("Relative strength", 20, 20),
+            ScoreComponent("Setup quality", 20, 20),
+            ScoreComponent("Volume confirmation", 11, 15),
+            ScoreComponent("Verified catalyst/context", 10, 10),
+            ScoreComponent("Liquidity and execution", 5, 10),
+        ),
+        trigger=Decimal("181.20"),
+        maximum_entry=Decimal("181.40"),
+        recommended_stop=Decimal("178.90"),
+        target=Decimal("186.40"),
+        shares=5,
+        planned_risk=Decimal("12.50"),
+        provider="ALPACA",
+        feed="SIP",
+        observed_at=datetime(2026, 8, 13, 15, 59, tzinfo=ET),
+        invalidations=(
+            "close below EMA20",
+            "Robinhood spread above 0.25%",
+        ),
+        sources=(
+            ReportSource(
+                "Issuer results",
+                "https://investor.nvidia.com/example",
+            ),
+            ReportSource(
+                "SEC filing",
+                "https://www.sec.gov/Archives/example",
+            ),
+        ),
+    )
 
 
 class GoldenReportTests(unittest.TestCase):
@@ -38,44 +81,7 @@ class GoldenReportTests(unittest.TestCase):
             generated_at=datetime(2026, 8, 14, 8, 45, tzinfo=ET),
             outcome="CANDIDATES",
             reason_codes=("QUALIFIED_PRIMARY_AVAILABLE",),
-            candidates=(
-                PremarketCandidate(
-                    symbol="NVDA",
-                    role="PRIMARY",
-                    setup="PULLBACK_RECLAIM",
-                    score_components=(
-                        ScoreComponent("Trend and market regime", 25, 25),
-                        ScoreComponent("Relative strength", 20, 20),
-                        ScoreComponent("Setup quality", 20, 20),
-                        ScoreComponent("Volume confirmation", 11, 15),
-                        ScoreComponent("Verified catalyst/context", 10, 10),
-                        ScoreComponent("Liquidity and execution", 5, 10),
-                    ),
-                    trigger=Decimal("181.20"),
-                    maximum_entry=Decimal("181.40"),
-                    recommended_stop=Decimal("178.90"),
-                    target=Decimal("186.40"),
-                    shares=5,
-                    planned_risk=Decimal("12.50"),
-                    provider="ALPACA",
-                    feed="SIP",
-                    observed_at=datetime(2026, 8, 13, 15, 59, tzinfo=ET),
-                    invalidations=(
-                        "close below EMA20",
-                        "Robinhood spread above 0.25%",
-                    ),
-                    sources=(
-                        ReportSource(
-                            "Issuer results",
-                            "https://investor.nvidia.com/example",
-                        ),
-                        ReportSource(
-                            "SEC filing",
-                            "https://www.sec.gov/Archives/example",
-                        ),
-                    ),
-                ),
-            ),
+            candidates=(_primary_projection(),),
             observation_ids=("obs-market", "obs-evidence"),
             state_hash="1" * 64,
         )
@@ -92,6 +98,103 @@ class GoldenReportTests(unittest.TestCase):
             hashlib.sha256(
                 (GOLDEN_ROOT / "premarket-candidate.md").read_bytes()
             ).hexdigest(),
+        )
+
+    def test_premarket_shadow_report_is_a_deterministic_watchlist_only_projection(
+        self,
+    ) -> None:
+        state = PremarketState(
+            session_date=date(2026, 8, 14),
+            generated_at=datetime(2026, 8, 14, 8, 45, tzinfo=ET),
+            outcome="CANDIDATES",
+            reason_codes=("QUALIFIED_PRIMARY_AVAILABLE",),
+            candidates=(
+                _primary_projection(),
+                PremarketShadow(
+                    symbol="AMD",
+                    role="WATCHLIST_SHADOW",
+                    score=Decimal("84"),
+                    setup="PULLBACK_RECLAIM",
+                    trigger=Decimal("100"),
+                ),
+            ),
+            observation_ids=("obs-shadow",),
+            state_hash="7" * 64,
+        )
+        expected = (
+            (GOLDEN_ROOT / "premarket-candidate.md").read_text(encoding="utf-8")
+            + """
+### 2. AMD - WATCHLIST_SHADOW
+
+- Setup: `PULLBACK_RECLAIM`
+- Total score: `84/100`
+- Entry trigger: `$100.00`
+- Maximum permitted entry: `N/A - WATCHLIST ONLY`
+- Recommended initial stop: `N/A - WATCHLIST ONLY`
+- First target: `N/A - WATCHLIST ONLY`
+- Whole shares: `N/A - WATCHLIST ONLY`
+- Planned risk: `N/A - WATCHLIST ONLY`
+"""
+        )
+
+        report = render_premarket_report(state)
+
+        self.assertEqual(report.body, expected)
+        self.assertEqual(report, render_premarket_report(state))
+        self.assertEqual(
+            report.content_sha256,
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        )
+
+    def test_unverified_close_report_is_a_deterministic_known_facts_projection(
+        self,
+    ) -> None:
+        state = CloseState(
+            session_date=date(2026, 8, 14),
+            generated_at=datetime(2026, 8, 14, 15, 30, tzinfo=ET),
+            reason_codes=("PLAN_LINEAGE_UNAVAILABLE",),
+            positions=(
+                UnverifiedClosePosition(
+                    symbol="AAPL",
+                    shares=4,
+                    exact_cost_basis=Decimal("225.10"),
+                    status="POSITION_UNVERIFIED",
+                    reason_codes=("PLAN_LINEAGE_UNAVAILABLE",),
+                ),
+            ),
+            observation_ids=("obs-position",),
+            state_hash="8" * 64,
+            position_verified=False,
+        )
+        expected = """# Stock Monitor Close Report - 2026-08-14
+
+- Outcome: `POSITION UNVERIFIED`
+- Generated at: `2026-08-14T15:30:00-04:00`
+
+> Every action is provisional pending current Robinhood verification. This report cannot change or replace the protective stop entered in Robinhood.
+
+## Reasons
+
+- `PLAN_LINEAGE_UNAVAILABLE`
+
+## Positions
+
+### 1. AAPL
+
+- Shares: `4`
+- Exact cost basis: `$225.10`
+- Status: `POSITION UNVERIFIED`
+- Position reasons:
+  - `PLAN LINEAGE UNAVAILABLE`
+"""
+
+        report = render_close_report(state)
+
+        self.assertEqual(report.body, expected)
+        self.assertEqual(report, render_close_report(state))
+        self.assertEqual(
+            report.content_sha256,
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
         )
 
     def test_premarket_no_trade_report_names_the_failed_gate(self) -> None:

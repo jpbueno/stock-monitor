@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import unittest
 from collections.abc import Mapping, MutableMapping
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from stock_monitor import unattended
@@ -124,6 +128,71 @@ class LiteralEnvironmentTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(LiteralEnvironmentError):
                 load_literal_environment(path)
 
+    def test_fifo_is_rejected_quickly_without_traceback_or_canary(self) -> None:
+        canary = "CANARY_FIFO_PATH_MUST_NOT_ESCAPE"
+        fifo = self.root / canary
+        os.mkfifo(fifo, mode=0o600)
+        program = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from stock_monitor.unattended import (\n"
+            "    LiteralEnvironmentError, load_literal_environment\n"
+            ")\n"
+            "try:\n"
+            "    load_literal_environment(Path(sys.argv[1]))\n"
+            "except LiteralEnvironmentError:\n"
+            "    print('CONFIGURATION REQUIRED')\n"
+            "    raise SystemExit(2)\n"
+            "except Exception:\n"
+            "    print('INTERNAL ERROR')\n"
+            "    raise SystemExit(10)\n"
+            "print('UNSAFE SUCCESS')\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-W", "error", "-c", program, str(fifo)],
+            cwd=self.root,
+            env={"PYTHONPATH": str(ROOT / "src")},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            self.fail("FIFO loading blocked before descriptor validation")
+
+        combined = stdout + stderr
+        self.assertEqual(process.returncode, 2)
+        self.assertEqual(stdout, "CONFIGURATION REQUIRED\n")
+        self.assertEqual(stderr, "")
+        self.assertNotIn(canary, combined)
+        self.assertNotIn("Traceback", combined)
+
+    def test_exact_private_mode_matrix(self) -> None:
+        for mode in (0o400, 0o600):
+            with self.subTest(mode=oct(mode), expected="accepted"):
+                path = self.private_file(
+                    self.valid_text(),
+                    name=f"accepted-{mode:o}.env",
+                    mode=mode,
+                )
+                self.assertEqual(
+                    load_literal_environment(path)["APCA_API_KEY_ID"],
+                    "literal-key-id",
+                )
+
+        for mode in (0o000, 0o100, 0o200, 0o500, 0o700, 0o601, 0o610, 0o640):
+            with self.subTest(mode=oct(mode), expected="rejected"):
+                path = self.private_file(
+                    self.valid_text(),
+                    name=f"rejected-{mode:o}.env",
+                    mode=mode,
+                )
+                with self.assertRaises(LiteralEnvironmentError):
+                    load_literal_environment(path)
+
     def test_wrong_owner_is_rejected(self) -> None:
         path = self.private_file(self.valid_text())
 
@@ -174,6 +243,38 @@ class LiteralEnvironmentTests(unittest.TestCase):
             with self.subTest(codepoint=codepoint):
                 payload = prefix + chr(codepoint).encode("utf-8") + b"hidden\n"
                 with self.assertRaises(LiteralEnvironmentError):
+                    parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+    def test_non_printable_unicode_is_rejected_in_every_grammar_position(self) -> None:
+        characters = (
+            "\N{LINE SEPARATOR}",
+            "\N{PARAGRAPH SEPARATOR}",
+            "\N{ZERO WIDTH SPACE}",
+            "\N{RIGHT-TO-LEFT OVERRIDE}",
+            "\N{WORD JOINER}",
+            "\N{ZERO WIDTH NO-BREAK SPACE}",
+            "\N{SOFT HYPHEN}",
+        )
+        for character in characters:
+            self.assertFalse(character.isprintable())
+            cases = {
+                "comment": (
+                    self.valid_text() + f"# hidden{character}content\n"
+                ).encode("utf-8"),
+                "key": self.valid_text().replace(
+                    "APCA_API_KEY_ID=",
+                    f"APCA_API_KEY{character}_ID=",
+                    1,
+                ).encode("utf-8"),
+                "value": self.valid_text(
+                    secret_key=f"before{character}after"
+                ).encode("utf-8"),
+            }
+            for position, payload in cases.items():
+                with self.subTest(
+                    codepoint=f"U+{ord(character):04X}",
+                    position=position,
+                ), self.assertRaises(LiteralEnvironmentError):
                     parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
 
     def test_controls_in_keys_and_around_separators_are_rejected(self) -> None:
@@ -239,6 +340,15 @@ class LiteralEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(values["APCA_API_KEY_ID"], "literal-key-id")
 
+    def test_printable_utf8_in_values_remains_literal(self) -> None:
+        printable = "café-東京-🙂"
+        self.assertTrue(printable.isprintable())
+        payload = self.valid_text(secret_key=printable).encode("utf-8")
+
+        values = parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
+
+        self.assertEqual(values["APCA_API_SECRET_KEY"], printable)
+
     def test_parser_wraps_the_explicit_approved_key_set(self) -> None:
         values = parse_exact_literal_assignments(
             b"SYNTHETIC=value\n",
@@ -263,11 +373,15 @@ class LiteralEnvironmentTests(unittest.TestCase):
         moved = self.root / "moved.env"
         replacement = self.valid_text(key_id="path-replacement")
         real_fstat = os.fstat
+        swapped = False
 
         def swap_after_open(descriptor: int):
-            original.rename(moved)
-            original.write_text(replacement, encoding="utf-8")
-            original.chmod(0o600)
+            nonlocal swapped
+            if not swapped:
+                original.rename(moved)
+                original.write_text(replacement, encoding="utf-8")
+                original.chmod(0o600)
+                swapped = True
             return real_fstat(descriptor)
 
         with patch.object(unattended.os, "fstat", side_effect=swap_after_open):
@@ -275,6 +389,73 @@ class LiteralEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(values["APCA_API_KEY_ID"], "descriptor-original")
         self.assertIn("path-replacement", original.read_text(encoding="utf-8"))
+
+    def test_descriptor_metadata_must_remain_stable_during_read(self) -> None:
+        path = self.private_file(self.valid_text())
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        real_fstat = os.fstat
+
+        for changed_field in fields:
+            calls = 0
+
+            def changing_fstat(
+                descriptor: int,
+                *,
+                field: str = changed_field,
+            ) -> SimpleNamespace | os.stat_result:
+                nonlocal calls
+                calls += 1
+                value = real_fstat(descriptor)
+                if calls == 1:
+                    return value
+                metadata = {name: getattr(value, name) for name in fields}
+                metadata[field] += 1
+                return SimpleNamespace(**metadata)
+
+            with self.subTest(field=changed_field), patch.object(
+                unattended.os,
+                "fstat",
+                side_effect=changing_fstat,
+            ):
+                with self.assertRaises(LiteralEnvironmentError):
+                    load_literal_environment(path)
+
+    def test_descriptor_size_must_equal_the_bytes_read(self) -> None:
+        path = self.private_file(self.valid_text())
+        real_fstat = os.fstat
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+
+        def inconsistent_size(descriptor: int) -> SimpleNamespace:
+            value = real_fstat(descriptor)
+            metadata = {name: getattr(value, name) for name in fields}
+            metadata["st_size"] += 1
+            return SimpleNamespace(**metadata)
+
+        with patch.object(
+            unattended.os,
+            "fstat",
+            side_effect=inconsistent_size,
+        ):
+            with self.assertRaises(LiteralEnvironmentError):
+                load_literal_environment(path)
 
     def test_read_bounded_descriptor_rejects_one_byte_over_limit(self) -> None:
         descriptor = os.open(
@@ -345,6 +526,39 @@ class LiteralEnvironmentTests(unittest.TestCase):
             values["APCA_API_SECRET_KEY"] = "replacement"  # type: ignore[index]
         self.assertEqual(values["APCA_API_SECRET_KEY"], "trusted-secret")
 
+    def test_mapping_storage_cannot_change_before_cli_run(self) -> None:
+        values = load_literal_environment(
+            self.private_file(self.valid_text(secret_key="trusted-secret"))
+        )
+        storage_names = tuple(
+            name for name in dir(values) if name.endswith("entries")
+        )
+        replacement = tuple(
+            (key, "attacker-controlled") for key in sorted(APPROVED_KEYS)
+        )
+
+        self.assertTrue(storage_names)
+        for name in storage_names:
+            with self.subTest(name=name, operation="assign"):
+                with self.assertRaises(AttributeError):
+                    setattr(values, name, replacement)
+            with self.subTest(name=name, operation="delete"):
+                with self.assertRaises(AttributeError):
+                    delattr(values, name)
+
+        observed: list[str] = []
+
+        def run_with_environment(argv, *, environ):
+            observed.append(environ["APCA_API_SECRET_KEY"])
+            return 0
+
+        with patch.object(unattended, "load_literal_environment", return_value=values):
+            with patch.object(unattended.cli, "run", side_effect=run_with_environment):
+                code = unattended.main(("provider", "smoke"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(observed, ["trusted-secret"])
+
     def test_loaded_mapping_remains_compatible_with_configuration_loader(self) -> None:
         path = self.private_file(
             self.valid_text(
@@ -376,6 +590,43 @@ class LiteralEnvironmentTests(unittest.TestCase):
             ("provider", "smoke", "--json"),
             environ=values,
         )
+
+    def test_main_rejects_an_interpreter_outside_the_module_root_venv(self) -> None:
+        canary = "CANARY_WRONG_INTERPRETER_MUST_NOT_ESCAPE"
+        values = {
+            "APCA_API_KEY_ID": "key",
+            "APCA_API_SECRET_KEY": "secret",
+            "SEC_USER_AGENT": "Stock Monitor test operator@example.com",
+            "STOCK_MONITOR_HOME": str(self.root / "state"),
+        }
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch.object(
+            sys,
+            "executable",
+            str(self.root / canary / "bin" / "python3"),
+        ), patch.object(
+            unattended,
+            "load_literal_environment",
+            return_value=values,
+        ) as load, patch.object(
+            unattended.cli,
+            "run",
+            return_value=7,
+        ) as run, redirect_stdout(stdout), redirect_stderr(stderr):
+            code = unattended.main(("provider", "smoke", "--json"))
+
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(code, 2)
+        self.assertEqual(
+            stdout.getvalue(),
+            "CONFIGURATION REQUIRED\nNo candidate or action was produced.\n",
+        )
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn(canary, combined)
+        self.assertNotIn("Traceback", combined)
+        load.assert_not_called()
+        run.assert_not_called()
 
     def test_main_maps_loader_and_internal_errors_without_tracebacks(self) -> None:
         canary = "CANARY_UNATTENDED_EXCEPTION_MUST_NOT_ESCAPE"
@@ -513,6 +764,112 @@ class UnattendedLauncherTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         self.assertFalse(marker.exists())
+
+    def test_copied_launcher_runs_actual_cli_in_its_isolated_venv(self) -> None:
+        launcher = self.install_launcher()
+        venv_root = self.root / ".venv"
+        setup = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "venv",
+                "--without-pip",
+                str(venv_root),
+            ],
+            cwd=self.root,
+            env={"PATH": os.environ.get("PATH", "")},
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+
+        python = venv_root / "bin" / "python3"
+        purelib_result = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            cwd=self.root,
+            env={},
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            purelib_result.returncode,
+            0,
+            purelib_result.stdout + purelib_result.stderr,
+        )
+        purelib = Path(purelib_result.stdout.strip())
+
+        source_root = self.root / "src"
+        shutil.copytree(
+            ROOT / "src" / "stock_monitor",
+            source_root / "stock_monitor",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        shutil.copytree(ROOT / "config", self.root / "config")
+        (purelib / "stock-monitor-test.pth").write_text(
+            f"{source_root}\n",
+            encoding="utf-8",
+        )
+
+        runtime = self.root / "runtime"
+        file_canaries = (
+            "CANARY_E2E_FILE_KEY_MUST_NOT_ESCAPE",
+            "CANARY_E2E_FILE_SECRET_MUST_NOT_ESCAPE",
+        )
+        private_environment = self.root / ".env"
+        private_environment.write_text(
+            "APCA_API_KEY_ID=" + file_canaries[0] + "\n"
+            "APCA_API_SECRET_KEY=" + file_canaries[1] + "\n"
+            "SEC_USER_AGENT=Stock Monitor e2e operator@example.com\n"
+            f"STOCK_MONITOR_HOME={runtime}\n",
+            encoding="utf-8",
+        )
+        private_environment.chmod(0o600)
+
+        inherited_runtime = self.root / "inherited-runtime"
+        inherited = {
+            "PATH": "/tmp/CANARY_E2E_PATH_MUST_NOT_BE_USED",
+            "PYTHONPATH": "/tmp/CANARY_E2E_PYTHONPATH_MUST_NOT_ESCAPE",
+            "HTTPS_PROXY": "http://CANARY_E2E_PROXY_MUST_NOT_ESCAPE.invalid",
+            "APCA_API_KEY_ID": "CANARY_E2E_INHERITED_KEY_MUST_NOT_ESCAPE",
+            "APCA_API_SECRET_KEY": "CANARY_E2E_INHERITED_SECRET_MUST_NOT_ESCAPE",
+            "STOCK_MONITOR_HOME": str(inherited_runtime),
+        }
+        outside = self.root / "outside"
+        outside.mkdir()
+
+        completed = subprocess.run(
+            [str(launcher), "db", "init", "--json"],
+            cwd=outside,
+            env=inherited,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        result = json.loads(completed.stdout)
+        self.assertEqual(set(result), {"migration_count", "status"})
+        self.assertEqual(result["status"], "INITIALIZED")
+        self.assertIsInstance(result["migration_count"], int)
+        self.assertGreater(result["migration_count"], 0)
+        combined = completed.stdout + completed.stderr
+        for canary in (*file_canaries, *inherited.values()):
+            with self.subTest(canary=canary):
+                self.assertNotIn(canary, combined)
+        self.assertTrue((runtime / ".stock-monitor" / "journal.sqlite3").is_file())
+        self.assertFalse(inherited_runtime.exists())
+        self.assertFalse((self.root / ".stock-monitor").exists())
 
 
 if __name__ == "__main__":

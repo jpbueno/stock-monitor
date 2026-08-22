@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -19,6 +20,17 @@ APPROVED_KEYS = frozenset(
     }
 )
 _MAXIMUM_ENVIRONMENT_BYTES = 16384
+_APPROVED_ENVIRONMENT_MODES = frozenset({0o400, 0o600})
+_DESCRIPTOR_METADATA_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
 
 
 class LiteralEnvironmentError(RuntimeError):
@@ -31,7 +43,17 @@ class _LiteralEnvironment(Mapping[str, str]):
     __slots__ = ("_entries",)
 
     def __init__(self, values: Mapping[str, str]) -> None:
-        self._entries = tuple((key, values[key]) for key in sorted(values))
+        object.__setattr__(
+            self,
+            "_entries",
+            tuple((key, values[key]) for key in sorted(values)),
+        )
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("literal environment is immutable")
+
+    def __delattr__(self, _name: str) -> None:
+        raise AttributeError("literal environment is immutable")
 
     def __getitem__(self, key: str) -> str:
         for candidate, value in self._entries:
@@ -71,6 +93,10 @@ def read_bounded_descriptor(descriptor: int, *, maximum_bytes: int) -> bytes:
             raise LiteralEnvironmentError("private environment is too large")
 
 
+def _descriptor_metadata(value: object) -> tuple[object, ...]:
+    return tuple(getattr(value, field) for field in _DESCRIPTOR_METADATA_FIELDS)
+
+
 def parse_exact_literal_assignments(
     payload: bytes,
     *,
@@ -85,7 +111,7 @@ def parse_exact_literal_assignments(
         ) from None
     if any(
         character != "\n"
-        and (ord(character) < 32 or 127 <= ord(character) <= 159)
+        and not character.isprintable()
         for character in text
     ):
         raise LiteralEnvironmentError("private environment control data is invalid")
@@ -114,19 +140,22 @@ def load_literal_environment(path: Path) -> Mapping[str, str]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
     except OSError:
         raise LiteralEnvironmentError("private environment is unavailable") from None
 
     try:
         try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
                 raise LiteralEnvironmentError(
                     "private environment ownership is invalid"
                 )
-            if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) & 0o077:
+            if (
+                before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) not in _APPROVED_ENVIRONMENT_MODES
+            ):
                 raise LiteralEnvironmentError(
                     "private environment permissions are invalid"
                 )
@@ -134,6 +163,14 @@ def load_literal_environment(path: Path) -> Mapping[str, str]:
                 descriptor,
                 maximum_bytes=_MAXIMUM_ENVIRONMENT_BYTES,
             )
+            after = os.fstat(descriptor)
+            if (
+                _descriptor_metadata(before) != _descriptor_metadata(after)
+                or after.st_size != len(payload)
+            ):
+                raise LiteralEnvironmentError(
+                    "private environment changed during read"
+                )
         except LiteralEnvironmentError:
             raise
         except OSError:
@@ -146,10 +183,17 @@ def load_literal_environment(path: Path) -> Mapping[str, str]:
     return parse_exact_literal_assignments(payload, approved=APPROVED_KEYS)
 
 
+def _require_expected_interpreter(root: Path) -> None:
+    expected_parent = root / ".venv" / "bin"
+    if Path(sys.executable).parent != expected_parent:
+        raise LiteralEnvironmentError("unattended interpreter is invalid")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Load only the reviewed literal environment and invoke the existing CLI."""
     try:
         root = Path(__file__).resolve(strict=True).parents[2]
+        _require_expected_interpreter(root)
         values = load_literal_environment(root / ".env")
         return cli.run(argv, environ=values)
     except LiteralEnvironmentError:

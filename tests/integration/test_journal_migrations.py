@@ -440,6 +440,21 @@ class JournalMigrationTests(unittest.TestCase):
                             2,
                             close_report.report_row_id,
                             "CLOSE",
+                            "2026-08-13T12:45:00.000000Z",
+                            "2026-08-14T12:45:01.000000Z",
+                            "f" * 64,
+                            "1" * 64,
+                            "2" * 64,
+                        ),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    journal._connection.execute(
+                        "INSERT INTO canonical_report_contexts VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            2,
+                            close_report.report_row_id,
+                            "CLOSE",
                             "2026-08-14T12:45:00.000000Z",
                             "2026-08-14T12:45:04.000000Z",
                             "f" * 64,
@@ -448,7 +463,7 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                     )
 
-    def test_actual_close_schema_binds_receipts_failures_and_nonwidening_stops(
+    def test_actual_close_schema_binds_complete_receipts_and_position_neutral_stops(
         self,
     ) -> None:
         timestamp = "2026-08-14T19:31:00.000000Z"
@@ -479,6 +494,101 @@ class JournalMigrationTests(unittest.TestCase):
                     ),
                 )
                 connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        2,
+                        "2" * 64,
+                        "3" * 64,
+                        "https://data.alpaca.markets/v2/stocks/quotes?page=2",
+                        "ALPACA_HISTORICAL_QUOTES",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-14T19:13:59.000000Z",
+                        "2026-08-14T19:31:01.000000Z",
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        3,
+                        "4" * 64,
+                        "5" * 64,
+                        "https://data.alpaca.markets/v2/stocks/quotes?early=1",
+                        "ALPACA_HISTORICAL_QUOTES",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-14T19:13:58.000000Z",
+                        "2026-08-14T19:30:45.000000Z",
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        4,
+                        "6" * 64,
+                        "7" * 64,
+                        "https://data.alpaca.markets/v2/stocks/bars?timeframe=1Min",
+                        "ALPACA_HISTORICAL_BARS",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-14T19:30:00.000000Z",
+                        "2026-08-14T19:31:02.000000Z",
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        5,
+                        "8" * 64,
+                        "9" * 64,
+                        "https://data.alpaca.markets/v2/stocks/bars?timeframe=1Day",
+                        "ALPACA_HISTORICAL_BARS",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-13T20:00:00.000000Z",
+                        "2026-08-14T19:31:03.000000Z",
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        6,
+                        "d" * 64,
+                        "e" * 64,
+                        "https://data.alpaca.markets/v2/stocks/quotes?next_day=1",
+                        "ALPACA_HISTORICAL_QUOTES",
+                        "Alpaca",
+                        "SIP",
+                        "2026-08-15T19:14:00.000000Z",
+                        "2026-08-15T19:31:00.000000Z",
+                        None,
+                        960,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.execute(
                     "INSERT INTO actual_close_reviews VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -489,7 +599,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "2026-08-14T19:14:00.000000Z",
                         "2026-08-14T19:30:30.000000Z",
                         timestamp,
-                        2,
+                        5,
                         "d" * 64,
                         "e" * 64,
                     ),
@@ -518,6 +628,18 @@ class JournalMigrationTests(unittest.TestCase):
                         -1,
                         "c" * 64,
                         "d" * 64,
+                    ),
+                    (
+                        5,
+                        "6" * 64,
+                        "2026-08-18",
+                        "2026-08-19T19:30:00.000000Z",
+                        "2026-08-19T19:14:00.000000Z",
+                        "2026-08-19T19:30:30.000000Z",
+                        "2026-08-19T19:31:00.000000Z",
+                        0,
+                        "7" * 64,
+                        "8" * 64,
                     ),
                 )
                 for review in invalid_reviews:
@@ -558,50 +680,69 @@ class JournalMigrationTests(unittest.TestCase):
                         "1" * 64,
                     ),
                 )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        3,
+                        "c" * 64,
+                        3,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        2,
+                        None,
+                        "2026-08-14T19:31:01.000000Z",
+                        "2" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        4,
+                        "c" * 64,
+                        4,
+                        "AAPL",
+                        "SIP_MINUTE_BAR",
+                        4,
+                        None,
+                        "2026-08-14T19:31:02.000000Z",
+                        "3" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        5,
+                        "c" * 64,
+                        5,
+                        "AAPL",
+                        "SIP_DAILY_BAR",
+                        5,
+                        None,
+                        "2026-08-14T19:31:03.000000Z",
+                        "4" * 64,
+                    ),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT source_role FROM actual_close_source_bindings "
+                        "WHERE source_observation_id IN (4, 5) ORDER BY source_role"
+                    ).fetchall(),
+                    [("SIP_DAILY_BAR",), ("SIP_MINUTE_BAR",)],
+                )
 
                 invalid_bindings = (
                     (
-                        3,
+                        6,
                         "c" * 64,
-                        3,
+                        6,
                         "AAPL",
-                        "SIP_SESSION_BAR",
+                        "SIP_MINUTE_BAR",
                         1,
                         "ALSO_FAILED",
                         timestamp,
-                        "2" * 64,
-                    ),
-                    (
-                        4,
-                        "c" * 64,
-                        4,
-                        "AAPL",
-                        "EVENT_EVIDENCE",
-                        None,
-                        None,
-                        timestamp,
-                        "3" * 64,
-                    ),
-                    (
-                        5,
-                        "c" * 64,
-                        5,
-                        "AAPL",
-                        "ATTACKER_ASSERTED_ROLE",
-                        None,
-                        "UNAVAILABLE",
-                        timestamp,
-                        "4" * 64,
-                    ),
-                    (
-                        6,
-                        "c" * 64,
-                        6,
-                        "AAPL",
-                        "IEX_FRESHNESS",
-                        1,
-                        None,
-                        "2026-08-14T19:31:01.000000Z",
                         "5" * 64,
                     ),
                     (
@@ -609,11 +750,99 @@ class JournalMigrationTests(unittest.TestCase):
                         "c" * 64,
                         7,
                         "AAPL",
-                        "SIP_QUOTE",
+                        "EVENT_EVIDENCE",
                         None,
-                        "DUPLICATE_ROLE",
-                        "2026-08-14T19:32:00.000000Z",
+                        None,
+                        timestamp,
                         "6" * 64,
+                    ),
+                    (
+                        8,
+                        "c" * 64,
+                        8,
+                        "AAPL",
+                        "ATTACKER_ASSERTED_ROLE",
+                        None,
+                        "UNAVAILABLE",
+                        timestamp,
+                        "7" * 64,
+                    ),
+                    (
+                        9,
+                        "c" * 64,
+                        9,
+                        "AAPL",
+                        "IEX_FRESHNESS",
+                        1,
+                        None,
+                        "2026-08-14T19:31:01.000000Z",
+                        "8" * 64,
+                    ),
+                    (
+                        10,
+                        "c" * 64,
+                        10,
+                        "MSFT",
+                        "SIP_SESSION_BAR",
+                        None,
+                        "LEGACY_ROLE",
+                        "2026-08-14T19:32:01.000000Z",
+                        "9" * 64,
+                    ),
+                    (
+                        11,
+                        "c" * 64,
+                        11,
+                        "AAPL",
+                        "SIP_DAILY_BAR",
+                        1,
+                        None,
+                        timestamp,
+                        "a" * 64,
+                    ),
+                    (
+                        12,
+                        "c" * 64,
+                        12,
+                        None,
+                        "OPERATIONAL_STATUS",
+                        None,
+                        "DUPLICATE_FAILURE_ROLE",
+                        "2026-08-14T19:32:01.000000Z",
+                        "b" * 64,
+                    ),
+                    (
+                        13,
+                        "c" * 64,
+                        13,
+                        "AAPL",
+                        "IEX_FRESHNESS",
+                        3,
+                        None,
+                        "2026-08-14T19:30:45.000000Z",
+                        "c" * 64,
+                    ),
+                    (
+                        14,
+                        "c" * 64,
+                        14,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        6,
+                        None,
+                        "2026-08-15T19:31:00.000000Z",
+                        "d" * 64,
+                    ),
+                    (
+                        15,
+                        "c" * 64,
+                        15,
+                        "MSFT",
+                        "PRIMARY_HALT_FEED",
+                        None,
+                        "FAR_FUTURE_FAILURE",
+                        "2099-08-14T19:31:00.000000Z",
+                        "e" * 64,
                     ),
                 )
                 for binding in invalid_bindings:
@@ -695,6 +924,19 @@ class JournalMigrationTests(unittest.TestCase):
                         "2026-08-14T19:30:59.999999Z",
                         "f" * 64,
                     ),
+                    (
+                        7,
+                        "e" * 64,
+                        "c" * 64,
+                        "2026-08-14",
+                        "NVDA",
+                        100_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "f" * 64,
+                        "2099-08-14T19:32:00.000000Z",
+                        "0" * 64,
+                    ),
                 )
                 for recommendation in invalid_recommendations:
                     with self.subTest(recommendation=recommendation[0]):
@@ -733,16 +975,10 @@ class JournalMigrationTests(unittest.TestCase):
                     "2026-08-15T19:32:00.000000Z",
                     "6" * 64,
                 )
-                with self.assertRaises(sqlite3.IntegrityError):
-                    connection.execute(
-                        "INSERT INTO close_recommendations VALUES "
-                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        next_recommendation,
-                    )
                 connection.execute(
                     "INSERT INTO close_recommendations VALUES "
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (*next_recommendation[:5], 220_010_000, *next_recommendation[6:]),
+                    next_recommendation,
                 )
                 self.assertEqual(
                     connection.execute(
@@ -750,7 +986,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "FROM close_recommendations "
                         "WHERE symbol = 'AAPL' ORDER BY session_date"
                     ).fetchall(),
-                    [(220_000_000,), (220_010_000,)],
+                    [(220_000_000,), (219_990_000,)],
                 )
 
     def test_migration_source_can_be_loaded_independently_of_source_tree(self) -> None:
@@ -3750,6 +3986,68 @@ class JournalMigrationTests(unittest.TestCase):
                     "UPDATE report_claims SET status = 'FINALIZED', "
                     "finalized_at = ?, report_id = 1 WHERE id = 1",
                     (timestamp,),
+                )
+                connection.execute(
+                    "INSERT INTO canonical_report_contexts VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        1,
+                        "CLOSE",
+                        timestamp,
+                        timestamp,
+                        "2" * 64,
+                        "3" * 64,
+                        "4" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_reviews VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "5" * 64,
+                        "2026-08-14",
+                        timestamp,
+                        "2026-08-14T13:44:00.000000Z",
+                        timestamp,
+                        timestamp,
+                        1,
+                        "6" * 64,
+                        "7" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "5" * 64,
+                        1,
+                        "SPY",
+                        "SIP_QUOTE",
+                        1,
+                        None,
+                        timestamp,
+                        "8" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO close_recommendations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "9" * 64,
+                        "5" * 64,
+                        "2026-08-14",
+                        "SPY",
+                        100_000_000,
+                        "HOLD",
+                        '["POSITION_REVIEW_COMPLETE"]',
+                        "a" * 64,
+                        timestamp,
+                        "b" * 64,
+                    ),
                 )
                 connection.execute(
                     "INSERT INTO outbox_delivery_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

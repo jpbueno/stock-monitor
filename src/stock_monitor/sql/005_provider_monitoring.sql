@@ -68,6 +68,8 @@ WHEN NOT EXISTS (
     SELECT 1
     FROM reports
     WHERE id = NEW.report_id
+      AND substr(NEW.economic_at, 1, 10) = session_date
+      AND substr(NEW.retrieved_at, 1, 10) = session_date
       AND NEW.retrieved_at <= created_at
       AND (
           (NEW.workflow_kind = 'PREMARKET' AND report_kind = 'MORNING')
@@ -142,6 +144,10 @@ CREATE TABLE actual_close_reviews (
     CHECK(mark_cutoff < review_at),
     CHECK(review_at <= query_cutoff),
     CHECK(query_cutoff <= retrieved_at),
+    CHECK(substr(mark_cutoff, 1, 10) = session_date),
+    CHECK(substr(review_at, 1, 10) = session_date),
+    CHECK(substr(query_cutoff, 1, 10) = session_date),
+    CHECK(substr(retrieved_at, 1, 10) = session_date),
     UNIQUE(session_date, query_cutoff)
 ) STRICT;
 
@@ -164,7 +170,8 @@ CREATE TABLE actual_close_source_bindings (
     source_role TEXT NOT NULL COLLATE BINARY
         CHECK(source_role IN (
             'SIP_QUOTE',
-            'SIP_SESSION_BAR',
+            'SIP_MINUTE_BAR',
+            'SIP_DAILY_BAR',
             'IEX_FRESHNESS',
             'EVENT_EVIDENCE',
             'PRIMARY_HALT_FEED',
@@ -211,12 +218,20 @@ CREATE TABLE actual_close_source_bindings (
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) STRICT;
 
-CREATE UNIQUE INDEX actual_close_source_bindings_unique_role
+CREATE UNIQUE INDEX actual_close_source_bindings_unique_observation
+ON actual_close_source_bindings(
+    review_id,
+    source_observation_id
+)
+WHERE source_observation_id IS NOT NULL;
+
+CREATE UNIQUE INDEX actual_close_source_bindings_unique_failure_role
 ON actual_close_source_bindings(
     review_id,
     COALESCE(symbol, ''),
     source_role
-);
+)
+WHERE failure_code IS NOT NULL;
 
 CREATE TRIGGER actual_close_source_bindings_validate_receipt
 BEFORE INSERT ON actual_close_source_bindings
@@ -224,7 +239,8 @@ WHEN NOT EXISTS (
     SELECT 1
     FROM actual_close_reviews AS review
     WHERE review.review_id = NEW.review_id COLLATE BINARY
-      AND NEW.received_at >= review.query_cutoff
+      AND substr(NEW.received_at, 1, 10) = review.session_date
+      AND NEW.received_at >= review.retrieved_at
       AND (
           NEW.source_observation_id IS NULL
           OR EXISTS (
@@ -298,22 +314,11 @@ WHEN NOT EXISTS (
     FROM actual_close_reviews
     WHERE review_id = NEW.review_id COLLATE BINARY
       AND session_date = NEW.session_date
+      AND substr(NEW.received_at, 1, 10) = session_date
       AND NEW.received_at >= retrieved_at
 )
 BEGIN
     SELECT RAISE(ABORT, 'close recommendation conflicts with review');
-END;
-
-CREATE TRIGGER close_recommendations_reject_wider_stop
-BEFORE INSERT ON close_recommendations
-WHEN EXISTS (
-    SELECT 1
-    FROM close_recommendations
-    WHERE symbol = NEW.symbol COLLATE BINARY
-      AND recommended_stop_micros > NEW.recommended_stop_micros
-)
-BEGIN
-    SELECT RAISE(ABORT, 'close recommendation cannot widen stop');
 END;
 
 CREATE TRIGGER close_recommendations_require_chronology
@@ -364,6 +369,13 @@ WHEN EXISTS (
        )
        OR (
            review_id = NEW.review_id COLLATE BINARY
+           AND NEW.source_observation_id IS NOT NULL
+           AND source_observation_id = NEW.source_observation_id
+       )
+       OR (
+           review_id = NEW.review_id COLLATE BINARY
+           AND NEW.failure_code IS NOT NULL
+           AND failure_code IS NOT NULL
            AND COALESCE(symbol, '') = COALESCE(NEW.symbol, '')
            AND source_role = NEW.source_role
        )

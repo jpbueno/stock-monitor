@@ -6348,15 +6348,29 @@ class ActualCloseMarketSource:
             self.iex_observed_at,
             "INVALID_ACTUAL_CLOSE_TIME",
         )
+        retrieval_cutoff = _require_aware(
+            self.review_source.retrieved_at,
+            "INVALID_ACTUAL_CLOSE_TIME",
+        )
+        iex_receipts = tuple(
+            receipt
+            for receipt in self.observation_receipts
+            if receipt.source_type == "ALPACA_LATEST_QUOTES"
+        )
         if (
             query_cutoff < review_at
+            or retrieval_cutoff < query_cutoff
             or cutoff > review_at
             or observed_at > cutoff
             or cutoff - observed_at > timedelta(minutes=5)
             or review_at - observed_at > timedelta(minutes=21)
-            or not review_at - timedelta(minutes=5)
-            <= iex_observed_at
-            <= review_at
+            or len(iex_receipts) != 1
+            or not (
+                iex_receipts[0].retrieved_at - timedelta(minutes=5)
+                <= iex_observed_at
+                <= iex_receipts[0].retrieved_at
+                <= retrieval_cutoff
+            )
         ):
             raise RiskBlock("INVALID_ACTUAL_CLOSE_TIME")
         for attribute, code in (
@@ -6902,8 +6916,13 @@ def issue_actual_close_market_source(
         review_source.query_cutoff,
         "INVALID_ACTUAL_CLOSE_QUERY_CUTOFF",
     )
+    retrieval_cutoff = _require_aware(
+        review_source.retrieved_at,
+        "INVALID_ACTUAL_CLOSE_RETRIEVAL_CUTOFF",
+    )
     if (
         query_cutoff < review_at
+        or retrieval_cutoff < query_cutoff
         or position_plan_source.query_cutoff != query_cutoff
         or not _actual_close_sources_share_owner(
             review_source,
@@ -6989,7 +7008,10 @@ def issue_actual_close_market_source(
         last_daily_schedule.close_time,
         tzinfo=last_daily_schedule.timezone,
     )
-    pages = _actual_close_pages(receipts, query_cutoff=query_cutoff)
+    pages = _actual_close_pages(
+        receipts,
+        query_cutoff=query_cutoff,
+    )
     receipt_role_order = (
         "ALPACA_DAILY_BARS",
         "ALPACA_INTRADAY_BARS",
@@ -7146,7 +7168,12 @@ def issue_actual_close_market_source(
         iex_collection[symbol],
         expected_feed="iex",
     )
-    if not review_at - timedelta(minutes=5) <= iex_observed_at <= review_at:
+    if not (
+        _iex_receipt.retrieved_at - timedelta(minutes=5)
+        <= iex_observed_at
+        <= _iex_receipt.retrieved_at
+        <= retrieval_cutoff
+    ):
         raise RiskBlock("ACTUAL_CLOSE_IEX_STALE")
 
     calendar_digest = _calendar_digest(calendar_resolver)
@@ -7591,7 +7618,14 @@ def issue_actual_position_event_context(
         ledger_name="ACTUAL",
         profit_target_taken=actual_position.cumulative_sale_proceeds_micros > 0,
     )
-    iex_age = market_source.review_at - market_source.iex_observed_at
+    iex_receipts = tuple(
+        receipt
+        for receipt in market_source.observation_receipts
+        if receipt.source_type == "ALPACA_LATEST_QUOTES"
+    )
+    if len(iex_receipts) != 1:
+        raise RiskBlock("ACTUAL_CLOSE_IEX_COHORT_INVALID")
+    iex_age = iex_receipts[0].retrieved_at - market_source.iex_observed_at
     context_payload = {
         "version": 2,
         "position_digest": _position_revision_digest(position),

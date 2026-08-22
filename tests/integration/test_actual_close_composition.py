@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,6 +12,8 @@ from unittest import mock
 from urllib.parse import urlencode
 
 import stock_monitor.evidence as evidence_module
+import stock_monitor.journal as journal_module
+import stock_monitor.provider_workflows as provider_workflows_module
 import stock_monitor.risk as risk_module
 from stock_monitor.confirmations import ConfirmationEnvelope
 from stock_monitor.indicators import IndicatorError
@@ -41,6 +44,7 @@ from tests.integration.test_phase1_authorities import (
     _persist_signal_evidence,
 )
 from tests.integration import (
+    test_phase1_authorities as phase1_authority_fixture_module,
     test_task7_position_plan_source as position_plan_fixture_module,
 )
 from tests.integration.test_signal_lifecycle import (
@@ -109,6 +113,23 @@ class ActualCloseCompositionTests(unittest.TestCase):
         )
         scoped_patcher.start()
         clear_patcher.start()
+        canonical_sources_patcher = mock.patch.object(
+            provider_workflows_module,
+            "_SCOPED_REFERENCE_SOURCES",
+            provider_workflows_module._freeze_scoped_reference_sources(),
+        )
+        canonical_sources_patcher.start()
+        canonical_sec_fixture_patcher = mock.patch.object(
+            provider_workflows_module,
+            "_SEC_ARCHIVE_PATH",
+            provider_workflows_module.re.compile(
+                r"/Archives/edgar/data/[0-9]+/[0-9]{18}/"
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z"
+            ),
+        )
+        canonical_sec_fixture_patcher.start()
+        self.addCleanup(canonical_sec_fixture_patcher.stop)
+        self.addCleanup(canonical_sources_patcher.stop)
         self.addCleanup(clear_patcher.stop)
         self.addCleanup(scoped_patcher.stop)
 
@@ -190,6 +211,114 @@ class ActualCloseCompositionTests(unittest.TestCase):
         )
         return signal_source, recorded_at + timedelta(seconds=1)
 
+    def _seed_two_linked_open_positions(self, journal: Journal):
+        phase1_authority_fixture_module._start_window(journal)
+        first_session = date(2026, 8, 14)
+        second_session = _calendar().add_sessions(first_session, 1)
+        first_signal = phase1_authority_fixture_module._publish_session_primary(
+            journal,
+            session_date=first_session,
+            sequence=701,
+        )
+        self.assertEqual(first_signal.symbol, _SYMBOL)
+        recorded_through = aware_et(first_session, "08:45")
+
+        def open_position(signal_source, *, ordinal: int) -> None:
+            nonlocal recorded_through
+            trigger_id, quote_id, completed_at = (
+                _append_completed_entry_observations(
+                    journal,
+                    signal_source,
+                )
+            )
+            action_source, recorded_at = self._confirmation_action_source_at(
+                journal,
+                signal_source,
+                event_clock=f"09:{36 + ordinal:02d}",
+                after=completed_at + timedelta(seconds=ordinal * 3),
+            )
+            journal.record_phase1_entry(
+                signal_source.signal_id,
+                confirmation_action_source=action_source,
+                trigger_observation_id=trigger_id,
+                quote_observation_id=quote_id,
+                calendar_resolver=_calendar(),
+                recorded_at=recorded_at,
+            )
+            recorded_through = max(
+                recorded_through,
+                recorded_at + timedelta(seconds=1),
+            )
+
+        open_position(first_signal, ordinal=1)
+        daily, _execution, quotes, transport, provider_retrieved_at = (
+            phase1_authority_fixture_module._issued_exit_review_cohorts(
+                symbol=first_signal.symbol,
+                session_date=first_session,
+                bid=Decimal("20.25"),
+                ask=Decimal("20.27"),
+                previous_session_low=Decimal("19.00"),
+                execution_open=Decimal("20.20"),
+                execution_high=Decimal("20.35"),
+                execution_low=Decimal("20.05"),
+                execution_close=Decimal("20.28"),
+            )
+        )
+        daily_rows = phase1_authority_fixture_module._pin_provider_cohort_pages(
+            journal,
+            daily,
+            transport,
+        )
+        quote_rows = phase1_authority_fixture_module._pin_provider_cohort_pages(
+            journal,
+            quotes,
+            transport,
+        )
+        mark_cutoff = max(
+            recorded_through,
+            provider_retrieved_at,
+        ) + timedelta(minutes=1)
+        journal.ingest_phase1_equity_mark_cohorts(
+            first_session,
+            quote_cohort=quotes,
+            daily_bar_cohort=daily,
+            core_source_row_ids=(*daily_rows, *quote_rows),
+            calendar_resolver=_calendar(),
+            recorded_at=mark_cutoff,
+        )
+        phase1_authority_fixture_module._record_cash_only_session_mark(
+            journal,
+            session_date=first_session,
+            query_cutoff=mark_cutoff,
+        )
+        second_candidates = (
+            phase1_authority_fixture_module._issued_provider_candidates_for_session(
+                second_session,
+                sequence=702,
+                count=2,
+            )
+        )
+        qqq_candidate = next(
+            candidate
+            for candidate in second_candidates
+            if candidate.symbol == "QQQ"
+        )
+        with mock.patch.object(
+            phase1_authority_fixture_module,
+            "_issued_provider_candidates_for_session",
+            return_value=(qqq_candidate,),
+        ):
+            second_signal = (
+                phase1_authority_fixture_module._publish_session_primary(
+                    journal,
+                    session_date=second_session,
+                    sequence=702,
+                )
+            )
+        self.assertEqual(second_signal.symbol, "QQQ")
+        open_position(second_signal, ordinal=2)
+        return (first_signal, second_signal), recorded_through
+
     def _context_inputs(
         self,
         journal: Journal,
@@ -251,6 +380,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
         journal: Journal,
         *,
         receipts,
+        global_receipts=(),
         review_at: datetime,
         query_cutoff: datetime,
         event_evidence=None,
@@ -267,6 +397,18 @@ class ActualCloseCompositionTests(unittest.TestCase):
             )
             for receipt in current_receipts
         ]
+        current_global_receipts = journal.read_source_observation_receipts(
+            tuple(receipt.row_id for receipt in global_receipts)
+        ) if global_receipts else ()
+        for receipt in current_global_receipts:
+            details = json.loads(receipt.details_json)
+            receipt_bindings.append(
+                ActualCloseReceiptBinding(
+                    None,
+                    details["source_role"],
+                    receipt,
+                )
+            )
         covered_roles = {
             binding.source_role for binding in receipt_bindings
         }
@@ -311,6 +453,11 @@ class ActualCloseCompositionTests(unittest.TestCase):
                 )
                 for receipt in evidence_receipts
             )
+        covered_global_roles = {
+            binding.source_role
+            for binding in receipt_bindings
+            if binding.symbol is None
+        }
         failures.extend(
             ActualCloseFailureBinding(
                 None,
@@ -319,6 +466,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                 query_cutoff,
             )
             for role in _GLOBAL_CLOSE_ROLES
+            if role not in covered_global_roles
         )
         review_session = review_at.astimezone(
             _calendar().session(review_at.date()).timezone
@@ -342,6 +490,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
         receipts,
         review_at: datetime,
         query_cutoff: datetime,
+        review_retrieved_at: datetime | None = None,
     ):
         if journal.count("phase1_signals") == 0:
             _signal_source, position_ready_cutoff = (
@@ -368,6 +517,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
             receipts=receipts,
             review_at=review_at,
             query_cutoff=effective_query_cutoff,
+            retrieved_at=review_retrieved_at,
         )
         plan_source = self._final_plan(journal, effective_query_cutoff)
         return issue_actual_close_market_source(
@@ -419,6 +569,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
         self,
         *,
         review_at: datetime,
+        symbol: str = _SYMBOL,
         quote_offsets: tuple[timedelta, ...] = (timedelta(),),
         sip_bid: str = "20.25",
         sip_ask: str = "20.27",
@@ -512,7 +663,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
             )
             daily_url = "https://data.alpaca.markets/v2/stocks/bars?" + urlencode(
                 (
-                    ("symbols", _SYMBOL),
+                    ("symbols", symbol),
                     ("timeframe", "1Day"),
                     ("start", _utc_text(daily_start)),
                     ("end", _utc_text(daily_end)),
@@ -548,7 +699,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                 source_type="ALPACA_DAILY_BARS",
                 source_uri=daily_url,
                 feed="sip",
-                document={"bars": {_SYMBOL: bars}, "next_page_token": None},
+                document={"bars": {symbol: bars}, "next_page_token": None},
             )
 
         if include_intraday:
@@ -561,7 +712,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                 "https://data.alpaca.markets/v2/stocks/bars?"
                 + urlencode(
                     (
-                        ("symbols", _SYMBOL),
+                        ("symbols", symbol),
                         ("timeframe", "1Min"),
                         ("start", _utc_text(session_open)),
                         ("end", _utc_text(cutoff)),
@@ -601,7 +752,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     source_uri=intraday_url,
                     feed="sip",
                     document={
-                        "bars": {_SYMBOL: [intraday_bars[0]]},
+                        "bars": {symbol: [intraday_bars[0]]},
                         "next_page_token": "intraday-next-1",
                     },
                 )
@@ -612,7 +763,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     ),
                     feed="sip",
                     document={
-                        "bars": {_SYMBOL: [intraday_bars[1]]},
+                        "bars": {symbol: [intraday_bars[1]]},
                         "next_page_token": None,
                     },
                 )
@@ -622,7 +773,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     source_uri=intraday_url,
                     feed="sip",
                     document={
-                        "bars": {_SYMBOL: list(intraday_bars)},
+                        "bars": {symbol: list(intraday_bars)},
                         "next_page_token": None,
                     },
                 )
@@ -630,7 +781,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
         if include_sip:
             quote_url = "https://data.alpaca.markets/v2/stocks/quotes?" + urlencode(
                 (
-                    ("symbols", _SYMBOL),
+                    ("symbols", symbol),
                     ("start", _utc_text(quote_start)),
                     ("end", _utc_text(cutoff)),
                     ("feed", "sip"),
@@ -644,7 +795,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     feed="sip",
                     document={
                         "quotes": {
-                            _SYMBOL: [
+                            symbol: [
                                 item(
                                     "ALPACA_HISTORICAL_QUOTES",
                                     {
@@ -667,7 +818,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     feed="sip",
                     document={
                         "quotes": {
-                            _SYMBOL: [
+                            symbol: [
                                 item(
                                     "ALPACA_HISTORICAL_QUOTES",
                                     {
@@ -700,7 +851,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                     source_uri=quote_url,
                     feed="sip",
                     document={
-                        "quotes": {_SYMBOL: quotes},
+                        "quotes": {symbol: quotes},
                         "next_page_token": None,
                     },
                 )
@@ -708,11 +859,11 @@ class ActualCloseCompositionTests(unittest.TestCase):
         if include_iex:
             iex_url = (
                 "https://data.alpaca.markets/v2/stocks/quotes/latest?"
-                + urlencode((("symbols", _SYMBOL), ("feed", "iex")))
+                + urlencode((("symbols", symbol), ("feed", "iex")))
             )
             iex_document = {
                 "quotes": {
-                    _SYMBOL: item(
+                    symbol: item(
                         "ALPACA_LATEST_QUOTES",
                         {
                             "ap": iex_ask,
@@ -752,6 +903,70 @@ class ActualCloseCompositionTests(unittest.TestCase):
             details={"source_observation_id": metadata.source_observation_id},
         )
         return rewritten
+
+    @staticmethod
+    def _global_close_specs(
+        review_at: datetime,
+        *,
+        retrieved_at: datetime | None = None,
+        timestamp_source: str = "PRIMARY_METADATA",
+    ) -> tuple[dict[str, object], ...]:
+        observed_at = (
+            review_at
+            if timestamp_source == "PRIMARY_METADATA"
+            else retrieved_at
+        )
+        if observed_at is None:
+            raise AssertionError(
+                "timestamp-unavailable references need a retrieval time"
+            )
+        sources = (
+            (
+                "PRIMARY_HALT_FEED",
+                "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts",
+                "Nasdaq",
+            ),
+            (
+                "TRADER_ALERT_HALT",
+                "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines",
+                "Nasdaq",
+            ),
+            (
+                "OPERATIONAL_STATUS",
+                "https://www.nyse.com/api/notifications/public/alerts?2=3",
+                "New York Stock Exchange",
+            ),
+            (
+                "CROSS_CHECK_CALENDAR",
+                "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+                "Nasdaq",
+            ),
+        )
+        return tuple(
+            {
+                "payload": _payload({"role": role, "status": "CLEAR"}),
+                "source_uri": source_uri,
+                "source_type": "OFFICIAL_REFERENCE",
+                "provider": provider,
+                "feed": timestamp_source,
+                "source_time": observed_at,
+                "retrieved_at": observed_at,
+                "provider_sequence": None,
+                "delay_seconds": 0,
+                "health_result": "OK",
+                "details": {
+                    "accession": None,
+                    "issuer_cik": None,
+                    "source_observation_id": (
+                        f"actual-close-{role.lower().replace('_', '-')}"
+                    ),
+                    "source_role": role,
+                    "symbol": None,
+                    "timestamp_source": timestamp_source,
+                },
+            }
+            for role, source_uri, provider in sources
+        )
 
     @staticmethod
     def _persist_clear_event_evidence(
@@ -827,6 +1042,1549 @@ class ActualCloseCompositionTests(unittest.TestCase):
             query_cutoff=query_cutoff,
         )
         return source, receipts
+
+    def _fixture_close_collector(
+        self,
+        signal_source: object,
+        *,
+        before_collection_writes=None,
+        during_collection=None,
+        collection_duration: timedelta = timedelta(),
+        **market_overrides: object,
+    ):
+        case = self
+
+        class FixtureCollector:
+            def __init__(collector_self) -> None:
+                collector_self.symbols: list[tuple[str, ...]] = []
+                collector_self.generations: list[tuple[int, int]] = []
+
+            def collect_close_sources(
+                collector_self,
+                *,
+                journal: Journal,
+                symbols: tuple[str, ...],
+                session_date: date,
+                review_at: datetime,
+                mark_cutoff: datetime,
+                command_started_at: datetime,
+            ):
+                del session_date
+                case.assertEqual(mark_cutoff, review_at - timedelta(minutes=16))
+                collected_at = command_started_at + collection_duration
+                collector_self.symbols.append(symbols)
+                before = journal._source_generation
+                if before_collection_writes is not None:
+                    before_collection_writes(journal)
+                case._persist_clear_event_evidence(
+                    journal,
+                    signal_source,
+                    review_at,
+                )
+                receipts = case._append_market_receipts(
+                    journal,
+                    case._market_specs(
+                        review_at=review_at,
+                        **market_overrides,
+                    ),
+                )
+                global_receipts = case._append_market_receipts(
+                    journal,
+                    case._global_close_specs(review_at),
+                )
+                if during_collection is not None:
+                    during_collection(journal)
+                event_evidence = case._final_event_evidence(
+                    journal,
+                    signal_source,
+                    review_at=review_at,
+                    query_cutoff=collected_at,
+                )
+                review = case._append_review_for_receipts(
+                    journal,
+                    receipts=receipts,
+                    global_receipts=global_receipts,
+                    review_at=review_at,
+                    query_cutoff=collected_at,
+                    event_evidence=event_evidence,
+                    retrieved_at=collected_at,
+                )
+                collector_self.generations.append(
+                    (before, journal._source_generation)
+                )
+                return provider_workflows_module.ActualCloseCollection(
+                    review_id=review.review_id,
+                    collected_at=collected_at,
+                )
+
+        return FixtureCollector()
+
+    def _empty_close_collector(
+        self,
+        *,
+        failed_global_roles: tuple[str, ...] = (),
+        collection_duration: timedelta = timedelta(),
+        global_timestamp_source: str = "PRIMARY_METADATA",
+    ):
+        case = self
+
+        class EmptyCollector:
+            def __init__(collector_self) -> None:
+                collector_self.symbols: list[tuple[str, ...]] = []
+                collector_self.mark_cutoffs: list[datetime] = []
+
+            def collect_close_sources(
+                collector_self,
+                *,
+                journal: Journal,
+                symbols: tuple[str, ...],
+                session_date: date,
+                review_at: datetime,
+                mark_cutoff: datetime,
+                command_started_at: datetime,
+            ):
+                case.assertEqual(symbols, ())
+                case.assertEqual(mark_cutoff, review_at - timedelta(minutes=16))
+                collected_at = command_started_at + collection_duration
+                collector_self.symbols.append(symbols)
+                collector_self.mark_cutoffs.append(mark_cutoff)
+                specs = tuple(
+                    spec
+                    for spec in case._global_close_specs(
+                        review_at,
+                        retrieved_at=collected_at,
+                        timestamp_source=global_timestamp_source,
+                    )
+                    if spec["details"]["source_role"]
+                    not in failed_global_roles
+                )
+                receipts = case._append_market_receipts(journal, specs)
+                bindings = tuple(
+                    ActualCloseReceiptBinding(
+                        None,
+                        json.loads(receipt.details_json)["source_role"],
+                        receipt,
+                    )
+                    for receipt in receipts
+                )
+                failures = tuple(
+                    ActualCloseFailureBinding(
+                        None,
+                        role,
+                        "SOURCE_UNAVAILABLE",
+                        collected_at,
+                    )
+                    for role in failed_global_roles
+                )
+                review = journal.append_actual_close_review(
+                    session_date=session_date,
+                    review_at=review_at,
+                    mark_cutoff=mark_cutoff,
+                    query_cutoff=collected_at,
+                    retrieved_at=collected_at,
+                    receipt_bindings=bindings,
+                    failure_bindings=failures,
+                )
+                return provider_workflows_module.ActualCloseCollection(
+                    review_id=review.review_id,
+                    collected_at=collected_at,
+                )
+
+        return EmptyCollector()
+
+    def _two_position_close_collector(self, signal_sources: tuple[object, ...]):
+        case = self
+
+        class TwoPositionCollector:
+            def __init__(collector_self) -> None:
+                collector_self.collection = None
+
+            def collect_close_sources(
+                collector_self,
+                *,
+                journal: Journal,
+                symbols: tuple[str, ...],
+                session_date: date,
+                review_at: datetime,
+                mark_cutoff: datetime,
+                command_started_at: datetime,
+            ):
+                case.assertEqual(symbols, (_SYMBOL, "QQQ"))
+                case.assertEqual(mark_cutoff, review_at - timedelta(minutes=16))
+                for signal_source in signal_sources:
+                    case._persist_clear_event_evidence(
+                        journal,
+                        signal_source,
+                        review_at,
+                    )
+                receipt_ids_by_symbol = {}
+                for signal_source in signal_sources:
+                    appended = case._append_market_receipts(
+                        journal,
+                        case._market_specs(
+                            review_at=review_at,
+                            symbol=signal_source.symbol,
+                        ),
+                    )
+                    receipt_ids_by_symbol[signal_source.symbol] = tuple(
+                        receipt.row_id for receipt in appended
+                    )
+                appended_globals = case._append_market_receipts(
+                    journal,
+                    case._global_close_specs(review_at),
+                )
+                global_receipt_ids = tuple(
+                    receipt.row_id for receipt in appended_globals
+                )
+                receipts_by_symbol = {
+                    symbol: journal.read_source_observation_receipts(row_ids)
+                    for symbol, row_ids in receipt_ids_by_symbol.items()
+                }
+                global_receipts = journal.read_source_observation_receipts(
+                    global_receipt_ids
+                )
+                receipt_bindings = []
+                for signal_source in signal_sources:
+                    symbol = signal_source.symbol
+                    receipt_bindings.extend(
+                        ActualCloseReceiptBinding(
+                            symbol,
+                            _MARKET_ROLE_BY_SOURCE_TYPE[receipt.source_type],
+                            receipt,
+                        )
+                        for receipt in receipts_by_symbol[symbol]
+                    )
+                    event_evidence = case._final_event_evidence(
+                        journal,
+                        signal_source,
+                        review_at=review_at,
+                        query_cutoff=command_started_at,
+                    )
+                    evidence_source = risk_module._phase1_bound_sources(
+                        event_evidence
+                    )[0][0]
+                    evidence_receipts = (
+                        journal.read_source_observation_receipts(
+                            evidence_source.source_observation_row_ids
+                        )
+                    )
+                    receipt_bindings.extend(
+                        ActualCloseReceiptBinding(
+                            symbol,
+                            "EVENT_EVIDENCE",
+                            receipt,
+                        )
+                        for receipt in evidence_receipts
+                    )
+                receipt_bindings.extend(
+                    ActualCloseReceiptBinding(
+                        None,
+                        json.loads(receipt.details_json)["source_role"],
+                        receipt,
+                    )
+                    for receipt in global_receipts
+                )
+                review = journal.append_actual_close_review(
+                    session_date=session_date,
+                    review_at=review_at,
+                    mark_cutoff=mark_cutoff,
+                    query_cutoff=command_started_at,
+                    retrieved_at=command_started_at,
+                    receipt_bindings=tuple(receipt_bindings),
+                    failure_bindings=(),
+                )
+                collector_self.collection = (
+                    provider_workflows_module.ActualCloseCollection(
+                        review_id=review.review_id,
+                        collected_at=command_started_at,
+                    )
+                )
+                return collector_self.collection
+
+        return TwoPositionCollector()
+
+    def test_coordinator_uses_early_close_nominal_sip_cutoff(self) -> None:
+        session_date = date(2026, 11, 27)
+        review_at = aware_et(session_date, "12:30")
+        retrieved_at = aware_et(session_date, "12:38")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                collector = self._empty_close_collector()
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=retrieved_at,
+                )
+
+                self.assertEqual(
+                    collector.mark_cutoffs,
+                    [aware_et(session_date, "12:14")],
+                )
+                self.assertEqual(material.positions, ())
+                self.assertEqual(
+                    material.report.outcome,
+                    "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE",
+                )
+
+    def test_public_evidence_read_reuses_only_exact_current_plan_signal(
+        self,
+    ) -> None:
+        review_at = aware_et(date(2026, 8, 14), "15:30")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.sqlite3"
+            with Journal.open(path) as journal:
+                stale_signal, query_cutoff = self._seed_linked_open_position(
+                    journal
+                )
+                self._persist_clear_event_evidence(
+                    journal,
+                    stale_signal,
+                    review_at,
+                )
+                plan_source = self._final_plan(journal, query_cutoff)
+                exact_signal = plan_source.signal_source
+
+                evidence_source = (
+                    journal.read_phase1_signal_evidence_source(
+                        exact_signal.signal_id,
+                        review_at=review_at,
+                        query_cutoff=query_cutoff,
+                        calendar_resolver=_calendar(),
+                        exact_signal_source=exact_signal,
+                    )
+                )
+                self.assertIs(evidence_source.signal_source, exact_signal)
+
+                for substituted_signal in (
+                    replace(exact_signal),
+                    stale_signal,
+                ):
+                    with self.subTest(
+                        substituted_signal=substituted_signal
+                    ), self.assertRaisesRegex(
+                        InvalidJournalValue,
+                        "nested signal source is unverified",
+                    ):
+                        journal.read_phase1_signal_evidence_source(
+                            exact_signal.signal_id,
+                            review_at=review_at,
+                            query_cutoff=query_cutoff,
+                            calendar_resolver=_calendar(),
+                            exact_signal_source=substituted_signal,
+                        )
+
+                with Journal.open(path) as other_journal:
+                    cross_owner_signal = (
+                        other_journal._read_phase1_signal_source(
+                            exact_signal.signal_id,
+                            query_cutoff=query_cutoff,
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        InvalidJournalValue,
+                        "nested signal source is unverified",
+                    ):
+                        journal.read_phase1_signal_evidence_source(
+                            exact_signal.signal_id,
+                            review_at=review_at,
+                            query_cutoff=query_cutoff,
+                            calendar_resolver=_calendar(),
+                            exact_signal_source=cross_owner_signal,
+                        )
+
+    def test_coordinator_maps_authoritative_empty_actual_cohort_to_hold(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "15:38")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                collector = self._empty_close_collector()
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=retrieved_at,
+                )
+
+                self.assertEqual(collector.symbols, [()])
+                self.assertEqual(material.actual_state.positions, ())
+                self.assertEqual(material.positions, ())
+                self.assertEqual(material.coordinator_reason_codes, ())
+                self.assertEqual(
+                    material.report.outcome,
+                    "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE",
+                )
+                self.assertIn("NO_ACTUAL_POSITIONS", material.report.body)
+                self.assertIn(
+                    "MANUAL_VERIFICATION_REQUIRED",
+                    material.report.body,
+                )
+                self.assertEqual(journal.count("close_recommendations"), 0)
+
+    def test_coordinator_rejects_terminal_collection_before_command_start(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        command_started_at = aware_et(session_date, "15:38")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=self._empty_close_collector(
+                            collection_duration=-timedelta(minutes=1),
+                        ),
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    provider_workflows_module.CanonicalMaterialError,
+                    "cutoff must be between review and retrieval",
+                ):
+                    coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=command_started_at,
+                    )
+
+                self.assertEqual(journal.count("close_recommendations"), 0)
+
+    def test_coordinator_accepts_timestamp_unavailable_global_health_after_review(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        command_started_at = aware_et(session_date, "15:38")
+        collected_at = aware_et(session_date, "15:39")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                collector = self._empty_close_collector(
+                    collection_duration=timedelta(minutes=1),
+                    global_timestamp_source="UNAVAILABLE",
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=command_started_at,
+                )
+
+                self.assertEqual(material.query_cutoff, collected_at)
+                self.assertEqual(material.retrieved_at, collected_at)
+                self.assertEqual(len(material.source_receipts), 4)
+                self.assertTrue(
+                    all(
+                        receipt.feed == "UNAVAILABLE"
+                        and receipt.source_time == collected_at
+                        and receipt.retrieved_at == collected_at
+                        for receipt in material.source_receipts
+                    )
+                )
+                self.assertEqual(
+                    material.report.outcome,
+                    "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE",
+                )
+
+    def test_coordinator_maps_empty_global_source_failure_to_data_unavailable(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "15:38")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                collector = self._empty_close_collector(
+                    failed_global_roles=("OPERATIONAL_STATUS",),
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=retrieved_at,
+                )
+
+                self.assertEqual(collector.symbols, [()])
+                self.assertEqual(material.actual_state.positions, ())
+                self.assertEqual(material.positions, ())
+                self.assertEqual(
+                    material.coordinator_reason_codes,
+                    ("SOURCE_CHECK_FAILED",),
+                )
+                self.assertEqual(material.report.outcome, "DATA UNAVAILABLE")
+                self.assertIn("SOURCE_CHECK_FAILED", material.report.body)
+                self.assertNotIn("NO_ACTUAL_POSITIONS", material.report.body)
+                self.assertEqual(journal.count("close_recommendations"), 0)
+
+    def test_coordinator_composes_one_verified_position_from_delayed_sip(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        # The linked-entry fixture seals its provider cohort at 16:21, so the
+        # invocation cutoff must follow that durable write.
+        retrieved_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _position_ready_at = (
+                    self._seed_linked_open_position(journal)
+                )
+                collector = self._fixture_close_collector(
+                    signal_source,
+                    sip_bid="20.25",
+                    sip_ask="20.27",
+                    iex_bid="999.00",
+                    iex_ask="999.01",
+                )
+
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                replay_generations: list[int] = []
+
+                def replay_with_generation(*args, **kwargs):
+                    replay_generations.append(journal._source_generation)
+                    return replay_actual(*args, **kwargs)
+
+                with mock.patch(
+                    "stock_monitor.reconciliation.replay_actual",
+                    side_effect=replay_with_generation,
+                ):
+                    material = coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=retrieved_at,
+                    )
+
+                self.assertEqual(collector.symbols, [(_SYMBOL,)])
+                self.assertGreater(
+                    collector.generations[0][1],
+                    collector.generations[0][0],
+                )
+                self.assertEqual(material.query_cutoff, retrieved_at)
+                self.assertEqual(len(material.actual_state.positions), 1)
+                self.assertEqual(len(material.positions), 1)
+                projection = material.positions[0]
+                self.assertEqual(
+                    type(projection).__name__,
+                    "ClosePosition",
+                    repr(projection),
+                )
+                self.assertEqual(projection.symbol, _SYMBOL)
+                self.assertEqual(projection.mark, Decimal("20.25"))
+                self.assertEqual(projection.provider, "ALPACA")
+                self.assertEqual(projection.feed, "SIP")
+                self.assertEqual(projection.action, "HOLD")
+                self.assertEqual(
+                    len(
+                        material.composition_authority.position_authority_digests
+                    ),
+                    1,
+                )
+                self.assertRegex(
+                    material.composition_authority.review_source_digest,
+                    r"\A[0-9a-f]{64}\Z",
+                )
+                self.assertEqual(
+                    material.report.outcome,
+                    "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE",
+                )
+                self.assertIn(
+                    "MANUAL_VERIFICATION_REQUIRED",
+                    material.report.body,
+                )
+                self.assertEqual(journal.count("close_recommendations"), 1)
+                self.assertGreaterEqual(len(replay_generations), 4)
+                self.assertGreater(
+                    replay_generations[-1],
+                    replay_generations[-2],
+                )
+                self.assertEqual(
+                    replay_generations[-1],
+                    journal._source_generation,
+                )
+                self.assertTrue(
+                    provider_workflows_module.is_issued_canonical_material(
+                        material,
+                        journal=journal,
+                        report_archive_root=root,
+                    )
+                )
+
+    def test_coordinator_uses_terminal_collection_time_after_provider_gets(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        command_started_at = aware_et(session_date, "16:30")
+        collected_at = aware_et(session_date, "16:31")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _position_ready_at = (
+                    self._seed_linked_open_position(journal)
+                )
+                collector = self._fixture_close_collector(
+                    signal_source,
+                    collection_duration=timedelta(minutes=1),
+                    retrieved_offset=timedelta(minutes=61),
+                    iex_offset=timedelta(minutes=60),
+                    iex_bid="999.00",
+                    iex_ask="999.01",
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=command_started_at,
+                )
+
+                self.assertEqual(material.query_cutoff, collected_at)
+                self.assertEqual(material.retrieved_at, collected_at)
+                self.assertEqual(
+                    material.composition_authority.retrieved_at,
+                    collected_at,
+                )
+                self.assertTrue(
+                    any(
+                        receipt.retrieved_at > command_started_at
+                        for receipt in material.source_receipts
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        receipt.retrieved_at <= material.retrieved_at
+                        for receipt in material.source_receipts
+                    )
+                )
+                projection = material.positions[0]
+                self.assertEqual(
+                    type(projection).__name__,
+                    "ClosePosition",
+                    repr(projection),
+                )
+                self.assertEqual(projection.feed, "SIP")
+                self.assertEqual(projection.mark, Decimal("20.25"))
+                self.assertNotEqual(projection.mark, Decimal("999.00"))
+                for forged_authority in (
+                    replace(
+                        material.composition_authority,
+                        review_source_digest="0" * 64,
+                    ),
+                    replace(
+                        material.composition_authority,
+                        position_authority_digests=("0" * 64,),
+                    ),
+                ):
+                    forged_material = replace(
+                        material,
+                        composition_authority=forged_authority,
+                    )
+                    self.assertFalse(
+                        provider_workflows_module.is_issued_canonical_material(
+                            forged_material,
+                            journal=journal,
+                            report_archive_root=root,
+                        )
+                    )
+                with provider_workflows_module._CLOSE_COMPOSITION_LOCK:
+                    candidate = provider_workflows_module._ISSUED_CLOSE_COMPOSITIONS[
+                        id(material.composition_authority)
+                    ]
+                original_semantic_children = candidate.semantic_children
+                try:
+                    object.__setattr__(
+                        candidate,
+                        "semantic_children",
+                        (
+                            replace(original_semantic_children[0]),
+                            *original_semantic_children[1:],
+                        ),
+                    )
+                    self.assertFalse(
+                        provider_workflows_module.is_issued_canonical_material(
+                            material,
+                            journal=journal,
+                            report_archive_root=root,
+                        )
+                    )
+                finally:
+                    object.__setattr__(
+                        candidate,
+                        "semantic_children",
+                        original_semantic_children,
+                    )
+                bundle = candidate.semantic_children[1]
+                original_digest = bundle.source_digest
+                try:
+                    object.__setattr__(bundle, "source_digest", "0" * 64)
+                    self.assertFalse(
+                        provider_workflows_module.is_issued_canonical_material(
+                            material,
+                            journal=journal,
+                            report_archive_root=root,
+                        )
+                    )
+                finally:
+                    object.__setattr__(
+                        bundle,
+                        "source_digest",
+                        original_digest,
+                    )
+                self.assertTrue(
+                    provider_workflows_module.is_issued_canonical_material(
+                        material,
+                        journal=journal,
+                        report_archive_root=root,
+                    )
+                )
+
+    def test_close_position_authority_rederives_the_exact_decision_projection(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _position_ready_at = (
+                    self._seed_linked_open_position(journal)
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=self._fixture_close_collector(
+                            signal_source,
+                        ),
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=retrieved_at,
+                )
+                with provider_workflows_module._CLOSE_COMPOSITION_LOCK:
+                    candidate = provider_workflows_module._ISSUED_CLOSE_COMPOSITIONS[
+                        id(material.composition_authority)
+                    ]
+                review_source, bundle = candidate.semantic_children
+                validate = (
+                    provider_workflows_module._is_issued_close_position_authority_bundle
+                )
+                self.assertTrue(
+                    validate(bundle, review_source=review_source)
+                )
+
+                self.assertFalse(
+                    validate(replace(bundle), review_source=review_source)
+                )
+                self.assertFalse(
+                    validate(
+                        bundle,
+                        review_source=replace(review_source),
+                    )
+                )
+                with Journal.open(root / "wrong-owner.sqlite3") as wrong_owner:
+                    self.assertFalse(
+                        validate(
+                            bundle,
+                            review_source=review_source,
+                            journal=wrong_owner,
+                        )
+                    )
+                for projection in (
+                    replace(
+                        bundle.projection,
+                        action="EXIT",
+                        reason_codes=("FORGED_EXIT",),
+                    ),
+                    replace(
+                        bundle.projection,
+                        reason_codes=("FORGED_REASON",),
+                    ),
+                ):
+                    forged = provider_workflows_module._ClosePositionAuthorityBundle(
+                        projection=projection,
+                        branch=bundle.branch,
+                        identity_children=bundle.identity_children,
+                        source_digest=(
+                            provider_workflows_module._close_position_authority_digest(
+                                projection=projection,
+                                branch=bundle.branch,
+                                identity_children=bundle.identity_children,
+                            )
+                        ),
+                    )
+                    self.assertFalse(
+                        validate(forged, review_source=review_source)
+                    )
+
+                children = bundle.identity_children
+                context, mark, action, decision = children[8:12]
+                copied_action = replace(action)
+                try:
+                    object.__setattr__(
+                        bundle,
+                        "identity_children",
+                        (*children[:10], copied_action, decision),
+                    )
+                    object.__setattr__(
+                        bundle,
+                        "source_digest",
+                        provider_workflows_module._close_position_authority_digest(
+                            projection=bundle.projection,
+                            branch=bundle.branch,
+                            identity_children=bundle.identity_children,
+                        ),
+                    )
+                    self.assertFalse(
+                        validate(bundle, review_source=review_source)
+                    )
+                finally:
+                    object.__setattr__(bundle, "identity_children", children)
+                    object.__setattr__(
+                        bundle,
+                        "source_digest",
+                        provider_workflows_module._close_position_authority_digest(
+                            projection=bundle.projection,
+                            branch=bundle.branch,
+                            identity_children=children,
+                        ),
+                    )
+
+                for field_name, forged_child in (
+                    ("position_action", replace(action)),
+                    ("context", replace(context)),
+                    ("mark", replace(mark)),
+                ):
+                    original_child = getattr(decision, field_name)
+                    try:
+                        object.__setattr__(
+                            decision,
+                            field_name,
+                            forged_child,
+                        )
+                        self.assertFalse(
+                            validate(bundle, review_source=review_source)
+                        )
+                    finally:
+                        object.__setattr__(
+                            decision,
+                            field_name,
+                            original_child,
+                        )
+                self.assertTrue(
+                    validate(bundle, review_source=review_source)
+                )
+
+                original_action = bundle.projection.action
+                original_reasons = bundle.projection.reason_codes
+                original_digest = bundle.source_digest
+                try:
+                    object.__setattr__(bundle.projection, "action", "EXIT")
+                    object.__setattr__(
+                        bundle.projection,
+                        "reason_codes",
+                        ("FORGED_EXIT",),
+                    )
+                    object.__setattr__(
+                        bundle,
+                        "source_digest",
+                        provider_workflows_module._close_position_authority_digest(
+                            projection=bundle.projection,
+                            branch=bundle.branch,
+                            identity_children=bundle.identity_children,
+                        ),
+                    )
+                    self.assertFalse(
+                        validate(bundle, review_source=review_source)
+                    )
+                finally:
+                    object.__setattr__(
+                        bundle.projection,
+                        "action",
+                        original_action,
+                    )
+                    object.__setattr__(
+                        bundle.projection,
+                        "reason_codes",
+                        original_reasons,
+                    )
+                    object.__setattr__(bundle, "source_digest", original_digest)
+
+    def test_stop_unverified_authority_rederives_its_exact_action_projection(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _ready_at = self._seed_linked_open_position(
+                    journal,
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=self._fixture_close_collector(
+                            signal_source,
+                        ),
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+                original_evaluate = risk_module.evaluate_position
+
+                def stop_unverified(position, mark, policy):
+                    action = original_evaluate(position, mark, policy)
+                    return replace(
+                        action,
+                        status="STOP_UNVERIFIED",
+                        reason_codes=("STOP_UNVERIFIED",),
+                        user_confirmed_stop=None,
+                    )
+
+                with mock.patch.object(
+                    risk_module,
+                    "evaluate_position",
+                    side_effect=stop_unverified,
+                ):
+                    material = coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=retrieved_at,
+                    )
+                    with provider_workflows_module._CLOSE_COMPOSITION_LOCK:
+                        candidate = (
+                            provider_workflows_module._ISSUED_CLOSE_COMPOSITIONS[
+                                id(material.composition_authority)
+                            ]
+                        )
+                    review_source, bundle = candidate.semantic_children
+                    self.assertEqual(bundle.branch, "STOP_UNVERIFIED")
+                    self.assertEqual(material.report.outcome, "STOP UNVERIFIED")
+                    self.assertEqual(journal.count("close_recommendations"), 0)
+                    validate = (
+                        provider_workflows_module._is_issued_close_position_authority_bundle
+                    )
+                    self.assertTrue(
+                        validate(bundle, review_source=review_source)
+                    )
+                    self.assertFalse(
+                        validate(replace(bundle), review_source=review_source)
+                    )
+                    children = bundle.identity_children
+                    action = children[10]
+                    try:
+                        object.__setattr__(
+                            bundle,
+                            "identity_children",
+                            (*children[:10], replace(action)),
+                        )
+                        object.__setattr__(
+                            bundle,
+                            "source_digest",
+                            provider_workflows_module._close_position_authority_digest(
+                                projection=bundle.projection,
+                                branch=bundle.branch,
+                                identity_children=bundle.identity_children,
+                            ),
+                        )
+                        self.assertFalse(
+                            validate(bundle, review_source=review_source)
+                        )
+                    finally:
+                        object.__setattr__(bundle, "identity_children", children)
+                        object.__setattr__(
+                            bundle,
+                            "source_digest",
+                            provider_workflows_module._close_position_authority_digest(
+                                projection=bundle.projection,
+                                branch=bundle.branch,
+                                identity_children=children,
+                            ),
+                        )
+                    self.assertTrue(
+                        validate(bundle, review_source=review_source)
+                    )
+
+    def test_later_stage_unverified_authorities_rederive_the_exact_failure(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+        original_event_authority = (
+            risk_module._issue_phase1_signal_evidence_authority_from_source
+        )
+        event_authority_calls = 0
+
+        def event_authority_after_collection(*args, **kwargs):
+            nonlocal event_authority_calls
+            event_authority_calls += 1
+            if event_authority_calls == 1:
+                return original_event_authority(*args, **kwargs)
+            raise RiskBlock("forced event-authority failure")
+
+        cases = (
+            (
+                "_issue_phase1_signal_evidence_authority_from_source",
+                event_authority_after_collection,
+                "EVENT_AUTHORITY_UNAVAILABLE",
+            ),
+            (
+                "issue_actual_close_mark",
+                RiskBlock("forced close-mark failure"),
+                "CLOSE_MARK_UNVERIFIED",
+            ),
+            (
+                "evaluate_position",
+                RiskBlock("forced position-evaluation failure"),
+                "POSITION_EVALUATION_UNVERIFIED",
+            ),
+        )
+
+        for attribute, effect, expected_branch in cases:
+            with self.subTest(stage=attribute):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    with Journal.open(root / "journal.sqlite3") as journal:
+                        signal_source, _ready_at = (
+                            self._seed_linked_open_position(journal)
+                        )
+                        coordinator = (
+                            provider_workflows_module.ActualCloseWorkflowCoordinator(
+                                journal=journal,
+                                report_archive_root=root,
+                                source_collector=self._fixture_close_collector(
+                                    signal_source,
+                                ),
+                                calendar_resolver=_calendar(),
+                                policy=policy_fixture(),
+                                plans=journal.phase1_signal_plan_resolver(),
+                            )
+                        )
+                        with mock.patch.object(
+                            risk_module,
+                            attribute,
+                            side_effect=effect,
+                        ):
+                            material = coordinator.close_material(
+                                session_date,
+                                review_at=review_at,
+                                retrieved_at=retrieved_at,
+                            )
+                            with provider_workflows_module._CLOSE_COMPOSITION_LOCK:
+                                candidate = provider_workflows_module._ISSUED_CLOSE_COMPOSITIONS[
+                                    id(material.composition_authority)
+                                ]
+                            review_source, bundle = candidate.semantic_children
+                            self.assertEqual(bundle.branch, expected_branch)
+                            self.assertTrue(
+                                provider_workflows_module._is_issued_close_position_authority_bundle(
+                                    bundle,
+                                    review_source=review_source,
+                                )
+                            )
+                            if (
+                                expected_branch
+                                == "POSITION_EVALUATION_UNVERIFIED"
+                            ):
+                                with mock.patch.object(
+                                    risk_module,
+                                    "issue_actual_close_mark",
+                                    side_effect=RiskBlock(
+                                        "forced prerequisite failure"
+                                    ),
+                                ):
+                                    self.assertFalse(
+                                        provider_workflows_module._is_issued_close_position_authority_bundle(
+                                            bundle,
+                                            review_source=review_source,
+                                        )
+                                    )
+                        self.assertEqual(
+                            material.report.outcome,
+                            "POSITION UNVERIFIED",
+                        )
+                        self.assertEqual(
+                            journal.count("close_recommendations"),
+                            0,
+                        )
+
+    def test_coordinator_keeps_reconciliation_dominant_when_sip_fails(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _position_ready_at = (
+                    self._seed_linked_open_position(journal)
+                )
+                ingest_confirmation(
+                    journal,
+                    ConfirmationEnvelope(
+                        message_id="actual-close:pending-orders",
+                        message_time=aware_et(session_date, "16:25"),
+                        received_at=(
+                            aware_et(session_date, "16:25")
+                            + timedelta(seconds=1)
+                        ),
+                        text=(
+                            "ACCOUNT CHECK settled_cash 5000 pending_orders 1 "
+                            "unlogged_positions 0 AT 16:25 ET"
+                        ),
+                        session_date=session_date,
+                    ),
+                    plans=UnavailableSignalPlanResolver(),
+                    calendar=_calendar(),
+                    policy=policy_fixture(),
+                    entry_authorities=UnavailableActualEntryAuthorityResolver(),
+                )
+                current_signal_source = journal._read_phase1_signal_source(
+                    signal_source.signal_id,
+                    query_cutoff=review_at,
+                )
+                collector = self._fixture_close_collector(
+                    current_signal_source,
+                    include_sip=False,
+                    include_iex=True,
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                material = coordinator.close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=retrieved_at,
+                )
+
+                self.assertEqual(collector.symbols, [(_SYMBOL,)])
+                self.assertEqual(
+                    material.report.outcome,
+                    "RECONCILIATION REQUIRED",
+                )
+                self.assertEqual(len(material.actual_state.positions), 1)
+                self.assertEqual(len(material.positions), 1)
+                projection = material.positions[0]
+                self.assertEqual(
+                    projection.status,
+                    "RECONCILIATION_REQUIRED",
+                )
+                self.assertIn(
+                    "PENDING_ORDERS_PRESENT",
+                    material.report.body,
+                )
+                self.assertIn(
+                    "SIP_MARK_UNAVAILABLE",
+                    material.report.body,
+                )
+                self.assertEqual(journal.count("close_recommendations"), 0)
+
+    def test_actual_ledger_mutation_during_collection_fails_closed(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+
+        def add_unlinked_position(journal: Journal) -> None:
+            ingest_confirmation(
+                journal,
+                ConfirmationEnvelope(
+                    message_id="actual-close:concurrent-unlinked-position",
+                    message_time=aware_et(session_date, "16:25"),
+                    received_at=(
+                        aware_et(session_date, "16:25")
+                        + timedelta(seconds=1)
+                    ),
+                    text=(
+                        "BOUGHT QQQ 2 shares @ 100 AT 15:20 ET; "
+                        "BID 99.99 ASK 100; STOP SET @ 95"
+                    ),
+                    session_date=session_date,
+                ),
+                plans=UnavailableSignalPlanResolver(),
+                calendar=_calendar(),
+                policy=policy_fixture(),
+                entry_authorities=UnavailableActualEntryAuthorityResolver(),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_source, _position_ready_at = (
+                    self._seed_linked_open_position(journal)
+                )
+                collector = self._fixture_close_collector(
+                    signal_source,
+                    during_collection=add_unlinked_position,
+                    sip_bid="19.90",
+                    sip_ask="19.91",
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    provider_workflows_module.CanonicalMaterialError,
+                    "ledger changed during provider collection",
+                ):
+                    coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=retrieved_at,
+                    )
+
+                self.assertEqual(collector.symbols, [(_SYMBOL,)])
+                self.assertEqual(journal.count("close_recommendations"), 0)
+                _terminal_source, terminal_state = self._actual_snapshot(
+                    journal,
+                    retrieved_at,
+                )
+                self.assertEqual(
+                    tuple(
+                        position.symbol
+                        for position in terminal_state.positions
+                    ),
+                    (_SYMBOL, "QQQ"),
+                )
+
+    def test_plan_binding_mutation_during_collection_fails_closed(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        command_started_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                _publish(journal)
+                signal_source = (
+                    journal._read_phase1_canonical_replay_source(
+                        query_cutoff=aware_et(session_date, "08:45"),
+                    ).signal_sources[0]
+                )
+                trigger_id, quote_id, completed_at = (
+                    _append_completed_entry_observations(
+                        journal,
+                        signal_source,
+                    )
+                )
+                action_source, recorded_at = self._confirmation_action_source_at(
+                    journal,
+                    signal_source,
+                    event_clock="09:37",
+                    after=completed_at,
+                )
+
+                def bind_existing_actual_position(owner: Journal) -> None:
+                    owner.record_phase1_entry(
+                        signal_source.signal_id,
+                        confirmation_action_source=action_source,
+                        trigger_observation_id=trigger_id,
+                        quote_observation_id=quote_id,
+                        calendar_resolver=_calendar(),
+                        recorded_at=recorded_at,
+                    )
+
+                collector = self._fixture_close_collector(
+                    signal_source,
+                    before_collection_writes=bind_existing_actual_position,
+                )
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    provider_workflows_module.CanonicalMaterialError,
+                    "plan binding changed during provider collection",
+                ):
+                    coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=command_started_at,
+                    )
+
+                self.assertEqual(journal.count("actual_position_plan_bindings"), 1)
+                self.assertEqual(journal.count("close_recommendations"), 0)
+
+    def test_two_position_recommendations_are_atomic_and_retryable(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 17)
+        review_at = aware_et(session_date, "15:30")
+        command_started_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                signal_sources, _ready_at = self._seed_two_linked_open_positions(
+                    journal
+                )
+                collector = self._two_position_close_collector(signal_sources)
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=collector,
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+                original_sql = journal_module._sql
+                inserts = 0
+
+                def fail_second_recommendation_insert(
+                    connection,
+                    statement,
+                    parameters=(),
+                ):
+                    nonlocal inserts
+                    if statement.startswith(
+                        "INSERT INTO close_recommendations("
+                    ):
+                        inserts += 1
+                        if inserts == 2:
+                            raise sqlite3.OperationalError(
+                                "injected second recommendation failure"
+                            )
+                    return original_sql(connection, statement, parameters)
+
+                with mock.patch.object(
+                    journal_module,
+                    "_sql",
+                    side_effect=fail_second_recommendation_insert,
+                ), self.assertRaisesRegex(
+                    provider_workflows_module.CanonicalMaterialError,
+                    "recommendation could not be persisted",
+                ):
+                    coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=command_started_at,
+                    )
+
+                self.assertEqual(inserts, 2)
+                self.assertEqual(journal.count("close_recommendations"), 0)
+                self.assertIsNotNone(collector.collection)
+
+                class ExistingCollection:
+                    def collect_close_sources(
+                        collector_self,
+                        **values,
+                    ):
+                        del collector_self, values
+                        return collector.collection
+
+                retry = provider_workflows_module.ActualCloseWorkflowCoordinator(
+                    journal=journal,
+                    report_archive_root=root,
+                    source_collector=ExistingCollection(),
+                    calendar_resolver=_calendar(),
+                    policy=policy_fixture(),
+                    plans=journal.phase1_signal_plan_resolver(),
+                ).close_material(
+                    session_date,
+                    review_at=review_at,
+                    retrieved_at=command_started_at,
+                )
+                self.assertEqual(
+                    tuple(position.symbol for position in retry.positions),
+                    (_SYMBOL, "QQQ"),
+                )
+                self.assertEqual(journal.count("close_recommendations"), 2)
+
+    def test_collection_write_then_error_forces_a_final_actual_replay(
+        self,
+    ) -> None:
+        session_date = date(2026, 8, 14)
+        review_at = aware_et(session_date, "15:30")
+        retrieved_at = aware_et(session_date, "16:30")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with Journal.open(root / "journal.sqlite3") as journal:
+                self._seed_linked_open_position(journal)
+                source_count = journal.count("source_observations")
+
+                class FailingCollector:
+                    def collect_close_sources(
+                        collector_self,
+                        *,
+                        journal: Journal,
+                        symbols: tuple[str, ...],
+                        session_date: date,
+                        review_at: datetime,
+                        mark_cutoff: datetime,
+                        command_started_at: datetime,
+                    ):
+                        del (
+                            collector_self,
+                            symbols,
+                            session_date,
+                            mark_cutoff,
+                            command_started_at,
+                        )
+                        journal.append_source_observation(
+                            payload=b'{"partial":true}',
+                            source_uri="https://example.invalid/partial-close",
+                            source_type="TEST",
+                            provider="fixture",
+                            feed=None,
+                            source_time=review_at,
+                            retrieved_at=review_at,
+                            provider_sequence=None,
+                            delay_seconds=0,
+                            health_result="OK",
+                            details={"version": 1},
+                        )
+                        raise RuntimeError("provider transport failed")
+
+                coordinator = (
+                    provider_workflows_module.ActualCloseWorkflowCoordinator(
+                        journal=journal,
+                        report_archive_root=root,
+                        source_collector=FailingCollector(),
+                        calendar_resolver=_calendar(),
+                        policy=policy_fixture(),
+                        plans=journal.phase1_signal_plan_resolver(),
+                    )
+                )
+                with mock.patch(
+                    "stock_monitor.reconciliation.replay_actual",
+                    wraps=replay_actual,
+                ) as replayed, self.assertRaisesRegex(
+                    provider_workflows_module.CanonicalMaterialError,
+                    "collection",
+                ):
+                    coordinator.close_material(
+                        session_date,
+                        review_at=review_at,
+                        retrieved_at=retrieved_at,
+                    )
+
+                self.assertEqual(replayed.call_count, 2)
+                self.assertEqual(
+                    journal.count("source_observations"),
+                    source_count + 1,
+                )
 
     def test_issues_delayed_sip_mark_with_distinct_final_query_cutoff(self) -> None:
         review_at = aware_et(date(2026, 8, 14), "15:30")
@@ -1446,7 +3204,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
                 self.assertEqual(source.sip_bid, Decimal("20.25"))
                 self.assertTrue(is_issued_actual_close_market_source(source))
 
-    def test_query_cutoff_and_receipt_retrieval_lookahead_fail_closed(self) -> None:
+    def test_query_cutoff_and_economic_source_lookahead_fail_closed(self) -> None:
         review_at = aware_et(date(2026, 8, 14), "15:30")
         cases = (
             (
@@ -1455,7 +3213,7 @@ class ActualCloseCompositionTests(unittest.TestCase):
             ),
             (
                 review_at + timedelta(seconds=30),
-                {"retrieved_offset": timedelta(minutes=1)},
+                {"quote_offsets": (timedelta(seconds=1),)},
             ),
         )
         for query_cutoff, overrides in cases:
@@ -1479,19 +3237,73 @@ class ActualCloseCompositionTests(unittest.TestCase):
                                 query_cutoff=query_cutoff,
                             )
 
+    def test_actual_close_review_rejects_receipt_after_terminal_collection(
+        self,
+    ) -> None:
+        review_at = aware_et(date(2026, 8, 14), "15:30")
+        query_cutoff = aware_et(date(2026, 8, 14), "15:38")
+        terminal_at = aware_et(date(2026, 8, 14), "15:39")
+        after_terminal = terminal_at + timedelta(microseconds=1)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with Journal.open(
+                Path(temporary_directory) / "journal.sqlite3"
+            ) as journal:
+                global_receipts = self._append_market_receipts(
+                    journal,
+                    self._global_close_specs(
+                        review_at,
+                        retrieved_at=after_terminal,
+                        timestamp_source="UNAVAILABLE",
+                    ),
+                )
+
+                with self.assertRaisesRegex(
+                    InvalidJournalValue,
+                    "chronology",
+                ):
+                    self._append_review_for_receipts(
+                        journal,
+                        receipts=(),
+                        global_receipts=global_receipts,
+                        review_at=review_at,
+                        query_cutoff=query_cutoff,
+                        retrieved_at=terminal_at,
+                    )
+
     def test_wrong_provider_query_receipt_feed_or_health_fails_closed(self) -> None:
         review_at = aware_et(date(2026, 8, 14), "15:30")
-        for mode in ("PROVIDER", "QUERY", "RECEIPT_FEED", "HEALTH"):
+        for mode in (
+            "PROVIDER",
+            "QUERY",
+            "REQUEST_LOOKAHEAD",
+            "RECEIPT_FEED",
+            "HEALTH",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 with Journal.open(Path(directory) / "journal.sqlite3") as journal:
-                    specs = list(self._market_specs(review_at=review_at))
+                    terminal_at = None
+                    query_cutoff = review_at + timedelta(minutes=1)
+                    specs = list(
+                        self._market_specs(
+                            review_at=review_at,
+                            **(
+                                {
+                                    "retrieved_offset": timedelta(minutes=62),
+                                    "iex_offset": timedelta(minutes=61),
+                                }
+                                if mode == "REQUEST_LOOKAHEAD"
+                                else {}
+                            ),
+                        )
+                    )
                     index = next(
                         ordinal
                         for ordinal, spec in enumerate(specs)
                         if spec["source_type"]
                         == (
                             "ALPACA_HISTORICAL_QUOTES"
-                            if mode in {"QUERY", "HEALTH"}
+                            if mode in {"QUERY", "REQUEST_LOOKAHEAD", "HEALTH"}
                             else "ALPACA_DAILY_BARS"
                         )
                     )
@@ -1506,6 +3318,31 @@ class ActualCloseCompositionTests(unittest.TestCase):
                             source_uri=str(specs[index]["source_uri"]).replace(
                                 "feed=sip",
                                 "feed=iex",
+                            ),
+                        )
+                    elif mode == "REQUEST_LOOKAHEAD":
+                        query_cutoff = review_at + timedelta(minutes=61)
+                        terminal_at = review_at + timedelta(minutes=62)
+                        mark_cutoff = review_at - timedelta(minutes=16)
+                        exact_end = urlencode(
+                            (("end", _utc_text(mark_cutoff)),)
+                        )
+                        lookahead_end = urlencode(
+                            (
+                                (
+                                    "end",
+                                    _utc_text(
+                                        mark_cutoff
+                                        + timedelta(microseconds=1)
+                                    ),
+                                ),
+                            )
+                        )
+                        specs[index] = self._rewrite_market_spec(
+                            specs[index],
+                            source_uri=str(specs[index]["source_uri"]).replace(
+                                exact_end,
+                                lookahead_end,
                             ),
                         )
                     elif mode == "RECEIPT_FEED":
@@ -1528,7 +3365,8 @@ class ActualCloseCompositionTests(unittest.TestCase):
                             journal,
                             receipts=receipts,
                             review_at=review_at,
-                            query_cutoff=review_at + timedelta(minutes=1),
+                            query_cutoff=query_cutoff,
+                            review_retrieved_at=terminal_at,
                         )
 
     def test_sip_pages_require_release_delay_and_retrieval_chronology(self) -> None:

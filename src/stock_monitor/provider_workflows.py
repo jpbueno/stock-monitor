@@ -9,12 +9,13 @@ before it acquires a durable report claim.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
 import threading
 from dataclasses import dataclass, fields, is_dataclass, replace
-from datetime import UTC, date, datetime, time, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
@@ -102,6 +103,9 @@ _CLOSE_BRANCH_PROJECTIONS = {
 }
 _COORDINATOR_CLOSE_REASONS = frozenset(
     {"MANUAL_VERIFICATION_REQUIRED", "NO_ACTUAL_POSITIONS"}
+)
+_LEGACY_ACTUAL_ENTRY_CONTEXT_REASONS = frozenset(
+    {"SIGNAL_PLAN_UNAVAILABLE", "AUTHORITY_CONTEXT_UNVERIFIED"}
 )
 _CLOSE_OUTCOME_EXIT_CODES = {
     report_outcome: exit_code
@@ -1010,6 +1014,36 @@ def _premarket_validation_calendar_resolver(
             "premarket validation calendar coverage is missing"
         ) from error
     return resolver
+@dataclass(frozen=True, slots=True)
+class ActualCloseCollection:
+    """Durable hand-off from provider collection to close composition."""
+
+    review_id: str
+    collected_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_digest(self.review_id, "actual close review identity")
+        _require_time(self.collected_at, "actual close terminal collection time")
+
+
+class ActualCloseSourceCollector(Protocol):
+    """Collect and persist one complete close-review source cohort.
+
+    The seam is intentionally narrower than an Alpaca client.  Implementations
+    may page provider APIs internally, but they return only the identity of the
+    exact Journal review that binds every receipt or explicit failure.
+    """
+
+    def collect_close_sources(
+        self,
+        *,
+        journal: object,
+        symbols: tuple[str, ...],
+        session_date: date,
+        review_at: datetime,
+        mark_cutoff: datetime,
+        command_started_at: datetime,
+    ) -> ActualCloseCollection: ...
 
 
 def _require_digest(value: object, label: str) -> str:
@@ -1508,13 +1542,42 @@ def _validate_receipt_envelope(
             continue
         if query_cutoff is None:
             raise CanonicalMaterialError("canonical close query cutoff is unavailable")
-        if receipt.source_time > economic_at:
-            raise CanonicalMaterialError(
-                "canonical close receipt exceeds its economic cutoff"
-            )
         if receipt.retrieved_at > query_cutoff:
             raise CanonicalMaterialError(
                 "canonical close receipt exceeds its query cutoff"
+            )
+        terminal_health_observation = (
+            receipt.source_type == "ALPACA_LATEST_QUOTES"
+        )
+        if (
+            receipt.source_type == "OFFICIAL_REFERENCE"
+            and receipt.feed == "UNAVAILABLE"
+        ):
+            details = _official_reference_details(
+                receipt.details_json,
+                required=True,
+            )
+            terminal_health_observation = (
+                details is not None
+                and details[0]
+                in {
+                    "PRIMARY_HALT_FEED",
+                    "TRADER_ALERT_HALT",
+                    "OPERATIONAL_STATUS",
+                    "CROSS_CHECK_CALENDAR",
+                }
+                and details[1] is None
+                and details[2] is None
+                and details[3] == "UNAVAILABLE"
+                and receipt.source_time == receipt.retrieved_at
+            )
+        if not terminal_health_observation and receipt.source_time > economic_at:
+            raise CanonicalMaterialError(
+                "canonical close receipt exceeds its economic cutoff"
+            )
+        if terminal_health_observation and receipt.source_time > query_cutoff:
+            raise CanonicalMaterialError(
+                "canonical close health receipt exceeds its retrieval envelope"
             )
 
 
@@ -3419,6 +3482,7 @@ def _validate_reason_tuple(value: object, label: str) -> tuple[str, ...]:
 def _canonical_close_projection(
     actual_state: object,
     positions: tuple[object, ...],
+    coordinator_reason_codes: tuple[str, ...] = (),
 ) -> tuple[str, str, int, tuple[str, ...]]:
     """Derive the only close outcome, workflow exit, and ordered reasons."""
     from .reconciliation import ActualLedgerState
@@ -3429,11 +3493,16 @@ def _canonical_close_projection(
             "close projection requires an exact actual state"
         )
     _positions_digest(positions)
-    reconciliation_reasons = actual_state.reconciliation_reasons
-    if type(reconciliation_reasons) is not tuple:
+    raw_reconciliation_reasons = actual_state.reconciliation_reasons
+    if type(raw_reconciliation_reasons) is not tuple:
         raise CanonicalMaterialError(
             "close actual reconciliation reasons are invalid"
         )
+    reconciliation_reasons = tuple(
+        reason
+        for reason in raw_reconciliation_reasons
+        if reason not in _LEGACY_ACTUAL_ENTRY_CONTEXT_REASONS
+    )
     if reconciliation_reasons:
         _validate_reason_tuple(
             reconciliation_reasons,
@@ -3444,10 +3513,25 @@ def _canonical_close_projection(
                 "close child reasons contain a coordinator-only reason"
             )
 
+    if (
+        type(coordinator_reason_codes) is not tuple
+        or len(set(coordinator_reason_codes)) != len(coordinator_reason_codes)
+        or any(
+            reason not in _CANONICAL_DATA_REASONS
+            for reason in coordinator_reason_codes
+        )
+    ):
+        raise CanonicalMaterialError(
+            "close coordinator data reasons are invalid"
+        )
+
     present = set()
     ordered_reasons = list(reconciliation_reasons)
     if reconciliation_reasons:
         present.add("RECONCILIATION_REQUIRED")
+    if coordinator_reason_codes:
+        present.add("DATA_UNAVAILABLE")
+        ordered_reasons.extend(coordinator_reason_codes)
     for position in positions:
         position_reasons = position.reason_codes
         if position_reasons:
@@ -3481,6 +3565,7 @@ def _canonical_close_projection(
     )
     if (
         not reconciliation_reasons
+        and not coordinator_reason_codes
         and not actual_state.positions
         and not positions
     ):
@@ -3545,13 +3630,228 @@ class _CompositionAuthorityCandidate:
     source_binding_candidate: object | None = None
     phase1_candidates: tuple[object, ...] = ()
     risk_children: tuple[object, ...] = ()
-    semantic_children: tuple[tuple[object, str], ...] = ()
+    semantic_children: tuple[object, ...] = ()
+    semantic_fingerprint: object | None = None
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _ClosePositionAuthorityBundle:
+    """Private exact-source chain behind one projected close position."""
+
+    projection: object
+    branch: str
+    identity_children: tuple[object, ...]
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        from .reports import ClosePosition, UnverifiedClosePosition
+
+        if type(self.projection) not in {
+            ClosePosition,
+            UnverifiedClosePosition,
+        }:
+            raise CanonicalMaterialError(
+                "close position authority projection is invalid"
+            )
+        if (
+            type(self.branch) is not str
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", self.branch) is None
+            or type(self.identity_children) is not tuple
+            or not self.identity_children
+        ):
+            raise CanonicalMaterialError(
+                "close position authority chain is invalid"
+            )
+        expected = _close_position_authority_digest(
+            projection=self.projection,
+            branch=self.branch,
+            identity_children=self.identity_children,
+        )
+        if self.source_digest != expected:
+            raise CanonicalMaterialError(
+                "close position authority digest is inconsistent"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _ClosePositionAuthorityCandidate:
+    bundle_reference: ReferenceType[object]
+    coordinator_reference: ReferenceType[object]
+    journal_reference: ReferenceType[object]
+    journal_generation: int
+    bundle_fingerprint: object
+    projection: object
+    identity_children: tuple[object, ...]
+    actual_state: object
+    actual_replay_source: object
+    query_cutoff: datetime
+    calendar_resolver: object
+    policy: object
+
+
+def _close_position_authority_child_material(value: object) -> object:
+    """Project one exact authority child into deterministic digest material."""
+    for field_name in (
+        "source_digest",
+        "context_digest",
+        "authority_digest",
+    ):
+        digest = getattr(value, field_name, None)
+        if (
+            type(digest) is str
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+        ):
+            value_type = type(value)
+            return {
+                "type": f"{value_type.__module__}.{value_type.__qualname__}",
+                "digest_field": field_name,
+                "digest": digest,
+            }
+    return _canonical_digest_value(value)
+
+
+def _close_position_authority_digest(
+    *,
+    projection: object,
+    branch: str,
+    identity_children: tuple[object, ...],
+) -> str:
+    return _canonical_sha256(
+        "stock-monitor/actual-close-position-authority/v1",
+        {
+            "branch": branch,
+            "projection": _canonical_digest_value(projection),
+            "identity_children": [
+                _close_position_authority_child_material(child)
+                for child in identity_children
+            ],
+        },
+    )
+
+
+def _issue_close_position_authority_bundle(
+    *,
+    projection: object,
+    branch: str,
+    identity_children: tuple[object, ...],
+    coordinator: object,
+    actual_state: object,
+    actual_replay_source: object,
+    query_cutoff: datetime,
+) -> _ClosePositionAuthorityBundle:
+    trusted_frame = None
+    frame = inspect.currentframe()
+    try:
+        candidate_frame = None if frame is None else frame.f_back
+        while candidate_frame is not None:
+            if (
+                candidate_frame.f_code
+                is ActualCloseWorkflowCoordinator._project_position.__code__
+                and candidate_frame.f_globals is globals()
+                and candidate_frame.f_locals.get("self") is coordinator
+            ):
+                trusted_frame = candidate_frame
+                break
+            candidate_frame = candidate_frame.f_back
+    finally:
+        del frame, candidate_frame
+    if trusted_frame is None:
+        raise CanonicalMaterialError(
+            "close position authority issuer is unavailable"
+        )
+    journal = getattr(coordinator, "_journal", None)
+    generation = getattr(journal, "_source_generation", None)
+    if type(generation) is not int or generation < 0:
+        raise CanonicalMaterialError(
+            "close position authority Journal generation is invalid"
+        )
+    bundle = _ClosePositionAuthorityBundle(
+        projection=projection,
+        branch=branch,
+        identity_children=identity_children,
+        source_digest=_close_position_authority_digest(
+            projection=projection,
+            branch=branch,
+            identity_children=identity_children,
+        ),
+    )
+    identity = id(bundle)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _CLOSE_POSITION_AUTHORITY_LOCK:
+            current = _ISSUED_CLOSE_POSITION_AUTHORITIES.get(identity)
+            if current is not None and current.bundle_reference is dead:
+                _ISSUED_CLOSE_POSITION_AUTHORITIES.pop(identity, None)
+
+    candidate = _ClosePositionAuthorityCandidate(
+        bundle_reference=ref(bundle, discard),
+        coordinator_reference=ref(coordinator),
+        journal_reference=ref(journal),
+        journal_generation=generation,
+        bundle_fingerprint=_value_fingerprint(bundle),
+        projection=projection,
+        identity_children=identity_children,
+        actual_state=actual_state,
+        actual_replay_source=actual_replay_source,
+        query_cutoff=query_cutoff,
+        calendar_resolver=getattr(coordinator, "_calendar_resolver", None),
+        policy=getattr(coordinator, "_policy", None),
+    )
+    with _CLOSE_POSITION_AUTHORITY_LOCK:
+        if _ISSUED_CLOSE_POSITION_AUTHORITIES.get(identity) is not None:
+            raise CanonicalMaterialError(
+                "close position authority identity is already registered"
+            )
+        _ISSUED_CLOSE_POSITION_AUTHORITIES[identity] = candidate
+    return bundle
+
+
+def _close_semantic_fingerprint(
+    semantic_children: tuple[object, ...],
+) -> object:
+    """Seal both exact identities and values for retained close authorities."""
+    if type(semantic_children) is not tuple:
+        raise CanonicalMaterialError(
+            "close semantic authority children are invalid"
+        )
+    sealed: list[object] = []
+    for child in semantic_children:
+        if type(child) is _ClosePositionAuthorityBundle:
+            sealed.append(
+                (
+                    "position-authority",
+                    id(child),
+                    id(child.projection),
+                    _value_fingerprint(child.projection),
+                    child.branch,
+                    child.source_digest,
+                    tuple(
+                        (id(source), _value_fingerprint(source))
+                        for source in child.identity_children
+                    ),
+                )
+            )
+        else:
+            sealed.append(
+                (
+                    "authority-child",
+                    id(child),
+                    _value_fingerprint(child),
+                )
+            )
+    return ("close-semantic-authority/v1", tuple(sealed))
 
 
 _PREMARKET_COMPOSITION_LOCK = threading.Lock()
 _CLOSE_COMPOSITION_LOCK = threading.Lock()
+_CLOSE_POSITION_AUTHORITY_LOCK = threading.Lock()
 _ISSUED_PREMARKET_COMPOSITIONS: dict[int, _CompositionAuthorityCandidate] = {}
 _ISSUED_CLOSE_COMPOSITIONS: dict[int, _CompositionAuthorityCandidate] = {}
+_ISSUED_CLOSE_POSITION_AUTHORITIES: dict[
+    int,
+    _ClosePositionAuthorityCandidate,
+] = {}
 
 
 def _premarket_composition_identity_children(
@@ -4597,6 +4897,9 @@ class CanonicalCloseCompositionAuthority:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    coordinator_reason_codes: tuple[str, ...] = ()
+    review_source_digest: str | None = None
+    position_authority_digests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         session_date = _require_session(self.session_date)
@@ -4632,6 +4935,29 @@ class CanonicalCloseCompositionAuthority:
         ):
             raise CanonicalMaterialError("close composition outcome is invalid")
         _validate_reason_tuple(self.reason_codes, "close composition reasons")
+        if (
+            type(self.coordinator_reason_codes) is not tuple
+            or len(set(self.coordinator_reason_codes))
+            != len(self.coordinator_reason_codes)
+            or any(
+                reason not in _CANONICAL_DATA_REASONS
+                for reason in self.coordinator_reason_codes
+            )
+        ):
+            raise CanonicalMaterialError(
+                "close composition coordinator reasons are invalid"
+            )
+        if self.review_source_digest is not None:
+            _require_digest(
+                self.review_source_digest,
+                "close composition review-source digest",
+            )
+        if type(self.position_authority_digests) is not tuple:
+            raise CanonicalMaterialError(
+                "close position authority digests are invalid"
+            )
+        for digest in self.position_authority_digests:
+            _require_digest(digest, "close position authority digest")
 
 
 def _is_issued_close_composition_authority(
@@ -4640,7 +4966,9 @@ def _is_issued_close_composition_authority(
     envelope: object,
     identity_children: tuple[object, ...],
 ) -> bool:
-    """Verify a complete Task 11 envelope; the registry is empty for now."""
+    """Verify a complete Task 11 envelope and its retained exact sources."""
+    from .journal import ActualCloseReviewSource
+
     if (
         type(authority) is not CanonicalCloseCompositionAuthority
         or type(envelope) is not _CloseCompositionEnvelope
@@ -4666,16 +4994,49 @@ def _is_issued_close_composition_authority(
         or authority.outcome != envelope.outcome
         or authority.reason_codes != envelope.reason_codes
         or authority.composition_digest != envelope.composition_digest
+        or authority.coordinator_reason_codes
+        != envelope.coordinator_reason_codes
+        or authority.review_source_digest != envelope.review_source_digest
+        or authority.position_authority_digests
+        != envelope.position_authority_digests
     ):
         return False
     with _CLOSE_COMPOSITION_LOCK:
         candidate = _ISSUED_CLOSE_COMPOSITIONS.get(id(authority))
+        requires_semantic_sources = authority.review_source_digest is not None
         if (
             type(candidate) is not _CompositionAuthorityCandidate
             or type(candidate.authority_reference) is not ReferenceType
             or candidate.authority_reference() is not authority
             or type(candidate.envelope) is not _CloseCompositionEnvelope
             or type(candidate.identity_children) is not tuple
+            or type(candidate.semantic_children) is not tuple
+            or (
+                requires_semantic_sources
+                and (
+                    candidate.semantic_fingerprint is None
+                    or len(candidate.semantic_children)
+                    != len(authority.position_authority_digests) + 1
+                    or type(candidate.semantic_children[0])
+                    is not ActualCloseReviewSource
+                    or candidate.semantic_children[0].source_digest
+                    != authority.review_source_digest
+                    or any(
+                        type(bundle) is not _ClosePositionAuthorityBundle
+                        or bundle.projection is not position
+                        or bundle.source_digest != digest
+                        for bundle, position, digest in zip(
+                            candidate.semantic_children[1:],
+                            identity_children[
+                                2 : 2
+                                + len(authority.position_authority_digests)
+                            ],
+                            authority.position_authority_digests,
+                            strict=True,
+                        )
+                    )
+                )
+            )
             or len(candidate.identity_children) != len(identity_children)
             or any(
                 current is not expected
@@ -4691,11 +5052,20 @@ def _is_issued_close_composition_authority(
             candidate_envelope_fingerprint = _value_fingerprint(
                 candidate.envelope
             )
+            semantic_fingerprint = (
+                _close_semantic_fingerprint(candidate.semantic_children)
+                if requires_semantic_sources
+                else None
+            )
         except Exception:
             return False
         return bool(
             candidate.authority_fingerprint == authority_fingerprint
             and candidate_envelope_fingerprint == envelope_fingerprint
+            and (
+                not requires_semantic_sources
+                or semantic_fingerprint == candidate.semantic_fingerprint
+            )
             and _ISSUED_CLOSE_COMPOSITIONS.get(id(authority)) is candidate
         )
 
@@ -4730,6 +5100,9 @@ class _CloseCompositionEnvelope:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    coordinator_reason_codes: tuple[str, ...] = ()
+    review_source_digest: str | None = None
+    position_authority_digests: tuple[str, ...] = ()
 
 
 def _close_composition_identity_children(
@@ -4760,6 +5133,9 @@ def _close_composition_envelope(
     source_receipts: tuple[object, ...],
     outcome: str,
     reason_codes: tuple[str, ...],
+    coordinator_reason_codes: tuple[str, ...] = (),
+    review_source_digest: str | None = None,
+    position_authority_digests: tuple[str, ...] = (),
 ) -> _CloseCompositionEnvelope:
     from .journal import JournalActualReplaySource
     from .reconciliation import ActualLedgerState
@@ -4796,12 +5172,27 @@ def _close_composition_envelope(
     if type(outcome) is not str or outcome not in _CLOSE_OUTCOME_EXIT_CODES:
         raise CanonicalMaterialError("close composition outcome is invalid")
     expected_outcome, _workflow_outcome, _exit_code, expected_reasons = (
-        _canonical_close_projection(actual_state, positions)
+        _canonical_close_projection(
+            actual_state,
+            positions,
+            coordinator_reason_codes,
+        )
     )
     if outcome != expected_outcome or reasons != expected_reasons:
         raise CanonicalMaterialError(
             "close outcome and reasons contradict the canonical matrix"
         )
+    if review_source_digest is not None:
+        _require_digest(
+            review_source_digest,
+            "close composition review-source digest",
+        )
+    if type(position_authority_digests) is not tuple:
+        raise CanonicalMaterialError(
+            "close position authority digests are invalid"
+        )
+    for digest in position_authority_digests:
+        _require_digest(digest, "close position authority digest")
     receipt_manifest = _canonical_receipt_manifest(receipts)
     source_digest = canonical_source_digest(receipts)
     state_digest = _actual_state_digest(actual_state)
@@ -4822,6 +5213,9 @@ def _close_composition_envelope(
         "positions_digest": position_digest,
         "outcome": outcome,
         "reason_codes": reasons,
+        "coordinator_reason_codes": coordinator_reason_codes,
+        "review_source_digest": review_source_digest,
+        "position_authority_digests": position_authority_digests,
     }
     return _CloseCompositionEnvelope(
         session_date=session_date,
@@ -4839,6 +5233,9 @@ def _close_composition_envelope(
             "stock-monitor/canonical-close-composition/v1",
             values,
         ),
+        coordinator_reason_codes=coordinator_reason_codes,
+        review_source_digest=review_source_digest,
+        position_authority_digests=position_authority_digests,
     )
 
 
@@ -4854,6 +5251,9 @@ def canonical_close_state_hash(
     source_receipts: tuple[object, ...],
     outcome: str,
     reason_codes: tuple[str, ...],
+    coordinator_reason_codes: tuple[str, ...] = (),
+    review_source_digest: str | None = None,
+    position_authority_digests: tuple[str, ...] = (),
     composition_authority: object | None = None,
 ) -> str:
     """Derive the report state hash from every actual-close semantic input."""
@@ -4869,6 +5269,9 @@ def canonical_close_state_hash(
         source_receipts=receipts,
         outcome=outcome,
         reason_codes=reason_codes,
+        coordinator_reason_codes=coordinator_reason_codes,
+        review_source_digest=review_source_digest,
+        position_authority_digests=position_authority_digests,
     )
     if not _is_issued_close_composition_authority(
         composition_authority,
@@ -4894,6 +5297,9 @@ def canonical_close_state_hash(
         "positions_digest": envelope.positions_digest,
         "outcome": envelope.outcome,
         "reason_codes": envelope.reason_codes,
+        "coordinator_reason_codes": envelope.coordinator_reason_codes,
+        "review_source_digest": envelope.review_source_digest,
+        "position_authority_digests": envelope.position_authority_digests,
         "composition_digest": envelope.composition_digest,
     }
     return _canonical_sha256(
@@ -4982,6 +5388,7 @@ class CanonicalCloseMaterial:
     source_digest: str
     material_digest: str
     composition_authority: object | None = None
+    coordinator_reason_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         from .journal import JournalActualReplaySource
@@ -5020,6 +5427,18 @@ class CanonicalCloseMaterial:
             raise CanonicalMaterialError(
                 "close composition authority is unavailable"
             )
+        if (
+            type(self.coordinator_reason_codes) is not tuple
+            or len(set(self.coordinator_reason_codes))
+            != len(self.coordinator_reason_codes)
+            or any(
+                reason not in _CANONICAL_DATA_REASONS
+                for reason in self.coordinator_reason_codes
+            )
+        ):
+            raise CanonicalMaterialError(
+                "close material coordinator reasons are invalid"
+            )
         receipts = _require_canonical_receipt_order(self.source_receipts)
         _validate_receipt_envelope(
             receipts,
@@ -5044,6 +5463,7 @@ class CanonicalCloseMaterial:
             report=self.report,
             retrieved_at=retrieved_at,
             composition_authority=self.composition_authority,
+            coordinator_reason_codes=self.coordinator_reason_codes,
         )
 
 
@@ -5115,6 +5535,13 @@ def _composition_envelope_for_material(
             source_receipts=material.source_receipts,
             outcome=material.report.outcome,
             reason_codes=reasons,
+            coordinator_reason_codes=material.coordinator_reason_codes,
+            review_source_digest=(
+                material.composition_authority.review_source_digest
+            ),
+            position_authority_digests=(
+                material.composition_authority.position_authority_digests
+            ),
         )
     raise CanonicalMaterialError("canonical composition material type is invalid")
 
@@ -5274,6 +5701,7 @@ def _validate_close_report_projection(
     report: object,
     retrieved_at: datetime,
     composition_authority: object,
+    coordinator_reason_codes: tuple[str, ...] = (),
 ) -> None:
     from . import reports as reports_module
 
@@ -5291,13 +5719,19 @@ def _validate_close_report_projection(
         type(composition_authority) is not CanonicalCloseCompositionAuthority
         or composition_authority.outcome != report.outcome
         or composition_authority.reason_codes != reasons
+        or composition_authority.coordinator_reason_codes
+        != coordinator_reason_codes
         or report.outcome not in _CLOSE_OUTCOME_EXIT_CODES
     ):
         raise CanonicalMaterialError(
             "canonical close report conflicts with composition authority"
         )
     expected_outcome, _workflow_outcome, _exit_code, expected_reasons = (
-        _canonical_close_projection(actual_state, positions)
+        _canonical_close_projection(
+            actual_state,
+            positions,
+            coordinator_reason_codes,
+        )
     )
     if report.outcome != expected_outcome or reasons != expected_reasons:
         raise CanonicalMaterialError(
@@ -5357,6 +5791,9 @@ def canonical_material_digest(material: object) -> str:
                     material.actual_replay_source.source_digest
                 ),
                 "positions": _canonical_digest_value(material.positions),
+                "coordinator_reason_codes": list(
+                    material.coordinator_reason_codes
+                ),
                 "composition_authority": _canonical_digest_value(
                     material.composition_authority
                 ),
@@ -5403,6 +5840,13 @@ def _validate_derived_material(material: CanonicalMaterial) -> None:
             source_receipts=material.source_receipts,
             outcome=material.report.outcome,
             reason_codes=reasons,
+            coordinator_reason_codes=material.coordinator_reason_codes,
+            review_source_digest=(
+                material.composition_authority.review_source_digest
+            ),
+            position_authority_digests=(
+                material.composition_authority.position_authority_digests
+            ),
             composition_authority=material.composition_authority,
         )
         _validate_close_report_projection(
@@ -5411,6 +5855,7 @@ def _validate_derived_material(material: CanonicalMaterial) -> None:
             report=material.report,
             retrieved_at=material.retrieved_at,
             composition_authority=material.composition_authority,
+            coordinator_reason_codes=material.coordinator_reason_codes,
         )
     _validate_report(
         material.report,
@@ -5535,6 +5980,8 @@ class _PremarketDomainAuthority:
 class _CloseDomainAuthority:
     replay_candidate: object
     state_candidate: object
+    composition_candidate: _CompositionAuthorityCandidate
+    semantic_fingerprint: object
 
 
 def _canonical_archive_root(value: object) -> Path:
@@ -5815,6 +6262,577 @@ def _premarket_domain_is_current_without_callbacks(
         )
 
 
+def _is_issued_close_position_authority_bundle(
+    bundle: object,
+    *,
+    review_source: object,
+    actual_state: object | None = None,
+    actual_replay_source: object | None = None,
+    journal: object | None = None,
+) -> bool:
+    """Rederive one exact coordinator-issued position projection."""
+    from . import journal as journal_module
+    from . import risk as risk_module
+    from .reconciliation import ActualLedgerState, ActualPositionState
+    from .reports import ClosePosition, UnverifiedClosePosition
+
+    if type(bundle) is not _ClosePositionAuthorityBundle:
+        return False
+    with _CLOSE_POSITION_AUTHORITY_LOCK:
+        candidate = _ISSUED_CLOSE_POSITION_AUTHORITIES.get(id(bundle))
+    if (
+        type(candidate) is not _ClosePositionAuthorityCandidate
+        or candidate.bundle_reference() is not bundle
+        or candidate.coordinator_reference() is None
+        or candidate.journal_reference() is None
+    ):
+        return False
+    candidate_journal = candidate.journal_reference()
+    exact_state = candidate.actual_state if actual_state is None else actual_state
+    exact_replay = (
+        candidate.actual_replay_source
+        if actual_replay_source is None
+        else actual_replay_source
+    )
+    exact_journal = candidate_journal if journal is None else journal
+    if (
+        exact_journal is not candidate_journal
+        or exact_state is not candidate.actual_state
+        or exact_replay is not candidate.actual_replay_source
+        or type(exact_state) is not ActualLedgerState
+        or type(review_source) is not journal_module.ActualCloseReviewSource
+        or getattr(candidate_journal, "_source_generation", None)
+        != candidate.journal_generation
+        or not candidate_journal.owns_actual_close_review_source(review_source)
+        or not journal_module.is_verified_actual_close_review_source(
+            review_source
+        )
+        or bundle.projection is not candidate.projection
+        or bundle.identity_children is not candidate.identity_children
+        or type(bundle.identity_children) is not tuple
+        or len(bundle.identity_children) < 2
+        or type(bundle.identity_children[0]) is not ActualPositionState
+        or type(bundle.identity_children[1])
+        is not journal_module.ActualPositionPlanResolution
+        or bundle.projection.symbol != bundle.identity_children[0].symbol
+        or bundle.source_digest
+        != _close_position_authority_digest(
+            projection=bundle.projection,
+            branch=bundle.branch,
+            identity_children=bundle.identity_children,
+        )
+    ):
+        return False
+    actual_position = bundle.identity_children[0]
+    resolution = bundle.identity_children[1]
+    if (
+        not any(position is actual_position for position in exact_state.positions)
+        or getattr(exact_replay, "query_cutoff", None) != candidate.query_cutoff
+        or getattr(exact_state, "query_cutoff", None) != candidate.query_cutoff
+        or review_source.query_cutoff != candidate.query_cutoff
+    ):
+        return False
+
+    # Exhaust callback-bearing child authority validation before the final
+    # registry/fingerprint seal below.
+    for child in bundle.identity_children[2:]:
+        child_type = type(child)
+        if child_type is journal_module.ActualPositionPlanSource:
+            current = journal_module.is_verified_actual_position_plan_source(
+                child
+            )
+        elif child_type is journal_module.ActualCloseReviewSource:
+            current = (
+                child is review_source
+                and journal_module.is_verified_actual_close_review_source(child)
+            )
+        elif child_type is journal_module.Phase1SignalEvidenceSource:
+            current = journal_module.is_verified_phase1_signal_evidence_source(
+                child
+            )
+        elif child_type is journal_module.LatestCloseRecommendationSource:
+            current = (
+                journal_module.is_verified_latest_close_recommendation_source(
+                    child
+                )
+            )
+        elif child_type is risk_module.Phase1SignalEvidenceAuthority:
+            current = risk_module.is_issued_phase1_signal_evidence_authority(
+                child
+            )
+        elif child_type is risk_module.ActualCloseMarketSource:
+            current = risk_module.is_issued_actual_close_market_source(child)
+        elif child_type is risk_module.ActualPositionEventContext:
+            current = risk_module.is_issued_actual_position_event_context(child)
+        elif child_type is risk_module.MarketMark:
+            current = risk_module.is_issued_market_mark(child)
+        elif child_type is risk_module.PositionAction:
+            current = True
+        elif child_type is risk_module.ActualCloseDecisionSource:
+            current = risk_module.is_issued_actual_close_decision_source(child)
+        else:
+            return False
+        if not current:
+            return False
+
+    reconciliation_reasons = _actual_close_reconciliation_reasons(exact_state)
+    status_for_block = (
+        "RECONCILIATION_REQUIRED"
+        if reconciliation_reasons
+        else "POSITION_UNVERIFIED"
+    )
+
+    def exact_unverified(status: str, reasons: tuple[str, ...]) -> bool:
+        try:
+            expected = _actual_close_unverified_projection(
+                actual_position,
+                status=status,
+                reason_codes=reasons,
+            )
+        except Exception:
+            return False
+        return type(bundle.projection) is UnverifiedClosePosition and (
+            bundle.projection == expected
+        )
+
+    children = bundle.identity_children
+    branch_valid = False
+    if bundle.branch == "PLAN_UNAVAILABLE":
+        try:
+            current_resolution = (
+                candidate_journal.resolve_actual_position_plan_source(
+                    actual_replay_source=exact_replay,
+                    actual_position_state=exact_state,
+                    symbol=actual_position.symbol,
+                    query_cutoff=candidate.query_cutoff,
+                )
+            )
+        except Exception:
+            current_resolution = None
+        branch_valid = bool(
+            len(children) == 2
+            and resolution.status != "RESOLVED"
+            and current_resolution == resolution
+            and exact_unverified(
+                status_for_block,
+                (*reconciliation_reasons, *resolution.reason_codes),
+            )
+        )
+    else:
+        if (
+            resolution.status != "RESOLVED"
+            or resolution.source is None
+            or len(children) < 4
+            or children[2] is not resolution.source
+            or children[3] is not review_source
+        ):
+            return False
+        plan_source = children[2]
+        if (
+            plan_source.actual_replay_source is not exact_replay
+            or plan_source.actual_position_state is not exact_state
+            or plan_source.query_cutoff != candidate.query_cutoff
+            or plan_source.symbol != actual_position.symbol
+        ):
+            return False
+
+        review_failure_reasons = _actual_close_review_failure_reasons(
+            review_source,
+            actual_position.symbol,
+        )
+        if bundle.branch == "REVIEW_SOURCE_UNAVAILABLE":
+            status = (
+                "RECONCILIATION_REQUIRED"
+                if reconciliation_reasons
+                else (
+                    "POSITION_UNVERIFIED"
+                    if "EVENT_EVIDENCE_UNAVAILABLE"
+                    in review_failure_reasons
+                    else "DATA_UNAVAILABLE"
+                )
+            )
+            branch_valid = bool(
+                len(children) == 4
+                and review_failure_reasons
+                and exact_unverified(
+                    status,
+                    (*reconciliation_reasons, *review_failure_reasons),
+                )
+            )
+        elif bundle.branch == "EVENT_EVIDENCE_UNAVAILABLE":
+            failed = False
+            try:
+                candidate_journal.read_phase1_signal_evidence_source(
+                    plan_source.signal_source.signal_id,
+                    review_at=review_source.review_at,
+                    query_cutoff=candidate.query_cutoff,
+                    calendar_resolver=candidate.calendar_resolver,
+                    exact_signal_source=plan_source.signal_source,
+                )
+            except (journal_module.JournalError, risk_module.RiskBlock):
+                failed = True
+            branch_valid = bool(
+                len(children) == 4
+                and not review_failure_reasons
+                and failed
+                and exact_unverified(
+                    status_for_block,
+                    (*reconciliation_reasons, "EVENT_EVIDENCE_UNAVAILABLE"),
+                )
+            )
+        elif bundle.branch == "EVENT_AUTHORITY_UNAVAILABLE":
+            if len(children) != 5:
+                return False
+            evidence_source = children[4]
+            if (
+                type(evidence_source)
+                is not journal_module.Phase1SignalEvidenceSource
+                or evidence_source.signal_source is not plan_source.signal_source
+            ):
+                return False
+            failed = False
+            try:
+                risk_module._issue_phase1_signal_evidence_authority_from_source(
+                    evidence_source,
+                    calendar_resolver=candidate.calendar_resolver,
+                )
+            except (journal_module.JournalError, risk_module.RiskBlock):
+                failed = True
+            branch_valid = bool(
+                not review_failure_reasons
+                and failed
+                and exact_unverified(
+                    status_for_block,
+                    (*reconciliation_reasons, "EVENT_EVIDENCE_UNAVAILABLE"),
+                )
+            )
+        else:
+            if len(children) < 6:
+                return False
+            evidence_source = children[4]
+            event_evidence = children[5]
+            if (
+                type(evidence_source)
+                is not journal_module.Phase1SignalEvidenceSource
+                or type(event_evidence)
+                is not risk_module.Phase1SignalEvidenceAuthority
+                or evidence_source.signal_source is not plan_source.signal_source
+                or not any(
+                    bound_source is evidence_source
+                    for bound_source, _kind in risk_module._phase1_bound_sources(
+                        event_evidence
+                    )
+                )
+            ):
+                return False
+            if bundle.branch == "RECOMMENDATION_HISTORY_UNAVAILABLE":
+                failed = False
+                try:
+                    candidate_journal.read_latest_close_recommendation_source(
+                        position_plan_source=plan_source,
+                        query_cutoff=candidate.query_cutoff,
+                    )
+                except (journal_module.JournalError, risk_module.RiskBlock):
+                    failed = True
+                branch_valid = bool(
+                    len(children) == 6
+                    and failed
+                    and exact_unverified(
+                        status_for_block,
+                        (
+                            *reconciliation_reasons,
+                            "RECOMMENDATION_HISTORY_UNAVAILABLE",
+                        ),
+                    )
+                )
+            else:
+                if len(children) < 7:
+                    return False
+                history_source = children[6]
+                if (
+                    type(history_source)
+                    is not journal_module.LatestCloseRecommendationSource
+                    or history_source.position_plan_source is not plan_source
+                ):
+                    return False
+                if bundle.branch == "MARKET_SOURCE_UNAVAILABLE":
+                    market_error = None
+                    try:
+                        risk_module.issue_actual_close_market_source(
+                            review_source,
+                            plan_source,
+                            calendar_resolver=candidate.calendar_resolver,
+                        )
+                    except risk_module.RiskBlock as error:
+                        market_error = error
+                    reason = (
+                        None
+                        if market_error is None
+                        else _actual_close_market_failure_reason(
+                            review_source,
+                            actual_position.symbol,
+                            market_error,
+                        )
+                    )
+                    branch_valid = bool(
+                        len(children) == 7
+                        and reason is not None
+                        and exact_unverified(
+                            (
+                                "RECONCILIATION_REQUIRED"
+                                if reconciliation_reasons
+                                else "DATA_UNAVAILABLE"
+                            ),
+                            (*reconciliation_reasons, reason),
+                        )
+                    )
+                else:
+                    if len(children) < 8:
+                        return False
+                    market_source = children[7]
+                    if (
+                        type(market_source)
+                        is not risk_module.ActualCloseMarketSource
+                        or market_source.review_source is not review_source
+                        or market_source.position_plan_source is not plan_source
+                    ):
+                        return False
+                    if bundle.branch == "POSITION_CONTEXT_UNVERIFIED":
+                        failed = False
+                        try:
+                            risk_module.issue_actual_position_event_context(
+                                market_source,
+                                plan_source,
+                                event_evidence,
+                                history_source,
+                                calendar_resolver=candidate.calendar_resolver,
+                                policy=candidate.policy,
+                            )
+                        except risk_module.RiskBlock:
+                            failed = True
+                        branch_valid = bool(
+                            len(children) == 8
+                            and failed
+                            and exact_unverified(
+                                status_for_block,
+                                (
+                                    *reconciliation_reasons,
+                                    "POSITION_CONTEXT_UNVERIFIED",
+                                ),
+                            )
+                        )
+                    elif bundle.branch == "CLOSE_MARK_UNVERIFIED":
+                        if len(children) != 9:
+                            return False
+                        context = children[8]
+                        if (
+                            type(context)
+                            is not risk_module.ActualPositionEventContext
+                            or context.review_source is not review_source
+                            or context.position_plan_source is not plan_source
+                            or context.latest_recommendation_source
+                            is not history_source
+                        ):
+                            return False
+                        failed = False
+                        try:
+                            risk_module.issue_actual_close_mark(
+                                market_source,
+                                context,
+                            )
+                        except risk_module.RiskBlock:
+                            failed = True
+                        branch_valid = bool(
+                            failed
+                            and exact_unverified(
+                                status_for_block,
+                                (
+                                    *reconciliation_reasons,
+                                    "POSITION_CONTEXT_UNVERIFIED",
+                                ),
+                            )
+                        )
+                    elif bundle.branch == "POSITION_EVALUATION_UNVERIFIED":
+                        if len(children) != 10:
+                            return False
+                        context, mark = children[8:10]
+                        if (
+                            type(context)
+                            is not risk_module.ActualPositionEventContext
+                            or type(mark) is not risk_module.MarketMark
+                            or context.review_source is not review_source
+                            or context.position_plan_source is not plan_source
+                            or context.latest_recommendation_source
+                            is not history_source
+                            or risk_module._registered_risk_authority_children(
+                                risk_module._MARK_AUTHORITIES,
+                                mark,
+                            )
+                            != (context,)
+                        ):
+                            return False
+                        try:
+                            expected_mark = risk_module.issue_actual_close_mark(
+                                market_source,
+                                context,
+                            )
+                        except risk_module.RiskBlock:
+                            return False
+                        if expected_mark != mark:
+                            return False
+                        failed = False
+                        try:
+                            risk_module.evaluate_position(
+                                context.position,
+                                mark,
+                                candidate.policy,
+                            )
+                        except risk_module.RiskBlock:
+                            failed = True
+                        branch_valid = bool(
+                            failed
+                            and exact_unverified(
+                                status_for_block,
+                                (
+                                    *reconciliation_reasons,
+                                    "POSITION_CONTEXT_UNVERIFIED",
+                                ),
+                            )
+                        )
+                    else:
+                        if len(children) not in {11, 12}:
+                            return False
+                        context, mark, action = children[8:11]
+                        if (
+                            type(context)
+                            is not risk_module.ActualPositionEventContext
+                            or type(mark) is not risk_module.MarketMark
+                            or type(action) is not risk_module.PositionAction
+                            or context.review_source is not review_source
+                            or context.position_plan_source is not plan_source
+                            or context.latest_recommendation_source
+                            is not history_source
+                        ):
+                            return False
+                        try:
+                            expected_action = risk_module.evaluate_position(
+                                context.position,
+                                mark,
+                                candidate.policy,
+                            )
+                        except risk_module.RiskBlock:
+                            return False
+                        if expected_action != action:
+                            return False
+                        if bundle.branch == "RECONCILIATION_REQUIRED":
+                            branch_valid = bool(
+                                len(children) == 11
+                                and reconciliation_reasons
+                                and exact_unverified(
+                                    "RECONCILIATION_REQUIRED",
+                                    reconciliation_reasons,
+                                )
+                            )
+                        elif bundle.branch in {
+                            "POSITION_UNVERIFIED",
+                            "RECONCILIATION_REQUIRED",
+                        }:
+                            branch_valid = bool(
+                                len(children) == 11
+                                and action.status == bundle.branch
+                                and exact_unverified(
+                                    action.status,
+                                    tuple(action.reason_codes),
+                                )
+                            )
+                        elif bundle.branch == "DECISION_AUTHORITY_UNAVAILABLE":
+                            failed = False
+                            try:
+                                risk_module.issue_actual_close_decision(
+                                    context,
+                                    mark,
+                                    candidate.policy,
+                                )
+                            except risk_module.RiskBlock:
+                                failed = True
+                            branch_valid = bool(
+                                len(children) == 11
+                                and failed
+                                and exact_unverified(
+                                    "POSITION_UNVERIFIED",
+                                    ("POSITION_CONTEXT_UNVERIFIED",),
+                                )
+                            )
+                        elif bundle.branch == "STOP_UNVERIFIED":
+                            try:
+                                expected_projection = (
+                                    _actual_close_verified_projection(
+                                        context=context,
+                                        market_source=market_source,
+                                        mark=mark,
+                                        action=action,
+                                        decision=None,
+                                    )
+                                )
+                            except Exception:
+                                expected_projection = None
+                            branch_valid = bool(
+                                len(children) == 11
+                                and action.status == "STOP_UNVERIFIED"
+                                and type(bundle.projection) is ClosePosition
+                                and bundle.projection == expected_projection
+                            )
+                        elif bundle.branch == "VERIFIED_DECISION":
+                            if len(children) != 12:
+                                return False
+                            decision = children[11]
+                            try:
+                                expected_projection = (
+                                    _actual_close_verified_projection(
+                                        context=context,
+                                        market_source=market_source,
+                                        mark=mark,
+                                        action=action,
+                                        decision=decision,
+                                    )
+                                )
+                            except Exception:
+                                expected_projection = None
+                            branch_valid = bool(
+                                type(decision)
+                                is risk_module.ActualCloseDecisionSource
+                                and decision.context is context
+                                and decision.mark is mark
+                                and decision.policy is candidate.policy
+                                and decision.position_action is action
+                                and decision.review_source is review_source
+                                and decision.position_plan_source is plan_source
+                                and decision.latest_recommendation_source
+                                is history_source
+                                and type(bundle.projection) is ClosePosition
+                                and bundle.projection == expected_projection
+                            )
+
+    if not branch_valid:
+        return False
+    try:
+        fingerprint = _value_fingerprint(bundle)
+    except Exception:
+        return False
+    with _CLOSE_POSITION_AUTHORITY_LOCK:
+        current = _ISSUED_CLOSE_POSITION_AUTHORITIES.get(id(bundle))
+        return bool(
+            current is candidate
+            and candidate.bundle_reference() is bundle
+            and candidate.journal_reference() is candidate_journal
+            and getattr(candidate_journal, "_source_generation", None)
+            == candidate.journal_generation
+            and candidate.projection is bundle.projection
+            and candidate.identity_children is bundle.identity_children
+            and candidate.bundle_fingerprint == fingerprint
+        )
+
+
 def _capture_close_domain_authority(
     material: CanonicalCloseMaterial,
     journal: object,
@@ -5839,6 +6857,47 @@ def _capture_close_domain_authority(
         raise CanonicalMaterialError(
             "close material actual replay authority is unverified"
         )
+    with _CLOSE_COMPOSITION_LOCK:
+        composition_candidate = _ISSUED_CLOSE_COMPOSITIONS.get(
+            id(material.composition_authority)
+        )
+    requires_semantic_sources = (
+        material.composition_authority.review_source_digest is not None
+    )
+    if (
+        type(composition_candidate) is not _CompositionAuthorityCandidate
+        or composition_candidate.authority_reference()
+        is not material.composition_authority
+        or (
+            requires_semantic_sources
+            and len(composition_candidate.semantic_children)
+            != len(material.positions) + 1
+        )
+    ):
+        raise CanonicalMaterialError(
+            "close material exact source chain is unavailable"
+        )
+    if requires_semantic_sources:
+        review_source = composition_candidate.semantic_children[0]
+        position_authorities = composition_candidate.semantic_children[1:]
+        if (
+            not journal.owns_actual_close_review_source(review_source)
+            or review_source.source_digest
+            != material.composition_authority.review_source_digest
+            or any(
+                not _is_issued_close_position_authority_bundle(
+                    bundle,
+                    review_source=review_source,
+                    actual_state=state,
+                    actual_replay_source=replay_source,
+                    journal=journal,
+                )
+                for bundle in position_authorities
+            )
+        ):
+            raise CanonicalMaterialError(
+                "close material exact source chain is unverified"
+            )
     replay_candidate = (
         journal_module._journal_replay_source_authority_candidate(replay_source)
     )
@@ -5856,6 +6915,10 @@ def _capture_close_domain_authority(
     authority = _CloseDomainAuthority(
         replay_candidate=replay_candidate,
         state_candidate=state_candidate,
+        composition_candidate=composition_candidate,
+        semantic_fingerprint=_close_semantic_fingerprint(
+            composition_candidate.semantic_children
+        ),
     )
     if state_candidate is None or not _close_domain_is_current_without_callbacks(
         material,
@@ -5874,6 +6937,16 @@ def _close_domain_is_current_without_callbacks(
     from . import journal as journal_module
     from . import reconciliation as reconciliation_module
 
+    try:
+        semantic_fingerprint = _close_semantic_fingerprint(
+            authority.composition_candidate.semantic_children
+        )
+    except Exception:
+        return False
+    with _CLOSE_COMPOSITION_LOCK:
+        current_composition = _ISSUED_CLOSE_COMPOSITIONS.get(
+            id(material.composition_authority)
+        )
     return bool(
         authority.replay_candidate[1] is material.actual_replay_source
         and authority.state_candidate[0] is material.actual_state
@@ -5884,6 +6957,15 @@ def _close_domain_is_current_without_callbacks(
         and reconciliation_module._is_current_actual_ledger_state_authority_candidate_without_callbacks(
             authority.state_candidate
         )
+        and authority.composition_candidate.authority_reference()
+        is material.composition_authority
+        and current_composition is authority.composition_candidate
+        and (
+            authority.composition_candidate.semantic_fingerprint is None
+            or authority.composition_candidate.semantic_fingerprint
+            == authority.semantic_fingerprint
+        )
+        and semantic_fingerprint == authority.semantic_fingerprint
     )
 
 
@@ -6087,6 +7169,7 @@ def issue_canonical_close_material(
     report: object,
     positions: tuple[object, ...],
     source_receipts: tuple[object, ...],
+    coordinator_reason_codes: tuple[str, ...] = (),
     state_hash: str | None = None,
     source_digest: str | None = None,
     material_digest: str | None = None,
@@ -6095,6 +7178,18 @@ def issue_canonical_close_material(
     receipts = _receipt_set(source_receipts)
     expected_source_digest = canonical_source_digest(receipts)
     report_reasons = _report_reason_codes(report)
+    review_source_digest = (
+        composition_authority.review_source_digest
+        if type(composition_authority)
+        is CanonicalCloseCompositionAuthority
+        else None
+    )
+    position_authority_digests = (
+        composition_authority.position_authority_digests
+        if type(composition_authority)
+        is CanonicalCloseCompositionAuthority
+        else ()
+    )
     expected_state_hash = canonical_close_state_hash(
         session_date=session_date,
         review_at=review_at,
@@ -6106,6 +7201,9 @@ def issue_canonical_close_material(
         source_receipts=receipts,
         outcome=report.outcome,
         reason_codes=report_reasons,
+        coordinator_reason_codes=coordinator_reason_codes,
+        review_source_digest=review_source_digest,
+        position_authority_digests=position_authority_digests,
         composition_authority=composition_authority,
     )
     for supplied, expected, label in (
@@ -6129,6 +7227,7 @@ def issue_canonical_close_material(
         report=report,
         retrieved_at=retrieved_at,
         composition_authority=composition_authority,
+        coordinator_reason_codes=coordinator_reason_codes,
     )
     provisional = CanonicalCloseMaterial(
         session_date=session_date,
@@ -6144,6 +7243,7 @@ def issue_canonical_close_material(
         state_hash=expected_state_hash,
         source_digest=expected_source_digest,
         material_digest="0" * 64,
+        coordinator_reason_codes=coordinator_reason_codes,
     )
     expected_material_digest = canonical_material_digest(provisional)
     if material_digest is not None and (
@@ -6162,6 +7262,1405 @@ def issue_canonical_close_material(
         journal=journal,
         report_archive_root=report_archive_root,
     )
+
+
+def _issue_close_composition_authority(
+    *,
+    session_date: date,
+    review_at: datetime,
+    retrieved_at: datetime,
+    query_cutoff: datetime,
+    actual_state: object,
+    actual_replay_source: object,
+    positions: tuple[object, ...],
+    source_receipts: tuple[object, ...],
+    review_source: object,
+    position_authorities: tuple[_ClosePositionAuthorityBundle, ...],
+    outcome: str,
+    reason_codes: tuple[str, ...],
+    coordinator_reason_codes: tuple[str, ...] = (),
+) -> CanonicalCloseCompositionAuthority:
+    """Register one exact coordinator-only close composition capability."""
+    from .journal import (
+        ActualCloseReviewSource,
+        is_verified_actual_close_review_source,
+    )
+
+    if (
+        type(review_source) is not ActualCloseReviewSource
+        or not is_verified_actual_close_review_source(review_source)
+        or review_source.session_date != session_date
+        or review_source.review_at != review_at
+        or review_source.query_cutoff != query_cutoff
+        or review_source.retrieved_at != retrieved_at
+        or type(position_authorities) is not tuple
+        or len(position_authorities) != len(positions)
+        or len(actual_state.positions) != len(position_authorities)
+        or any(
+            type(bundle) is not _ClosePositionAuthorityBundle
+            or bundle.projection is not position
+            or bundle.identity_children[0] is not actual_position
+            or not _is_issued_close_position_authority_bundle(
+                bundle,
+                review_source=review_source,
+                actual_state=actual_state,
+                actual_replay_source=actual_replay_source,
+            )
+            for bundle, position, actual_position in zip(
+                position_authorities,
+                positions,
+                actual_state.positions,
+                strict=True,
+            )
+        )
+    ):
+        raise CanonicalMaterialError(
+            "close composition source authority chain is invalid"
+        )
+    receipts = _receipt_set(source_receipts)
+    if (
+        len(receipts) != len(review_source.receipts)
+        or {id(receipt) for receipt in receipts}
+        != {id(receipt) for receipt in review_source.receipts}
+    ):
+        raise CanonicalMaterialError(
+            "close composition review receipts are not exact"
+        )
+    position_authority_digests = tuple(
+        bundle.source_digest for bundle in position_authorities
+    )
+    envelope = _close_composition_envelope(
+        session_date=session_date,
+        review_at=review_at,
+        retrieved_at=retrieved_at,
+        query_cutoff=query_cutoff,
+        actual_state=actual_state,
+        actual_replay_source=actual_replay_source,
+        positions=positions,
+        source_receipts=receipts,
+        outcome=outcome,
+        reason_codes=reason_codes,
+        coordinator_reason_codes=coordinator_reason_codes,
+        review_source_digest=review_source.source_digest,
+        position_authority_digests=position_authority_digests,
+    )
+    authority = CanonicalCloseCompositionAuthority(
+        session_date=envelope.session_date,
+        review_at=envelope.review_at,
+        retrieved_at=envelope.retrieved_at,
+        query_cutoff=envelope.query_cutoff,
+        receipt_manifest=envelope.receipt_manifest,
+        source_digest=envelope.source_digest,
+        actual_state_digest=envelope.actual_state_digest,
+        actual_replay_source_digest=envelope.actual_replay_source_digest,
+        positions_digest=envelope.positions_digest,
+        outcome=envelope.outcome,
+        reason_codes=envelope.reason_codes,
+        composition_digest=envelope.composition_digest,
+        coordinator_reason_codes=envelope.coordinator_reason_codes,
+        review_source_digest=envelope.review_source_digest,
+        position_authority_digests=envelope.position_authority_digests,
+    )
+    children = _close_composition_identity_children(
+        actual_state=actual_state,
+        actual_replay_source=actual_replay_source,
+        positions=positions,
+        source_receipts=receipts,
+    )
+    identity = id(authority)
+
+    def discard(dead: ReferenceType[object]) -> None:
+        with _CLOSE_COMPOSITION_LOCK:
+            current = _ISSUED_CLOSE_COMPOSITIONS.get(identity)
+            if current is not None and current.authority_reference is dead:
+                _ISSUED_CLOSE_COMPOSITIONS.pop(identity, None)
+
+    candidate = _CompositionAuthorityCandidate(
+        authority_reference=ref(authority, discard),
+        authority_fingerprint=_value_fingerprint(authority),
+        envelope=envelope,
+        identity_children=children,
+        semantic_children=(review_source, *position_authorities),
+        semantic_fingerprint=_close_semantic_fingerprint(
+            (review_source, *position_authorities)
+        ),
+    )
+    with _CLOSE_COMPOSITION_LOCK:
+        if _ISSUED_CLOSE_COMPOSITIONS.get(identity) is not None:
+            raise CanonicalMaterialError(
+                "close composition authority identity is already registered"
+            )
+        _ISSUED_CLOSE_COMPOSITIONS[identity] = candidate
+    if not _is_issued_close_composition_authority(
+        authority,
+        envelope=envelope,
+        identity_children=children,
+    ):
+        with _CLOSE_COMPOSITION_LOCK:
+            if _ISSUED_CLOSE_COMPOSITIONS.get(identity) is candidate:
+                _ISSUED_CLOSE_COMPOSITIONS.pop(identity, None)
+        raise CanonicalMaterialError(
+            "close composition authority changed during issuance"
+        )
+    return authority
+
+
+def _actual_close_unverified_projection(
+    actual_position: object,
+    *,
+    status: str,
+    reason_codes: tuple[str, ...],
+) -> object:
+    from .domain import money_from_micros
+    from .reconciliation import ActualPositionState
+    from .reports import UnverifiedClosePosition
+
+    if type(actual_position) is not ActualPositionState:
+        raise CanonicalMaterialError(
+            "actual close projection requires an exact position"
+        )
+    reasons = tuple(dict.fromkeys(reason_codes))
+    _validate_reason_tuple(reasons, "actual close position reasons")
+    return UnverifiedClosePosition(
+        symbol=actual_position.symbol,
+        shares=actual_position.shares,
+        exact_cost_basis=money_from_micros(actual_position.cost_basis_micros),
+        status=status,
+        reason_codes=reasons,
+    )
+
+
+def _actual_close_reconciliation_reasons(actual_state: object) -> tuple[str, ...]:
+    from .reconciliation import ActualLedgerState
+
+    if type(actual_state) is not ActualLedgerState or type(
+        actual_state.reconciliation_reasons
+    ) is not tuple:
+        raise CanonicalMaterialError(
+            "actual close reconciliation state is invalid"
+        )
+    return tuple(
+        reason
+        for reason in actual_state.reconciliation_reasons
+        if reason not in _LEGACY_ACTUAL_ENTRY_CONTEXT_REASONS
+    )
+
+
+def _actual_close_report_sources(market_source: object) -> tuple[object, ...]:
+    from .journal import SourceObservationReceipt
+    from .reports import ReportSource
+    from .risk import ActualCloseMarketSource
+
+    if type(market_source) is not ActualCloseMarketSource:
+        raise CanonicalMaterialError("actual close market source is invalid")
+    sources: list[ReportSource] = []
+    seen: set[str] = set()
+    for receipt in market_source.observation_receipts:
+        if type(receipt) is not SourceObservationReceipt:
+            raise CanonicalMaterialError(
+                "actual close market receipt is invalid"
+            )
+        if receipt.source_uri in seen:
+            continue
+        seen.add(receipt.source_uri)
+        sources.append(
+            ReportSource(
+                label=f"{receipt.provider} {receipt.source_type}",
+                url=receipt.source_uri,
+            )
+        )
+    return tuple(sources)
+
+
+def _actual_close_verified_projection(
+    *,
+    context: object,
+    market_source: object,
+    mark: object,
+    action: object,
+    decision: object | None,
+) -> object:
+    from .domain import money_from_micros
+    from .reports import ClosePosition
+    from .risk import (
+        ActualCloseDecisionSource,
+        ActualCloseMarketSource,
+        ActualPositionEventContext,
+        MarketMark,
+        PositionAction,
+    )
+
+    if (
+        type(context) is not ActualPositionEventContext
+        or type(market_source) is not ActualCloseMarketSource
+        or type(mark) is not MarketMark
+        or type(action) is not PositionAction
+        or (
+            decision is not None
+            and type(decision) is not ActualCloseDecisionSource
+        )
+    ):
+        raise CanonicalMaterialError(
+            "actual close verified projection inputs are invalid"
+        )
+    mapped_action = {
+        "PROVISIONAL_EXIT": "EXIT",
+        "PROVISIONAL_HOLD": "HOLD",
+        "PROVISIONAL_TIGHTEN_STOP": "TIGHTEN_STOP",
+        "STOP_UNVERIFIED": "HOLD",
+    }.get(action.status)
+    if mapped_action is None:
+        raise CanonicalMaterialError(
+            "actual close position action cannot be projected as verified"
+        )
+    reasons = (
+        decision.reason_codes
+        if decision is not None
+        else tuple(action.reason_codes)
+    )
+    recommended_stop = (
+        money_from_micros(decision.recommended_stop_micros)
+        if decision is not None
+        else action.recommended_stop
+    )
+    quote_receipts = tuple(
+        receipt
+        for receipt in market_source.observation_receipts
+        if receipt.source_type == "ALPACA_HISTORICAL_QUOTES"
+    )
+    if len(quote_receipts) != 1:
+        raise CanonicalMaterialError(
+            "actual close SIP quote receipt is not exact"
+        )
+    quote_receipt = quote_receipts[0]
+    position = context.position
+    return ClosePosition(
+        symbol=position.symbol,
+        shares=position.shares,
+        mark=mark.price,
+        estimated_unrealized_pl=(mark.price - position.entry) * position.shares,
+        r_multiple=action.r_multiple,
+        recommended_stop=recommended_stop,
+        user_confirmed_stop=action.user_confirmed_stop,
+        target=action.published_target,
+        holding_days=context.holding_sessions,
+        provider=quote_receipt.provider.upper(),
+        feed=quote_receipt.feed.upper(),
+        observed_at=market_source.observed_at,
+        upcoming_events=(),
+        evidence=_actual_close_report_sources(market_source),
+        action=mapped_action,
+        reason_codes=reasons,
+    )
+
+
+def _actual_close_market_failure_reason(
+    review_source: object,
+    symbol: str,
+    error: Exception,
+) -> str:
+    from .journal import ActualCloseReviewSource
+
+    if type(review_source) is ActualCloseReviewSource:
+        failures = {
+            binding.source_role
+            for binding in review_source.bindings
+            if binding.symbol == symbol and binding.failure_code is not None
+        }
+        if failures.intersection(
+            {"SIP_DAILY_BAR", "SIP_MINUTE_BAR", "SIP_QUOTE"}
+        ):
+            return "SIP_MARK_UNAVAILABLE"
+        if "IEX_FRESHNESS" in failures:
+            return "PROVIDER_CHECK_FAILED"
+    code = str(error)
+    if "IEX" in code:
+        return "PROVIDER_CHECK_FAILED"
+    return "SIP_MARK_UNAVAILABLE"
+
+
+def _actual_close_review_failure_reasons(
+    review_source: object,
+    symbol: str,
+) -> tuple[str, ...]:
+    from .journal import ActualCloseReviewSource
+
+    if type(review_source) is not ActualCloseReviewSource:
+        raise CanonicalMaterialError("actual close review source is invalid")
+    reasons: list[str] = []
+    if any(
+        binding.symbol == symbol
+        and binding.source_role == "EVENT_EVIDENCE"
+        and binding.failure_code is not None
+        for binding in review_source.bindings
+    ):
+        reasons.append("EVENT_EVIDENCE_UNAVAILABLE")
+    return tuple(reasons)
+
+
+def _actual_close_coordinator_reason_codes(
+    review_source: object,
+) -> tuple[str, ...]:
+    from .journal import ActualCloseReviewSource
+
+    if type(review_source) is not ActualCloseReviewSource:
+        raise CanonicalMaterialError("actual close review source is invalid")
+    if any(
+        binding.symbol is None and binding.failure_code is not None
+        for binding in review_source.bindings
+    ):
+        return ("SOURCE_CHECK_FAILED",)
+    return ()
+
+
+def _actual_close_ledger_fingerprint_value(value: object) -> object:
+    """Return callback-free canonical material for the ACTUAL stability seal."""
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is datetime:
+        return {"datetime": _canonical_timestamp(value)}
+    if type(value) is date:
+        return {"date": value.isoformat()}
+    if type(value) is Decimal:
+        return {"decimal": str(value)}
+    if type(value) is bytes:
+        return {
+            "bytes_length": len(value),
+            "bytes_sha256": hashlib.sha256(value).hexdigest(),
+        }
+    if type(value) is tuple:
+        return [
+            _actual_close_ledger_fingerprint_value(item)
+            for item in value
+        ]
+    if type(value) is list:
+        return [
+            _actual_close_ledger_fingerprint_value(item)
+            for item in value
+        ]
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise CanonicalMaterialError(
+                "actual close ledger stability mapping is invalid"
+            )
+        return {
+            key: _actual_close_ledger_fingerprint_value(value[key])
+            for key in sorted(value)
+        }
+    if is_dataclass(value) and type(value).__module__.startswith(
+        "stock_monitor."
+    ):
+        return {
+            "dataclass": (
+                f"{type(value).__module__}.{type(value).__qualname__}"
+            ),
+            "fields": {
+                field.name: _actual_close_ledger_fingerprint_value(
+                    getattr(value, field.name)
+                )
+                for field in fields(type(value))
+            },
+        }
+    raise CanonicalMaterialError(
+        "actual close ledger stability value is unsupported"
+    )
+
+
+def _actual_close_ledger_stability_digest(
+    replay_source: object,
+    actual_state: object,
+) -> str:
+    """Bind all ACTUAL economics while excluding cutoff-derived digests."""
+    from .journal import JournalActualReplaySource
+    from .reconciliation import ActualLedgerState
+
+    if (
+        type(replay_source) is not JournalActualReplaySource
+        or type(actual_state) is not ActualLedgerState
+    ):
+        raise CanonicalMaterialError(
+            "actual close ledger stability inputs are invalid"
+        )
+    replay_material = {
+        field.name: _actual_close_ledger_fingerprint_value(
+            getattr(replay_source, field.name)
+        )
+        for field in fields(JournalActualReplaySource)
+        if field.name not in {"query_cutoff", "source_digest"}
+    }
+    state_material = {
+        field.name: _actual_close_ledger_fingerprint_value(
+            getattr(actual_state, field.name)
+        )
+        for field in fields(ActualLedgerState)
+        if field.name
+        not in {
+            "query_cutoff",
+            "source_digest",
+            "journal_source_digest",
+        }
+    }
+    return hashlib.sha256(
+        b"stock-monitor/actual-close-ledger-stability/v1\0"
+        + json.dumps(
+            {
+                "replay": replay_material,
+                "state": state_material,
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _actual_close_plan_resolution_stability_digest(
+    resolutions: tuple[tuple[str, object], ...],
+) -> str:
+    """Bind exact per-position plan semantics without cutoff-derived digests."""
+    from .journal import (
+        ActualPositionPlanResolution,
+        ActualPositionPlanSource,
+        Phase1SignalSource,
+    )
+
+    if (
+        type(resolutions) is not tuple
+        or tuple(sorted(symbol for symbol, _resolution in resolutions))
+        != tuple(symbol for symbol, _resolution in resolutions)
+        or len({symbol for symbol, _resolution in resolutions})
+        != len(resolutions)
+    ):
+        raise CanonicalMaterialError(
+            "actual close plan stability resolutions are invalid"
+        )
+    material: list[object] = []
+    for symbol, resolution in resolutions:
+        if (
+            type(symbol) is not str
+            or not symbol
+            or type(resolution) is not ActualPositionPlanResolution
+        ):
+            raise CanonicalMaterialError(
+                "actual close plan stability resolution is invalid"
+            )
+        resolution_material: dict[str, object] = {
+            "symbol": symbol,
+            "status": resolution.status,
+            "reason_codes": list(resolution.reason_codes),
+        }
+        source = resolution.source
+        if source is None:
+            resolution_material["source"] = None
+        else:
+            if (
+                type(source) is not ActualPositionPlanSource
+                or source.symbol != symbol
+                or type(source.signal_source) is not Phase1SignalSource
+            ):
+                raise CanonicalMaterialError(
+                    "actual close plan stability source is invalid"
+                )
+            signal_material = {
+                field.name: _actual_close_ledger_fingerprint_value(
+                    getattr(source.signal_source, field.name)
+                )
+                for field in fields(Phase1SignalSource)
+                if field.name
+                not in {
+                    "publication_source",
+                    "query_cutoff",
+                    "source_digest",
+                }
+            }
+            source_material = {
+                field.name: _actual_close_ledger_fingerprint_value(
+                    getattr(source, field.name)
+                )
+                for field in fields(ActualPositionPlanSource)
+                if field.name
+                not in {
+                    "actual_position_state",
+                    "actual_replay_source",
+                    "query_cutoff",
+                    "signal_source",
+                    "source_digest",
+                }
+            }
+            source_material["signal_source"] = signal_material
+            resolution_material["source"] = source_material
+        material.append(resolution_material)
+    return hashlib.sha256(
+        b"stock-monitor/actual-close-plan-stability/v1\0"
+        + json.dumps(
+            material,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+class ActualCloseWorkflowCoordinator:
+    """Compose canonical ACTUAL close material without brokerage mutation."""
+
+    def __init__(
+        self,
+        *,
+        journal: object,
+        report_archive_root: Path,
+        source_collector: ActualCloseSourceCollector,
+        calendar_resolver: object,
+        policy: object,
+        plans: object,
+    ) -> None:
+        from .journal import Journal
+        from .risk import Policy, SessionCalendarResolver
+
+        if type(journal) is not Journal or getattr(journal, "_closed", True):
+            raise CanonicalMaterialError(
+                "actual close coordinator requires an open Journal"
+            )
+        if not callable(getattr(source_collector, "collect_close_sources", None)):
+            raise CanonicalMaterialError(
+                "actual close source collector is unavailable"
+            )
+        if type(calendar_resolver) is not SessionCalendarResolver:
+            raise CanonicalMaterialError(
+                "actual close calendar authority is invalid"
+            )
+        if type(policy) is not Policy:
+            raise CanonicalMaterialError("actual close policy is invalid")
+        policy.validate()
+        self._journal = journal
+        self._report_archive_root = _canonical_archive_root(
+            report_archive_root
+        )
+        self._source_collector = source_collector
+        self._calendar_resolver = calendar_resolver
+        self._policy = policy
+        self._plans = plans
+
+    def _snapshot(self, query_cutoff: datetime) -> tuple[object, object]:
+        from .reconciliation import replay_actual
+
+        try:
+            with self._journal.transaction() as transaction:
+                replay_source = transaction.read_actual_replay(
+                    query_cutoff=query_cutoff,
+                )
+            actual_state = replay_actual(
+                replay_source,
+                plans=self._plans,
+                calendar=self._calendar_resolver,
+                policy=self._policy,
+            )
+        except Exception as error:
+            raise CanonicalMaterialError(
+                "actual close replay is unavailable"
+            ) from error
+        return replay_source, actual_state
+
+    def _plan_resolutions(
+        self,
+        *,
+        replay_source: object,
+        actual_state: object,
+        query_cutoff: datetime,
+    ) -> tuple[tuple[str, object], ...]:
+        from .journal import JournalError
+
+        resolutions: list[tuple[str, object]] = []
+        try:
+            for actual_position in actual_state.positions:
+                resolutions.append(
+                    (
+                        actual_position.symbol,
+                        self._journal.resolve_actual_position_plan_source(
+                            actual_replay_source=replay_source,
+                            actual_position_state=actual_state,
+                            symbol=actual_position.symbol,
+                            query_cutoff=query_cutoff,
+                        ),
+                    )
+                )
+        except JournalError as error:
+            raise CanonicalMaterialError(
+                "actual close plan resolution is unavailable"
+            ) from error
+        return tuple(sorted(resolutions, key=lambda value: value[0]))
+
+    def _read_review(
+        self,
+        collection: ActualCloseCollection,
+        *,
+        session_date: date,
+        review_at: datetime,
+        mark_cutoff: datetime,
+        query_cutoff: datetime,
+        retrieved_at: datetime,
+    ) -> object:
+        try:
+            review_source = self._journal.read_actual_close_review_source(
+                collection.review_id,
+                query_cutoff=query_cutoff,
+            )
+        except Exception as error:
+            raise CanonicalMaterialError(
+                "actual close final review is unavailable"
+            ) from error
+        if (
+            review_source.session_date != session_date
+            or review_source.review_at != review_at
+            or review_source.mark_cutoff != mark_cutoff
+            or review_source.query_cutoff != query_cutoff
+            or review_source.retrieved_at != retrieved_at
+        ):
+            raise CanonicalMaterialError(
+                "actual close collection review timing is not exact"
+            )
+        return review_source
+
+    def _project_position(
+        self,
+        *,
+        replay_source: object,
+        actual_state: object,
+        actual_position: object,
+        resolution: object,
+        review_source: object,
+        query_cutoff: datetime,
+    ) -> tuple[object, object | None, _ClosePositionAuthorityBundle]:
+        from .journal import (
+            ActualCloseReviewSource,
+            ActualPositionPlanResolution,
+            JournalError,
+        )
+        from .risk import (
+            RiskBlock,
+            evaluate_position,
+            issue_actual_close_decision,
+            issue_actual_close_mark,
+            issue_actual_close_market_source,
+            issue_actual_position_event_context,
+        )
+
+        if type(review_source) is not ActualCloseReviewSource:
+            raise CanonicalMaterialError(
+                "actual close projection requires an exact final review"
+            )
+        review_at = review_source.review_at
+        reconciliation_reasons = _actual_close_reconciliation_reasons(
+            actual_state
+        )
+        status_for_block = (
+            "RECONCILIATION_REQUIRED"
+            if reconciliation_reasons
+            else "POSITION_UNVERIFIED"
+        )
+        if type(resolution) is not ActualPositionPlanResolution:
+            raise CanonicalMaterialError(
+                "actual close plan resolution is unavailable"
+            )
+
+        def unverified(
+            *,
+            status: str,
+            reason_codes: tuple[str, ...],
+            branch: str,
+            authority_children: tuple[object, ...] = (),
+        ) -> tuple[object, None, _ClosePositionAuthorityBundle]:
+            projection = _actual_close_unverified_projection(
+                actual_position,
+                status=status,
+                reason_codes=reason_codes,
+            )
+            return (
+                projection,
+                None,
+                _issue_close_position_authority_bundle(
+                    projection=projection,
+                    branch=branch,
+                    identity_children=(
+                        actual_position,
+                        resolution,
+                        *authority_children,
+                    ),
+                    coordinator=self,
+                    actual_state=actual_state,
+                    actual_replay_source=replay_source,
+                    query_cutoff=query_cutoff,
+                ),
+            )
+
+        if resolution.status != "RESOLVED" or resolution.source is None:
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    *resolution.reason_codes,
+                ),
+                branch="PLAN_UNAVAILABLE",
+            )
+        plan_source = resolution.source
+        review_failure_reasons = _actual_close_review_failure_reasons(
+            review_source,
+            actual_position.symbol,
+        )
+        if review_failure_reasons:
+            status = (
+                "RECONCILIATION_REQUIRED"
+                if reconciliation_reasons
+                else (
+                    "POSITION_UNVERIFIED"
+                    if "EVENT_EVIDENCE_UNAVAILABLE"
+                    in review_failure_reasons
+                    else "DATA_UNAVAILABLE"
+                )
+            )
+            return unverified(
+                status=status,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    *review_failure_reasons,
+                ),
+                branch="REVIEW_SOURCE_UNAVAILABLE",
+                authority_children=(plan_source, review_source),
+            )
+        try:
+            evidence_source = self._journal.read_phase1_signal_evidence_source(
+                plan_source.signal_source.signal_id,
+                review_at=review_at,
+                query_cutoff=query_cutoff,
+                calendar_resolver=self._calendar_resolver,
+                exact_signal_source=plan_source.signal_source,
+            )
+        except (JournalError, RiskBlock):
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "EVENT_EVIDENCE_UNAVAILABLE",
+                ),
+                branch="EVENT_EVIDENCE_UNAVAILABLE",
+                authority_children=(plan_source, review_source),
+            )
+        try:
+            from .risk import _issue_phase1_signal_evidence_authority_from_source
+
+            event_evidence = _issue_phase1_signal_evidence_authority_from_source(
+                evidence_source,
+                calendar_resolver=self._calendar_resolver,
+            )
+        except (JournalError, RiskBlock):
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "EVENT_EVIDENCE_UNAVAILABLE",
+                ),
+                branch="EVENT_AUTHORITY_UNAVAILABLE",
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                ),
+            )
+        try:
+            history_source = (
+                self._journal.read_latest_close_recommendation_source(
+                    position_plan_source=plan_source,
+                    query_cutoff=query_cutoff,
+                )
+            )
+        except (JournalError, RiskBlock):
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "RECOMMENDATION_HISTORY_UNAVAILABLE",
+                ),
+                branch="RECOMMENDATION_HISTORY_UNAVAILABLE",
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                    event_evidence,
+                ),
+            )
+        try:
+            market_source = issue_actual_close_market_source(
+                review_source,
+                plan_source,
+                calendar_resolver=self._calendar_resolver,
+            )
+        except RiskBlock as error:
+            reason = _actual_close_market_failure_reason(
+                review_source,
+                actual_position.symbol,
+                error,
+            )
+            return unverified(
+                status=(
+                    "RECONCILIATION_REQUIRED"
+                    if reconciliation_reasons
+                    else "DATA_UNAVAILABLE"
+                ),
+                reason_codes=(*reconciliation_reasons, reason),
+                branch="MARKET_SOURCE_UNAVAILABLE",
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                    event_evidence,
+                    history_source,
+                ),
+            )
+        try:
+            context = issue_actual_position_event_context(
+                market_source,
+                plan_source,
+                event_evidence,
+                history_source,
+                calendar_resolver=self._calendar_resolver,
+                policy=self._policy,
+            )
+        except RiskBlock:
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "POSITION_CONTEXT_UNVERIFIED",
+                ),
+                branch="POSITION_CONTEXT_UNVERIFIED",
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                    event_evidence,
+                    history_source,
+                    market_source,
+                ),
+            )
+        try:
+            mark = issue_actual_close_mark(market_source, context)
+        except RiskBlock:
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "POSITION_CONTEXT_UNVERIFIED",
+                ),
+                branch="CLOSE_MARK_UNVERIFIED",
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                    event_evidence,
+                    history_source,
+                    market_source,
+                    context,
+                ),
+            )
+        try:
+            action = evaluate_position(context.position, mark, self._policy)
+        except RiskBlock:
+            return unverified(
+                status=status_for_block,
+                reason_codes=(
+                    *reconciliation_reasons,
+                    "POSITION_CONTEXT_UNVERIFIED",
+                ),
+                authority_children=(
+                    plan_source,
+                    review_source,
+                    evidence_source,
+                    event_evidence,
+                    history_source,
+                    market_source,
+                    context,
+                    mark,
+                ),
+                branch="POSITION_EVALUATION_UNVERIFIED",
+            )
+        exact_chain = (
+            plan_source,
+            review_source,
+            evidence_source,
+            event_evidence,
+            history_source,
+            market_source,
+            context,
+            mark,
+            action,
+        )
+        if reconciliation_reasons:
+            return unverified(
+                status="RECONCILIATION_REQUIRED",
+                reason_codes=reconciliation_reasons,
+                branch="RECONCILIATION_REQUIRED",
+                authority_children=exact_chain,
+            )
+        if action.status in {"POSITION_UNVERIFIED", "RECONCILIATION_REQUIRED"}:
+            return unverified(
+                status=action.status,
+                reason_codes=tuple(action.reason_codes),
+                branch=action.status,
+                authority_children=exact_chain,
+            )
+        decision = None
+        if action.status != "STOP_UNVERIFIED":
+            try:
+                decision = issue_actual_close_decision(
+                    context,
+                    mark,
+                    self._policy,
+                )
+                action = decision.position_action
+                exact_chain = (*exact_chain[:-1], action)
+            except RiskBlock:
+                return unverified(
+                    status="POSITION_UNVERIFIED",
+                    reason_codes=("POSITION_CONTEXT_UNVERIFIED",),
+                    branch="DECISION_AUTHORITY_UNAVAILABLE",
+                    authority_children=exact_chain,
+                )
+        projection = _actual_close_verified_projection(
+            context=context,
+            market_source=market_source,
+            mark=mark,
+            action=action,
+            decision=decision,
+        )
+        bundle_children = (
+            *exact_chain,
+            *((decision,) if decision is not None else ()),
+        )
+        return (
+            projection,
+            decision,
+            _issue_close_position_authority_bundle(
+                projection=projection,
+                branch=(
+                    "STOP_UNVERIFIED"
+                    if decision is None
+                    else "VERIFIED_DECISION"
+                ),
+                identity_children=(
+                    actual_position,
+                    resolution,
+                    *bundle_children,
+                ),
+                coordinator=self,
+                actual_state=actual_state,
+                actual_replay_source=replay_source,
+                query_cutoff=query_cutoff,
+            ),
+        )
+
+    def _project_all(
+        self,
+        *,
+        replay_source: object,
+        actual_state: object,
+        resolutions: tuple[tuple[str, object], ...],
+        review_source: object,
+        query_cutoff: datetime,
+    ) -> tuple[
+        tuple[object, ...],
+        tuple[object, ...],
+        tuple[_ClosePositionAuthorityBundle, ...],
+    ]:
+        projections: list[object] = []
+        decisions: list[object] = []
+        authorities: list[_ClosePositionAuthorityBundle] = []
+        resolution_by_symbol = dict(resolutions)
+        if (
+            len(resolution_by_symbol) != len(resolutions)
+            or set(resolution_by_symbol)
+            != {position.symbol for position in actual_state.positions}
+        ):
+            raise CanonicalMaterialError(
+                "actual close plan resolution cohort is not exact"
+            )
+        for actual_position in actual_state.positions:
+            projection, decision, authority = self._project_position(
+                replay_source=replay_source,
+                actual_state=actual_state,
+                actual_position=actual_position,
+                resolution=resolution_by_symbol[actual_position.symbol],
+                review_source=review_source,
+                query_cutoff=query_cutoff,
+            )
+            projections.append(projection)
+            authorities.append(authority)
+            if decision is not None:
+                decisions.append(decision)
+        return tuple(projections), tuple(decisions), tuple(authorities)
+
+    def close_material(
+        self,
+        session_date: date,
+        *,
+        review_at: datetime,
+        retrieved_at: datetime,
+    ) -> CanonicalCloseMaterial:
+        from .reports import (
+            ClosePosition,
+            CloseState,
+            UnverifiedClosePosition,
+            render_close_report,
+        )
+
+        session_date = _require_session(session_date)
+        review_at = _require_time(review_at, "actual close review time")
+        command_started_at = _require_time(
+            retrieved_at,
+            "actual close command start time",
+        )
+        discovery_cutoff = command_started_at
+        _validate_close_times(
+            session_date,
+            review_at,
+            discovery_cutoff,
+            command_started_at,
+        )
+        try:
+            schedule = self._calendar_resolver.session(session_date)
+        except Exception as error:
+            raise CanonicalMaterialError(
+                "actual close calendar session is unavailable"
+            ) from error
+        expected_review = datetime.combine(
+            session_date,
+            schedule.review_time,
+            tzinfo=schedule.timezone,
+        )
+        if review_at != expected_review:
+            raise CanonicalMaterialError(
+                "actual close review time conflicts with calendar"
+            )
+        session_close = datetime.combine(
+            session_date,
+            schedule.close_time,
+            tzinfo=schedule.timezone,
+        )
+        mark_cutoff = min(review_at - timedelta(minutes=16), session_close)
+
+        discovery_source, discovery_state = self._snapshot(
+            discovery_cutoff
+        )
+        ledger_stability_digest = _actual_close_ledger_stability_digest(
+            discovery_source,
+            discovery_state,
+        )
+        plan_stability_digest = (
+            _actual_close_plan_resolution_stability_digest(
+                self._plan_resolutions(
+                    replay_source=discovery_source,
+                    actual_state=discovery_state,
+                    query_cutoff=discovery_cutoff,
+                )
+            )
+        )
+        symbols = tuple(
+            sorted(
+                {
+                    position.symbol
+                    for position in discovery_state.positions
+                    if position.shares > 0
+                }
+            )
+        )
+        try:
+            collection = self._source_collector.collect_close_sources(
+                journal=self._journal,
+                symbols=symbols,
+                session_date=session_date,
+                review_at=review_at,
+                mark_cutoff=mark_cutoff,
+                command_started_at=command_started_at,
+            )
+        except Exception as error:
+            # Collection may already have persisted one or more source rows.
+            # Always obtain a new ACTUAL authority before surfacing the error
+            # so a discovered reconciliation condition is never hidden behind
+            # stale pre-write state.
+            self._snapshot(discovery_cutoff)
+            raise CanonicalMaterialError(
+                "actual close collection failed after final replay"
+            ) from error
+        if type(collection) is not ActualCloseCollection:
+            raise CanonicalMaterialError(
+                "actual close collector returned an invalid durable review"
+            )
+        collected_at = _require_time(
+            collection.collected_at,
+            "actual close terminal collection time",
+        )
+        _validate_close_times(
+            session_date,
+            review_at,
+            discovery_cutoff,
+            collected_at,
+        )
+        query_cutoff = collected_at
+        collected_review = self._read_review(
+            collection,
+            session_date=session_date,
+            review_at=review_at,
+            mark_cutoff=mark_cutoff,
+            query_cutoff=query_cutoff,
+            retrieved_at=collected_at,
+        )
+        coordinator_reason_codes = _actual_close_coordinator_reason_codes(
+            collected_review
+        )
+
+        stable_source, stable_state = self._snapshot(query_cutoff)
+        if _actual_close_ledger_stability_digest(
+            stable_source,
+            stable_state,
+        ) != ledger_stability_digest:
+            raise CanonicalMaterialError(
+                "actual close ledger changed during provider collection"
+            )
+        stable_resolutions = self._plan_resolutions(
+            replay_source=stable_source,
+            actual_state=stable_state,
+            query_cutoff=query_cutoff,
+        )
+        if _actual_close_plan_resolution_stability_digest(
+            stable_resolutions
+        ) != plan_stability_digest:
+            raise CanonicalMaterialError(
+                "actual close plan binding changed during provider collection"
+            )
+        stable_positions, stable_decisions, _stable_authorities = (
+            self._project_all(
+            replay_source=stable_source,
+            actual_state=stable_state,
+            resolutions=stable_resolutions,
+            review_source=collected_review,
+            query_cutoff=query_cutoff,
+            )
+        )
+        _report_outcome, _workflow_outcome, exit_code, _reasons = (
+            _canonical_close_projection(
+                stable_state,
+                stable_positions,
+                coordinator_reason_codes,
+            )
+        )
+        if exit_code == 0 and stable_decisions:
+            current_decisions: list[object] = []
+            recommendation_review = self._read_review(
+                collection,
+                session_date=session_date,
+                review_at=review_at,
+                mark_cutoff=mark_cutoff,
+                query_cutoff=query_cutoff,
+                retrieved_at=collected_at,
+            )
+            for expected_decision in stable_decisions:
+                current_source, current_state = self._snapshot(query_cutoff)
+                if _actual_close_ledger_stability_digest(
+                    current_source,
+                    current_state,
+                ) != ledger_stability_digest:
+                    raise CanonicalMaterialError(
+                        "actual close ledger changed before recommendation"
+                    )
+                current_resolutions = self._plan_resolutions(
+                    replay_source=current_source,
+                    actual_state=current_state,
+                    query_cutoff=query_cutoff,
+                )
+                if _actual_close_plan_resolution_stability_digest(
+                    current_resolutions
+                ) != plan_stability_digest:
+                    raise CanonicalMaterialError(
+                        "actual close plan binding changed before recommendation"
+                    )
+                matching = tuple(
+                    position
+                    for position in current_state.positions
+                    if position.symbol == expected_decision.symbol
+                )
+                if len(matching) != 1:
+                    raise CanonicalMaterialError(
+                        "actual close position changed before recommendation"
+                    )
+                current_resolution = dict(current_resolutions)[
+                    expected_decision.symbol
+                ]
+                _projection, current_decision, _current_authority = (
+                    self._project_position(
+                    replay_source=current_source,
+                    actual_state=current_state,
+                    actual_position=matching[0],
+                    resolution=current_resolution,
+                    review_source=recommendation_review,
+                    query_cutoff=query_cutoff,
+                    )
+                )
+                if (
+                    current_decision is None
+                    or current_decision.source_digest
+                    != expected_decision.source_digest
+                ):
+                    raise CanonicalMaterialError(
+                        "actual close decision changed before recommendation"
+                    )
+                current_decisions.append(current_decision)
+            try:
+                self._journal.append_close_recommendations(
+                    tuple(current_decisions)
+                )
+            except Exception as error:
+                raise CanonicalMaterialError(
+                    "actual close recommendation could not be persisted"
+                ) from error
+
+        final_source, final_state = self._snapshot(query_cutoff)
+        if _actual_close_ledger_stability_digest(
+            final_source,
+            final_state,
+        ) != ledger_stability_digest:
+            raise CanonicalMaterialError(
+                "actual close ledger changed before final composition"
+            )
+        final_resolutions = self._plan_resolutions(
+            replay_source=final_source,
+            actual_state=final_state,
+            query_cutoff=query_cutoff,
+        )
+        if _actual_close_plan_resolution_stability_digest(
+            final_resolutions
+        ) != plan_stability_digest:
+            raise CanonicalMaterialError(
+                "actual close plan binding changed before final composition"
+            )
+        final_review = self._read_review(
+            collection,
+            session_date=session_date,
+            review_at=review_at,
+            mark_cutoff=mark_cutoff,
+            query_cutoff=query_cutoff,
+            retrieved_at=collected_at,
+        )
+        positions, _final_decisions, position_authorities = self._project_all(
+            replay_source=final_source,
+            actual_state=final_state,
+            resolutions=final_resolutions,
+            review_source=final_review,
+            query_cutoff=query_cutoff,
+        )
+        coordinator_reason_codes = _actual_close_coordinator_reason_codes(
+            final_review
+        )
+        outcome, _workflow_outcome, _exit_code, reason_codes = (
+            _canonical_close_projection(
+                final_state,
+                positions,
+                coordinator_reason_codes,
+            )
+        )
+        receipts = canonical_source_receipts(final_review.receipts)
+        composition_authority = _issue_close_composition_authority(
+            session_date=session_date,
+            review_at=review_at,
+            retrieved_at=collected_at,
+            query_cutoff=query_cutoff,
+            actual_state=final_state,
+            actual_replay_source=final_source,
+            positions=positions,
+            source_receipts=receipts,
+            review_source=final_review,
+            position_authorities=position_authorities,
+            outcome=outcome,
+            reason_codes=reason_codes,
+            coordinator_reason_codes=coordinator_reason_codes,
+        )
+        state_hash = canonical_close_state_hash(
+            session_date=session_date,
+            review_at=review_at,
+            retrieved_at=collected_at,
+            query_cutoff=query_cutoff,
+            actual_state=final_state,
+            actual_replay_source=final_source,
+            positions=positions,
+            source_receipts=receipts,
+            outcome=outcome,
+            reason_codes=reason_codes,
+            coordinator_reason_codes=coordinator_reason_codes,
+            review_source_digest=composition_authority.review_source_digest,
+            position_authority_digests=(
+                composition_authority.position_authority_digests
+            ),
+            composition_authority=composition_authority,
+        )
+        unverified_statuses = {
+            position.status
+            for position in positions
+            if type(position) is UnverifiedClosePosition
+        }
+        actions = {
+            position.action
+            for position in positions
+            if type(position) is ClosePosition
+        }
+        close_state = CloseState(
+            session_date=session_date,
+            generated_at=collected_at,
+            reason_codes=reason_codes,
+            positions=positions,
+            observation_ids=tuple(
+                receipt.observation_sha256 for receipt in receipts
+            ),
+            state_hash=state_hash,
+            reconciliation_required=bool(
+                _actual_close_reconciliation_reasons(final_state)
+            ),
+            position_verified="POSITION_UNVERIFIED" not in unverified_statuses,
+            stop_verified=(
+                "STOP_UNVERIFIED" not in unverified_statuses
+                and all(
+                    position.user_confirmed_stop is not None
+                    for position in positions
+                    if type(position) is ClosePosition
+                )
+            ),
+            data_available=(
+                not coordinator_reason_codes
+                and "DATA_UNAVAILABLE" not in unverified_statuses
+            ),
+            exit_due="EXIT" in actions,
+            tighten_stop_due="TIGHTEN_STOP" in actions,
+        )
+        report = render_close_report(close_state)
+        if report.outcome != outcome:
+            raise CanonicalMaterialError(
+                "actual close report outcome conflicts with aggregation"
+            )
+        return issue_canonical_close_material(
+            journal=self._journal,
+            report_archive_root=self._report_archive_root,
+            session_date=session_date,
+            review_at=review_at,
+            retrieved_at=collected_at,
+            query_cutoff=query_cutoff,
+            actual_state=final_state,
+            actual_replay_source=final_source,
+            composition_authority=composition_authority,
+            report=report,
+            positions=positions,
+            source_receipts=receipts,
+            coordinator_reason_codes=coordinator_reason_codes,
+            state_hash=state_hash,
+        )
 
 
 def _material_authority(
@@ -6303,6 +8802,9 @@ def is_issued_canonical_material(
 
 
 __all__ = [
+    "ActualCloseCollection",
+    "ActualCloseSourceCollector",
+    "ActualCloseWorkflowCoordinator",
     "CanonicalCloseCompositionAuthority",
     "CanonicalCloseMaterial",
     "CanonicalMaterialError",

@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol
 from weakref import ReferenceType, ref
+from zoneinfo import ZoneInfo
 
 from .domain import require_aware_timestamp
 from .reports import (
@@ -42,6 +43,7 @@ from .reports import (
 _TOKEN = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _SYMBOL = re.compile(r"[A-Z][A-Z0-9.]{0,9}\Z")
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_NEW_YORK = ZoneInfo("America/New_York")
 _FIXTURE_KEYS = frozenset(
     {"now", "account", "provider_fixture", "evidence_fixture", "expected_outcome"}
 )
@@ -154,6 +156,8 @@ _ISSUED_WORKFLOW_RESULTS: dict[
         tuple[str, ...],
     ],
 ] = {}
+_ISSUED_CANONICAL_RESULTS_LOCK = threading.Lock()
+_ISSUED_CANONICAL_RESULTS: dict[int, _CanonicalResultAuthority] = {}
 
 
 class WorkflowError(RuntimeError):
@@ -258,6 +262,8 @@ class PremarketSnapshot:
     breaker_active: bool
 
     def __post_init__(self) -> None:
+        if type(self.breaker_active) is not bool:
+            raise TypeError("breaker_active must be an exact boolean")
         _validate_candidate_summary_composition(
             self.candidates,
             required=False,
@@ -423,6 +429,138 @@ class WorkflowPublisher(Protocol):
     def heal_finalized(
         self, *, kind: str, session_date: date
     ) -> PublishedWorkflow: ...
+
+
+class CanonicalWorkflowAdapter(Protocol):
+    """Separate provider-backed adapter with fixed economic and retrieval times."""
+
+    def premarket_material(
+        self,
+        session_date: date,
+        *,
+        decision_at: datetime,
+        retrieved_at: datetime,
+    ) -> CanonicalPremarketMaterial: ...
+
+    def close_material(
+        self,
+        session_date: date,
+        *,
+        review_at: datetime,
+        retrieved_at: datetime,
+    ) -> CanonicalCloseMaterial: ...
+
+
+class CanonicalWorkflowPublisher(Protocol):
+    """Publisher that also requires exact canonical material authority."""
+
+    def issue_result(
+        self,
+        *,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+    ) -> WorkflowResult: ...
+
+    def publish(
+        self,
+        *,
+        kind: str,
+        session_date: date,
+        generated_at: datetime,
+        result: WorkflowResult,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+    ) -> PublishedWorkflow: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPublicationPlan:
+    """Verified, side-effect-free inputs for canonical Journal finalization."""
+
+    workflow_kind: str
+    storage_kind: str
+    session_date: date
+    generated_at: datetime
+    economic_at: datetime
+    retrieved_at: datetime
+    material_digest: str
+    source_digest: str
+    source_observation_row_ids: tuple[int, ...]
+    rendered_report_id: str
+    report: Report
+    material: object
+
+    def __post_init__(self) -> None:
+        expected_storage = {"PREMARKET": "MORNING", "CLOSE": "CLOSE"}
+        if (
+            self.workflow_kind not in expected_storage
+            or self.storage_kind != expected_storage[self.workflow_kind]
+        ):
+            raise ValueError("canonical publication storage kind is invalid")
+        if type(self.session_date) is not date:
+            raise TypeError("canonical publication session must be an exact date")
+        require_aware_timestamp(self.generated_at, "canonical generation time")
+        require_aware_timestamp(self.economic_at, "canonical economic time")
+        require_aware_timestamp(self.retrieved_at, "canonical retrieval time")
+        if (
+            self.generated_at != self.retrieved_at
+            or self.economic_at > self.retrieved_at
+            or any(
+                value.astimezone(_NEW_YORK).date() != self.session_date
+                for value in (
+                    self.generated_at,
+                    self.economic_at,
+                    self.retrieved_at,
+                )
+            )
+        ):
+            raise ValueError("canonical publication timing is inconsistent")
+        if (
+            _LOWER_SHA256.fullmatch(self.material_digest) is None
+            or _LOWER_SHA256.fullmatch(self.source_digest) is None
+            or _LOWER_SHA256.fullmatch(self.rendered_report_id) is None
+        ):
+            raise ValueError("canonical publication digest is invalid")
+        if type(self.source_observation_row_ids) is not tuple or not (
+            self.source_observation_row_ids
+        ) or any(
+            type(row_id) is not int or row_id < 1
+            for row_id in self.source_observation_row_ids
+        ):
+            raise ValueError("canonical publication source rows are invalid")
+        if len(set(self.source_observation_row_ids)) != len(
+            self.source_observation_row_ids
+        ):
+            raise ValueError("canonical publication source rows must be unique")
+        if (
+            type(self.report) is not Report
+            or self.report.report_id != self.rendered_report_id
+            or self.report.kind != self.workflow_kind
+            or self.report.session_date != self.session_date
+        ):
+            raise ValueError("canonical rendered report identity is invalid")
+
+    def archive_relative_path(self, stored_report_id: str) -> str:
+        """Derive the archive from the durable kind and durable report ID."""
+        from .journal import report_archive_relative_path
+
+        if type(stored_report_id) is not str or _LOWER_SHA256.fullmatch(
+            stored_report_id
+        ) is None:
+            raise ValueError("stored report ID must be a SHA-256 digest")
+        return report_archive_relative_path(
+            self.storage_kind,
+            self.session_date,
+            stored_report_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalResultAuthority:
+    result_reference: ReferenceType[object]
+    result_fingerprint: tuple[object, ...]
+    material_reference: ReferenceType[object]
+    publisher_reference: ReferenceType[object]
+    journal_reference: ReferenceType[object]
+    archive_root: Path
 
 
 class ScheduledWorkflowStore(Protocol):
@@ -862,6 +1000,423 @@ class JournalWorkflowPublisher:
         )
 
 
+def _canonical_report_reason_codes(report: Report) -> tuple[str, ...]:
+    """Read back the exact deterministic reason block from a rendered report."""
+    lines = report.body.splitlines()
+    try:
+        start = lines.index("## Reasons") + 1
+        end = next(
+            index
+            for index in range(start, len(lines))
+            if lines[index].startswith("## ")
+        )
+    except (ValueError, StopIteration) as error:
+        raise WorkflowError("canonical report reason block is malformed") from error
+    reasons: list[str] = []
+    for line in lines[start:end]:
+        if not line:
+            continue
+        match = re.fullmatch(r"- `([A-Z][A-Z0-9_]{0,63})`", line)
+        if match is None:
+            raise WorkflowError("canonical report reason block is malformed")
+        reasons.append(match.group(1))
+    if not reasons or len(reasons) != len(set(reasons)):
+        raise WorkflowError("canonical report reasons are incomplete")
+    return tuple(reasons)
+
+
+def _canonical_result_projection(
+    material: object,
+) -> tuple[str, int, tuple[str, ...]]:
+    from .provider_workflows import (
+        CanonicalCloseCompositionAuthority,
+        CanonicalCloseMaterial,
+        CanonicalPremarketCompositionAuthority,
+        CanonicalPremarketMaterial,
+    )
+
+    report = material.report
+    reasons = _canonical_report_reason_codes(report)
+    if type(material) is CanonicalPremarketMaterial:
+        premarket_matrix = {
+            ("CANDIDATES", ("PAPER_PLAN_ONLY", "MANUAL_EXECUTION_REQUIRED")): (
+                "CANDIDATES",
+                0,
+            ),
+            ("NO TRADE", ("ACTIVE_BREAKER",)): ("NO_TRADE", 4),
+            ("NO TRADE", ("MARKET_CLOSED",)): ("NO_TRADE", 0),
+            ("NO TRADE", ("NO_CANDIDATES",)): ("NO_TRADE", 0),
+        }
+        for data_reason in (
+            "DATA_UNAVAILABLE",
+            "PROVIDER_CHECK_FAILED",
+            "SOURCE_CHECK_FAILED",
+            "STALE_CALENDAR",
+            "STALE_UNIVERSE",
+        ):
+            premarket_matrix[
+                ("NO NEW TRADE - DATA UNAVAILABLE", (data_reason,))
+            ] = ("DATA_UNAVAILABLE", 3)
+        projection = premarket_matrix.get((report.outcome, reasons))
+        authority = material.composition_authority
+        if (
+            projection is None
+            or type(authority) is not CanonicalPremarketCompositionAuthority
+            or authority.outcome != report.outcome
+            or authority.reason_codes != reasons
+        ):
+            raise WorkflowError(
+                "canonical premarket report outcome/reasons are unsupported"
+            )
+        has_candidates = bool(material.snapshot.candidates)
+        if has_candidates != (projection[0] == "CANDIDATES") or (
+            material.snapshot.breaker_active
+            != ("ACTIVE_BREAKER" in reasons)
+        ):
+            raise WorkflowError(
+                "canonical premarket report contradicts its normalized snapshot"
+            )
+        return projection[0], projection[1], reasons
+    if type(material) is not CanonicalCloseMaterial:
+        raise WorkflowError("canonical result material type is unsupported")
+    close_outcomes = {
+        "RECONCILIATION REQUIRED": ("RECONCILIATION_REQUIRED", 5),
+        "POSITION UNVERIFIED": ("POSITION_UNVERIFIED", 4),
+        "STOP UNVERIFIED": ("STOP_UNVERIFIED", 4),
+        "DATA UNAVAILABLE": ("DATA_UNAVAILABLE", 3),
+        "PROVISIONAL EXIT - VERIFY CURRENT ROBINHOOD PRICE": ("EXIT", 0),
+        "PROVISIONAL TIGHTEN STOP - VERIFY CURRENT ROBINHOOD PRICE": (
+            "TIGHTEN_STOP",
+            0,
+        ),
+        "PROVISIONAL HOLD - VERIFY CURRENT ROBINHOOD PRICE": ("HOLD", 0),
+    }
+    projection = close_outcomes.get(report.outcome)
+    authority = material.composition_authority
+    if (
+        projection is None
+        or type(authority) is not CanonicalCloseCompositionAuthority
+        or authority.outcome != report.outcome
+        or authority.reason_codes != reasons
+    ):
+        raise WorkflowError("canonical close report outcome is unsupported")
+    return projection[0], projection[1], reasons
+
+
+class CanonicalJournalWorkflowPublisher:
+    """Prepare owner-bound canonical publication without fixture authority.
+
+    Durable writes remain disabled until the Journal can atomically finalize a
+    report and its canonical timing/digest context.  That check happens after
+    exact authority preparation but before a claim or archive mutation.
+    """
+
+    __slots__ = (
+        "journal",
+        "report_archive_root",
+        "_bound_journal",
+        "_bound_archive_root",
+        "__weakref__",
+    )
+
+    def __init__(self, journal: object, report_archive_root: Path) -> None:
+        from .journal import Journal
+
+        if type(journal) is not Journal or getattr(journal, "_closed", True):
+            raise TypeError("canonical publisher journal must be an open Journal")
+        expected_path_type = type(Path())
+        if type(report_archive_root) is not expected_path_type:
+            raise TypeError("canonical report archive root must be a pathlib.Path")
+        root = Path(os.path.abspath(report_archive_root))
+        if (
+            root != report_archive_root
+            or root.is_symlink()
+            or not root.is_dir()
+        ):
+            raise WorkflowError("canonical report archive root is unverified")
+        self.journal = journal
+        self.report_archive_root = root
+        self._bound_journal = journal
+        self._bound_archive_root = root
+
+    def _is_current(self) -> bool:
+        return bool(
+            type(self) is CanonicalJournalWorkflowPublisher
+            and self.journal is self._bound_journal
+            and self.report_archive_root is self._bound_archive_root
+            and not getattr(self.journal, "_closed", True)
+            and self.report_archive_root.is_dir()
+            and not self.report_archive_root.is_symlink()
+        )
+
+    def _result_material(
+        self,
+        material: object,
+    ) -> tuple[tuple[int, ...], tuple[CandidateSummary, ...]]:
+        from .provider_workflows import (
+            CanonicalCloseMaterial,
+            CanonicalPremarketMaterial,
+            is_issued_canonical_material,
+        )
+
+        if not self._is_current():
+            raise WorkflowError("canonical workflow publisher authority is invalid")
+        if type(material) not in {
+            CanonicalPremarketMaterial,
+            CanonicalCloseMaterial,
+        } or not is_issued_canonical_material(
+            material,
+            journal=self.journal,
+            report_archive_root=self.report_archive_root,
+        ):
+            raise WorkflowError("canonical workflow material authority is invalid")
+        row_ids = tuple(receipt.row_id for receipt in material.source_receipts)
+        candidates = (
+            material.snapshot.candidates
+            if type(material) is CanonicalPremarketMaterial
+            else ()
+        )
+        return row_ids, candidates
+
+    def issue_result(
+        self,
+        *,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+        _result_type: object = WorkflowResult,
+    ) -> WorkflowResult:
+        """Construct and register a canonical result from exact material."""
+        from .provider_workflows import _is_current_canonical_material_without_callbacks
+
+        if WorkflowResult is not _result_type:
+            raise WorkflowError("canonical workflow result dependency was replaced")
+        row_ids, candidates = self._result_material(material)
+        outcome, exit_code, reason_codes = _canonical_result_projection(material)
+        try:
+            result = _result_type(
+                outcome=outcome,
+                message=material.report.body,
+                exit_code=exit_code,
+                reason_codes=reason_codes,
+                candidates=candidates,
+                report=material.report,
+                source_observation_row_ids=row_ids,
+                execution_mode="CANONICAL",
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkflowError("canonical workflow result values are invalid") from error
+        if type(result) is not WorkflowResult:
+            raise WorkflowError("canonical result construction was intercepted")
+        fingerprint = _workflow_result_fingerprint(result)
+        if fingerprint is None:
+            raise WorkflowError("canonical workflow result could not be sealed")
+        identity = id(result)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with _ISSUED_CANONICAL_RESULTS_LOCK:
+                current = _ISSUED_CANONICAL_RESULTS.get(identity)
+                if (
+                    isinstance(current, _CanonicalResultAuthority)
+                    and current.result_reference is dead
+                ):
+                    _ISSUED_CANONICAL_RESULTS.pop(identity, None)
+
+        authority = _CanonicalResultAuthority(
+            result_reference=ref(result, discard),
+            result_fingerprint=fingerprint,
+            material_reference=ref(material),
+            publisher_reference=ref(self),
+            journal_reference=ref(self.journal),
+            archive_root=self.report_archive_root,
+        )
+        with _ISSUED_CANONICAL_RESULTS_LOCK:
+            _ISSUED_CANONICAL_RESULTS[identity] = authority
+        if (
+            not _is_current_canonical_material_without_callbacks(material)
+            or _workflow_result_fingerprint(result) != fingerprint
+        ):
+            with _ISSUED_CANONICAL_RESULTS_LOCK:
+                if _ISSUED_CANONICAL_RESULTS.get(identity) is authority:
+                    _ISSUED_CANONICAL_RESULTS.pop(identity, None)
+            raise WorkflowError(
+                "canonical workflow authority changed while it was issued"
+            )
+        return result
+
+    def bind_result(
+        self,
+        *,
+        result: WorkflowResult,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+    ) -> WorkflowResult:
+        """Verify a publisher-issued result; never bless a caller-built copy."""
+        from .provider_workflows import _is_current_canonical_material_without_callbacks
+
+        if type(result) is not WorkflowResult:
+            raise WorkflowError("canonical workflow result authority is invalid")
+        expected_row_ids, expected_candidates = self._result_material(material)
+        if (
+            result.execution_mode != "CANONICAL"
+            or result.report is not material.report
+            or result.source_observation_row_ids != expected_row_ids
+            or any(
+                identity is not None
+                for identity in (
+                    result.report_id,
+                    result.report_row_id,
+                    result.report_path,
+                )
+            )
+        ):
+            raise WorkflowError("canonical workflow result conflicts with material")
+        if len(result.candidates) != len(expected_candidates) or any(
+            actual is not expected
+            for actual, expected in zip(
+                result.candidates,
+                expected_candidates,
+                strict=True,
+            )
+        ):
+            raise WorkflowError("canonical result conflicts with its candidates")
+        fingerprint = _workflow_result_fingerprint(result)
+        with _ISSUED_CANONICAL_RESULTS_LOCK:
+            authority = _ISSUED_CANONICAL_RESULTS.get(id(result))
+        if (
+            not isinstance(authority, _CanonicalResultAuthority)
+            or authority.result_reference() is not result
+            or authority.material_reference() is not material
+            or authority.publisher_reference() is not self
+            or authority.journal_reference() is not self.journal
+            or authority.archive_root != self.report_archive_root
+            or fingerprint is None
+            or fingerprint != authority.result_fingerprint
+            or not _is_current_canonical_material_without_callbacks(material)
+        ):
+            raise WorkflowError("canonical workflow result authority is unverified")
+        return result
+
+    def prepare_publication(
+        self,
+        *,
+        kind: str,
+        session_date: date,
+        generated_at: datetime,
+        result: WorkflowResult,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+    ) -> CanonicalPublicationPlan:
+        """Verify every canonical capability without mutating Journal or archive."""
+        from .provider_workflows import (
+            CanonicalCloseMaterial,
+            CanonicalPremarketMaterial,
+            _is_current_canonical_material_without_callbacks,
+            is_issued_canonical_material,
+        )
+
+        if (
+            not self._is_current()
+            or type(kind) is not str
+            or kind not in {"PREMARKET", "CLOSE"}
+            or type(session_date) is not date
+            or type(generated_at) is not datetime
+            or type(result) is not WorkflowResult
+            or type(material)
+            not in {CanonicalPremarketMaterial, CanonicalCloseMaterial}
+        ):
+            raise WorkflowError("canonical publication request is invalid")
+        try:
+            require_aware_timestamp(generated_at, "canonical publication time")
+        except (TypeError, ValueError) as error:
+            raise WorkflowError("canonical publication time is invalid") from error
+        with _ISSUED_CANONICAL_RESULTS_LOCK:
+            authority = _ISSUED_CANONICAL_RESULTS.get(id(result))
+        fingerprint = _workflow_result_fingerprint(result)
+        if (
+            not isinstance(authority, _CanonicalResultAuthority)
+            or authority.result_reference() is not result
+            or authority.material_reference() is not material
+            or authority.publisher_reference() is not self
+            or authority.journal_reference() is not self.journal
+            or authority.archive_root != self.report_archive_root
+            or fingerprint is None
+            or fingerprint != authority.result_fingerprint
+            or not is_issued_canonical_material(
+                material,
+                journal=self.journal,
+                report_archive_root=self.report_archive_root,
+            )
+        ):
+            raise WorkflowError("canonical publication authority is unverified")
+
+        expected_type = (
+            CanonicalPremarketMaterial if kind == "PREMARKET" else CanonicalCloseMaterial
+        )
+        economic_at = (
+            material.decision_at
+            if type(material) is CanonicalPremarketMaterial
+            else material.review_at
+        )
+        storage_kind = "MORNING" if kind == "PREMARKET" else "CLOSE"
+        if (
+            type(material) is not expected_type
+            or material.session_date != session_date
+            or generated_at != material.retrieved_at
+            or result.execution_mode != "CANONICAL"
+            or result.report is not material.report
+            or material.report.kind != kind
+            or material.report.session_date != session_date
+        ):
+            raise WorkflowError("canonical publication identity conflicts with material")
+        plan = CanonicalPublicationPlan(
+            workflow_kind=kind,
+            storage_kind=storage_kind,
+            session_date=session_date,
+            generated_at=generated_at,
+            economic_at=economic_at,
+            retrieved_at=material.retrieved_at,
+            material_digest=material.material_digest,
+            source_digest=material.source_digest,
+            source_observation_row_ids=tuple(
+                receipt.row_id for receipt in material.source_receipts
+            ),
+            rendered_report_id=material.report.report_id,
+            report=material.report,
+            material=material,
+        )
+        if (
+            not _is_current_canonical_material_without_callbacks(material)
+            or _workflow_result_fingerprint(result) != authority.result_fingerprint
+        ):
+            raise WorkflowError("canonical publication authority changed during seal")
+        with _ISSUED_CANONICAL_RESULTS_LOCK:
+            if _ISSUED_CANONICAL_RESULTS.get(id(result)) is not authority:
+                raise WorkflowError(
+                    "canonical publication result authority changed during seal"
+                )
+        return plan
+
+    def publish(
+        self,
+        *,
+        kind: str,
+        session_date: date,
+        generated_at: datetime,
+        result: WorkflowResult,
+        material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+    ) -> PublishedWorkflow:
+        self.prepare_publication(
+            kind=kind,
+            session_date=session_date,
+            generated_at=generated_at,
+            result=result,
+            material=material,
+        )
+        # Context-free ``finalize_report`` must never be used here.  The later
+        # Journal integration replaces this fail-closed boundary with one
+        # transaction that also writes ``canonical_report_contexts``.
+        raise WorkflowError(
+            "canonical Journal publication context integration is unavailable"
+        )
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class RecordedScenarioAdapter:
     """Strict fixture adapter; expected outcomes never drive decisions."""
@@ -1031,11 +1586,21 @@ class RecordedScenarioAdapter:
 
     def premarket_snapshot(self, day: date) -> PremarketSnapshot:
         del day
-        return PremarketSnapshot(self.candidates, self.breaker == "ACTIVE")
+        try:
+            return PremarketSnapshot(self.candidates, self.breaker == "ACTIVE")
+        except (TypeError, ValueError) as error:
+            raise WorkflowError(
+                "workflow-issued fixture premarket snapshot is invalid"
+            ) from error
 
     def close_snapshot(self, day: date) -> CloseSnapshot:
         del day
-        return CloseSnapshot(self.close_state, self.close_positions)
+        try:
+            return CloseSnapshot(self.close_state, self.close_positions)
+        except (TypeError, ValueError) as error:
+            raise WorkflowError(
+                "workflow-issued fixture close snapshot is invalid"
+            ) from error
 
 
 def _recorded_scenario_from_payload(payload: bytes) -> RecordedScenarioAdapter:
@@ -1977,6 +2542,10 @@ def _wall_time(value: object) -> time:
 
 __all__ = [
     "CandidateSummary",
+    "CanonicalJournalWorkflowPublisher",
+    "CanonicalPublicationPlan",
+    "CanonicalWorkflowAdapter",
+    "CanonicalWorkflowPublisher",
     "CloseSnapshot",
     "JournalWorkflowPublisher",
     "PremarketSnapshot",

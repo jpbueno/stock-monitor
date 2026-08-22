@@ -108,6 +108,19 @@ class ScheduledTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             JournalWorkflowPublisher(self.journal)
 
+    def test_fixture_candidate_result_requires_a_primary_candidate(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate outcome requires one primary candidate",
+        ):
+            WorkflowResult(
+                outcome="CANDIDATES",
+                message="# Invalid fixture candidate result\n",
+                exit_code=0,
+                reason_codes=("FIXTURE",),
+                execution_mode="FIXTURE",
+            )
+
     def test_publisher_rejects_a_caller_built_report_before_claiming(self):
         observed_at = datetime.now(timezone.utc)
         observation_id, _ = self.journal.append_source_observation(
@@ -149,6 +162,9 @@ class ScheduledTests(unittest.TestCase):
             message=body,
             exit_code=0,
             reason_codes=("FIXTURE",),
+            candidates=(
+                workflows_module.CandidateSummary("SPY", "PRIMARY"),
+            ),
             report=report,
             source_observation_row_ids=(observation_id,),
             execution_mode="FIXTURE",

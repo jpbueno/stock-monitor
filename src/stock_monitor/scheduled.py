@@ -169,7 +169,7 @@ def _run_scheduled_with_authority(
     execution_mode: object,
     workflow_dependencies_current: object,
 ) -> WorkflowResult:
-    """Run exactly at the selected wake, deduplicate, and never backfill."""
+    """Run within the selected bounded dispatch window and never backfill."""
     if result_class.__init__ is not result_initializer:
         raise workflow_error_type("scheduled result constructor was replaced")
     if not workflow_dependencies_current(context):

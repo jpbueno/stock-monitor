@@ -1,0 +1,403 @@
+{
+  "schema_version": 1,
+  "effective_date": "2026-08-22",
+  "reviewed_at": "2026-08-22",
+  "review_by": "2026-09-22",
+  "acquisition_method": "manual_primary_source_review",
+  "benchmark_policy": {
+    "stock_market_benchmark": "SPY",
+    "spy_market_benchmark": "VTI",
+    "other_etf_market_benchmark": "SPY",
+    "regime_support_symbols": [
+      "SPY",
+      "QQQ"
+    ],
+    "sector_mapping": {
+      "AAPL": "XLK",
+      "AMD": "XLK",
+      "NVDA": "XLK"
+    }
+  },
+  "tick_policy": {
+    "classification": "reviewed_conditional_price_at_or_above_1_usd",
+    "reviewed_at": "2026-08-22",
+    "sources": [
+      {
+        "scope": "nasdaq_listed",
+        "url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201",
+        "source_as_of": "2026-08-22"
+      },
+      {
+        "scope": "nyse_listed",
+        "url": "https://www.nyse.com/regulation/rules",
+        "source_as_of": "2026-08-22"
+      },
+      {
+        "scope": "sec_subpenny_faq",
+        "url": "https://www.sec.gov/divisions/marketreg/subpenny612faq.htm",
+        "source_as_of": "2026-08-22"
+      },
+      {
+        "scope": "sec_minimum_increment_postponement",
+        "url": "https://www.sec.gov/newsroom/speeches-statements/atkins-statement-minimum-pricing-increments-access-fee-caps-061126",
+        "source_as_of": "2026-08-22"
+      }
+    ]
+  },
+  "records": [
+    {
+      "symbol": "AAPL",
+      "product_type": "common_stock",
+      "listing_venue": "NASDAQ",
+      "benchmark": "SPY",
+      "sector_etf": "XLK",
+      "support_roles": [
+        "eligible"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm",
+      "source_as_of": "2026-01-02",
+      "membership_sources": [
+        {
+          "index": "sp_500_information_technology",
+          "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/",
+          "source_as_of": "2026-06-30",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        },
+        {
+          "index": "nasdaq_100",
+          "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf",
+          "source_as_of": "2026-05-01",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        }
+      ],
+      "free_float": 14600000000,
+      "float_source": {
+        "source_as_of": "2026-01-02",
+        "sources": [
+          {
+            "url": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm",
+            "source_as_of": "2026-01-02"
+          },
+          {
+            "url": "https://www.sec.gov/Archives/edgar/data/320193/000130817926000008/aapl014016-def14a.htm",
+            "source_as_of": "2026-01-02"
+          }
+        ],
+        "formula": "shares_outstanding - directors_and_officers_shares",
+        "operands": {
+          "shares_outstanding": 14697926000,
+          "directors_and_officers_shares": 9079765
+        },
+        "operand_source_dates": {
+          "shares_outstanding": "2026-01-02",
+          "directors_and_officers_shares": "2026-01-02"
+        },
+        "derived_value": 14688846235,
+        "stored_value": 14600000000,
+        "rounding": "conservative_round_down",
+        "rounded_down": true
+      },
+      "issuer_cik": "0000320193",
+      "issuer_cik_source_url": "https://data.sec.gov/submissions/CIK0000320193.json",
+      "initial_listing_date": "1980-12-12",
+      "initial_listing_date_kind": "initial_public_trading_date",
+      "initial_listing_source_url": "https://investor.apple.com/investor-relations/faq/default.aspx",
+      "issuer_cik_source_as_of": "2026-08-22",
+      "initial_listing_source_as_of": "2026-08-22"
+    },
+    {
+      "symbol": "AMD",
+      "product_type": "common_stock",
+      "listing_venue": "NASDAQ",
+      "benchmark": "SPY",
+      "sector_etf": "XLK",
+      "support_roles": [
+        "eligible"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/2488/000000248826000018/amd-20251227.htm",
+      "source_as_of": "2026-01-30",
+      "membership_sources": [
+        {
+          "index": "sp_500_information_technology",
+          "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/",
+          "source_as_of": "2026-06-30",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        },
+        {
+          "index": "nasdaq_100",
+          "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf",
+          "source_as_of": "2026-05-01",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        }
+      ],
+      "free_float": 1600000000,
+      "float_source": {
+        "source_as_of": "2026-01-30",
+        "sources": [
+          {
+            "url": "https://www.sec.gov/Archives/edgar/data/2488/000000248826000018/amd-20251227.htm",
+            "source_as_of": "2026-01-30"
+          }
+        ],
+        "formula": "floor(nonaffiliate_market_value / share_price)",
+        "operands": {
+          "nonaffiliate_market_value": 232300000000,
+          "share_price": "143.81"
+        },
+        "operand_source_dates": {
+          "nonaffiliate_market_value": "2025-06-28",
+          "share_price": "2025-06-27"
+        },
+        "derived_value": 1615325777,
+        "stored_value": 1600000000,
+        "rounding": "conservative_round_down",
+        "rounded_down": true,
+        "corroborating_shares_outstanding": 1630410843,
+        "corroborating_shares_outstanding_as_of": "2026-01-30"
+      },
+      "issuer_cik": "0000002488",
+      "issuer_cik_source_url": "https://data.sec.gov/submissions/CIK0000002488.json",
+      "initial_listing_date": "1979-10-15",
+      "initial_listing_date_kind": "first_exchange_listing_date",
+      "initial_listing_source_url": "https://ir.amd.com/contacts-faq/faq",
+      "issuer_cik_source_as_of": "2026-08-22",
+      "initial_listing_source_as_of": "2026-08-22"
+    },
+    {
+      "symbol": "NVDA",
+      "product_type": "common_stock",
+      "listing_venue": "NASDAQ",
+      "benchmark": "SPY",
+      "sector_etf": "XLK",
+      "support_roles": [
+        "eligible"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm",
+      "source_as_of": "2026-03-23",
+      "membership_sources": [
+        {
+          "index": "sp_500_information_technology",
+          "url": "https://www.spglobal.com/spdji/en/indices/equity/sp-500-information-technology-sector/",
+          "source_as_of": "2026-06-30",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        },
+        {
+          "index": "nasdaq_100",
+          "url": "https://www.nasdaq.com/docs/2026/05/04/NDX.pdf",
+          "source_as_of": "2026-05-01",
+          "acquisition_method": "manual_primary_source_review",
+          "member": true
+        }
+      ],
+      "free_float": 23000000000,
+      "float_source": {
+        "source_as_of": "2026-03-23",
+        "sources": [
+          {
+            "url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm",
+            "source_as_of": "2026-03-23"
+          },
+          {
+            "url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000036/nvda-20260512.htm",
+            "source_as_of": "2026-03-23"
+          }
+        ],
+        "formula": "shares_outstanding - directors_and_officers_shares",
+        "operands": {
+          "shares_outstanding": 24312141810,
+          "directors_and_officers_shares": 957313517
+        },
+        "operand_source_dates": {
+          "shares_outstanding": "2026-03-23",
+          "directors_and_officers_shares": "2026-03-23"
+        },
+        "derived_value": 23354828293,
+        "stored_value": 23000000000,
+        "rounding": "conservative_round_down",
+        "rounded_down": true
+      },
+      "issuer_cik": "0001045810",
+      "issuer_cik_source_url": "https://data.sec.gov/submissions/CIK0001045810.json",
+      "initial_listing_date": "1999-01-22",
+      "initial_listing_date_kind": "initial_public_trading_date",
+      "initial_listing_source_url": "https://investor.nvidia.com/investor-resources/faqs/default.aspx",
+      "issuer_cik_source_as_of": "2026-08-22",
+      "initial_listing_source_as_of": "2026-08-22"
+    },
+    {
+      "symbol": "QQQ",
+      "product_type": "etf",
+      "listing_venue": "NASDAQ",
+      "benchmark": "SPY",
+      "sector_etf": null,
+      "support_roles": [
+        "eligible",
+        "regime_benchmark"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/Nasdaq%20Equity%201",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.invesco.com/qqq-etf/en/home.html",
+      "source_as_of": "2026-08-22",
+      "sponsor_sources": [
+        {
+          "url": "https://www.invesco.com/qqq-etf/en/home.html",
+          "source_as_of": "2026-08-22"
+        }
+      ],
+      "objective_classification_method": "manual_official_sponsor_objective_review_same_direction",
+      "issuer_cik": null,
+      "issuer_cik_source_url": null,
+      "issuer_cik_source_as_of": null,
+      "initial_listing_date": "1999-03-10",
+      "initial_listing_date_kind": "exchange_listing_date",
+      "initial_listing_source_url": "https://www.sec.gov/Archives/edgar/data/1067839/000110465910002985/a09-28465_1485bpos.htm",
+      "initial_listing_source_as_of": "2010-01-26"
+    },
+    {
+      "symbol": "SPY",
+      "product_type": "etf",
+      "listing_venue": "NYSE_ARCA",
+      "benchmark": "VTI",
+      "sector_etf": null,
+      "support_roles": [
+        "eligible",
+        "market_benchmark",
+        "regime_benchmark"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://www.nyse.com/regulation/rules",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy",
+      "source_as_of": "2026-08-14",
+      "sponsor_sources": [
+        {
+          "url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy",
+          "source_as_of": "2026-08-14"
+        }
+      ],
+      "objective_classification_method": "manual_official_sponsor_objective_review_same_direction",
+      "issuer_cik": null,
+      "issuer_cik_source_url": null,
+      "issuer_cik_source_as_of": null,
+      "initial_listing_date": "1993-01-22",
+      "initial_listing_date_kind": "exchange_listing_date",
+      "initial_listing_source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy",
+      "initial_listing_source_as_of": "2026-08-22"
+    },
+    {
+      "symbol": "VTI",
+      "product_type": "etf",
+      "listing_venue": "NYSE_ARCA",
+      "benchmark": "SPY",
+      "sector_etf": null,
+      "support_roles": [
+        "eligible",
+        "spy_benchmark"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://www.nyse.com/regulation/rules",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+      "source_as_of": "2026-04-28",
+      "sponsor_sources": [
+        {
+          "url": "https://investor.vanguard.com/investment-products/etfs/profile/vti",
+          "source_as_of": "2026-08-14"
+        },
+        {
+          "url": "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+          "source_as_of": "2026-04-28"
+        }
+      ],
+      "objective_classification_method": "manual_official_sponsor_objective_review_same_direction",
+      "issuer_cik": null,
+      "issuer_cik_source_url": null,
+      "issuer_cik_source_as_of": null,
+      "initial_listing_date": "2001-05-24",
+      "initial_listing_date_kind": "etf_share_class_launch_proxy",
+      "initial_listing_source_url": "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+      "initial_listing_source_as_of": "2026-04-28"
+    },
+    {
+      "symbol": "XLK",
+      "product_type": "etf",
+      "listing_venue": "NYSE_ARCA",
+      "benchmark": "SPY",
+      "sector_etf": null,
+      "support_roles": [
+        "eligible",
+        "sector_benchmark"
+      ],
+      "enabled": true,
+      "leveraged": false,
+      "inverse": false,
+      "reviewed_at": "2026-08-22",
+      "tick_size": "0.01",
+      "tick_source_url": "https://www.nyse.com/regulation/rules",
+      "tick_source_as_of": "2026-08-22",
+      "tick_classification": "reviewed_conditional_price_at_or_above_1_usd",
+      "source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-technology-select-sector-spdr-etf-xlk",
+      "source_as_of": "2026-08-14",
+      "sponsor_sources": [
+        {
+          "url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-technology-select-sector-spdr-etf-xlk",
+          "source_as_of": "2026-08-14"
+        }
+      ],
+      "objective_classification_method": "manual_official_sponsor_objective_review_same_direction",
+      "issuer_cik": null,
+      "issuer_cik_source_url": null,
+      "issuer_cik_source_as_of": null,
+      "initial_listing_date": "1998-12-22",
+      "initial_listing_date_kind": "exchange_listing_date",
+      "initial_listing_source_url": "https://www.ssga.com/us/en/intermediary/etfs/state-street-technology-select-sector-spdr-etf-xlk",
+      "initial_listing_source_as_of": "2026-08-22"
+    }
+  ],
+  "checksum": "sha256:564055efe8a72fd3db1afb8d00c9a1f7fc31eb7f698a419e50ca45b8458edc9e"
+}

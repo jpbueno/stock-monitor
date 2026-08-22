@@ -1,10 +1,59 @@
 {
-  "schema_version": 2,
-  "kind": "REVIEWED_EVIDENCE_BUNDLE",
-  "registry_id": "evidence-registry-20260814",
-  "reviewed_at": "2026-08-14T12:00:00Z",
-  "subject": null,
-  "records": [],
-  "source_bindings": [],
-  "coverage_attestations": []
+  "schema_version": 1,
+  "kind": "REVIEWED_EVIDENCE_RELEASE",
+  "release_id": "reviewed-evidence-2026-08-22",
+  "universe_sha256": "0029795bd6dc8cfc1a52b97c69e2aa113e788a771d69408270c8504bba5427e9",
+  "reviewed_at": "2026-08-22T00:40:00.000000Z",
+  "review_by": "2026-08-23T00:39:58.000000Z",
+  "subjects": [
+    {
+      "symbol": "AAPL",
+      "subject_kind": "STOCK",
+      "issuer_cik": "0000320193",
+      "path": "subjects/AAPL.json",
+      "sha256": "33c726de0fbd1da5619569c75a94c04bb76e6d220e69e34667b17f22613ad588"
+    },
+    {
+      "symbol": "AMD",
+      "subject_kind": "STOCK",
+      "issuer_cik": "0000002488",
+      "path": "subjects/AMD.json",
+      "sha256": "e5ab52f0b76b74c5d5bd5068fcf953b0538e35a05713313695209336509e7f6d"
+    },
+    {
+      "symbol": "NVDA",
+      "subject_kind": "STOCK",
+      "issuer_cik": "0001045810",
+      "path": "subjects/NVDA.json",
+      "sha256": "ec3321ecc85bf3df57107a1d84f476635675f29d89f8982921e234517128d3bf"
+    },
+    {
+      "symbol": "QQQ",
+      "subject_kind": "ETF",
+      "issuer_cik": null,
+      "path": "subjects/QQQ.json",
+      "sha256": "4321e97b18642dd78a413e53426680be428bc027a08600280e81b8b82cc5b422"
+    },
+    {
+      "symbol": "SPY",
+      "subject_kind": "ETF",
+      "issuer_cik": null,
+      "path": "subjects/SPY.json",
+      "sha256": "849c895f984ca63762aeab49e676e6f09b00286cef74aa9ead3969197b9d16ed"
+    },
+    {
+      "symbol": "VTI",
+      "subject_kind": "ETF",
+      "issuer_cik": null,
+      "path": "subjects/VTI.json",
+      "sha256": "de7da1aed335aa23dd5557a6d72b216ada0bda3e33cbeb74857476dea0abe93f"
+    },
+    {
+      "symbol": "XLK",
+      "subject_kind": "ETF",
+      "issuer_cik": null,
+      "path": "subjects/XLK.json",
+      "sha256": "9b7fd9fa23c9f3e71fdf86a91776a10df3d1d4caebda2045cfb2f7c69ddd3114"
+    }
+  ]
 }

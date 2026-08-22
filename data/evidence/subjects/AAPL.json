@@ -1,0 +1,67 @@
+{
+  "coverage_attestations": [
+    {
+      "checked_at": "2026-08-22T00:40:00.000000Z",
+      "complete": false,
+      "conflicts": [],
+      "coverage": "UNKNOWN",
+      "coverage_end": "2026-09-04",
+      "coverage_kind": "BINARY_EVENT",
+      "coverage_start": "2026-08-22",
+      "healthy": true,
+      "issuer_cik": "0000320193",
+      "source_observation_ids": [
+        "coverage-aapl"
+      ],
+      "subject_kind": "STOCK",
+      "symbol": "AAPL",
+      "valid_until": "2026-08-23T00:39:58.000000Z"
+    },
+    {
+      "checked_at": "2026-08-22T00:40:00.000000Z",
+      "complete": true,
+      "conflicts": [],
+      "coverage": "NOT_APPLICABLE",
+      "coverage_end": "2026-09-04",
+      "coverage_kind": "ETF_ACTION",
+      "coverage_start": "2026-08-22",
+      "healthy": true,
+      "issuer_cik": "0000320193",
+      "source_observation_ids": [
+        "coverage-aapl"
+      ],
+      "subject_kind": "STOCK",
+      "symbol": "AAPL",
+      "valid_until": "2026-08-23T00:39:58.000000Z"
+    }
+  ],
+  "kind": "REVIEWED_EVIDENCE_BUNDLE",
+  "records": [],
+  "registry_id": "reviewed-aapl",
+  "reviewed_at": "2026-08-22T00:40:00.000000Z",
+  "schema_version": 3,
+  "source_bindings": [
+    {
+      "accession": null,
+      "checked_at": "2026-08-22T00:40:00.000000Z",
+      "content_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "healthy": true,
+      "issuer_cik": "0000320193",
+      "primary_url": "https://www.nyse.com/api/notifications/public/alerts?2=3",
+      "published_at": null,
+      "publisher": "New York Stock Exchange",
+      "retrieved_at": "2026-08-22T00:39:58.000000Z",
+      "source_observation_id": "coverage-aapl",
+      "source_role": "OPERATIONAL_STATUS",
+      "source_type": "OFFICIAL_REFERENCE",
+      "symbol": "AAPL",
+      "timestamp_source": "UNAVAILABLE",
+      "valid_until": "2026-08-23T00:39:58.000000Z"
+    }
+  ],
+  "subject": {
+    "issuer_cik": "0000320193",
+    "subject_kind": "STOCK",
+    "symbol": "AAPL"
+  }
+}

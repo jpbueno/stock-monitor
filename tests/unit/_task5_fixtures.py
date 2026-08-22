@@ -29,7 +29,7 @@ from stock_monitor.providers.reference import (
     ReferenceClient,
     classify_instrument_status,
 )
-from stock_monitor.universe import load_current_universe
+from stock_monitor.universe import load_universe_release
 
 
 ET = ZoneInfo("America/New_York")
@@ -43,8 +43,49 @@ MARKET_CALENDAR = load_current_market_calendar(
 )
 PRIMARY_SYMBOL = "AAPL"
 SECONDARY_SYMBOL = "AMD"
-TEST_UNIVERSE = load_current_universe(PROJECT_ROOT, as_of=SESSION_DATE)
+HISTORICAL_UNIVERSE_SHA256 = (
+    "dd61c50b6e398a2c48770436127bce37dd23c2523f32620c3d10227e538ff907"
+)
+TEST_UNIVERSE = load_universe_release(
+    PROJECT_ROOT
+    / "tests"
+    / "fixtures"
+    / "reference"
+    / "universe-2026-08-14.json",
+    expected_sha256=HISTORICAL_UNIVERSE_SHA256,
+    as_of=SESSION_DATE,
+)
 _UNIVERSE_RECORDS = TEST_UNIVERSE.records
+_TEST_COVERAGE_PUBLISHER = "Reviewed Task 5 Coverage Authority"
+_ETF_ISSUER_SOURCES = {
+    "QQQ": ("https://www.invesco.com/qqq-etf/en/home.html", "Invesco"),
+    "SPY": (
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-spdr-sp-500-etf-trust-spy",
+        "State Street Global Advisors",
+    ),
+    "VTI": (
+        "https://investor.vanguard.com/investment-products/etfs/profile/vti",
+        "Vanguard",
+    ),
+    "XLK": (
+        "https://www.ssga.com/us/en/intermediary/etfs/"
+        "state-street-technology-select-sector-spdr-etf-xlk",
+        "State Street Global Advisors",
+    ),
+}
+
+
+def _test_coverage_authority(
+    symbol: str,
+    issuer_cik: str | None,
+) -> tuple[str, tuple[str, str], tuple[str | None, frozenset[tuple[str, str]]]]:
+    role = f"CORPORATE_ACTION:{symbol}"
+    pair = (
+        f"https://reviewed.task5.invalid/coverage/{symbol.lower()}",
+        _TEST_COVERAGE_PUBLISHER,
+    )
+    return role, pair, (issuer_cik, frozenset({pair}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,11 +429,7 @@ def _reviewed_record(
         f"{issuer_cik}-26-{sequence:06d}" if issuer_cik is not None else None
     )
     if issuer_cik is None:
-        primary_url = (
-            "https://www.ssga.com/us/en/intermediary/etfs/"
-            f"reviewed-{symbol.lower()}-notice-{sequence}"
-        )
-        publisher = "State Street Global Advisors"
+        primary_url, publisher = _ETF_ISSUER_SOURCES[symbol]
     else:
         primary_url = (
             "https://www.sec.gov/Archives/edgar/data/"
@@ -555,26 +592,31 @@ def _coverage_binding(
         },
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    role, pair, scoped_authority = _test_coverage_authority(symbol, issuer_cik)
     document = SourceDocument(
-        url="https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+        url=pair[0],
         published_at=checked_at,
         retrieved_at=checked_at,
         content_hash=hashlib.sha256(body).hexdigest(),
         body=body,
         source_observation_id=identifier,
-        publisher="Nasdaq",
+        publisher=pair[1],
         source_type="OFFICIAL_REFERENCE",
         timestamp_source="PRIMARY_METADATA",
-        source_role="CROSS_CHECK_CALENDAR",
+        source_role=role,
     )
-    binding = EvidenceSourceBinding.from_document(
-        document,
-        symbol=symbol,
-        issuer_cik=issuer_cik,
-        checked_at=checked_at,
-        valid_until=checked_at + timedelta(hours=24),
-        healthy=healthy,
-    )
+    with mock.patch.dict(
+        evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+        {role: scoped_authority},
+    ):
+        binding = EvidenceSourceBinding.from_document(
+            document,
+            symbol=symbol,
+            issuer_cik=issuer_cik,
+            checked_at=checked_at,
+            valid_until=checked_at + timedelta(hours=24),
+            healthy=healthy,
+        )
     return binding, attestations
 
 
@@ -706,6 +748,7 @@ def evidence(
         separators=(",", ":"),
     ).encode()
     digest = hashlib.sha256(payload).hexdigest()
+    role, pair, scoped_authority = _test_coverage_authority(symbol, issuer_cik)
     with tempfile.TemporaryDirectory() as directory:
         project_root = Path(directory)
         registry_path = project_root / "data" / "evidence" / "legacy"
@@ -715,6 +758,12 @@ def evidence(
             evidence_module,
             "CURRENT_EVIDENCE_REGISTRY_SHA256",
             digest,
+        ), mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {role: scoped_authority},
+        ), mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {role: frozenset({pair})},
         ):
             authority = evidence_module.load_current_evidence_bundle(
                 project_root,

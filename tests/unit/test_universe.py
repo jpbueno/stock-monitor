@@ -20,6 +20,7 @@ from stock_monitor.universe import (
     UniverseSnapshot,
     is_verified_universe_snapshot,
     load_current_universe,
+    load_universe_release,
 )
 from tests.support import load_json, universe_fixture as _legacy_universe_fixture
 
@@ -94,23 +95,27 @@ _ETF_LISTING_METADATA = {
         "exchange_listing_date",
         "https://www.sec.gov/Archives/edgar/data/1067839/"
         "000110465910002985/a09-28465_1485bpos.htm",
+        "2010-01-26",
     ),
     "SPY": (
         "1993-01-22",
         "exchange_listing_date",
         "https://www.ssga.com/us/en/intermediary/etfs/"
         "state-street-spdr-sp-500-etf-trust-spy",
+        "2026-08-22",
     ),
     "VTI": (
         "2001-05-24",
         "etf_share_class_launch_proxy",
         "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
+        "2026-04-28",
     ),
     "XLK": (
         "1998-12-22",
         "exchange_listing_date",
         "https://www.ssga.com/us/en/intermediary/etfs/"
         "state-street-technology-select-sector-spdr-etf-xlk",
+        "2026-08-22",
     ),
 }
 
@@ -147,18 +152,20 @@ def universe_fixture() -> dict[str, object]:
         if item["product_type"] == "common_stock":
             metadata = _STOCK_IDENTITY_METADATA[symbol]
             for name, value in metadata.items():
-                item.setdefault(name, value)
-            item.setdefault("issuer_cik_source_as_of", "2026-08-22")
-            item.setdefault("initial_listing_source_as_of", "2026-08-22")
+                item[name] = value
+            item["issuer_cik_source_as_of"] = "2026-08-22"
+            item["initial_listing_source_as_of"] = "2026-08-22"
         else:
-            listing_date, listing_kind, listing_url = _ETF_LISTING_METADATA[symbol]
-            item.setdefault("issuer_cik", None)
-            item.setdefault("issuer_cik_source_url", None)
-            item.setdefault("issuer_cik_source_as_of", None)
-            item.setdefault("initial_listing_date", listing_date)
-            item.setdefault("initial_listing_date_kind", listing_kind)
-            item.setdefault("initial_listing_source_url", listing_url)
-            item.setdefault("initial_listing_source_as_of", "2026-08-22")
+            listing_date, listing_kind, listing_url, listing_source_as_of = (
+                _ETF_LISTING_METADATA[symbol]
+            )
+            item["issuer_cik"] = None
+            item["issuer_cik_source_url"] = None
+            item["issuer_cik_source_as_of"] = None
+            item["initial_listing_date"] = listing_date
+            item["initial_listing_date_kind"] = listing_kind
+            item["initial_listing_source_url"] = listing_url
+            item["initial_listing_source_as_of"] = listing_source_as_of
     return _resign(raw)
 
 
@@ -170,6 +177,34 @@ class UniverseSnapshotTests(unittest.TestCase):
         as_of: date = date(2026, 8, 22),
     ) -> UniverseSnapshot:
         return UniverseSnapshot.from_mapping(raw, as_of=as_of)
+
+    def test_explicit_release_loader_preserves_a_historical_external_pin(
+        self,
+    ) -> None:
+        path = (
+            PROJECT_ROOT
+            / "tests"
+            / "fixtures"
+            / "reference"
+            / "universe-2026-08-14.json"
+        )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        snapshot = load_universe_release(
+            path,
+            expected_sha256=digest,
+            as_of=date(2026, 8, 14),
+        )
+
+        self.assertTrue(is_verified_universe_snapshot(snapshot))
+        self.assertEqual(snapshot._release_pin, digest)
+        self.assertNotEqual(snapshot._release_pin, CURRENT_UNIVERSE_SHA256)
+        with self.assertRaises(UniverseError):
+            load_universe_release(
+                path,
+                expected_sha256="0" * 64,
+                as_of=date(2026, 8, 14),
+            )
 
     def test_published_universe_matches_reviewed_reference_fixture(self) -> None:
         published = json.loads(PUBLISHED_UNIVERSE.read_text(encoding="utf-8"))
@@ -644,7 +679,7 @@ class UniverseSnapshotTests(unittest.TestCase):
             "SPY": date(2026, 8, 14),
             "VTI": date(2026, 4, 28),
             "XLK": date(2026, 8, 14),
-            "QQQ": date(2026, 3, 31),
+            "QQQ": date(2026, 8, 22),
         }
 
         for symbol, source_as_of in expected_primary_dates.items():
@@ -667,6 +702,14 @@ class UniverseSnapshotTests(unittest.TestCase):
         self.assertNotEqual(
             snapshot.by_symbol["QQQ"].initial_listing_source.url,
             snapshot.by_symbol["QQQ"].source_url,
+        )
+        self.assertEqual(
+            snapshot.by_symbol["QQQ"].initial_listing_source.source_as_of,
+            date(2010, 1, 26),
+        )
+        self.assertEqual(
+            snapshot.by_symbol["VTI"].initial_listing_source.source_as_of,
+            date(2026, 4, 28),
         )
 
     def test_benchmark_and_support_roles_are_distinct_and_complete(self) -> None:

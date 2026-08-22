@@ -129,7 +129,7 @@ _MAPPING_PROXY_TYPE = type(MappingProxyType({}))
 _CURRENT_UNIVERSE_RELATIVE_PATH = Path("data/universe/2026-08-22.json")
 _MAXIMUM_UNIVERSE_BYTES = 1_048_576
 CURRENT_UNIVERSE_SHA256 = (
-    "e277048b6c0580dc7f82d062f04ac2898f51ff81cb3673e4d79b54f320fba753"
+    "0029795bd6dc8cfc1a52b97c69e2aa113e788a771d69408270c8504bba5427e9"
 )
 
 
@@ -362,7 +362,7 @@ class UniverseSnapshot:
 
 _ISSUED_UNIVERSES: dict[
     int,
-    tuple[ReferenceType[UniverseSnapshot], str],
+    tuple[ReferenceType[UniverseSnapshot], str, str],
 ] = {}
 _ISSUED_UNIVERSES_LOCK = RLock()
 
@@ -383,23 +383,28 @@ def canonical_payload_checksum(raw: Mapping[str, object]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def load_current_universe(
-    project_root: Path,
+def load_universe_release(
+    path: Path,
     *,
+    expected_sha256: str,
     as_of: date,
 ) -> UniverseSnapshot:
-    """Load only the externally pinned current reviewed universe release."""
-    root = Path(project_root)
-    manifest = root / _CURRENT_UNIVERSE_RELATIVE_PATH
+    """Load one reviewed universe release pinned by an external SHA-256."""
+    if (
+        type(expected_sha256) is not str
+        or _SHA256_DIGEST_PATTERN.fullmatch(expected_sha256) is None
+    ):
+        raise UniverseError("universe release checksum is malformed")
+    manifest = Path(path)
     try:
         payload = manifest.read_bytes()
     except OSError as exc:
-        raise UniverseError("current universe manifest could not be read") from exc
+        raise UniverseError("universe release could not be read") from exc
     if not payload or len(payload) > _MAXIMUM_UNIVERSE_BYTES:
-        raise UniverseError("current universe manifest size is invalid")
+        raise UniverseError("universe release size is invalid")
     digest = hashlib.sha256(payload).hexdigest()
-    if not hmac.compare_digest(digest, CURRENT_UNIVERSE_SHA256):
-        raise UniverseError("current universe release checksum mismatch")
+    if not hmac.compare_digest(digest, expected_sha256):
+        raise UniverseError("universe release checksum mismatch")
     try:
         raw = json.loads(
             payload,
@@ -410,10 +415,10 @@ def load_current_universe(
     except UniverseError:
         raise
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise UniverseError("current universe manifest could not be read") from exc
+        raise UniverseError("universe release could not be read") from exc
     snapshot = UniverseSnapshot.from_mapping(raw, as_of=as_of)
     object.__setattr__(snapshot, "_authority", _VERIFIED_UNIVERSE_AUTHORITY)
-    object.__setattr__(snapshot, "_release_pin", CURRENT_UNIVERSE_SHA256)
+    object.__setattr__(snapshot, "_release_pin", expected_sha256)
     snapshot_digest = _snapshot_fingerprint(snapshot)
     object.__setattr__(snapshot, "_snapshot_digest", snapshot_digest)
     identity = id(snapshot)
@@ -428,8 +433,26 @@ def load_current_universe(
 
     snapshot_reference = ref(snapshot, discard_snapshot)
     with _ISSUED_UNIVERSES_LOCK:
-        _ISSUED_UNIVERSES[identity] = (snapshot_reference, snapshot_digest)
+        _ISSUED_UNIVERSES[identity] = (
+            snapshot_reference,
+            snapshot_digest,
+            expected_sha256,
+        )
     return snapshot
+
+
+def load_current_universe(
+    project_root: Path,
+    *,
+    as_of: date,
+) -> UniverseSnapshot:
+    """Load only the embedded-path, embedded-pin current universe release."""
+    root = Path(project_root)
+    return load_universe_release(
+        root / _CURRENT_UNIVERSE_RELATIVE_PATH,
+        expected_sha256=CURRENT_UNIVERSE_SHA256,
+        as_of=as_of,
+    )
 
 
 def _date_document(value: object, name: str) -> str:
@@ -684,25 +707,33 @@ def _snapshot_fingerprint(value: UniverseSnapshot) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _issued_universe_digest(value: UniverseSnapshot) -> str | None:
+def _issued_universe_authority(
+    value: UniverseSnapshot,
+) -> tuple[str, str] | None:
     with _ISSUED_UNIVERSES_LOCK:
         issued = _ISSUED_UNIVERSES.get(id(value))
         if issued is None or issued[0]() is not value:
             return None
-        return issued[1]
+        return issued[1], issued[2]
 
 
 def is_verified_universe_snapshot(value: object) -> bool:
     """Return true only for an untampered snapshot from the validated loader."""
     if type(value) is not UniverseSnapshot:
         return False
-    issued_digest = _issued_universe_digest(value)
+    issued = _issued_universe_authority(value)
     if (
-        issued_digest is None
+        issued is None
         or value._authority is not _VERIFIED_UNIVERSE_AUTHORITY
-        or value._release_pin != CURRENT_UNIVERSE_SHA256
         or type(value._snapshot_digest) is not str
         or _SHA256_DIGEST_PATTERN.fullmatch(value._snapshot_digest) is None
+    ):
+        return False
+    issued_digest, issued_release_pin = issued
+    if (
+        type(value._release_pin) is not str
+        or _SHA256_DIGEST_PATTERN.fullmatch(value._release_pin) is None
+        or not hmac.compare_digest(value._release_pin, issued_release_pin)
         or not hmac.compare_digest(value._snapshot_digest, issued_digest)
     ):
         return False
@@ -1502,4 +1533,5 @@ __all__ = [
     "canonical_payload_checksum",
     "is_verified_universe_snapshot",
     "load_current_universe",
+    "load_universe_release",
 ]

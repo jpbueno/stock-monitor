@@ -18,6 +18,7 @@ from stock_monitor.providers import reference as reference_module
 from stock_monitor.providers.reference import InstrumentStatusDecision
 from stock_monitor.screening import (
     ScreeningError,
+    _quote_spread,
     build_market_session_attestation,
     evaluate_eligibility,
 )
@@ -156,6 +157,47 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(decision.average_dollar_volume, Decimal("100000000"))
         self.assertEqual(decision.median_share_volume, Decimal("1000000"))
         self.assertEqual(decision.spread_percent, Decimal("0.0025"))
+
+    def test_previous_quote_uses_reviewed_session_final_five_minutes(self) -> None:
+        base = candidate_context()
+        cases = (
+            (
+                "regular session",
+                date(2026, 8, 13),
+                datetime(2026, 8, 13, 15, 58, tzinfo=ET),
+                False,
+            ),
+            (
+                "early close",
+                date(2026, 11, 27),
+                datetime(2026, 11, 27, 12, 58, tzinfo=ET),
+                False,
+            ),
+            (
+                "after early close",
+                date(2026, 11, 27),
+                datetime(2026, 11, 27, 15, 58, tzinfo=ET),
+                True,
+            ),
+        )
+        for label, previous_session, observed_at, outside in cases:
+            with self.subTest(label=label):
+                context = replace(
+                    base,
+                    previous_session_date=previous_session,
+                    previous_session_quote=replace(
+                        base.previous_session_quote,
+                        timestamp=observed_at,
+                    ),
+                )
+                reasons: list[str] = []
+
+                _quote_spread(context, previous_session, reasons)
+
+                self.assertEqual(
+                    "PREVIOUS_SESSION_QUOTE_OUTSIDE_WINDOW" in reasons,
+                    outside,
+                )
 
     def test_each_numeric_gate_fails_immediately_below_its_boundary(self) -> None:
         base = candidate_context()

@@ -1315,6 +1315,7 @@ def _canonical_result_projection(
             ("NO TRADE", ("ACTIVE_BREAKER",)): ("NO_TRADE", 4),
             ("NO TRADE", ("MARKET_CLOSED",)): ("NO_TRADE", 0),
             ("NO TRADE", ("NO_CANDIDATES",)): ("NO_TRADE", 0),
+            ("NO TRADE", ("NO_PRIMARY_CAPACITY",)): ("NO_TRADE", 0),
         }
         for data_reason in (
             "DATA_UNAVAILABLE",

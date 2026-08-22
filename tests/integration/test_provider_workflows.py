@@ -50,7 +50,11 @@ from stock_monitor.providers.cache import SourceObservation
 from stock_monitor.providers.http import EgressPolicy, HttpResponse
 from stock_monitor.providers.reference import ReferenceClient
 from stock_monitor.universe import load_current_universe
-from stock_monitor.workflows import PremarketSnapshot, WorkflowDataError
+from stock_monitor.workflows import (
+    PremarketSnapshot,
+    WorkflowDataError,
+    _canonical_result_projection,
+)
 from tests.support import FixtureTransport, credentials
 
 
@@ -77,6 +81,96 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             as_of=DECISION_AT,
             universe=self.universe,
         )
+
+    def _validation_breaker(
+        self,
+        *,
+        journal: Journal | None = None,
+        window_id: str = "a" * 64,
+        calendar=None,
+        session_date: date = DAY,
+        decision_at: datetime = DECISION_AT,
+    ):
+        import stock_monitor.risk as risk_module
+
+        target = self.journal if journal is None else journal
+        reviewed_calendar = self.calendar if calendar is None else calendar
+        resolver = risk_module.SessionCalendarResolver((reviewed_calendar,))
+        previous_session = resolver.previous_session(session_date)
+        target.start_phase1_validation_window(
+            window_id=window_id,
+            started_session=previous_session,
+            starting_capital=Decimal("5000"),
+            started_at=datetime.combine(
+                previous_session,
+                reviewed_calendar.session(previous_session).close_time,
+                ET,
+            ),
+            received_at=datetime.combine(
+                previous_session,
+                reviewed_calendar.session(previous_session).close_time,
+                ET,
+            ),
+            calendar_resolver=resolver,
+        )
+        return self._read_validation_breaker(
+            journal=target,
+            calendar=reviewed_calendar,
+            session_date=session_date,
+            decision_at=decision_at,
+        )
+
+    def _read_validation_breaker(
+        self,
+        *,
+        journal: Journal | None = None,
+        calendar=None,
+        session_date: date = DAY,
+        decision_at: datetime = DECISION_AT,
+    ):
+        import stock_monitor.risk as risk_module
+
+        target = self.journal if journal is None else journal
+        reviewed_calendar = self.calendar if calendar is None else calendar
+        resolver = risk_module.SessionCalendarResolver((reviewed_calendar,))
+        history = target.read_phase1_breaker_history(
+            ledger_name="CANONICAL",
+            through_session=resolver.previous_session(session_date),
+            query_cutoff=decision_at,
+            calendar_resolver=resolver,
+        )
+        return risk_module.evaluate_authorized_breakers(history)
+
+    def _configure_validation_resolver(
+        self,
+        resolver,
+        *,
+        journal: Journal | None = None,
+        calendar=None,
+        session_date: date = DAY,
+        decision_at: datetime = DECISION_AT,
+        window_id: str = "a" * 64,
+    ):
+        target = self.journal if journal is None else journal
+        reviewed_calendar = self.calendar if calendar is None else calendar
+        self._validation_breaker(
+            journal=target,
+            window_id=window_id,
+            calendar=reviewed_calendar,
+            session_date=session_date,
+            decision_at=decision_at,
+        )
+
+        def issue(**_kwargs):
+            return self._read_validation_breaker(
+                journal=target,
+                calendar=reviewed_calendar,
+                session_date=session_date,
+                decision_at=decision_at,
+            )
+
+        resolver.validation_breaker.side_effect = issue
+        return resolver
 
     @staticmethod
     def _reviewed_uri(role: str, payload: bytes) -> str:
@@ -523,7 +617,12 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             frozenset(scoped_sources),
         )
 
-    def _complete_candidate_collection(self, **kwargs):
+    def _complete_candidate_collection(
+        self,
+        *,
+        capacity_block: bool = False,
+        **kwargs,
+    ):
         import stock_monitor.evidence as evidence_module
         import stock_monitor.providers.alpaca as alpaca_module
         import stock_monitor.screening as screening_module
@@ -540,6 +639,7 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
         calendar = kwargs["calendar"]
         universe = kwargs["universe"]
         evidence_release = kwargs["evidence_release"]
+        price_scale = Decimal("100") if capacity_block else Decimal("1")
         previous_session = session_date - timedelta(days=1)
         while not calendar.is_open(previous_session):
             previous_session -= timedelta(days=1)
@@ -575,6 +675,10 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                         tzinfo=ET,
                     ).astimezone(UTC),
                     source_observation_id=f"raw-bars-{symbol.lower()}",
+                    open=bar.open * price_scale,
+                    high=bar.high * price_scale,
+                    low=bar.low * price_scale,
+                    close=bar.close * price_scale,
                 )
                 for day, bar in zip(
                     history_dates,
@@ -643,6 +747,8 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                         source_observation_id=(
                             f"raw-previous-{record.symbol.lower()}"
                         ),
+                        bid=template.previous_session_quote.bid * price_scale,
+                        ask=template.previous_session_quote.ask * price_scale,
                     ),
                     latest_iex_quote=replace(
                         template.latest_iex_quote,
@@ -650,6 +756,8 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                         source_observation_id=(
                             f"raw-latest-{record.symbol.lower()}"
                         ),
+                        bid=template.latest_iex_quote.bid * price_scale,
+                        ask=template.latest_iex_quote.ask * price_scale,
                     ),
                     instrument_status=status,
                     evidence=evidence,
@@ -772,50 +880,252 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             required_symbols=kwargs["required_symbols"],
         )
         return PremarketProviderCollection(
+            collected_at=kwargs["retrieved_at"],
             provider_cohorts=cohorts,
             reference_sources=documents,
             contexts=contexts,
             persisted_bindings=(*reference_bindings, *provider_bindings),
         )
 
-    def test_market_closed_composes_real_reviewed_material_without_provider_calls(self) -> None:
+    def test_market_closed_requires_open_session_without_writes_or_calls(self) -> None:
         collector = mock.Mock()
+        resolver = mock.Mock()
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-market-closed",
+            risk_resolver=resolver,
         )
+        total_changes = self.journal._connection.total_changes
 
-        material = coordinator.premarket_material(
-            DAY,
-            decision_at=DECISION_AT,
-            retrieved_at=RETRIEVED_AT,
-        )
+        with self.assertRaisesRegex(
+            CanonicalMaterialError,
+            "^premarket coordinator requires an open session$",
+        ):
+            coordinator.premarket_material(
+                DAY,
+                decision_at=DECISION_AT,
+                retrieved_at=RETRIEVED_AT,
+            )
 
-        self.assertEqual(material.report.outcome, "NO TRADE")
-        self.assertIn("`MARKET_CLOSED`", material.report.body)
-        self.assertEqual(material.snapshot, PremarketSnapshot((), False))
-        self.assertTrue(material.source_receipts)
-        self.assertTrue(
-            all(receipt.source_payload for receipt in material.source_receipts)
-        )
+        self.assertEqual(self.journal._connection.total_changes, total_changes)
         collector.collect.assert_not_called()
+        resolver.validation_breaker.assert_not_called()
+        resolver.resolve.assert_not_called()
+
+    def test_open_failure_derives_window_from_exact_validation_breaker(self) -> None:
+        self._validation_breaker()
+        collected_at = RETRIEVED_AT + timedelta(minutes=3)
+        events: list[str] = []
+        collector = mock.Mock()
+        collector.collect.side_effect = lambda **_kwargs: (
+            events.append("collect")
+            or PremarketProviderCollection(
+                collected_at=collected_at,
+                failure_reason="DATA_UNAVAILABLE",
+            )
+        )
+        resolver = mock.Mock()
+        validation_breakers = []
+
+        def validation_breaker(**_kwargs):
+            events.append("validation")
+            breaker = self._read_validation_breaker()
+            validation_breakers.append(breaker)
+            return breaker
+
+        resolver.validation_breaker.side_effect = validation_breaker
+        coordinator = PremarketWorkflowCoordinator(
+            journal=self.journal,
+            project_root=ROOT,
+            report_archive_root=self.archive_root,
+            collector=collector,
+            risk_resolver=resolver,
+        )
+
+        with mock.patch(
+            "stock_monitor.market_calendar.MarketCalendar.is_open",
+            return_value=True,
+        ):
+            material = coordinator.premarket_material(
+                DAY,
+                decision_at=DECISION_AT,
+                retrieved_at=RETRIEVED_AT,
+            )
+
+        self.assertEqual(events, ["validation", "collect", "validation"])
+        self.assertEqual(material.validation_window_id, "a" * 64)
+        self.assertEqual(material.retrieved_at, collected_at)
+        self.assertTrue(
+            all(
+                receipt.retrieved_at <= material.retrieved_at
+                for receipt in material.source_receipts
+            )
+        )
+        candidate = provider_workflows_module._ISSUED_PREMARKET_COMPOSITIONS[
+            id(material.composition_authority)
+        ]
+        self.assertIn(validation_breakers[-1], candidate.risk_children)
+        self.assertTrue(
+            any(
+                getattr(child, "validation_window_id", None) == "a" * 64
+                for child in candidate.identity_children
+            )
+        )
+        resolver.resolve.assert_not_called()
+
+    def test_forged_or_cross_journal_validation_breaker_fails_before_writes(self) -> None:
+        issued = self._validation_breaker()
+        forged = replace(issued, history_digest="f" * 64)
+        with tempfile.TemporaryDirectory() as other_root:
+            other = Journal.open(Path(other_root) / "other.sqlite3")
+            self.addCleanup(other.close)
+            cross_owner = self._validation_breaker(
+                journal=other,
+                window_id="b" * 64,
+            )
+            for label, breaker in (
+                ("forged", forged),
+                ("cross-owner", cross_owner),
+            ):
+                with self.subTest(label=label):
+                    collector = mock.Mock()
+                    resolver = mock.Mock()
+                    resolver.validation_breaker.return_value = breaker
+                    coordinator = PremarketWorkflowCoordinator(
+                        journal=self.journal,
+                        project_root=ROOT,
+                        report_archive_root=self.archive_root,
+                        collector=collector,
+                        risk_resolver=resolver,
+                    )
+                    total_changes = self.journal._connection.total_changes
+                    with mock.patch(
+                        "stock_monitor.market_calendar.MarketCalendar.is_open",
+                        return_value=True,
+                    ), self.assertRaisesRegex(
+                        CanonicalMaterialError,
+                        "authority|owner|current",
+                    ):
+                        coordinator.premarket_material(
+                            DAY,
+                            decision_at=DECISION_AT,
+                            retrieved_at=RETRIEVED_AT,
+                        )
+                    self.assertEqual(
+                        self.journal._connection.total_changes,
+                        total_changes,
+                    )
+                    collector.collect.assert_not_called()
+                    resolver.resolve.assert_not_called()
+
+    def test_year_boundary_validation_uses_release_verified_adjacent_calendar(self) -> None:
+        import stock_monitor.risk as risk_module
+        from tests.support import calendar_fixture
+
+        session_date = date(2027, 1, 4)
+        decision_at = datetime(2027, 1, 4, 8, 45, tzinfo=ET)
+        project = self.temporary_root / "year-boundary-project"
+        calendar_root = project / "data/calendars"
+        calendar_root.mkdir(parents=True)
+        digests = {}
+        for year, reviewed_at in (
+            (2026, date(2026, 12, 31)),
+            (2027, date(2027, 1, 4)),
+        ):
+            raw = calendar_fixture(year)
+            reviewed_text = reviewed_at.isoformat()
+            raw["retrieved_at"] = reviewed_text
+            raw["reviewed_at"] = reviewed_text
+            for source in raw["sources"].values():
+                source["retrieved_at"] = reviewed_text
+                source["reviewed_at"] = reviewed_text
+            payload = json.dumps(
+                raw,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            (calendar_root / f"{year}.json").write_bytes(payload)
+            digests[year] = hashlib.sha256(payload).hexdigest()
+
+        with mock.patch.dict(
+            market_calendar_module._RELEASE_MANIFEST_SHA256,
+            digests,
+        ):
+            previous_calendar = load_current_market_calendar(
+                project,
+                as_of=date(2026, 12, 31),
+            )
+            current_calendar = load_current_market_calendar(
+                project,
+                as_of=session_date,
+            )
+            seed_resolver = risk_module.SessionCalendarResolver(
+                (previous_calendar, current_calendar)
+            )
+            previous_session = seed_resolver.previous_session(session_date)
+            self.assertEqual(previous_session, date(2026, 12, 31))
+            self.journal.start_phase1_validation_window(
+                window_id="c" * 64,
+                started_session=previous_session,
+                starting_capital=Decimal("5000"),
+                started_at=datetime(2026, 12, 31, 16, tzinfo=ET),
+                received_at=datetime(2026, 12, 31, 16, tzinfo=ET),
+                calendar_resolver=seed_resolver,
+            )
+            observed_resolvers = []
+
+            class Resolver:
+                def validation_breaker(inner_self, **kwargs):
+                    del inner_self
+                    resolver = kwargs["calendar_resolver"]
+                    observed_resolvers.append(resolver)
+                    history = self.journal.read_phase1_breaker_history(
+                        ledger_name="CANONICAL",
+                        through_session=resolver.previous_session(
+                            kwargs["session_date"]
+                        ),
+                        query_cutoff=kwargs["decision_at"],
+                        calendar_resolver=resolver,
+                    )
+                    return risk_module.evaluate_authorized_breakers(history)
+
+            resolved = (
+                provider_workflows_module._resolve_premarket_validation_context(
+                    journal=self.journal,
+                    risk_resolver=Resolver(),
+                    project_root=project,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    calendar=current_calendar,
+                )
+            )
+
+        self.assertEqual(resolved.history_source.through_session, previous_session)
+        self.assertEqual(
+            tuple(calendar.year for calendar in observed_resolvers[0].calendars),
+            (2026, 2027),
+        )
+        self.assertTrue(observed_resolvers[0].release_verified)
 
     def test_stale_reviewed_evidence_is_data_unavailable_with_zero_candidates(self) -> None:
         session_date = date(2026, 8, 24)
         decision_at = datetime(2026, 8, 24, 8, 45, tzinfo=ET)
         retrieved_at = datetime(2026, 8, 24, 8, 52, tzinfo=ET)
         collector = mock.Mock()
+        resolver = self._configure_validation_resolver(
+            mock.Mock(),
+            session_date=session_date,
+            decision_at=decision_at,
+        )
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-stale-evidence",
+            risk_resolver=resolver,
         )
 
         material = coordinator.premarket_material(
@@ -834,16 +1144,19 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
 
     def test_corrupt_subject_release_normalizes_to_source_check_failure(self) -> None:
         collector = mock.Mock()
+        resolver = self._configure_validation_resolver(mock.Mock())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-corrupt-evidence",
+            risk_resolver=resolver,
         )
 
         with mock.patch(
+            "stock_monitor.market_calendar.MarketCalendar.is_open",
+            return_value=True,
+        ), mock.patch(
             "stock_monitor.evidence.load_current_evidence_release",
             side_effect=EvidenceRegistryError(
                 "reviewed evidence child checksum mismatch"
@@ -879,15 +1192,20 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
         for target, error, reason in cases:
             with self.subTest(reason=reason):
                 collector = mock.Mock()
+                resolver = mock.Mock()
+                if reason == "STALE_UNIVERSE":
+                    resolver = self._configure_validation_resolver(resolver)
                 coordinator = PremarketWorkflowCoordinator(
                     journal=self.journal,
                     project_root=ROOT,
                     report_archive_root=self.archive_root,
                     collector=collector,
-                    risk_resolver=None,
-                    validation_window_id=f"task10-{reason.lower()}",
+                    risk_resolver=resolver,
                 )
-                with mock.patch(target, side_effect=error), self.assertRaisesRegex(
+                with mock.patch(
+                    "stock_monitor.market_calendar.MarketCalendar.is_open",
+                    return_value=True,
+                ), mock.patch(target, side_effect=error), self.assertRaisesRegex(
                     WorkflowDataError,
                     f"^{reason}$",
                 ):
@@ -904,13 +1222,24 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
         project, evidence_sha256, *_unused = self._fresh_open_project()
         (project / "data/evidence/subjects/AAPL.json").unlink()
         collector = mock.Mock()
+        session_date = date(2026, 8, 24)
+        decision_at = datetime(2026, 8, 24, 8, 45, tzinfo=ET)
+        project_calendar = load_current_market_calendar(
+            project,
+            as_of=session_date,
+        )
+        resolver = self._configure_validation_resolver(
+            mock.Mock(),
+            calendar=project_calendar,
+            session_date=session_date,
+            decision_at=decision_at,
+        )
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=project,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-missing-subject-file",
+            risk_resolver=resolver,
         )
 
         with mock.patch.object(
@@ -922,8 +1251,8 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             "^SOURCE_CHECK_FAILED$",
         ):
             coordinator.premarket_material(
-                date(2026, 8, 24),
-                decision_at=datetime(2026, 8, 24, 8, 45, tzinfo=ET),
+                session_date,
+                decision_at=decision_at,
                 retrieved_at=datetime(2026, 8, 24, 8, 52, tzinfo=ET),
             )
 
@@ -936,13 +1265,13 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
         collector.collect.side_effect = ProviderResponseError(
             "reference source unavailable"
         )
+        resolver = self._configure_validation_resolver(mock.Mock())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-provider-exception",
+            risk_resolver=resolver,
         )
 
         with mock.patch(
@@ -961,15 +1290,16 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
     def test_missing_subject_evidence_is_data_unavailable_after_collection(self) -> None:
         collector = mock.Mock()
         collector.collect.return_value = PremarketProviderCollection(
+            collected_at=RETRIEVED_AT,
             failure_reason="SOURCE_CHECK_FAILED",
         )
+        resolver = self._configure_validation_resolver(mock.Mock())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-missing-subject",
+            risk_resolver=resolver,
         )
 
         with mock.patch(
@@ -1024,19 +1354,20 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                 ),
             )
             return PremarketProviderCollection(
+                collected_at=RETRIEVED_AT,
                 provider_cohorts=cohorts,
                 persisted_bindings=persisted,
                 failure_reason="DATA_UNAVAILABLE",
             )
 
         collector.collect.side_effect = collect_failure
+        resolver = self._configure_validation_resolver(mock.Mock())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-provider-pages",
+            risk_resolver=resolver,
         )
 
         with mock.patch(
@@ -1101,6 +1432,10 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             )
             raise PremarketCollectionError(
                 PremarketProviderCollection(
+                    collected_at=max(
+                        RETRIEVED_AT,
+                        receipt.retrieved_at,
+                    ),
                     persisted_bindings=(
                         PremarketSourceBinding(
                             receipt=receipt,
@@ -1113,13 +1448,13 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             )
 
         collector.collect.side_effect = collect_partial
+        resolver = self._configure_validation_resolver(mock.Mock())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=None,
-            validation_window_id="task10-partial-page",
+            risk_resolver=resolver,
         )
 
         with mock.patch(
@@ -1186,6 +1521,7 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                 for binding in (*persisted, *reference_bindings)
             )
             return PremarketProviderCollection(
+                collected_at=RETRIEVED_AT,
                 provider_cohorts=cohorts,
                 reference_sources=documents,
                 contexts=tuple(object() for _record in self.universe.records),
@@ -1193,14 +1529,16 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             )
 
         collector.collect.side_effect = collect_success
-        breaker = object()
         resolver = mock.Mock()
 
         def resolve(**_kwargs):
             events.append(("resolve", ()))
-            return PremarketRiskResolution(breaker_state=breaker)
+            return PremarketRiskResolution(
+                breaker_state=_kwargs["validation_breaker"]
+            )
 
         resolver.resolve.side_effect = resolve
+        self._configure_validation_resolver(resolver)
 
         def read_receipts(journal, row_ids):
             identifiers = tuple(row_ids)
@@ -1213,7 +1551,6 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             report_archive_root=self.archive_root,
             collector=collector,
             risk_resolver=resolver,
-            validation_window_id="task10-no-candidates",
         )
 
         with mock.patch(
@@ -1237,9 +1574,6 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             "_rank_premarket_contexts",
             return_value=(),
             create=True,
-        ), mock.patch(
-            "stock_monitor.risk.is_issued_breaker_state",
-            side_effect=lambda value: value is breaker,
         ), mock.patch(
             "stock_monitor.risk.breaker_pauses_entry",
             return_value=False,
@@ -1280,21 +1614,40 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             (),
         )
 
-    def test_active_breaker_precedes_data_unavailable_cohort(self) -> None:
-        breaker = object()
-        collector = mock.Mock()
-        collector.collect.return_value = PremarketProviderCollection()
-        resolver = mock.Mock()
-        resolver.resolve.return_value = PremarketRiskResolution(
-            breaker_state=breaker,
+    def test_capacity_block_has_an_explicit_nonpublication_authority_child(self) -> None:
+        capacity_decision = object()
+        resolution = PremarketRiskResolution(
+            breaker_state=object(),
+            capacity_decision=capacity_decision,
         )
+
+        self.assertIs(resolution.capacity_decision, capacity_decision)
+        self.assertIsNone(resolution.primary_plan)
+        self.assertIsNone(resolution.publication_decision)
+        self.assertEqual(
+            provider_workflows_module._validate_premarket_outcome_reasons(
+                "NO TRADE",
+                ("NO_PRIMARY_CAPACITY",),
+            ),
+            ("NO_PRIMARY_CAPACITY",),
+        )
+
+    def test_active_breaker_precedes_data_unavailable_cohort(self) -> None:
+        collector = mock.Mock()
+        collector.collect.return_value = PremarketProviderCollection(
+            collected_at=RETRIEVED_AT,
+        )
+        resolver = mock.Mock()
+        resolver.resolve.side_effect = lambda **kwargs: PremarketRiskResolution(
+            breaker_state=kwargs["validation_breaker"],
+        )
+        self._configure_validation_resolver(resolver)
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=ROOT,
             report_archive_root=self.archive_root,
             collector=collector,
             risk_resolver=resolver,
-            validation_window_id="task10-breaker-precedence",
         )
 
         with mock.patch(
@@ -1311,9 +1664,6 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
             "_rank_premarket_contexts",
             return_value=None,
         ), mock.patch(
-            "stock_monitor.risk.is_issued_breaker_state",
-            side_effect=lambda value: value is breaker,
-        ), mock.patch(
             "stock_monitor.risk.breaker_pauses_entry",
             return_value=True,
         ):
@@ -1329,7 +1679,6 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
 
     def test_complete_cohort_sizes_only_primary_with_real_authorities(self) -> None:
         import stock_monitor.evidence as evidence_module
-        import stock_monitor.ledger as ledger_module
         import stock_monitor.risk as risk_module
         import stock_monitor.screening as screening_module
         from stock_monitor.risk import LongPlanRequest, SessionCalendarResolver
@@ -1359,47 +1708,53 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
         )
 
         class Resolver:
-            def resolve(inner_self, **kwargs):
-                del inner_self
+            def __init__(inner_self, policy) -> None:
+                inner_self.policy = policy
+                inner_self.capacity_decision = None
+                inner_self.ranked_candidates = ()
+                inner_self.validation_calls = 0
+
+            def validation_breaker(inner_self, **kwargs):
+                inner_self.validation_calls += 1
                 resolver = SessionCalendarResolver((kwargs["calendar"],))
-                replay_source = self.journal._read_phase1_canonical_replay_source(
-                    query_cutoff=kwargs["decision_at"],
-                )
-                replay = ledger_module._issue_canonical_ledger_replay_from_phase1_source(
-                    replay_source
-                )
-                previous = resolver.previous_session(kwargs["session_date"])
-                history_source = self.journal._read_phase1_breaker_history_source(
+                history = self.journal.read_phase1_breaker_history(
                     ledger_name="CANONICAL",
-                    through_session=previous,
+                    through_session=resolver.previous_session(
+                        kwargs["session_date"]
+                    ),
                     query_cutoff=kwargs["decision_at"],
-                )
-                history = risk_module._issue_breaker_history_from_phase1_source(
-                    history_source,
                     calendar_resolver=resolver,
                 )
-                breaker = risk_module.evaluate_authorized_breakers(history)
+                return risk_module.evaluate_authorized_breakers(history)
+
+            def resolve(inner_self, **kwargs):
+                resolver = SessionCalendarResolver((kwargs["calendar"],))
                 ranked = kwargs["ranked_candidates"]
+                inner_self.ranked_candidates = ranked
                 if not ranked:
-                    return PremarketRiskResolution(breaker_state=breaker)
+                    return PremarketRiskResolution(
+                        breaker_state=kwargs["validation_breaker"]
+                    )
                 request = LongPlanRequest.from_scored_candidate(ranked[0])
-                portfolio = risk_module._issue_portfolio_risk_authority(
+                portfolio = self.journal.read_phase1_canonical_portfolio_authority(
                     request=request,
-                    ledger_pair=replay.ledger_pair,
-                    ledger_name="CANONICAL",
-                    breaker_state=breaker,
-                    calendar_resolver=resolver,
-                    policy=policy_fixture(),
-                    scope="CANONICAL_PUBLICATION",
                     as_of=kwargs["decision_at"],
-                    phase1_canonical_replay=replay,
+                    calendar_resolver=resolver,
+                    policy=inner_self.policy,
                 )
+                breaker = portfolio.portfolio_state.breaker_states[0]
                 plan = risk_module.plan_long(
                     request,
                     portfolio.portfolio_state,
-                    policy_fixture(),
+                    inner_self.policy,
                     portfolio_authority=portfolio,
                 )
+                if not plan.eligible:
+                    inner_self.capacity_decision = plan
+                    return PremarketRiskResolution(
+                        breaker_state=breaker,
+                        capacity_decision=plan,
+                    )
                 decision = screening_module._issue_portfolio_bound_publication_decision(
                     ranked[:3],
                     primary_plan_decision=plan,
@@ -1412,13 +1767,28 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
 
         collector = mock.Mock()
         collector.collect.side_effect = self._complete_candidate_collection
+        ready_resolver = Resolver(policy_fixture())
         coordinator = PremarketWorkflowCoordinator(
             journal=self.journal,
             project_root=project,
             report_archive_root=self.archive_root,
             collector=collector,
-            risk_resolver=Resolver(),
-            validation_window_id=window_id,
+            risk_resolver=ready_resolver,
+        )
+        blocked_resolver = Resolver(policy_fixture())
+        blocked_collector = mock.Mock()
+        blocked_collector.collect.side_effect = lambda **kwargs: (
+            self._complete_candidate_collection(
+                capacity_block=True,
+                **kwargs,
+            )
+        )
+        blocked_coordinator = PremarketWorkflowCoordinator(
+            journal=self.journal,
+            project_root=project,
+            report_archive_root=self.archive_root,
+            collector=blocked_collector,
+            risk_resolver=blocked_resolver,
         )
 
         with mock.patch.object(
@@ -1454,6 +1824,11 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                 decision_at=decision_at,
                 retrieved_at=retrieved_at,
             )
+            blocked_material = blocked_coordinator.premarket_material(
+                session_date,
+                decision_at=decision_at,
+                retrieved_at=retrieved_at,
+            )
 
         self.assertEqual(
             material.report.outcome,
@@ -1469,6 +1844,123 @@ class CanonicalPremarketSourceBindingTests(unittest.TestCase):
                 and not hasattr(item.material, "shares")
                 for item in material.snapshot.candidates[1:]
             )
+        )
+        self.assertEqual(blocked_material.report.outcome, "NO TRADE")
+        self.assertIn("`NO_PRIMARY_CAPACITY`", blocked_material.report.body)
+        self.assertEqual(blocked_material.snapshot.candidates, ())
+        self.assertIsNone(blocked_material.publication_decision)
+        self.assertIsNone(blocked_material.primary_plan)
+        self.assertIsNotNone(blocked_resolver.capacity_decision)
+        self.assertFalse(blocked_resolver.capacity_decision.eligible)
+        self.assertEqual(
+            blocked_resolver.capacity_decision.reason_codes,
+            ("QUANTITY_BELOW_ONE",),
+        )
+        self.assertEqual(
+            blocked_material.composition_authority.capacity_decision_digest,
+            provider_workflows_module._long_plan_digest(
+                blocked_resolver.capacity_decision
+            ),
+        )
+        self.assertEqual(
+            blocked_material.composition_authority.capacity_candidate_digest,
+            screening_module._scored_candidate_fingerprint(
+                blocked_resolver.ranked_candidates[0]
+            ),
+        )
+        blocked_candidate = (
+            provider_workflows_module._ISSUED_PREMARKET_COMPOSITIONS[
+                id(blocked_material.composition_authority)
+            ]
+        )
+        self.assertIn(
+            blocked_resolver.capacity_decision,
+            blocked_candidate.risk_children,
+        )
+        self.assertEqual(ready_resolver.validation_calls, 3)
+        self.assertEqual(blocked_resolver.validation_calls, 3)
+        with mock.patch.object(
+            evidence_module,
+            "CURRENT_EVIDENCE_RELEASE_SHA256",
+            evidence_sha256,
+        ), mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            scoped_authorities,
+        ), mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            clear_authorities,
+        ), mock.patch.object(
+            provider_workflows_module,
+            "_SCOPED_REFERENCE_SOURCES",
+            scoped_sources,
+        ), mock.patch.object(
+            provider_workflows_module,
+            "_is_issued_provider_fetch_page_bundle",
+            return_value=True,
+        ):
+            self.assertTrue(
+                is_issued_canonical_premarket_composition_authority(
+                    blocked_material.composition_authority
+                )
+            )
+            self.assertFalse(
+                is_issued_canonical_premarket_composition_authority(
+                    replace(
+                        blocked_material.composition_authority,
+                        capacity_candidate_digest="f" * 64,
+                    )
+                )
+            )
+            self.assertGreaterEqual(
+                len(blocked_resolver.ranked_candidates),
+                2,
+            )
+            base_length = 1 + len(blocked_material.source_receipts) + 2
+            source_authority = blocked_candidate.identity_children[base_length]
+            exact_calendar = blocked_candidate.identity_children[base_length + 1]
+            exact_universe = blocked_candidate.identity_children[base_length + 2]
+            exact_evidence = blocked_candidate.identity_children[base_length + 3]
+            total_changes = self.journal._connection.total_changes
+            for label, reused_candidate in (
+                (
+                    "copy",
+                    replace(blocked_resolver.ranked_candidates[0]),
+                ),
+                (
+                    "cross-candidate",
+                    blocked_resolver.ranked_candidates[1],
+                ),
+            ):
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    CanonicalMaterialError,
+                    "capacity candidate",
+                ):
+                    issue_canonical_premarket_composition_authority(
+                        journal=self.journal,
+                        session_date=session_date,
+                        decision_at=decision_at,
+                        retrieved_at=retrieved_at,
+                        validation_window_id=blocked_material.validation_window_id,
+                        source_binding_authority=source_authority,
+                        snapshot=blocked_material.snapshot,
+                        publication_decision=None,
+                        primary_plan=None,
+                        capacity_decision=blocked_resolver.capacity_decision,
+                        capacity_candidate=reused_candidate,
+                        outcome="NO TRADE",
+                        reason_codes=("NO_PRIMARY_CAPACITY",),
+                        calendar=exact_calendar,
+                        universe=exact_universe,
+                        evidence_release=exact_evidence,
+                        phase1_replay_children=(),
+                    )
+            self.assertEqual(
+                self.journal._connection.total_changes,
+                total_changes,
+            )
+        self.assertEqual(
+            _canonical_result_projection(blocked_material),
+            ("NO_TRADE", 0, ("NO_PRIMARY_CAPACITY",)),
         )
 
     def test_exact_reviewed_bytes_children_and_owner_issue_one_current_authority(self) -> None:

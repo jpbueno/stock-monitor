@@ -36,6 +36,16 @@ _CANONICAL_DATA_REASONS = frozenset(
         "STALE_UNIVERSE",
     }
 )
+_PRIMARY_CAPACITY_REASONS = frozenset(
+    {
+        "COMBINED_RISK_CAP_REACHED",
+        "DUPLICATE_TICKER_EXPOSURE",
+        "EXPOSURE_CAP_REACHED",
+        "POSITION_LIMIT_REACHED",
+        "QUANTITY_BELOW_ONE",
+        "SESSION_ENTRY_LIMIT_REACHED",
+    }
+)
 _PREMARKET_OUTCOME_REASONS = {
     "CANDIDATES": frozenset(
         {("PAPER_PLAN_ONLY", "MANUAL_EXECUTION_REQUIRED")}
@@ -45,6 +55,7 @@ _PREMARKET_OUTCOME_REASONS = {
             ("ACTIVE_BREAKER",),
             ("MARKET_CLOSED",),
             ("NO_CANDIDATES",),
+            ("NO_PRIMARY_CAPACITY",),
         }
     ),
     "NO NEW TRADE - DATA UNAVAILABLE": frozenset(
@@ -274,6 +285,7 @@ class CanonicalPremarketSourceBindingAuthority:
 class PremarketProviderCollection:
     """Exact injectable output of one bounded premarket collection pass."""
 
+    collected_at: datetime
     provider_cohorts: tuple[object, ...] = ()
     reference_sources: tuple[object, ...] = ()
     contexts: tuple[object, ...] = ()
@@ -281,6 +293,10 @@ class PremarketProviderCollection:
     failure_reason: str | None = None
 
     def __post_init__(self) -> None:
+        collected_at = _require_time(
+            self.collected_at,
+            "premarket collection terminal time",
+        )
         for value in (
             self.provider_cohorts,
             self.reference_sources,
@@ -307,6 +323,13 @@ class PremarketProviderCollection:
             raise CanonicalMaterialError(
                 "premarket persisted bindings are malformed"
             )
+        if any(
+            binding.receipt.retrieved_at > collected_at
+            for binding in self.persisted_bindings
+        ):
+            raise CanonicalMaterialError(
+                "premarket collection predates a persisted source receipt"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,11 +339,16 @@ class PremarketRiskResolution:
     breaker_state: object
     primary_plan: object | None = None
     publication_decision: object | None = None
+    capacity_decision: object | None = None
 
     def __post_init__(self) -> None:
         if (self.primary_plan is None) != (self.publication_decision is None):
             raise CanonicalMaterialError(
                 "premarket plan and publication decision must be paired"
+            )
+        if self.capacity_decision is not None and self.primary_plan is not None:
+            raise CanonicalMaterialError(
+                "premarket capacity and publication decisions are mutually exclusive"
             )
 
 
@@ -337,6 +365,16 @@ class PremarketCollectionError(RuntimeError):
             )
         self.collection = collection
         super().__init__(collection.failure_reason)
+
+
+@dataclass(frozen=True, slots=True)
+class _PremarketValidationContext:
+    """Exact Journal-derived Phase 1 authority for one open-session run."""
+
+    breaker_state: object
+    history_source: object
+    validation_window_id: str
+    calendar_resolver: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,7 +478,6 @@ class PremarketWorkflowCoordinator:
         "_project_root",
         "_report_archive_root",
         "_risk_resolver",
-        "_validation_window_id",
     )
 
     def __init__(
@@ -450,8 +487,7 @@ class PremarketWorkflowCoordinator:
         project_root: Path,
         report_archive_root: Path,
         collector: object,
-        risk_resolver: object | None,
-        validation_window_id: str,
+        risk_resolver: object,
     ) -> None:
         from .journal import Journal
 
@@ -476,8 +512,8 @@ class PremarketWorkflowCoordinator:
             raise CanonicalMaterialError(
                 "premarket coordinator collector is unavailable"
             )
-        if risk_resolver is not None and not callable(
-            getattr(risk_resolver, "resolve", None)
+        if not callable(getattr(risk_resolver, "resolve", None)) or not callable(
+            getattr(risk_resolver, "validation_breaker", None)
         ):
             raise CanonicalMaterialError(
                 "premarket coordinator risk resolver is unavailable"
@@ -487,9 +523,6 @@ class PremarketWorkflowCoordinator:
         self._report_archive_root = report_archive_root
         self._collector = collector
         self._risk_resolver = risk_resolver
-        self._validation_window_id = _validation_window_id(
-            validation_window_id
-        )
 
     def premarket_material(
         self,
@@ -514,6 +547,22 @@ class PremarketWorkflowCoordinator:
                 as_of=session_date,
             )
         except (CalendarError, OSError) as error:
+            raise WorkflowDataError("STALE_CALENDAR") from error
+        session_open = calendar.is_open(session_date)
+        if not session_open:
+            raise CanonicalMaterialError(
+                "premarket coordinator requires an open session"
+            )
+        try:
+            validation = _resolve_premarket_validation_context(
+                journal=self._journal,
+                risk_resolver=self._risk_resolver,
+                project_root=self._project_root,
+                session_date=session_date,
+                decision_at=decision_at,
+                calendar=calendar,
+            )
+        except CalendarError as error:
             raise WorkflowDataError("STALE_CALENDAR") from error
         try:
             universe = load_current_universe(
@@ -540,15 +589,24 @@ class PremarketWorkflowCoordinator:
             )
         except (EvidenceRegistryError, EvidenceUnavailableError, OSError) as error:
             raise WorkflowDataError("SOURCE_CHECK_FAILED") from error
-        if calendar.is_open(session_date):
+        if session_open:
             if evidence_failure is not None:
+                validation = _resolve_premarket_validation_context(
+                    journal=self._journal,
+                    risk_resolver=self._risk_resolver,
+                    project_root=self._project_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    calendar=calendar,
+                    expected=validation,
+                )
                 return _issue_coordinator_premarket_branch(
                     journal=self._journal,
                     report_archive_root=self._report_archive_root,
                     session_date=session_date,
                     decision_at=decision_at,
                     retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
+                    validation=validation,
                     bindings=bindings,
                     calendar=calendar,
                     universe=universe,
@@ -590,9 +648,27 @@ class PremarketWorkflowCoordinator:
                 raise CanonicalMaterialError(
                     "premarket collector returned an invalid result"
                 )
+            if (
+                collection.collected_at < retrieved_at
+                or collection.collected_at.astimezone(_NEW_YORK).date()
+                != session_date
+            ):
+                raise CanonicalMaterialError(
+                    "premarket collection terminal time is inconsistent"
+                )
+            retrieved_at = collection.collected_at
             bindings = _reread_premarket_bindings(
                 self._journal,
                 (*bindings, *collection.persisted_bindings),
+            )
+            validation = _resolve_premarket_validation_context(
+                journal=self._journal,
+                risk_resolver=self._risk_resolver,
+                project_root=self._project_root,
+                session_date=session_date,
+                decision_at=decision_at,
+                calendar=calendar,
+                expected=validation,
             )
             if collection.failure_reason is not None:
                 return _issue_coordinator_premarket_branch(
@@ -601,7 +677,7 @@ class PremarketWorkflowCoordinator:
                     session_date=session_date,
                     decision_at=decision_at,
                     retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
+                    validation=validation,
                     bindings=bindings,
                     calendar=calendar,
                     universe=universe,
@@ -632,27 +708,6 @@ class PremarketWorkflowCoordinator:
             )
             cohort_data_unavailable = ranked is None
             ranked_candidates = () if ranked is None else ranked
-            if self._risk_resolver is None:
-                return _issue_coordinator_premarket_branch(
-                    journal=self._journal,
-                    report_archive_root=self._report_archive_root,
-                    session_date=session_date,
-                    decision_at=decision_at,
-                    retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
-                    bindings=bindings,
-                    calendar=calendar,
-                    universe=universe,
-                    evidence_release=evidence_release,
-                    snapshot=_empty_premarket_snapshot(False),
-                    publication_decision=None,
-                    primary_plan=None,
-                    outcome="NO NEW TRADE - DATA UNAVAILABLE",
-                    reason_codes=("PROVIDER_CHECK_FAILED",),
-                    phase1_replay_children=_evidence_phase1_children(
-                        evidence_release
-                    ),
-                )
             resolution = self._risk_resolver.resolve(
                 journal=self._journal,
                 session_date=session_date,
@@ -662,15 +717,28 @@ class PremarketWorkflowCoordinator:
                 universe=universe,
                 evidence_release=evidence_release,
                 ranked_candidates=ranked_candidates,
+                validation_breaker=validation.breaker_state,
+            )
+            validation = _resolve_premarket_validation_context(
+                journal=self._journal,
+                risk_resolver=self._risk_resolver,
+                project_root=self._project_root,
+                session_date=session_date,
+                decision_at=decision_at,
+                calendar=calendar,
+                expected=validation,
             )
             breaker_active = _validate_premarket_risk_resolution(
                 resolution,
                 session_date=session_date,
+                decision_at=decision_at,
                 ranked_candidates=ranked_candidates,
+                validation=validation,
             )
             phase1_children = _premarket_phase1_children(
                 evidence_release,
                 resolution,
+                validation,
             )
             if breaker_active:
                 return _issue_coordinator_premarket_branch(
@@ -679,7 +747,7 @@ class PremarketWorkflowCoordinator:
                     session_date=session_date,
                     decision_at=decision_at,
                     retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
+                    validation=validation,
                     bindings=bindings,
                     calendar=calendar,
                     universe=universe,
@@ -699,7 +767,7 @@ class PremarketWorkflowCoordinator:
                     session_date=session_date,
                     decision_at=decision_at,
                     retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
+                    validation=validation,
                     bindings=bindings,
                     calendar=calendar,
                     universe=universe,
@@ -719,7 +787,7 @@ class PremarketWorkflowCoordinator:
                     session_date=session_date,
                     decision_at=decision_at,
                     retrieved_at=retrieved_at,
-                    validation_window_id=self._validation_window_id,
+                    validation=validation,
                     bindings=bindings,
                     calendar=calendar,
                     universe=universe,
@@ -732,13 +800,35 @@ class PremarketWorkflowCoordinator:
                     phase1_replay_children=phase1_children,
                     breaker_state=resolution.breaker_state,
                 )
+            if resolution.capacity_decision is not None:
+                return _issue_coordinator_premarket_branch(
+                    journal=self._journal,
+                    report_archive_root=self._report_archive_root,
+                    session_date=session_date,
+                    decision_at=decision_at,
+                    retrieved_at=retrieved_at,
+                    validation=validation,
+                    bindings=bindings,
+                    calendar=calendar,
+                    universe=universe,
+                    evidence_release=evidence_release,
+                    snapshot=_empty_premarket_snapshot(False),
+                    publication_decision=None,
+                    primary_plan=None,
+                    capacity_decision=resolution.capacity_decision,
+                    capacity_candidate=ranked_candidates[0],
+                    outcome="NO TRADE",
+                    reason_codes=("NO_PRIMARY_CAPACITY",),
+                    phase1_replay_children=phase1_children,
+                    breaker_state=resolution.breaker_state,
+                )
             return _issue_coordinator_premarket_branch(
                 journal=self._journal,
                 report_archive_root=self._report_archive_root,
                 session_date=session_date,
                 decision_at=decision_at,
                 retrieved_at=retrieved_at,
-                validation_window_id=self._validation_window_id,
+                validation=validation,
                 bindings=bindings,
                 calendar=calendar,
                 universe=universe,
@@ -754,26 +844,172 @@ class PremarketWorkflowCoordinator:
                 phase1_replay_children=phase1_children,
                 breaker_state=resolution.breaker_state,
             )
-        return _issue_coordinator_premarket_branch(
-            journal=self._journal,
-            report_archive_root=self._report_archive_root,
-            session_date=session_date,
-            decision_at=decision_at,
-            retrieved_at=retrieved_at,
-            validation_window_id=self._validation_window_id,
-            bindings=bindings,
-            calendar=calendar,
-            universe=universe,
-            evidence_release=evidence_release,
-            snapshot=_empty_premarket_snapshot(False),
-            publication_decision=None,
-            primary_plan=None,
-            outcome="NO TRADE",
-            reason_codes=("MARKET_CLOSED",),
-            phase1_replay_children=_evidence_phase1_children(
-                evidence_release
-            ),
+        raise CanonicalMaterialError(
+            "premarket coordinator session authority changed during composition"
         )
+
+
+def _resolve_premarket_validation_context(
+    *,
+    journal: object,
+    risk_resolver: object,
+    project_root: Path,
+    session_date: date,
+    decision_at: datetime,
+    calendar: object,
+    expected: _PremarketValidationContext | None = None,
+) -> _PremarketValidationContext:
+    """Derive the validation window only from one current breaker-history read."""
+    from . import journal as journal_module
+    from . import risk as risk_module
+    from .journal import Journal, Phase1BreakerHistorySource
+    from .market_calendar import MarketCalendar
+
+    if (
+        type(journal) is not Journal
+        or getattr(journal, "_closed", True)
+        or type(project_root) is not type(Path())
+        or not project_root.is_absolute()
+        or type(calendar) is not MarketCalendar
+    ):
+        raise CanonicalMaterialError(
+            "premarket validation authority context is unavailable"
+        )
+    issue = getattr(risk_resolver, "validation_breaker", None)
+    if not callable(issue):
+        raise CanonicalMaterialError(
+            "premarket validation authority resolver is unavailable"
+        )
+    if expected is not None and type(expected) is not _PremarketValidationContext:
+        raise CanonicalMaterialError(
+            "premarket validation authority context is malformed"
+        )
+    if expected is None:
+        resolver = _premarket_validation_calendar_resolver(
+            project_root=project_root,
+            session_date=session_date,
+            calendar=calendar,
+        )
+    else:
+        resolver = expected.calendar_resolver
+    if (
+        type(resolver) is not risk_module.SessionCalendarResolver
+        or not resolver.release_verified
+        or not any(
+            candidate is calendar for candidate in resolver.calendars
+        )
+    ):
+        raise CanonicalMaterialError(
+            "premarket validation calendar authority is unavailable"
+        )
+    try:
+        previous_session = resolver.previous_session(session_date)
+    except risk_module.RiskBlock as error:
+        from .market_calendar import CalendarError
+
+        raise CalendarError(
+            "premarket validation calendar coverage is missing"
+        ) from error
+    breaker = issue(
+        journal=journal,
+        session_date=session_date,
+        decision_at=decision_at,
+        calendar=calendar,
+        calendar_resolver=resolver,
+    )
+    bindings = risk_module._phase1_bound_sources(breaker)
+    if (
+        type(breaker) is not risk_module.BreakerState
+        or not risk_module.is_issued_breaker_state(breaker)
+        or breaker.ledger_name != "CANONICAL"
+        or breaker.as_of != previous_session
+        or len(bindings) != 1
+        or bindings[0][1] != "BREAKER_HISTORY"
+        or type(bindings[0][0]) is not Phase1BreakerHistorySource
+    ):
+        raise CanonicalMaterialError(
+            "premarket validation breaker authority is unavailable"
+        )
+    source = bindings[0][0]
+    source_candidate = journal_module._journal_any_source_authority_candidate(
+        source
+    )
+    if (
+        source.ledger_name != "CANONICAL"
+        or source.through_session != previous_session
+        or source.query_cutoff != decision_at
+        or source.calendar_digest != risk_module._calendar_digest(resolver)
+        or breaker.history_digest != source.source_digest
+        or _validation_window_id(source.validation_window_id)
+        != source.validation_window_id
+        or source_candidate is None
+        or journal_module._current_journal_source_authority_owner(
+            (source_candidate,)
+        )
+        is not journal
+        or not journal_module._is_current_journal_authority_candidate_without_callbacks(
+            source_candidate
+        )
+        or not risk_module._is_current_breaker_state_without_callbacks(breaker)
+    ):
+        raise CanonicalMaterialError(
+            "premarket validation history has the wrong owner or is not current"
+        )
+    resolved = _PremarketValidationContext(
+        breaker_state=breaker,
+        history_source=source,
+        validation_window_id=source.validation_window_id,
+        calendar_resolver=resolver,
+    )
+    if expected is not None and (
+        type(expected) is not _PremarketValidationContext
+        or resolved.calendar_resolver is not expected.calendar_resolver
+        or resolved.validation_window_id != expected.validation_window_id
+        or resolved.history_source.window_start_session
+        != expected.history_source.window_start_session
+        or resolved.history_source.window_start_source_id
+        != expected.history_source.window_start_source_id
+        or resolved.history_source.source_digest
+        != expected.history_source.source_digest
+    ):
+        raise CanonicalMaterialError(
+            "premarket validation authority changed during collection"
+        )
+    return resolved
+
+
+def _premarket_validation_calendar_resolver(
+    *,
+    project_root: Path,
+    session_date: date,
+    calendar: object,
+) -> object:
+    """Load only release-pinned adjacent coverage needed for the prior session."""
+    from . import risk as risk_module
+    from .market_calendar import CalendarError, load_current_market_calendar
+
+    resolver = risk_module.SessionCalendarResolver((calendar,))
+    try:
+        resolver.previous_session(session_date)
+        return resolver
+    except risk_module.RiskBlock as error:
+        if error.reason_code != "CALENDAR_COVERAGE_MISSING":
+            raise CalendarError(
+                "premarket validation calendar arithmetic failed"
+            ) from error
+    previous_year = session_date.year - 1
+    adjacent = load_current_market_calendar(
+        project_root,
+        as_of=date(previous_year, 12, 31),
+    )
+    resolver = risk_module.SessionCalendarResolver((adjacent, calendar))
+    try:
+        resolver.previous_session(session_date)
+    except risk_module.RiskBlock as error:
+        raise CalendarError(
+            "premarket validation calendar coverage is missing"
+        ) from error
+    return resolver
 
 
 def _require_digest(value: object, label: str) -> str:
@@ -2043,7 +2279,9 @@ def _validate_premarket_risk_resolution(
     resolution: object,
     *,
     session_date: date,
+    decision_at: datetime,
     ranked_candidates: tuple[object, ...],
+    validation: _PremarketValidationContext,
 ) -> bool:
     from . import risk as risk_module
     from . import screening as screening_module
@@ -2053,12 +2291,27 @@ def _validate_premarket_risk_resolution(
             "premarket risk resolver returned an invalid result"
         )
     breaker = resolution.breaker_state
-    if not (
-        risk_module.is_issued_breaker_state(breaker)
-        or risk_module.is_issued_paired_breaker_state(breaker)
+    if (
+        type(breaker) is not risk_module.BreakerState
+        or not risk_module.is_issued_breaker_state(breaker)
     ):
         raise CanonicalMaterialError(
             "premarket breaker authority is unavailable"
+        )
+    breaker_sources = tuple(
+        source
+        for source, kind in risk_module._phase1_bound_sources(breaker)
+        if kind == "BREAKER_HISTORY"
+    )
+    if (
+        len(breaker_sources) != 1
+        or breaker_sources[0].validation_window_id
+        != validation.validation_window_id
+        or breaker_sources[0].source_digest
+        != validation.history_source.source_digest
+    ):
+        raise CanonicalMaterialError(
+            "premarket breaker and validation histories conflict"
         )
     breaker_active = risk_module.breaker_pauses_entry(
         breaker,
@@ -2066,12 +2319,43 @@ def _validate_premarket_risk_resolution(
     )
     decision = resolution.publication_decision
     plan = resolution.primary_plan
+    capacity = resolution.capacity_decision
     if breaker_active or not ranked_candidates:
-        if decision is not None or plan is not None:
+        if decision is not None or plan is not None or capacity is not None:
             raise CanonicalMaterialError(
                 "premarket blocked cohort cannot carry a sized plan"
             )
         return breaker_active
+    if capacity is not None:
+        request = risk_module.LongPlanRequest.from_scored_candidate(
+            ranked_candidates[0]
+        )
+        portfolio = getattr(capacity, "portfolio_authority", None)
+        if (
+            decision is not None
+            or plan is not None
+            or type(capacity) is not risk_module.LongPlanDecision
+            or not risk_module.is_issued_long_plan_decision(capacity)
+            or capacity.eligible
+            or capacity.plan is not None
+            or capacity.target is not None
+            or capacity.request != request
+            or capacity.authority_scope != "CANONICAL_PUBLICATION"
+            or capacity.as_of != decision_at
+            or not capacity.reason_codes
+            or not set(capacity.reason_codes).issubset(
+                _PRIMARY_CAPACITY_REASONS
+            )
+            or not risk_module.is_issued_portfolio_risk_authority(portfolio)
+            or portfolio is not capacity.portfolio_authority
+            or portfolio.request is not capacity.request
+            or len(portfolio.portfolio_state.breaker_states) != 1
+            or portfolio.portfolio_state.breaker_states[0] is not breaker
+        ):
+            raise CanonicalMaterialError(
+                "premarket capacity decision authority is inconsistent"
+            )
+        return False
     if (
         not risk_module.is_issued_long_plan_decision(plan)
         or not screening_module.is_issued_publication_decision_for_plan(
@@ -2227,10 +2511,21 @@ def _evidence_phase1_children(evidence_release: object) -> tuple[object, ...]:
 def _premarket_phase1_children(
     evidence_release: object,
     resolution: PremarketRiskResolution,
+    validation: _PremarketValidationContext,
 ) -> tuple[object, ...]:
     from . import risk as risk_module
 
-    values = list(_evidence_phase1_children(evidence_release))
+    values = [
+        *_evidence_phase1_children(evidence_release),
+        validation.history_source,
+    ]
+    if resolution.capacity_decision is not None:
+        values.extend(
+            source
+            for source, _kind in risk_module._phase1_bound_sources(
+                resolution.capacity_decision.portfolio_authority
+            )
+        )
     values.extend(
         source
         for source, _kind in risk_module._phase1_bound_sources(
@@ -2741,7 +3036,7 @@ def _issue_coordinator_premarket_branch(
     session_date: date,
     decision_at: datetime,
     retrieved_at: datetime,
-    validation_window_id: str,
+    validation: _PremarketValidationContext,
     bindings: tuple[PremarketSourceBinding, ...],
     calendar: object,
     universe: object,
@@ -2749,6 +3044,8 @@ def _issue_coordinator_premarket_branch(
     snapshot: object,
     publication_decision: object | None,
     primary_plan: object | None,
+    capacity_decision: object | None = None,
+    capacity_candidate: object | None = None,
     outcome: str,
     reason_codes: tuple[str, ...],
     phase1_replay_children: tuple[object, ...],
@@ -2756,6 +3053,14 @@ def _issue_coordinator_premarket_branch(
 ) -> object:
     from .reports import PremarketState, render_premarket_report
 
+    phase1_children: list[object] = []
+    for child in phase1_replay_children:
+        if not any(child is current for current in phase1_children):
+            phase1_children.append(child)
+    if not any(
+        validation.history_source is current for current in phase1_children
+    ):
+        phase1_children.append(validation.history_source)
     source_authority = issue_canonical_premarket_source_binding_authority(
         journal=journal,
         decision_at=decision_at,
@@ -2768,18 +3073,21 @@ def _issue_coordinator_premarket_branch(
         session_date=session_date,
         decision_at=decision_at,
         retrieved_at=retrieved_at,
-        validation_window_id=validation_window_id,
+        validation_window_id=validation.validation_window_id,
         source_binding_authority=source_authority,
         snapshot=snapshot,
         publication_decision=publication_decision,
         primary_plan=primary_plan,
+        capacity_decision=capacity_decision,
+        capacity_candidate=capacity_candidate,
         outcome=outcome,
         reason_codes=reason_codes,
         calendar=calendar,
         universe=universe,
         evidence_release=evidence_release,
-        phase1_replay_children=phase1_replay_children,
+        phase1_replay_children=tuple(phase1_children),
         breaker_state=breaker_state,
+        validation_breaker_state=validation.breaker_state,
     )
     state_hash = canonical_premarket_state_hash(
         session_date=session_date,
@@ -2789,7 +3097,7 @@ def _issue_coordinator_premarket_branch(
         source_receipts=receipts,
         publication_decision=publication_decision,
         primary_plan=primary_plan,
-        validation_window_id=validation_window_id,
+        validation_window_id=validation.validation_window_id,
         outcome=outcome,
         reason_codes=reason_codes,
         composition_authority=composition,
@@ -2820,7 +3128,7 @@ def _issue_coordinator_premarket_branch(
         source_receipts=receipts,
         publication_decision=publication_decision,
         primary_plan=primary_plan,
-        validation_window_id=validation_window_id,
+        validation_window_id=validation.validation_window_id,
         composition_authority=composition,
     )
 
@@ -3216,6 +3524,8 @@ class _PremarketCompositionEnvelope:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    capacity_decision_digest: str | None = None
+    capacity_candidate_digest: str | None = None
     source_binding_digest: str | None = None
     decision_basis: tuple[tuple[int, str, str], ...] = ()
     calendar_release_sha256: str | None = None
@@ -3234,6 +3544,8 @@ class _CompositionAuthorityCandidate:
     journal_generation: int | None = None
     source_binding_candidate: object | None = None
     phase1_candidates: tuple[object, ...] = ()
+    risk_children: tuple[object, ...] = ()
+    semantic_children: tuple[tuple[object, str], ...] = ()
 
 
 _PREMARKET_COMPOSITION_LOCK = threading.Lock()
@@ -3272,6 +3584,8 @@ def _premarket_composition_envelope(
     snapshot: object,
     publication_decision: object | None,
     primary_plan: object | None,
+    capacity_decision_digest: str | None = None,
+    capacity_candidate_digest: str | None = None,
     outcome: str,
     reason_codes: tuple[str, ...],
     source_binding_digest: str | None = None,
@@ -3320,6 +3634,28 @@ def _premarket_composition_envelope(
     snapshot_digest = _snapshot_digest(snapshot)
     decision_digest = _publication_decision_digest(publication_decision)
     plan_digest = _long_plan_digest(primary_plan)
+    if capacity_decision_digest is not None:
+        _require_digest(
+            capacity_decision_digest,
+            "premarket capacity-decision digest",
+        )
+    if capacity_candidate_digest is not None:
+        _require_digest(
+            capacity_candidate_digest,
+            "premarket capacity-candidate digest",
+        )
+    capacity_blocked = reasons == ("NO_PRIMARY_CAPACITY",)
+    capacity_pair_complete = (
+        capacity_decision_digest is not None
+        and capacity_candidate_digest is not None
+    )
+    capacity_pair_malformed = (capacity_decision_digest is None) != (
+        capacity_candidate_digest is None
+    )
+    if capacity_blocked != capacity_pair_complete or capacity_pair_malformed:
+        raise CanonicalMaterialError(
+            "premarket capacity branch lacks its exact candidate and decision digests"
+        )
     extended_values = (
         source_binding_digest,
         calendar_release_sha256,
@@ -3366,6 +3702,8 @@ def _premarket_composition_envelope(
         "snapshot_digest": snapshot_digest,
         "publication_decision_digest": decision_digest,
         "primary_plan_digest": plan_digest,
+        "capacity_decision_digest": capacity_decision_digest,
+        "capacity_candidate_digest": capacity_candidate_digest,
         "outcome": outcome,
         "reason_codes": reasons,
         "source_binding_digest": source_binding_digest,
@@ -3385,6 +3723,8 @@ def _premarket_composition_envelope(
         snapshot_digest=snapshot_digest,
         publication_decision_digest=decision_digest,
         primary_plan_digest=plan_digest,
+        capacity_decision_digest=capacity_decision_digest,
+        capacity_candidate_digest=capacity_candidate_digest,
         outcome=outcome,
         reason_codes=reasons,
         composition_digest=_composition_digest(
@@ -3421,6 +3761,8 @@ class CanonicalPremarketCompositionAuthority:
     outcome: str
     reason_codes: tuple[str, ...]
     composition_digest: str
+    capacity_decision_digest: str | None = None
+    capacity_candidate_digest: str | None = None
     source_binding_digest: str | None = None
     decision_basis: tuple[tuple[int, str, str], ...] = ()
     calendar_release_sha256: str | None = None
@@ -3459,6 +3801,18 @@ class CanonicalPremarketCompositionAuthority:
                 "premarket composition publication-decision digest",
             )
             _require_digest(plan_digest, "premarket composition primary-plan digest")
+        capacity_digest = self.capacity_decision_digest
+        if capacity_digest is not None:
+            _require_digest(
+                capacity_digest,
+                "premarket composition capacity-decision digest",
+            )
+        capacity_candidate_digest = self.capacity_candidate_digest
+        if capacity_candidate_digest is not None:
+            _require_digest(
+                capacity_candidate_digest,
+                "premarket composition capacity-candidate digest",
+            )
         reasons = _validate_premarket_outcome_reasons(
             self.outcome,
             self.reason_codes,
@@ -3466,6 +3820,21 @@ class CanonicalPremarketCompositionAuthority:
         if (self.outcome == "CANDIDATES") != (decision_digest is not None):
             raise CanonicalMaterialError(
                 "premarket composition candidate authority is inconsistent"
+            )
+        capacity_pair_complete = (
+            capacity_digest is not None
+            and capacity_candidate_digest is not None
+        )
+        capacity_pair_malformed = (capacity_digest is None) != (
+            capacity_candidate_digest is None
+        )
+        if (
+            (reasons == ("NO_PRIMARY_CAPACITY",))
+            != capacity_pair_complete
+            or capacity_pair_malformed
+        ):
+            raise CanonicalMaterialError(
+                "premarket composition capacity authority is inconsistent"
             )
         if reasons == ("ACTIVE_BREAKER",) and self.outcome != "NO TRADE":
             raise CanonicalMaterialError(
@@ -3502,6 +3871,53 @@ class CanonicalPremarketCompositionAuthority:
             )
 
 
+def _premarket_risk_child_is_current_without_callbacks(child: object) -> bool:
+    from . import risk as risk_module
+
+    if type(child) is risk_module.BreakerState:
+        return risk_module._is_current_breaker_state_without_callbacks(child)
+    if type(child) is risk_module.LongPlanDecision:
+        portfolio = child.portfolio_authority
+        return bool(
+            portfolio is not None
+            and risk_module._is_current_portfolio_risk_authority_without_callbacks(
+                portfolio
+            )
+            and risk_module._phase1_derived_sources_are_current_without_callbacks(
+                portfolio
+            )
+            and risk_module._is_current_risk_authority_without_callbacks(
+                risk_module._LONG_PLAN_AUTHORITIES,
+                child,
+                exact_type=risk_module.LongPlanDecision,
+                children=(portfolio,),
+            )
+        )
+    return False
+
+
+def _premarket_semantic_child_is_current_without_callbacks(
+    child: object,
+    digest: str,
+) -> bool:
+    from . import screening as screening_module
+
+    if type(child) is not screening_module.ScoredCandidate:
+        return False
+    try:
+        current_digest = screening_module._scored_candidate_fingerprint(child)
+    except Exception:
+        return False
+    with screening_module._ISSUED_SCORED_CANDIDATES_LOCK:
+        issued = screening_module._ISSUED_SCORED_CANDIDATES.get(id(child))
+        return bool(
+            type(issued) is screening_module._IssuedScoredCandidateAuthority
+            and issued.reference() is child
+            and issued.candidate_digest == digest
+            and current_digest == digest
+        )
+
+
 def _is_issued_premarket_composition_authority(
     authority: object,
     *,
@@ -3531,6 +3947,10 @@ def _is_issued_premarket_composition_authority(
         or authority.publication_decision_digest
         != envelope.publication_decision_digest
         or authority.primary_plan_digest != envelope.primary_plan_digest
+        or authority.capacity_decision_digest
+        != envelope.capacity_decision_digest
+        or authority.capacity_candidate_digest
+        != envelope.capacity_candidate_digest
         or authority.outcome != envelope.outcome
         or authority.reason_codes != envelope.reason_codes
         or authority.composition_digest != envelope.composition_digest
@@ -3606,6 +4026,17 @@ def _is_issued_premarket_composition_authority(
                     )
                     for phase1_candidate in candidate.phase1_candidates
                 )
+                and all(
+                    _premarket_risk_child_is_current_without_callbacks(child)
+                    for child in candidate.risk_children
+                )
+                and all(
+                    _premarket_semantic_child_is_current_without_callbacks(
+                        child,
+                        digest,
+                    )
+                    for child, digest in candidate.semantic_children
+                )
             )
         return bool(
             candidate.authority_fingerprint == authority_fingerprint
@@ -3624,6 +4055,8 @@ def _premarket_composition_extended_values(
     ):
         return {}
     return {
+        "capacity_decision_digest": authority.capacity_decision_digest,
+        "capacity_candidate_digest": authority.capacity_candidate_digest,
         "source_binding_digest": authority.source_binding_digest,
         "decision_basis": authority.decision_basis,
         "calendar_release_sha256": authority.calendar_release_sha256,
@@ -3644,6 +4077,8 @@ def issue_canonical_premarket_composition_authority(
     snapshot: object,
     publication_decision: object | None,
     primary_plan: object | None,
+    capacity_decision: object | None = None,
+    capacity_candidate: object | None = None,
     outcome: str,
     reason_codes: tuple[str, ...],
     calendar: object,
@@ -3651,12 +4086,14 @@ def issue_canonical_premarket_composition_authority(
     evidence_release: object,
     phase1_replay_children: tuple[object, ...],
     breaker_state: object | None = None,
+    validation_breaker_state: object | None = None,
 ) -> CanonicalPremarketCompositionAuthority:
     """Seal reviewed releases, receipt bindings, and replay children together."""
     from . import evidence as evidence_module
     from . import journal as journal_module
     from . import market_calendar as calendar_module
     from . import risk as risk_module
+    from . import screening as screening_module
     from . import universe as universe_module
     from .journal import Journal
 
@@ -3739,6 +4176,90 @@ def issue_canonical_premarket_composition_authority(
         for bundle in evidence_release.by_symbol.values()
         if bundle._phase1_source is not None
     )
+    risk_children: list[object] = []
+    semantic_children: list[tuple[object, str]] = []
+    capacity_candidate_digest: str | None = None
+    if validation_breaker_state is not None:
+        if (
+            type(validation_breaker_state) is not risk_module.BreakerState
+            or not risk_module.is_issued_breaker_state(
+                validation_breaker_state
+            )
+        ):
+            raise CanonicalMaterialError(
+                "premarket validation breaker authority is unavailable"
+            )
+        validation_sources = tuple(
+            source
+            for source, kind in risk_module._phase1_bound_sources(
+                validation_breaker_state
+            )
+            if kind == "BREAKER_HISTORY"
+        )
+        if (
+            len(validation_sources) != 1
+            or validation_sources[0].validation_window_id
+            != validation_window_id
+        ):
+            raise CanonicalMaterialError(
+                "premarket validation window conflicts with breaker history"
+            )
+        expected_phase1_values.extend(validation_sources)
+        risk_children.append(validation_breaker_state)
+    if (capacity_decision is None) != (capacity_candidate is None):
+        raise CanonicalMaterialError(
+            "premarket capacity candidate and decision must be paired"
+        )
+    if capacity_decision is not None:
+        try:
+            capacity_request = risk_module.LongPlanRequest.from_scored_candidate(
+                capacity_candidate
+            )
+            capacity_candidate_digest = (
+                screening_module._scored_candidate_fingerprint(
+                    capacity_candidate
+                )
+            )
+        except Exception as error:
+            raise CanonicalMaterialError(
+                "premarket capacity candidate authority is unavailable"
+            ) from error
+        if (
+            type(capacity_candidate) is not screening_module.ScoredCandidate
+            or not screening_module.is_issued_scored_candidate(
+                capacity_candidate
+            )
+            or capacity_candidate.publication_session != session_date
+            or type(capacity_decision) is not risk_module.LongPlanDecision
+            or not risk_module.is_issued_long_plan_decision(capacity_decision)
+            or capacity_decision.eligible
+            or capacity_decision.plan is not None
+            or capacity_decision.target is not None
+            or capacity_decision.authority_scope != "CANONICAL_PUBLICATION"
+            or capacity_decision.as_of != decision_at
+            or capacity_decision.request != capacity_request
+            or not capacity_decision.reason_codes
+            or not set(capacity_decision.reason_codes).issubset(
+                _PRIMARY_CAPACITY_REASONS
+            )
+            or publication_decision is not None
+            or primary_plan is not None
+            or outcome != "NO TRADE"
+            or reason_codes != ("NO_PRIMARY_CAPACITY",)
+        ):
+            raise CanonicalMaterialError(
+                "premarket capacity candidate and decision conflict"
+            )
+        expected_phase1_values.extend(
+            source
+            for source, _kind in risk_module._phase1_bound_sources(
+                capacity_decision.portfolio_authority
+            )
+        )
+        risk_children.append(capacity_decision)
+        semantic_children.append(
+            (capacity_candidate, capacity_candidate_digest)
+        )
     if breaker_state is not None:
         if not (
             risk_module.is_issued_breaker_state(breaker_state)
@@ -3760,6 +4281,8 @@ def issue_canonical_premarket_composition_authority(
                 breaker_state
             )
         )
+        if not any(breaker_state is child for child in risk_children):
+            risk_children.append(breaker_state)
         if primary_plan is not None:
             expected_phase1_values.extend(
                 source
@@ -3841,6 +4364,8 @@ def issue_canonical_premarket_composition_authority(
         snapshot=snapshot,
         publication_decision=publication_decision,
         primary_plan=primary_plan,
+        capacity_decision_digest=_long_plan_digest(capacity_decision),
+        capacity_candidate_digest=capacity_candidate_digest,
         outcome=outcome,
         reason_codes=reason_codes,
         source_binding_digest=source_binding_authority.binding_digest,
@@ -3860,6 +4385,8 @@ def issue_canonical_premarket_composition_authority(
         snapshot_digest=envelope.snapshot_digest,
         publication_decision_digest=envelope.publication_decision_digest,
         primary_plan_digest=envelope.primary_plan_digest,
+        capacity_decision_digest=envelope.capacity_decision_digest,
+        capacity_candidate_digest=envelope.capacity_candidate_digest,
         outcome=envelope.outcome,
         reason_codes=envelope.reason_codes,
         composition_digest=envelope.composition_digest,
@@ -3884,6 +4411,9 @@ def issue_canonical_premarket_composition_authority(
         evidence_release,
         *tuple(evidence_release.by_symbol.values()),
         breaker_state,
+        validation_breaker_state,
+        capacity_decision,
+        capacity_candidate,
         *phase1_replay_children,
     )
     generation = getattr(journal, "_source_generation", None)
@@ -3906,6 +4436,8 @@ def issue_canonical_premarket_composition_authority(
         journal_generation=generation,
         source_binding_candidate=source_candidate,
         phase1_candidates=exact_phase1_candidates,
+        risk_children=tuple(risk_children),
+        semantic_children=tuple(semantic_children),
     )
     with _PREMARKET_COMPOSITION_LOCK:
         _ISSUED_PREMARKET_COMPOSITIONS[identity] = candidate
@@ -4026,6 +4558,8 @@ def canonical_premarket_state_hash(
         "snapshot_digest": envelope.snapshot_digest,
         "publication_decision_digest": envelope.publication_decision_digest,
         "primary_plan_digest": envelope.primary_plan_digest,
+        "capacity_decision_digest": envelope.capacity_decision_digest,
+        "capacity_candidate_digest": envelope.capacity_candidate_digest,
         "outcome": envelope.outcome,
         "reason_codes": envelope.reason_codes,
         "composition_digest": envelope.composition_digest,

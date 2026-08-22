@@ -1466,9 +1466,20 @@ def _quote_spread(
         local = timestamp.astimezone(_ET)
         if latest_completed is not None and local.date() != latest_completed:
             _append(data_reasons, "PREVIOUS_SESSION_QUOTE_WRONG_SESSION")
-        wall = local.timetz().replace(tzinfo=None)
-        if wall < time(15, 55) or wall > time(16, 0):
+        try:
+            if type(latest_completed) is not date:
+                raise CalendarError("previous quote session is unavailable")
+            session = context.market_calendar.session(latest_completed)
+            closed_at = datetime.combine(
+                latest_completed,
+                session.close_time,
+                session.timezone,
+            )
+        except (AttributeError, CalendarError):
             _append(data_reasons, "PREVIOUS_SESSION_QUOTE_OUTSIDE_WINDOW")
+        else:
+            if not closed_at - timedelta(minutes=5) <= local <= closed_at:
+                _append(data_reasons, "PREVIOUS_SESSION_QUOTE_OUTSIDE_WINDOW")
     if (
         not isinstance(bid, Decimal)
         or not isinstance(ask, Decimal)

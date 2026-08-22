@@ -228,7 +228,10 @@ class AcceptanceTests(unittest.TestCase):
             "2–10 trading days",
             "Phase 1",
             "Phase 2",
-            "./scripts/run_monitor.sh",
+            (
+                "/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/"
+                "scripts/run_monitor_unattended.sh"
+            ),
             "provider smoke",
             "reconciliation",
             "export",

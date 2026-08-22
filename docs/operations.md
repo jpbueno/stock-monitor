@@ -184,19 +184,19 @@ Give each source message a stable unique ID and its original offset-aware
 message time. Examples:
 
 ```sh
-./scripts/run_monitor.sh confirm \
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' confirm \
   --message-id msg-account-20260814-1010 \
   --message-time 2026-08-14T10:10:00-04:00 \
   --text 'ACCOUNT CHECK settled_cash 5000 pending_orders 0 unlogged_positions 0 AT 10:10 ET' \
   --json
 
-./scripts/run_monitor.sh confirm \
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' confirm \
   --message-id msg-buy-aapl-20260814-1014 \
   --message-time 2026-08-14T10:14:00-04:00 \
   --text 'BOUGHT AAPL 4 shares @ 225.10 AT 10:14 ET; BID 225.09 ASK 225.10; STOP SET @ 220.00' \
   --json
 
-./scripts/run_monitor.sh confirm \
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' confirm \
   --message-id msg-skip-spy-20260814 \
   --message-time 2026-08-14T10:20:00-04:00 \
   --text 'SKIPPED SPY' \
@@ -229,7 +229,7 @@ report is clear, take no new action and do not infer state from Robinhood.
 ## Inspectable exports
 
 ```sh
-./scripts/run_monitor.sh export --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' export --json
 ```
 
 Exit `0` returns the CSV paths under `.stock-monitor/exports/`. Money is

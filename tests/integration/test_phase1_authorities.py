@@ -27,6 +27,7 @@ import stock_monitor.reconciliation as reconciliation_module
 import stock_monitor.risk as risk_module
 import stock_monitor.screening as screening_module
 import stock_monitor.validation as validation_module
+import tests.integration.test_signal_lifecycle as signal_lifecycle_test_module
 import tests.unit._task5_fixtures as task5_fixture_module
 import tests.unit.test_evidence as evidence_test_module
 from stock_monitor.evidence import DateRange, EvidenceSourceBinding
@@ -96,6 +97,47 @@ def _provider_timestamp(value: datetime) -> str:
 
 def _session_hold_sessions(session_date: date) -> tuple[date, ...]:
     return tuple(_calendar().add_sessions(session_date, offset) for offset in range(10))
+
+
+def _bind_test_parent_release(bundle: object) -> object:
+    """Bind synthetic scoped evidence to one deterministic test-only release."""
+    universe_sha256 = TEST_UNIVERSE._release_pin
+    if not isinstance(universe_sha256, str):
+        raise AssertionError("test universe release pin is unavailable")
+    review_by = min(
+        binding.valid_until for binding in bundle.source_bindings
+    )
+    release_sha256 = hashlib.sha256(
+        (
+            "stock-monitor/test-reviewed-evidence-release/v1\x00"
+            + bundle.registry_id
+            + "\x00"
+            + bundle.content_hash
+            + "\x00"
+            + universe_sha256
+            + "\x00"
+            + reviewed_evidence_iso(review_by)
+        ).encode("utf-8")
+    ).hexdigest()
+    registry = evidence_module.EvidenceRegistry(
+        registry_id=bundle.registry_id,
+        reviewed_at=bundle.reviewed_at,
+        subject_kind=bundle.subject_kind,
+        symbol=bundle.symbol,
+        issuer_cik=bundle.issuer_cik,
+        records=bundle.records,
+        source_bindings=bundle.source_bindings,
+        coverage_attestations=bundle.coverage_attestations,
+        content_hash=bundle.content_hash,
+    )
+    return evidence_module._issue_reviewed_evidence_bundle(
+        registry,
+        release_pin=bundle.content_hash,
+        parent_release_id=f"test-reviewed-release-{release_sha256[:24]}",
+        parent_release_sha256=release_sha256,
+        parent_universe_sha256=universe_sha256,
+        parent_release_review_by=review_by,
+    )
 
 
 def _session_reviewed_evidence(
@@ -172,26 +214,33 @@ def _session_reviewed_evidence(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
+    coverage_role, coverage_pair, scoped_authority = (
+        task5_fixture_module._test_coverage_authority(symbol, issuer_cik)
+    )
     coverage_document = SourceDocument(
-        url="https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+        url=coverage_pair[0],
         published_at=retrieved_at,
         retrieved_at=retrieved_at,
         content_hash=hashlib.sha256(coverage_body).hexdigest(),
         body=coverage_body,
         source_observation_id=coverage_identifier,
-        publisher="Nasdaq",
+        publisher=coverage_pair[1],
         source_type="OFFICIAL_REFERENCE",
         timestamp_source="PRIMARY_METADATA",
-        source_role="CROSS_CHECK_CALENDAR",
+        source_role=coverage_role,
     )
-    coverage_binding = EvidenceSourceBinding.from_document(
-        coverage_document,
-        symbol=symbol,
-        issuer_cik=issuer_cik,
-        checked_at=retrieved_at,
-        valid_until=retrieved_at + timedelta(hours=24),
-        healthy=True,
-    )
+    with mock.patch.dict(
+        evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+        {coverage_role: scoped_authority},
+    ):
+        coverage_binding = EvidenceSourceBinding.from_document(
+            coverage_document,
+            symbol=symbol,
+            issuer_cik=issuer_cik,
+            checked_at=retrieved_at,
+            valid_until=retrieved_at + timedelta(hours=24),
+            healthy=True,
+        )
     bindings = tuple(
         sorted(
             (primary_binding, coverage_binding),
@@ -244,6 +293,12 @@ def _session_reviewed_evidence(
             evidence_module,
             "CURRENT_EVIDENCE_REGISTRY_SHA256",
             release_sha256,
+        ), mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {coverage_role: scoped_authority},
+        ), mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {coverage_role: frozenset({coverage_pair})},
         ):
             bundle = evidence_module.load_current_evidence_bundle(
                 project_root,
@@ -253,6 +308,7 @@ def _session_reviewed_evidence(
                     for value in bindings
                 },
             )
+    bundle = _bind_test_parent_release(bundle)
     hold_sessions = _session_hold_sessions(session_date)
     decision = evidence_module.classify_evidence(
         (record,),
@@ -559,6 +615,7 @@ def _session_candidate_contexts(
     session_date: date,
     *,
     sequence: int,
+    use_universe_identity: bool = False,
 ) -> tuple[object, ...]:
     resolver = _calendar()
     market_calendar = resolver.calendars[0]
@@ -595,7 +652,13 @@ def _session_candidate_contexts(
     for context in raw_contexts:
         symbol = context.record.symbol
         is_etf = context.record.product_type == "etf"
-        issuer_cik = None if is_etf else "0000000000"
+        issuer_cik = (
+            None
+            if is_etf
+            else context.record.issuer_cik
+            if use_universe_identity
+            else "0000000000"
+        )
         with mock.patch.object(task5_fixture_module, "RUN_AT", as_of):
             instrument_status = task5_fixture_module.reviewed_instrument_status(
                 symbol,
@@ -647,10 +710,12 @@ def _issued_provider_candidates_for_session(
     *,
     sequence: int,
     count: int = 1,
+    use_universe_identity: bool = False,
 ):
     raw_contexts = _session_candidate_contexts(
         session_date,
         sequence=sequence,
+        use_universe_identity=use_universe_identity,
     )
     transport = _CandidateAlpacaTransport(raw_contexts)
     now = aware_et(session_date, "08:45").astimezone(UTC)
@@ -828,6 +893,22 @@ def _append_publication_source_pin(
         }
     )
     return row_id, hashlib.sha256(observation_material.encode()).hexdigest()
+
+
+def _signal_lifecycle_provider_raw_pages() -> dict[str, dict[str, object]]:
+    """Project this module's exact provider pages into the imported publisher."""
+    pages: dict[str, dict[str, object]] = {}
+    for external_id, fixture in _PROVIDER_PAGE_FIXTURES.items():
+        page = fixture["page"]
+        pages[external_id] = {
+            "feed": str(fixture["feed"]).upper(),
+            "payload": fixture["body"],
+            "retrieved_at": fixture["retrieved_at"],
+            "source_time": fixture["source_time"],
+            "source_type": page.source_type,
+            "source_uri": page.request_url,
+        }
+    return pages
 
 
 def _publish_session_primary(
@@ -1280,6 +1361,7 @@ def _reviewed_position_evidence_context(
     )
     if symbol_override is not None:
         assert symbol == symbol_override
+    reviewed_bundle = _bind_test_parent_release(reviewed_bundle)
     position = _position_for_reviewed_evidence(symbol=symbol)
     terminal = _calendar().add_sessions(
         position.entered_session,
@@ -1341,6 +1423,25 @@ def _pin_reviewed_evidence_material(
     reviewed_bundle: object,
 ) -> tuple[int, tuple[int, ...]]:
     registry_payload = _reviewed_registry_payload(reviewed_bundle)
+    registry_details: dict[str, object] = {
+        "content_hash": reviewed_bundle.content_hash,
+        "registry_id": reviewed_bundle.registry_id,
+    }
+    parent_release = (
+        reviewed_bundle._parent_release_id,
+        reviewed_bundle._parent_release_sha256,
+        reviewed_bundle._parent_universe_sha256,
+        reviewed_bundle._parent_release_review_by,
+    )
+    if all(value is not None for value in parent_release):
+        registry_details["parent_release"] = {
+            "release_id": reviewed_bundle._parent_release_id,
+            "release_sha256": reviewed_bundle._parent_release_sha256,
+            "review_by": reviewed_evidence_iso(
+                reviewed_bundle._parent_release_review_by
+            ),
+            "universe_sha256": reviewed_bundle._parent_universe_sha256,
+        }
     registry_row_id, _ = journal.append_source_observation(
         payload=registry_payload,
         source_uri=(
@@ -1355,10 +1456,7 @@ def _pin_reviewed_evidence_material(
         provider_sequence=None,
         delay_seconds=0,
         health_result="REVIEWED",
-        details={
-            "content_hash": reviewed_bundle.content_hash,
-            "registry_id": reviewed_bundle.registry_id,
-        },
+        details=registry_details,
     )
     binding_row_ids: list[int] = []
     for binding in reviewed_bundle.source_bindings:
@@ -2439,6 +2537,155 @@ def _issued_candidates_with_shared_provider_page():
 
 
 class Phase1AuthorityAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        scoped: dict[str, tuple[str | None, frozenset[tuple[str, str]]]] = {}
+        clear: dict[str, frozenset[tuple[str, str]]] = {}
+        for record_value in TEST_UNIVERSE.records:
+            issuer_cik = (
+                None
+                if record_value.product_type == "etf"
+                else "0000000000"
+            )
+            role, pair, authority = task5_fixture_module._test_coverage_authority(
+                record_value.symbol,
+                issuer_cik,
+            )
+            scoped[role] = authority
+            clear[role] = frozenset({pair})
+        scoped_patcher = mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            scoped,
+        )
+        clear_patcher = mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            clear,
+        )
+        scoped_patcher.start()
+        clear_patcher.start()
+        self.addCleanup(clear_patcher.stop)
+        self.addCleanup(scoped_patcher.stop)
+
+    def test_legacy_subjectless_registry_serializer_remains_exact_schema_v2(
+        self,
+    ) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        bundle = evidence_module.load_current_evidence_bundle(
+            project_root,
+            as_of=_EVIDENCE_AS_OF,
+        )
+        payload = journal_module._canonical_audit_json(
+            journal_module._phase1_reviewed_registry_document(bundle)
+        ).encode("utf-8")
+        self.assertEqual(
+            payload,
+            b'{"coverage_attestations":[],"kind":"REVIEWED_EVIDENCE_BUNDLE",'
+            b'"records":[],"registry_id":"evidence-registry-20260814",'
+            b'"reviewed_at":"2026-08-14T12:00:00.000000Z",'
+            b'"schema_version":2,"source_bindings":[],"subject":null}',
+        )
+
+    def test_journal_parent_metadata_and_scoped_schema_versions_fail_closed(
+        self,
+    ) -> None:
+        parent = {
+            "release_id": "reviewed-evidence-2026-08-14",
+            "release_sha256": "1" * 64,
+            "review_by": "2026-08-15T12:39:58.000000Z",
+            "universe_sha256": "2" * 64,
+        }
+        parsed = journal_module._phase1_stored_parent_release(
+            {"parent_release": parent},
+            schema_version=3,
+            review_at=_EVIDENCE_AS_OF,
+        )
+        self.assertEqual(parsed[0], parent)
+        self.assertEqual(
+            journal_module._canonical_timestamp(parsed[-1]),
+            parent["review_by"],
+        )
+        with self.assertRaises(journal_module.MigrationCorruption):
+            journal_module._phase1_stored_parent_release(
+                {},
+                schema_version=3,
+                review_at=_EVIDENCE_AS_OF,
+            )
+        invalid = (
+            None,
+            {key: value for key, value in parent.items() if key != "review_by"},
+            {**parent, "unexpected": "field"},
+            {**parent, "review_by": "2026-08-15T12:39:58.0Z"},
+        )
+        for value in invalid:
+            with self.subTest(parent=value), self.assertRaises(
+                journal_module.MigrationCorruption
+            ):
+                journal_module._phase1_stored_parent_release(
+                    {"parent_release": value},
+                    schema_version=3,
+                    review_at=_EVIDENCE_AS_OF,
+                )
+        with self.assertRaises(journal_module.MigrationCorruption):
+            journal_module._phase1_stored_parent_release(
+                {"parent_release": parent},
+                schema_version=2,
+                review_at=_EVIDENCE_AS_OF,
+            )
+
+        parentless_scoped = SimpleNamespace(
+            subject_kind="STOCK",
+            _parent_release_id=None,
+            _parent_release_sha256=None,
+            _parent_universe_sha256=None,
+            _parent_release_review_by=None,
+        )
+        with self.assertRaises(journal_module.InvalidJournalValue):
+            journal_module._phase1_evidence_parent_release_document(
+                parentless_scoped
+            )
+
+        parented_legacy = SimpleNamespace(
+            subject_kind=None,
+            _parent_release_id=parent["release_id"],
+            _parent_release_sha256=parent["release_sha256"],
+            _parent_universe_sha256=parent["universe_sha256"],
+            _parent_release_review_by=parsed[-1],
+        )
+        with self.assertRaises(journal_module.InvalidJournalValue):
+            journal_module._phase1_evidence_parent_release_document(
+                parented_legacy
+            )
+
+        bundle, _decision = _session_reviewed_evidence(
+            session_date=_SESSION,
+            sequence=882,
+            subject_kind="STOCK",
+            symbol="AAPL",
+            issuer_cik="0000000000",
+        )
+        scoped_v2 = json.loads(_reviewed_registry_payload(bundle))
+        scoped_v2["schema_version"] = 2
+        for binding in scoped_v2["source_bindings"]:
+            binding.pop("published_at")
+        for coverage in scoped_v2["coverage_attestations"]:
+            coverage.pop("coverage_start")
+            coverage.pop("coverage_end")
+        scoped_payload = json.dumps(
+            scoped_v2,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        with self.assertRaises(evidence_module.EvidenceRegistryError):
+            evidence_module._load_evidence_registry_payload(
+                scoped_payload,
+                expected_sha256=hashlib.sha256(scoped_payload).hexdigest(),
+                as_of=_EVIDENCE_AS_OF,
+                source_documents={
+                    binding.source_observation_id: binding.document
+                    for binding in bundle.source_bindings
+                },
+            )
+
     def test_actual_equity_economic_cash_includes_unsettled_sale_only(
         self,
     ) -> None:
@@ -6184,6 +6431,174 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
             hasattr(evidence_module, "load_released_evidence_bundle"),
             "raw registry bytes plus a caller-supplied hash must not be a registrar",
         )
+
+    def test_release_bound_evidence_restarts_with_parent_authority_and_expiry(
+        self,
+    ) -> None:
+        review_at = _EVIDENCE_AS_OF
+        release_reviewed_at = review_at - timedelta(minutes=5)
+        release_retrieved_at = release_reviewed_at - timedelta(seconds=2)
+        release_review_by = release_reviewed_at + timedelta(
+            hours=23,
+            minutes=59,
+            seconds=58,
+        )
+        terminal = _calendar().add_sessions(
+            _SESSION,
+            risk_module.MAX_HOLD_SESSIONS - 1,
+        )
+        hold = DateRange(_SESSION, terminal)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with mock.patch.multiple(
+                evidence_test_module,
+                RELEASE_RETRIEVED=release_retrieved_at,
+                RELEASE_REVIEWED=release_reviewed_at,
+                RELEASE_AS_OF=review_at,
+                RELEASE_REVIEW_BY=release_review_by,
+                RELEASE_HOLD=hold,
+            ):
+                manifest, children, artifacts, _documents = (
+                    evidence_test_module.release_material(TEST_UNIVERSE)
+                )
+            manifest["release_id"] = "reviewed-evidence-2026-08-14"
+            release_path, release_sha256 = evidence_test_module.write_release(
+                root,
+                manifest,
+                children,
+                artifacts,
+            )
+            release = evidence_module.load_evidence_release(
+                release_path,
+                expected_sha256=release_sha256,
+                as_of=review_at,
+                universe=TEST_UNIVERSE,
+            )
+            original_bundle = release.by_symbol["AAPL"]
+            decision = evidence_module.classify_evidence(
+                original_bundle.records,
+                hold,
+                symbol="AAPL",
+                issuer_cik="0000320193",
+                source_bindings=original_bundle.source_bindings,
+                as_of=review_at,
+                subject_kind="STOCK",
+                coverage_attestations=original_bundle.coverage_attestations,
+                reviewed_bundle=original_bundle,
+            )
+
+            journal_path = root / "journal.db"
+            candidates = _issued_provider_candidates_for_session(
+                _SESSION,
+                sequence=881,
+                use_universe_identity=True,
+            )
+            with Journal.open(journal_path) as first_journal:
+                with mock.patch.dict(
+                    signal_lifecycle_test_module._PROVIDER_RAW_PAGES,
+                    _signal_lifecycle_provider_raw_pages(),
+                    clear=True,
+                ):
+                    signal_source = _published_signal_source(
+                        first_journal,
+                        candidates=candidates,
+                    )
+                registry_row_id, binding_row_ids = _pin_reviewed_evidence_material(
+                    first_journal,
+                    original_bundle,
+                )
+                signal_source = first_journal._read_phase1_signal_source(
+                    signal_source.signal_id,
+                    query_cutoff=review_at,
+                )
+                authority = risk_module._issue_phase1_signal_evidence_authority(
+                    signal_source,
+                    original_bundle,
+                    decision,
+                    review_at=review_at,
+                    calendar_resolver=_calendar(),
+                )
+                first_journal.record_phase1_signal_evidence(
+                    authority=authority,
+                    registry_source_row_id=registry_row_id,
+                    source_observation_row_ids=binding_row_ids,
+                )
+                first_source = first_journal.read_phase1_signal_evidence_source(
+                    signal_source.signal_id,
+                    review_at=review_at,
+                    query_cutoff=review_at,
+                    calendar_resolver=_calendar(),
+                )
+                self.assertEqual(
+                    first_source.reviewed_bundle._bundle_digest,
+                    original_bundle._bundle_digest,
+                )
+
+            with Journal.open(journal_path) as second_journal:
+                second_source = second_journal.read_phase1_signal_evidence_source(
+                    signal_source.signal_id,
+                    review_at=review_at,
+                    query_cutoff=review_at,
+                    calendar_resolver=_calendar(),
+                )
+                reissued = second_source.reviewed_bundle
+                self.assertEqual(
+                    (
+                        second_source.parent_release_id,
+                        second_source.parent_release_sha256,
+                        second_source.parent_universe_sha256,
+                        second_source.parent_release_review_by,
+                    ),
+                    (
+                        release.release_id,
+                        release.release_sha256,
+                        release.universe_sha256,
+                        release.review_by,
+                    ),
+                )
+                self.assertEqual(
+                    (
+                        reissued._parent_release_id,
+                        reissued._parent_release_sha256,
+                        reissued._parent_universe_sha256,
+                        reissued._parent_release_review_by,
+                    ),
+                    (
+                        release.release_id,
+                        release.release_sha256,
+                        release.universe_sha256,
+                        release.review_by,
+                    ),
+                )
+                self.assertEqual(
+                    reissued._bundle_digest,
+                    original_bundle._bundle_digest,
+                )
+                before_expiry = evidence_module.classify_evidence(
+                    reissued.records,
+                    hold,
+                    symbol="AAPL",
+                    issuer_cik="0000320193",
+                    source_bindings=reissued.source_bindings,
+                    as_of=review_at,
+                    subject_kind="STOCK",
+                    coverage_attestations=reissued.coverage_attestations,
+                    reviewed_bundle=reissued,
+                )
+                self.assertEqual(before_expiry, decision)
+                with self.assertRaises(evidence_module.EvidenceUnavailableError):
+                    evidence_module.classify_evidence(
+                        reissued.records,
+                        hold,
+                        symbol="AAPL",
+                        issuer_cik="0000320193",
+                        source_bindings=reissued.source_bindings,
+                        as_of=release.review_by,
+                        subject_kind="STOCK",
+                        coverage_attestations=reissued.coverage_attestations,
+                        reviewed_bundle=reissued,
+                    )
 
     def test_durable_signal_evidence_rejects_copy_subset_lookahead_and_splice(
         self,

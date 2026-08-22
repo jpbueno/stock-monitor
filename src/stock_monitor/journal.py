@@ -1644,6 +1644,10 @@ class Phase1SignalEvidenceSource:
     expected_source_observation_count: int
     row_references: tuple[JournalRowReference, ...]
     source_digest: str
+    parent_release_id: str | None = None
+    parent_release_sha256: str | None = None
+    parent_universe_sha256: str | None = None
+    parent_release_review_by: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -2703,8 +2707,12 @@ def _phase1_evidence_record_document(record: object) -> dict[str, object]:
     }
 
 
-def _phase1_evidence_coverage_document(value: object) -> dict[str, object]:
-    return {
+def _phase1_evidence_coverage_document(
+    value: object,
+    *,
+    schema_version: int,
+) -> dict[str, object]:
+    document = {
         "checked_at": _canonical_timestamp(getattr(value, "checked_at")),
         "complete": getattr(value, "complete"),
         "conflicts": list(getattr(value, "conflicts")),
@@ -2719,11 +2727,20 @@ def _phase1_evidence_coverage_document(value: object) -> dict[str, object]:
         "symbol": getattr(value, "symbol"),
         "valid_until": _canonical_timestamp(getattr(value, "valid_until")),
     }
+    if schema_version == 3:
+        document["coverage_end"] = getattr(value, "coverage_end").isoformat()
+        document["coverage_start"] = getattr(value, "coverage_start").isoformat()
+    return document
 
 
-def _phase1_evidence_binding_document(value: object) -> dict[str, object]:
+def _phase1_evidence_binding_document(
+    value: object,
+    *,
+    schema_version: int,
+) -> dict[str, object]:
     document = getattr(value, "document")
-    return {
+    published_at = getattr(document, "published_at")
+    result = {
         "accession": getattr(document, "accession"),
         "checked_at": _canonical_timestamp(getattr(value, "checked_at")),
         "content_hash": getattr(document, "content_hash"),
@@ -2742,10 +2759,16 @@ def _phase1_evidence_binding_document(value: object) -> dict[str, object]:
         "timestamp_source": getattr(document, "timestamp_source"),
         "valid_until": _canonical_timestamp(getattr(value, "valid_until")),
     }
+    if schema_version == 3:
+        result["published_at"] = (
+            None if published_at is None else _canonical_timestamp(published_at)
+        )
+    return result
 
 
 def _phase1_reviewed_registry_document(bundle: object) -> dict[str, object]:
     subject_kind = getattr(bundle, "subject_kind")
+    schema_version = 2 if subject_kind is None else 3
     subject = (
         None
         if subject_kind is None
@@ -2757,7 +2780,10 @@ def _phase1_reviewed_registry_document(bundle: object) -> dict[str, object]:
     )
     return {
         "coverage_attestations": [
-            _phase1_evidence_coverage_document(value)
+            _phase1_evidence_coverage_document(
+                value,
+                schema_version=schema_version,
+            )
             for value in getattr(bundle, "coverage_attestations")
         ],
         "kind": "REVIEWED_EVIDENCE_BUNDLE",
@@ -2767,13 +2793,124 @@ def _phase1_reviewed_registry_document(bundle: object) -> dict[str, object]:
         ],
         "registry_id": getattr(bundle, "registry_id"),
         "reviewed_at": _canonical_timestamp(getattr(bundle, "reviewed_at")),
-        "schema_version": 2,
+        "schema_version": schema_version,
         "source_bindings": [
-            _phase1_evidence_binding_document(value)
+            _phase1_evidence_binding_document(
+                value,
+                schema_version=schema_version,
+            )
             for value in getattr(bundle, "source_bindings")
         ],
         "subject": subject,
     }
+
+
+def _phase1_evidence_parent_release_document(
+    bundle: object,
+) -> dict[str, object] | None:
+    subject_kind = getattr(bundle, "subject_kind", None)
+    values = (
+        getattr(bundle, "_parent_release_id", None),
+        getattr(bundle, "_parent_release_sha256", None),
+        getattr(bundle, "_parent_universe_sha256", None),
+        getattr(bundle, "_parent_release_review_by", None),
+    )
+    if all(value is None for value in values):
+        if subject_kind is not None:
+            raise InvalidJournalValue(
+                "Phase 1 scoped evidence requires parent release authority"
+            )
+        return None
+    if subject_kind is None:
+        raise InvalidJournalValue(
+            "Phase 1 legacy evidence cannot carry parent release authority"
+        )
+    if not all(value is not None for value in values):
+        raise InvalidJournalValue(
+            "Phase 1 evidence parent release authority is incomplete"
+        )
+    release_id, release_sha256, universe_sha256, review_by = values
+    if (
+        type(release_id) is not str
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", release_id) is None
+        or type(release_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", release_sha256) is None
+        or type(universe_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", universe_sha256) is None
+        or type(review_by) is not datetime
+    ):
+        raise InvalidJournalValue(
+            "Phase 1 evidence parent release authority is malformed"
+        )
+    return {
+        "release_id": release_id,
+        "release_sha256": release_sha256,
+        "review_by": _canonical_timestamp(review_by),
+        "universe_sha256": universe_sha256,
+    }
+
+
+def _phase1_stored_parent_release(
+    registry_details: Mapping[str, object],
+    *,
+    schema_version: int,
+    review_at: datetime,
+) -> tuple[
+    dict[str, object] | None,
+    str | None,
+    str | None,
+    str | None,
+    datetime | None,
+]:
+    if "parent_release" not in registry_details:
+        if schema_version == 3:
+            raise MigrationCorruption(
+                "Phase 1 scoped evidence parent release metadata is missing"
+            )
+        return None, None, None, None, None
+    parent = registry_details["parent_release"]
+    if (
+        schema_version != 3
+        or type(parent) is not dict
+        or set(parent)
+        != {
+            "release_id",
+            "release_sha256",
+            "review_by",
+            "universe_sha256",
+        }
+        or type(parent.get("release_id")) is not str
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            str(parent.get("release_id")),
+        )
+        is None
+        or type(parent.get("release_sha256")) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(parent.get("release_sha256")),
+        )
+        is None
+        or type(parent.get("universe_sha256")) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(parent.get("universe_sha256")),
+        )
+        is None
+        or type(parent.get("review_by")) is not str
+    ):
+        raise MigrationCorruption("Phase 1 evidence parent release metadata failed")
+    raw_review_by = str(parent["review_by"])
+    review_by = _parse_canonical_timestamp(raw_review_by)
+    if raw_review_by != _canonical_timestamp(review_by) or review_at >= review_by:
+        raise MigrationCorruption("Phase 1 evidence parent release metadata failed")
+    return (
+        parent,
+        str(parent["release_id"]),
+        str(parent["release_sha256"]),
+        str(parent["universe_sha256"]),
+        review_by,
+    )
 
 
 def _phase1_primary_plan_manifest(primary_plan_decision: object) -> dict[str, object]:
@@ -12166,7 +12303,7 @@ class Journal:
             type(registry_document) is not dict
             or _canonical_audit_json(registry_document).encode("utf-8")
             != registry_payload
-            or registry_document.get("schema_version") != 2
+            or registry_document.get("schema_version") not in {2, 3}
             or registry_document.get("kind") != "REVIEWED_EVIDENCE_BUNDLE"
             or registry_document.get("registry_id") != stored["registry_id"]
             or not isinstance(registry_document.get("source_bindings"), list)
@@ -12182,6 +12319,24 @@ class Journal:
             registry_row[12],
             label="Phase 1 evidence registry source",
         )
+        schema_version = int(registry_document["schema_version"])
+        (
+            parent_release_document,
+            parent_release_id,
+            parent_release_sha256,
+            parent_universe_sha256,
+            parent_release_review_by,
+        ) = _phase1_stored_parent_release(
+            registry_details,
+            schema_version=schema_version,
+            review_at=normalized_review_at,
+        )
+        expected_registry_details: dict[str, object] = {
+            "content_hash": str(stored["registry_content_hash"]),
+            "registry_id": str(stored["registry_id"]),
+        }
+        if parent_release_document is not None:
+            expected_registry_details["parent_release"] = parent_release_document
         if (
             str(registry_row[3])
             != (
@@ -12196,11 +12351,7 @@ class Journal:
             or registry_row[9] is not None
             or int(registry_row[10]) != 0
             or str(registry_row[11]) != "REVIEWED"
-            or registry_details
-            != {
-                "content_hash": str(stored["registry_content_hash"]),
-                "registry_id": str(stored["registry_id"]),
-            }
+            or registry_details != expected_registry_details
         ):
             raise MigrationCorruption(
                 "Phase 1 signal evidence registry metadata failed"
@@ -12285,10 +12436,21 @@ class Journal:
             retrieved_at = _parse_canonical_timestamp(
                 str(binding_document["retrieved_at"])
             )
-            published_at = published_by_source.get(
-                external_id,
-                _parse_canonical_timestamp(str(source_row[7])),
-            )
+            if schema_version == 3:
+                raw_published_at = binding_document.get("published_at")
+                if raw_published_at is None:
+                    published_at = None
+                elif type(raw_published_at) is str:
+                    published_at = _parse_canonical_timestamp(raw_published_at)
+                else:
+                    raise MigrationCorruption(
+                        "Phase 1 signal evidence publication time failed"
+                    )
+            else:
+                published_at = published_by_source.get(
+                    external_id,
+                    _parse_canonical_timestamp(str(source_row[7])),
+                )
             source_document = SourceDocument(
                 url=str(binding_document["primary_url"]),
                 published_at=published_at,
@@ -12310,15 +12472,14 @@ class Journal:
                     else str(binding_document["source_role"])
                 ),
             )
-            expected_delay = int(
-                (retrieved_at - published_at).total_seconds()
-            )
+            source_time = published_at or retrieved_at
+            expected_delay = int((retrieved_at - source_time).total_seconds())
             if (
                 str(source_row[3]) != source_document.url
                 or str(source_row[4]) != source_document.source_type
                 or str(source_row[5]) != source_document.publisher
                 or str(source_row[6]) != source_document.timestamp_source
-                or _parse_canonical_timestamp(str(source_row[7])) != published_at
+                or _parse_canonical_timestamp(str(source_row[7])) != source_time
                 or _parse_canonical_timestamp(str(source_row[8])) != retrieved_at
                 or source_row[9] is not None
                 or int(source_row[10]) != expected_delay
@@ -12396,27 +12557,30 @@ class Journal:
             registry_payload_reference,
             *binding_core_references,
         )
+        source_material = {
+            "evidence_id": str(stored["evidence_id"]),
+            "signal_id": signal_id,
+            "review_at": _canonical_timestamp(normalized_review_at),
+            "manifest_digest": str(stored["manifest_digest"]),
+            "registry_source_row_id": int(stored["registry_source_row_id"]),
+            "source_observation_row_ids": binding_row_ids,
+            "registry_id": str(stored["registry_id"]),
+            "registry_content_hash": str(stored["registry_content_hash"]),
+            "registry_release_pin": str(stored["registry_release_pin"]),
+            "bundle_digest": str(stored["bundle_digest"]),
+            "decision_digest": str(stored["decision_digest"]),
+            "calendar_digest": calendar_digest,
+            "source_observation_highwater": int(
+                stored["source_observation_highwater"]
+            ),
+            "expected_source_observation_count": expected_count,
+        }
+        if parent_release_document is not None:
+            source_material["parent_release"] = parent_release_document
         expected_source_digest = _journal_bundle_digest(
             "stock-monitor/phase1-signal-evidence-source/v1",
             provenance_references,
-            {
-                "evidence_id": str(stored["evidence_id"]),
-                "signal_id": signal_id,
-                "review_at": _canonical_timestamp(normalized_review_at),
-                "manifest_digest": str(stored["manifest_digest"]),
-                "registry_source_row_id": int(stored["registry_source_row_id"]),
-                "source_observation_row_ids": binding_row_ids,
-                "registry_id": str(stored["registry_id"]),
-                "registry_content_hash": str(stored["registry_content_hash"]),
-                "registry_release_pin": str(stored["registry_release_pin"]),
-                "bundle_digest": str(stored["bundle_digest"]),
-                "decision_digest": str(stored["decision_digest"]),
-                "calendar_digest": calendar_digest,
-                "source_observation_highwater": int(
-                    stored["source_observation_highwater"]
-                ),
-                "expected_source_observation_count": expected_count,
-            },
+            source_material,
         )
         if str(stored["source_digest"]) != expected_source_digest:
             raise MigrationCorruption(
@@ -12457,6 +12621,10 @@ class Journal:
             expected_source_observation_count=expected_count,
             row_references=tuple(row_references),
             source_digest=expected_source_digest,
+            parent_release_id=parent_release_id,
+            parent_release_sha256=parent_release_sha256,
+            parent_universe_sha256=parent_universe_sha256,
+            parent_release_review_by=parent_release_review_by,
         )
         _reader_source_identity, _reader_source_authority = (
             _phase1_reader_source_registration_material(
@@ -24931,6 +25099,9 @@ class Journal:
             "content_hash": authority.registry_content_hash,
             "registry_id": authority.registry_id,
         }
+        parent_release = _phase1_evidence_parent_release_document(bundle)
+        if parent_release is not None:
+            expected_registry_details["parent_release"] = parent_release
         reviewed_at = getattr(bundle, "reviewed_at")
         if (
             registry_payload != expected_registry_payload
@@ -25125,25 +25296,28 @@ class Journal:
             registry_source_row_id,
             *canonical_binding_row_ids,
         )
+        source_material = {
+            "evidence_id": evidence_id,
+            "signal_id": authority.signal_id,
+            "review_at": _canonical_timestamp(authority.review_at),
+            "manifest_digest": manifest_digest,
+            "registry_source_row_id": registry_source_row_id,
+            "source_observation_row_ids": canonical_binding_row_ids,
+            "registry_id": authority.registry_id,
+            "registry_content_hash": authority.registry_content_hash,
+            "registry_release_pin": release_sha256,
+            "bundle_digest": authority.bundle_digest,
+            "decision_digest": authority.decision_digest,
+            "calendar_digest": authority.calendar_digest,
+            "source_observation_highwater": source_observation_highwater,
+            "expected_source_observation_count": len(bindings),
+        }
+        if parent_release is not None:
+            source_material["parent_release"] = parent_release
         source_digest = _journal_bundle_digest(
             "stock-monitor/phase1-signal-evidence-source/v1",
             provenance_references,
-            {
-                "evidence_id": evidence_id,
-                "signal_id": authority.signal_id,
-                "review_at": _canonical_timestamp(authority.review_at),
-                "manifest_digest": manifest_digest,
-                "registry_source_row_id": registry_source_row_id,
-                "source_observation_row_ids": canonical_binding_row_ids,
-                "registry_id": authority.registry_id,
-                "registry_content_hash": authority.registry_content_hash,
-                "registry_release_pin": release_sha256,
-                "bundle_digest": authority.bundle_digest,
-                "decision_digest": authority.decision_digest,
-                "calendar_digest": authority.calendar_digest,
-                "source_observation_highwater": source_observation_highwater,
-                "expected_source_observation_count": len(bindings),
-            },
+            source_material,
         )
         review_without_hash = (
             evidence_id,

@@ -2819,6 +2819,18 @@ def _issue_reviewed_bundle_from_phase1_source(
             or bundle.content_hash != source.release_sha256
             or bundle.registry_id != source.registry_id
             or bundle._bundle_digest != source.bundle_digest
+            or (
+                bundle._parent_release_id,
+                bundle._parent_release_sha256,
+                bundle._parent_universe_sha256,
+                bundle._parent_release_review_by,
+            )
+            != (
+                source.parent_release_id,
+                source.parent_release_sha256,
+                source.parent_universe_sha256,
+                source.parent_release_review_by,
+            )
         ):
             raise EvidenceUnavailableError(
                 "Phase 1 reviewed evidence source authority is inconsistent"
@@ -2860,6 +2872,10 @@ def _issue_reviewed_bundle_from_phase1_source(
         registry,
         release_pin=source.release_sha256,
         phase1_source=source,
+        parent_release_id=source.parent_release_id,
+        parent_release_sha256=source.parent_release_sha256,
+        parent_universe_sha256=source.parent_universe_sha256,
+        parent_release_review_by=source.parent_release_review_by,
     )
     if (
         bundle.registry_id != source.registry_id

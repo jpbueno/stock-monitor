@@ -454,7 +454,9 @@ class JournalTests(unittest.TestCase):
         method_names = (
             "append_execution_event",
             "append_source_observation",
+            "claim_report",
             "finalize_report",
+            "finalize_canonical_report",
             "append_outbox",
             "record_outbox_delivery_attempt",
             "start_scheduled_run",

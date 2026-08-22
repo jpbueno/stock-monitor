@@ -471,7 +471,7 @@ class CanonicalWorkflowPublisher(Protocol):
     ) -> PublishedWorkflow: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class CanonicalPublicationPlan:
     """Verified, side-effect-free inputs for canonical Journal finalization."""
 
@@ -519,9 +519,7 @@ class CanonicalPublicationPlan:
             or _LOWER_SHA256.fullmatch(self.rendered_report_id) is None
         ):
             raise ValueError("canonical publication digest is invalid")
-        if type(self.source_observation_row_ids) is not tuple or not (
-            self.source_observation_row_ids
-        ) or any(
+        if type(self.source_observation_row_ids) is not tuple or any(
             type(row_id) is not int or row_id < 1
             for row_id in self.source_observation_row_ids
         ):
@@ -561,6 +559,137 @@ class _CanonicalResultAuthority:
     publisher_reference: ReferenceType[object]
     journal_reference: ReferenceType[object]
     archive_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPublicationPlanAuthority:
+    plan_reference: ReferenceType[object]
+    plan_seal: tuple[object, ...]
+    result_reference: ReferenceType[object]
+    result_fingerprint: tuple[object, ...]
+    material_reference: ReferenceType[object]
+    publisher_reference: ReferenceType[object]
+    journal_reference: ReferenceType[object]
+    journal_generation: int
+    archive_root: Path
+    publisher_code: object
+
+
+_ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK = threading.Lock()
+_ISSUED_CANONICAL_PUBLICATION_PLANS: dict[
+    int, _CanonicalPublicationPlanAuthority
+] = {}
+
+
+def _canonical_publication_plan_seal(
+    plan: object,
+) -> tuple[object, ...] | None:
+    """Capture a hook-free exact-object seal for a publication plan."""
+    if type(plan) is not CanonicalPublicationPlan:
+        return None
+    values = (
+        plan.workflow_kind,
+        plan.storage_kind,
+        plan.material_digest,
+        plan.source_digest,
+        plan.source_observation_row_ids,
+        plan.rendered_report_id,
+    )
+    if (
+        any(type(value) is not str for value in values[:4])
+        or type(plan.source_observation_row_ids) is not tuple
+        or type(plan.rendered_report_id) is not str
+    ):
+        return None
+    return (
+        *values,
+        id(plan.session_date),
+        id(plan.generated_at),
+        id(plan.economic_at),
+        id(plan.retrieved_at),
+        id(plan.report),
+        id(plan.material),
+    )
+
+
+def _canonical_publication_plan_values_without_callbacks(
+    plan: object,
+    journal: object,
+) -> tuple[object, ...] | None:
+    """Return exact persistence values for a still-current issued plan."""
+    from .provider_workflows import _is_current_canonical_material_without_callbacks
+
+    seal = _canonical_publication_plan_seal(plan)
+    with _ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK:
+        authority = _ISSUED_CANONICAL_PUBLICATION_PLANS.get(id(plan))
+    if (
+        type(plan) is not CanonicalPublicationPlan
+        or not isinstance(authority, _CanonicalPublicationPlanAuthority)
+        or authority.plan_reference() is not plan
+        or authority.plan_seal != seal
+        or authority.journal_reference() is not journal
+        or getattr(journal, "_closed", True)
+        or getattr(journal, "_source_generation", None)
+        != authority.journal_generation
+    ):
+        return None
+    result = authority.result_reference()
+    material = authority.material_reference()
+    publisher = authority.publisher_reference()
+    if (
+        type(result) is not WorkflowResult
+        or material is not plan.material
+        or type(publisher) is not CanonicalJournalWorkflowPublisher
+        or CanonicalJournalWorkflowPublisher.publish.__code__
+        is not authority.publisher_code
+        or getattr(publisher, "journal", None) is not journal
+        or getattr(publisher, "report_archive_root", None)
+        is not authority.archive_root
+        or _workflow_result_fingerprint(result) != authority.result_fingerprint
+        or result.report is not plan.report
+        or not _is_current_canonical_material_without_callbacks(material)
+    ):
+        return None
+    with _ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK:
+        if _ISSUED_CANONICAL_PUBLICATION_PLANS.get(id(plan)) is not authority:
+            return None
+    return (
+        plan.workflow_kind,
+        plan.storage_kind,
+        plan.session_date,
+        plan.economic_at,
+        plan.retrieved_at,
+        plan.material_digest,
+        plan.source_digest,
+        plan.source_observation_row_ids,
+        plan.report.body,
+        plan.report.state_hash,
+        plan.report,
+        result,
+        material,
+        publisher,
+    )
+
+
+def _canonical_publication_values_are_exact(
+    current: object,
+    expected: object,
+) -> bool:
+    """Compare issued plan values without invoking domain-object equality."""
+    if (
+        type(current) is not tuple
+        or type(expected) is not tuple
+        or len(current) != 14
+        or len(expected) != 14
+    ):
+        return False
+    identity_indices = {2, 3, 4, 10, 11, 12, 13}
+    return all(
+        (left is right) if index in identity_indices else (left == right)
+        for index, (left, right) in enumerate(
+            zip(current, expected, strict=True)
+        )
+    )
 
 
 class ScheduledWorkflowStore(Protocol):
@@ -1391,6 +1520,47 @@ class CanonicalJournalWorkflowPublisher:
                 raise WorkflowError(
                     "canonical publication result authority changed during seal"
                 )
+        plan_seal = _canonical_publication_plan_seal(plan)
+        generation = getattr(self.journal, "_source_generation", None)
+        if plan_seal is None or type(generation) is not int or generation < 0:
+            raise WorkflowError("canonical publication plan could not be sealed")
+        plan_identity = id(plan)
+
+        def discard(dead: ReferenceType[object]) -> None:
+            with _ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK:
+                current = _ISSUED_CANONICAL_PUBLICATION_PLANS.get(plan_identity)
+                if (
+                    isinstance(current, _CanonicalPublicationPlanAuthority)
+                    and current.plan_reference is dead
+                ):
+                    _ISSUED_CANONICAL_PUBLICATION_PLANS.pop(plan_identity, None)
+
+        plan_authority = _CanonicalPublicationPlanAuthority(
+            plan_reference=ref(plan, discard),
+            plan_seal=plan_seal,
+            result_reference=ref(result),
+            result_fingerprint=authority.result_fingerprint,
+            material_reference=ref(material),
+            publisher_reference=ref(self),
+            journal_reference=ref(self.journal),
+            journal_generation=generation,
+            archive_root=self.report_archive_root,
+            publisher_code=CanonicalJournalWorkflowPublisher.publish.__code__,
+        )
+        with _ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK:
+            _ISSUED_CANONICAL_PUBLICATION_PLANS[plan_identity] = plan_authority
+        if _canonical_publication_plan_values_without_callbacks(
+            plan, self.journal
+        ) is None:
+            with _ISSUED_CANONICAL_PUBLICATION_PLANS_LOCK:
+                if (
+                    _ISSUED_CANONICAL_PUBLICATION_PLANS.get(plan_identity)
+                    is plan_authority
+                ):
+                    _ISSUED_CANONICAL_PUBLICATION_PLANS.pop(plan_identity, None)
+            raise WorkflowError(
+                "canonical publication plan changed while it was issued"
+            )
         return plan
 
     def publish(
@@ -1401,19 +1571,340 @@ class CanonicalJournalWorkflowPublisher:
         generated_at: datetime,
         result: WorkflowResult,
         material: CanonicalPremarketMaterial | CanonicalCloseMaterial,
+        _archive_function: object = archive_report,
+        _archive_code: object = archive_report.__code__,
+        _archive_globals: object = archive_report.__globals__,
+        _archive_global_function: object = archive_report.__globals__.get(
+            "archive_report"
+        ),
+        _report_type: object = Report,
+        _report_init_code: object = Report.__init__.__code__,
     ) -> PublishedWorkflow:
-        self.prepare_publication(
+        from .journal import (
+            JournalError,
+            StoredCanonicalReportContext,
+            StoredReport,
+        )
+
+        initial_plan = self.prepare_publication(
             kind=kind,
             session_date=session_date,
             generated_at=generated_at,
             result=result,
             material=material,
         )
-        # Context-free ``finalize_report`` must never be used here.  The later
-        # Journal integration replaces this fail-closed boundary with one
-        # transaction that also writes ``canonical_report_contexts``.
-        raise WorkflowError(
-            "canonical Journal publication context integration is unavailable"
+        initial_values = _canonical_publication_plan_values_without_callbacks(
+            initial_plan,
+            self.journal,
+        )
+        if initial_values is None:
+            raise WorkflowError("canonical publication plan authority is invalid")
+        archive_outcome = material.report.outcome
+
+        def require_publication_dependencies() -> None:
+            if (
+                Report is not _report_type
+                or getattr(getattr(_report_type, "__init__", None), "__code__", None)
+                is not _report_init_code
+            ):
+                raise WorkflowError(
+                    "canonical report dependency was replaced"
+                )
+            if (
+                archive_report is not _archive_function
+                or getattr(_archive_function, "__code__", None)
+                is not _archive_code
+                or getattr(_archive_function, "__globals__", None)
+                is not _archive_globals
+                or not isinstance(_archive_globals, dict)
+                or _archive_globals.get("archive_report")
+                is not _archive_global_function
+                or _archive_global_function is not _archive_function
+                or _archive_globals.get("Report") is not _report_type
+            ):
+                raise WorkflowError(
+                    "canonical report archive dependency was replaced"
+                )
+
+        require_publication_dependencies()
+
+        def stored_expectations(
+            expected: tuple[object, ...],
+        ) -> tuple[object, ...]:
+            report = expected[10]
+            if type(report) is not _report_type:
+                raise WorkflowError(
+                    "canonical report dependency was replaced"
+                )
+            return (
+                *expected[:10],
+                report.content_sha256,
+                report.observation_ids,
+                report.report_id,
+            )
+
+        def exact_stored_material(
+            stored: object,
+            context: object,
+            expected: tuple[object, ...],
+        ) -> bool:
+            if type(stored) is not StoredReport or type(
+                context
+            ) is not StoredCanonicalReportContext:
+                return False
+            (
+                workflow_kind,
+                storage_kind,
+                expected_session_date,
+                economic_at,
+                retrieved_at,
+                material_digest,
+                source_digest,
+                observation_ids,
+                body,
+                state_sha256,
+                content_sha256,
+                observation_sha256s,
+                _rendered_report_id,
+            ) = expected
+            return bool(
+                getattr(stored, "session_date", None) == expected_session_date
+                and getattr(stored, "report_kind", None) == storage_kind
+                and getattr(stored, "body", None) == body
+                and getattr(stored, "content_sha256", None) == content_sha256
+                and getattr(stored, "state_sha256", None) == state_sha256
+                and getattr(stored, "observation_ids", None) == observation_ids
+                and getattr(stored, "observation_sha256s", None)
+                == observation_sha256s
+                and getattr(context, "report_row_id", None)
+                == getattr(stored, "report_row_id", None)
+                and getattr(context, "workflow_kind", None) == workflow_kind
+                and getattr(context, "economic_at", None) == economic_at
+                and getattr(context, "retrieved_at", None) == retrieved_at
+                and getattr(context, "material_digest", None) == material_digest
+                and getattr(context, "source_digest", None) == source_digest
+            )
+
+        claim = None
+        finalized = None
+        expected_values = None
+        expected_stored_values = None
+        try:
+            with self.journal.transaction() as transaction:
+                # Re-run every callback-bearing owner/source check under the
+                # clean write snapshot before the first claim mutation.
+                transaction_plan = self.prepare_publication(
+                    kind=kind,
+                    session_date=session_date,
+                    generated_at=generated_at,
+                    result=result,
+                    material=material,
+                )
+                expected_values = (
+                    _canonical_publication_plan_values_without_callbacks(
+                        transaction_plan,
+                        self.journal,
+                    )
+                )
+                if expected_values is None:
+                    raise WorkflowError(
+                        "canonical publication authority changed before claim"
+                    )
+                require_publication_dependencies()
+                expected_stored_values = stored_expectations(expected_values)
+                claim = transaction.claim_report(
+                    session_date,
+                    transaction_plan.storage_kind,
+                )
+                if claim.status == "IN_PROGRESS":
+                    self.journal._clear_sqlite_callbacks_before_authority_commit()
+                    require_publication_dependencies()
+                    if not _canonical_publication_values_are_exact(
+                        _canonical_publication_plan_values_without_callbacks(
+                            transaction_plan,
+                            self.journal,
+                        ),
+                        expected_values,
+                    ):
+                        raise WorkflowError(
+                            "canonical publication authority changed during claim"
+                        )
+                    return PublishedWorkflow(None, None, None, "IN_PROGRESS")
+                if claim.status == "ALREADY_FINALIZED":
+                    if claim.report_id is None or claim.report_row_id is None:
+                        raise WorkflowError(
+                            "finalized canonical report identity is unavailable"
+                        )
+                    try:
+                        context = self.journal.read_canonical_report_context(
+                            claim.report_id
+                        )
+                        stored = self.journal.read_report(claim.report_id)
+                    except JournalError as error:
+                        raise WorkflowError(
+                            "finalized report lacks exact canonical context"
+                        ) from error
+                    if not exact_stored_material(
+                        stored, context, expected_stored_values
+                    ):
+                        raise WorkflowError(
+                            "finalized canonical report conflicts with material"
+                        )
+                else:
+                    if claim.status not in {"ACQUIRED", "RECOVERED_EXPIRED"} or (
+                        claim.claim_token is None
+                    ):
+                        raise WorkflowError(
+                            "canonical report claim is unavailable"
+                        )
+                    if not _canonical_publication_values_are_exact(
+                        _canonical_publication_plan_values_without_callbacks(
+                            transaction_plan,
+                            self.journal,
+                        ),
+                        expected_values,
+                    ):
+                        raise WorkflowError(
+                            "canonical publication authority changed during claim"
+                        )
+                    require_publication_dependencies()
+                    finalized = transaction.finalize_canonical_report(
+                        claim_id=claim.claim_id,
+                        claim_token=claim.claim_token,
+                        publication_plan=transaction_plan,
+                    )
+                    require_publication_dependencies()
+                    if not _canonical_publication_values_are_exact(
+                        _canonical_publication_plan_values_without_callbacks(
+                            transaction_plan,
+                            self.journal,
+                        ),
+                        expected_values,
+                    ):
+                        raise WorkflowError(
+                            "canonical publication authority changed during finalization"
+                        )
+                # SQLite may otherwise dispatch raw connection callbacks for
+                # COMMIT after the last authority seal.
+                self.journal._clear_sqlite_callbacks_before_authority_commit()
+                require_publication_dependencies()
+                if not _canonical_publication_values_are_exact(
+                    _canonical_publication_plan_values_without_callbacks(
+                        transaction_plan,
+                        self.journal,
+                    ),
+                    expected_values,
+                ):
+                    raise WorkflowError(
+                        "canonical publication authority changed before commit"
+                    )
+        except WorkflowError:
+            raise
+        except JournalError as error:
+            raise WorkflowError("canonical Journal publication failed") from error
+
+        if claim is None or expected_stored_values is None:
+            raise WorkflowError("canonical publication did not produce a claim")
+        require_publication_dependencies()
+        durable_report_id = (
+            claim.report_id
+            if claim.status == "ALREADY_FINALIZED"
+            else getattr(getattr(finalized, "report", None), "report_id", None)
+        )
+        durable_report_row_id = (
+            claim.report_row_id
+            if claim.status == "ALREADY_FINALIZED"
+            else getattr(
+                getattr(finalized, "report", None), "report_row_id", None
+            )
+        )
+        if type(durable_report_id) is not str or type(
+            durable_report_row_id
+        ) is not int:
+            raise WorkflowError("canonical report finalization identity is invalid")
+        try:
+            stored = self.journal.read_report(durable_report_id)
+            context = self.journal.read_canonical_report_context(durable_report_id)
+        except JournalError as error:
+            raise WorkflowError(
+                "canonical report readback failed after commit"
+            ) from error
+        if (
+            stored.report_row_id != durable_report_row_id
+            or not exact_stored_material(
+                stored, context, expected_stored_values
+            )
+        ):
+            raise WorkflowError(
+                "canonical report readback conflicts with publication"
+            )
+        require_publication_dependencies()
+        durable_report = _report_type(
+            report_id=stored.report_id,
+            kind=stored.report_kind,
+            session_date=stored.session_date,
+            outcome=archive_outcome,
+            body=stored.body,
+            content_sha256=stored.content_sha256,
+            observation_ids=stored.observation_sha256s,
+            state_hash=stored.state_sha256,
+        )
+        require_publication_dependencies()
+        if (
+            type(durable_report) is not _report_type
+            or durable_report.report_id != stored.report_id
+            or durable_report.kind != stored.report_kind
+            or durable_report.session_date != stored.session_date
+            or durable_report.outcome != archive_outcome
+            or durable_report.body != stored.body
+            or durable_report.content_sha256 != stored.content_sha256
+            or durable_report.observation_ids != stored.observation_sha256s
+            or durable_report.state_hash != stored.state_sha256
+        ):
+            raise WorkflowError(
+                "canonical durable report reconstruction failed"
+            )
+        require_publication_dependencies()
+        try:
+            archived = _archive_function(durable_report, self.report_archive_root)
+        except Exception as error:
+            raise WorkflowError("canonical report archive failed") from error
+        require_publication_dependencies()
+        expected_path = self.report_archive_root / stored.archive_relative_path
+        try:
+            archived_bytes = expected_path.read_bytes()
+            root_resolved = self.report_archive_root.resolve(strict=True)
+            path_resolved = expected_path.resolve(strict=True)
+        except OSError as error:
+            raise WorkflowError(
+                "canonical report archive verification failed"
+            ) from error
+        current = self.report_archive_root
+        archive_has_symlink = self.report_archive_root.is_symlink()
+        for part in stored.archive_relative_path.split("/"):
+            current = current / part
+            archive_has_symlink = archive_has_symlink or current.is_symlink()
+        if (
+            getattr(archived, "report_id", None) != stored.report_id
+            or getattr(archived, "path", None) != expected_path
+            or getattr(archived, "sha256", None) != stored.content_sha256
+            or archive_has_symlink
+            or not expected_path.is_file()
+            or path_resolved != root_resolved / stored.archive_relative_path
+            or archived_bytes != stored.body.encode("utf-8")
+            or hashlib.sha256(archived_bytes).hexdigest()
+            != stored.content_sha256
+        ):
+            raise WorkflowError("canonical report archive verification failed")
+        return PublishedWorkflow(
+            stored.report_id,
+            stored.report_row_id,
+            str(expected_path),
+            (
+                "ALREADY_EMITTED"
+                if claim.status == "ALREADY_FINALIZED"
+                else "PUBLISHED"
+            ),
         )
 
 

@@ -1143,6 +1143,28 @@ class FinalizedReport:
     duplicate: bool
 
 
+@dataclass(frozen=True, slots=True)
+class StoredCanonicalReportContext:
+    """Immutable timing and material seal for one canonical report row."""
+
+    context_row_id: int
+    report_row_id: int
+    workflow_kind: str
+    economic_at: datetime
+    retrieved_at: datetime
+    material_digest: str
+    source_digest: str
+    record_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedCanonicalReport:
+    """One atomic report finalization and its exact canonical context."""
+
+    report: FinalizedReport
+    context: StoredCanonicalReportContext
+
+
 @dataclass(frozen=True)
 class StoredReport:
     """Immutable report material sufficient to reconstruct its archive."""
@@ -7905,6 +7927,71 @@ class JournalTransaction:
             created_at=created_at,
             outbox_destination=outbox_destination,
             outbox_payload=outbox_payload,
+        )
+
+    def claim_report(
+        self,
+        session_date: date,
+        kind: str,
+    ) -> ReportClaim:
+        """Claim one report without committing the surrounding transaction."""
+        self._ensure_active()
+        if self._source_read:
+            raise JournalError("source authority transaction is sealed read-only")
+        return self._journal._claim_report_in_active_transaction(
+            session_date,
+            kind,
+            _before_write=self._mark_dirty,
+        )
+
+    def finalize_canonical_report(
+        self,
+        *,
+        claim_id: int,
+        claim_token: str,
+        publication_plan: object,
+    ) -> FinalizedCanonicalReport:
+        """Atomically finalize a report and its canonical source context."""
+        self._ensure_active()
+        from . import workflows as workflows_module
+
+        plan_values = workflows_module._canonical_publication_plan_values_without_callbacks(
+            publication_plan,
+            self._journal,
+        )
+        if plan_values is None:
+            raise IdempotencyConflict(
+                "canonical publication plan authority is invalid"
+            )
+        frame = inspect.currentframe()
+        try:
+            caller = None if frame is None else frame.f_back
+            allowed = bool(
+                caller is not None
+                and (
+                    (
+                        caller.f_code
+                        is workflows_module.CanonicalJournalWorkflowPublisher.publish.__code__
+                        and caller.f_locals.get("self")
+                        is plan_values[13]
+                    )
+                    or (
+                        caller.f_code is Journal.finalize_canonical_report.__code__
+                        and caller.f_locals.get("self") is self._journal
+                    )
+                )
+            )
+        finally:
+            del frame
+        if not allowed:
+            raise JournalError(
+                "canonical finalization requires its publisher boundary"
+            )
+        self._mark_dirty()
+        return self._journal._finalize_canonical_report_from_plan(
+            claim_id=claim_id,
+            claim_token=claim_token,
+            publication_plan=publication_plan,
         )
 
     def append_outbox(
@@ -16124,115 +16211,131 @@ class Journal:
         kind: str,
     ) -> ReportClaim:
         """Acquire, observe, or explicitly recover a report publication claim."""
+        with self.transaction() as transaction:
+            return transaction.claim_report(session_date, kind)
+
+    def _claim_report_in_active_transaction(
+        self,
+        session_date: date,
+        kind: str,
+        *,
+        _before_write: Callable[[], None],
+    ) -> ReportClaim:
+        """Claim one report using the caller's immediate transaction."""
+        if not self._transaction_active:
+            raise JournalError("report claim requires an active transaction")
         stored_date = _canonical_date(session_date)
         report_kind = _require_canonical_report_kind(kind)
-
-        with self._immediate_connection() as connection:
-            stored_now = _canonical_timestamp(_utc_now())
-            row = _sql(connection,
-                "SELECT claim.id, claim.claim_token, claim.status, "
-                "claim.lease_expires_at, claim.report_id, report.report_id "
-                "FROM report_claims AS claim LEFT JOIN reports AS report "
-                "ON report.id = claim.report_id "
-                "WHERE claim.session_date = ? AND claim.report_kind = ?",
-                (stored_date, report_kind),
-            ).fetchone()
-            if row is None:
-                acquired_at = stored_now
-                expires_at = _add_seconds(
-                    acquired_at, _REPORT_CLAIM_LEASE_SECONDS
-                )
-                token = secrets.token_urlsafe(32)
-                with self._report_claim_write():
-                    cursor = _sql(connection,
-                        "INSERT INTO report_claims("
-                        "session_date, report_kind, claim_token, status, created_at, "
-                        "lease_started_at, lease_expires_at, finalized_at, report_id"
-                        ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, NULL, NULL)",
-                        (
-                            stored_date,
-                            report_kind,
-                            token,
-                            acquired_at,
-                            acquired_at,
-                            expires_at,
-                        ),
-                    )
-                return ReportClaim(
-                    claim_id=int(cursor.lastrowid),
-                    session_date=session_date,
-                    report_kind=report_kind,
-                    status="ACQUIRED",
-                    claim_token=token,
-                    lease_expires_at=_parse_canonical_timestamp(expires_at),
-                    report_row_id=None,
-                    report_id=None,
-                )
-
-            claim_id = int(row[0])
-            stored_status = str(row[2])
-            expires_at = str(row[3])
-            report_row_id = int(row[4]) if row[4] is not None else None
-            report_id = str(row[5]) if row[5] is not None else None
-            if stored_status == "FINALIZED":
-                if report_row_id is None or report_id is None:
-                    raise MigrationCorruption(
-                        "finalized report claim lacks its report identity"
-                    )
-                return ReportClaim(
-                    claim_id=claim_id,
-                    session_date=session_date,
-                    report_kind=report_kind,
-                    status="ALREADY_FINALIZED",
-                    claim_token=None,
-                    lease_expires_at=_parse_canonical_timestamp(expires_at),
-                    report_row_id=report_row_id,
-                    report_id=report_id,
-                )
-            if stored_status != "IN_PROGRESS":
-                raise MigrationCorruption("report claim has an invalid stored status")
-            if stored_now >= expires_at:
-                recovered_expires_at = _add_seconds(
-                    stored_now, _REPORT_CLAIM_LEASE_SECONDS
-                )
-                token = secrets.token_urlsafe(32)
-                with self._report_claim_write():
-                    cursor = _sql(connection,
-                        "UPDATE report_claims SET claim_token = ?, lease_started_at = ?, "
-                        "lease_expires_at = ? WHERE id = ? AND status = 'IN_PROGRESS' "
-                        "AND lease_expires_at <= ?",
-                        (
-                            token,
-                            stored_now,
-                            recovered_expires_at,
-                            claim_id,
-                            stored_now,
-                        ),
-                    )
-                if cursor.rowcount != 1:
-                    raise JournalBusy("report claim changed during recovery")
-                return ReportClaim(
-                    claim_id=claim_id,
-                    session_date=session_date,
-                    report_kind=report_kind,
-                    status="RECOVERED_EXPIRED",
-                    claim_token=token,
-                    lease_expires_at=_parse_canonical_timestamp(
-                        recovered_expires_at
+        stored_now = _canonical_timestamp(_utc_now())
+        row = _sql(
+            self._connection,
+            "SELECT claim.id, claim.claim_token, claim.status, "
+            "claim.lease_expires_at, claim.report_id, report.report_id "
+            "FROM report_claims AS claim LEFT JOIN reports AS report "
+            "ON report.id = claim.report_id "
+            "WHERE claim.session_date = ? AND claim.report_kind = ?",
+            (stored_date, report_kind),
+        ).fetchone()
+        if row is None:
+            acquired_at = stored_now
+            expires_at = _add_seconds(
+                acquired_at, _REPORT_CLAIM_LEASE_SECONDS
+            )
+            token = secrets.token_urlsafe(32)
+            _before_write()
+            with self._report_claim_write():
+                cursor = _sql(
+                    self._connection,
+                    "INSERT INTO report_claims("
+                    "session_date, report_kind, claim_token, status, created_at, "
+                    "lease_started_at, lease_expires_at, finalized_at, report_id"
+                    ") VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, NULL, NULL)",
+                    (
+                        stored_date,
+                        report_kind,
+                        token,
+                        acquired_at,
+                        acquired_at,
+                        expires_at,
                     ),
-                    report_row_id=None,
-                    report_id=None,
+                )
+            return ReportClaim(
+                claim_id=int(cursor.lastrowid),
+                session_date=session_date,
+                report_kind=report_kind,
+                status="ACQUIRED",
+                claim_token=token,
+                lease_expires_at=_parse_canonical_timestamp(expires_at),
+                report_row_id=None,
+                report_id=None,
+            )
+
+        claim_id = int(row[0])
+        stored_status = str(row[2])
+        expires_at = str(row[3])
+        report_row_id = int(row[4]) if row[4] is not None else None
+        report_id = str(row[5]) if row[5] is not None else None
+        if stored_status == "FINALIZED":
+            if report_row_id is None or report_id is None:
+                raise MigrationCorruption(
+                    "finalized report claim lacks its report identity"
                 )
             return ReportClaim(
                 claim_id=claim_id,
                 session_date=session_date,
                 report_kind=report_kind,
-                status="IN_PROGRESS",
+                status="ALREADY_FINALIZED",
                 claim_token=None,
                 lease_expires_at=_parse_canonical_timestamp(expires_at),
+                report_row_id=report_row_id,
+                report_id=report_id,
+            )
+        if stored_status != "IN_PROGRESS":
+            raise MigrationCorruption("report claim has an invalid stored status")
+        if stored_now >= expires_at:
+            recovered_expires_at = _add_seconds(
+                stored_now, _REPORT_CLAIM_LEASE_SECONDS
+            )
+            token = secrets.token_urlsafe(32)
+            _before_write()
+            with self._report_claim_write():
+                cursor = _sql(
+                    self._connection,
+                    "UPDATE report_claims SET claim_token = ?, lease_started_at = ?, "
+                    "lease_expires_at = ? WHERE id = ? AND status = 'IN_PROGRESS' "
+                    "AND lease_expires_at <= ?",
+                    (
+                        token,
+                        stored_now,
+                        recovered_expires_at,
+                        claim_id,
+                        stored_now,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise JournalBusy("report claim changed during recovery")
+            return ReportClaim(
+                claim_id=claim_id,
+                session_date=session_date,
+                report_kind=report_kind,
+                status="RECOVERED_EXPIRED",
+                claim_token=token,
+                lease_expires_at=_parse_canonical_timestamp(
+                    recovered_expires_at
+                ),
                 report_row_id=None,
                 report_id=None,
             )
+        return ReportClaim(
+            claim_id=claim_id,
+            session_date=session_date,
+            report_kind=report_kind,
+            status="IN_PROGRESS",
+            claim_token=None,
+            lease_expires_at=_parse_canonical_timestamp(expires_at),
+            report_row_id=None,
+            report_id=None,
+        )
 
     def finalize_report(
         self,
@@ -16260,6 +16363,43 @@ class Journal:
                 outbox_destination=outbox_destination,
                 outbox_payload=outbox_payload,
             )
+
+    def finalize_canonical_report(
+        self,
+        *,
+        claim_id: int,
+        claim_token: str,
+        publication_plan: object,
+    ) -> FinalizedCanonicalReport:
+        """Finalize one report and canonical context in one transaction."""
+        with self.transaction() as transaction:
+            finalized = transaction.finalize_canonical_report(
+                claim_id=claim_id,
+                claim_token=claim_token,
+                publication_plan=publication_plan,
+            )
+            self._clear_sqlite_callbacks_before_authority_commit()
+            from .workflows import (
+                _canonical_publication_plan_values_without_callbacks,
+            )
+
+            if _canonical_publication_plan_values_without_callbacks(
+                publication_plan,
+                self,
+            ) is None:
+                raise IdempotencyConflict(
+                    "canonical publication plan changed before commit"
+                )
+            return finalized
+
+    def read_canonical_report_context(
+        self,
+        report_id: str,
+    ) -> StoredCanonicalReportContext:
+        """Read and authenticate the canonical context for a stable report ID."""
+        self._ensure_open()
+        report_id = _require_sha256(report_id, "report ID")
+        return self._read_canonical_report_context(report_id)
 
     def read_report(self, report_id: str) -> StoredReport:
         """Read immutable report material for crash-safe archive reconstruction."""
@@ -32698,6 +32838,394 @@ class Journal:
                 raise MigrationCorruption(
                     "Phase 1 validation window baseline integrity failed"
                 )
+
+    def _canonical_report_context_record_sha256(
+        self,
+        *,
+        finalized: FinalizedReport,
+        workflow_kind: str,
+        economic_at: str,
+        retrieved_at: str,
+        material_digest: str,
+        source_digest: str,
+    ) -> str:
+        report_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_REPORT_COLUMNS) + " FROM reports WHERE id = ?",
+            (finalized.report_row_id,),
+        ).fetchone()
+        pin_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_REPORT_OBSERVATION_COLUMNS)
+            + " FROM report_observations WHERE report_id = ? "
+            "ORDER BY observation_ordinal",
+            (finalized.report_row_id,),
+        ).fetchall()
+        outbox_row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_OUTBOX_COLUMNS) + " FROM outbox WHERE id = ?",
+            (finalized.outbox_id,),
+        ).fetchone()
+        claim_row = (
+            None
+            if report_row is None
+            else _sql(
+                self._connection,
+                "SELECT " + ", ".join(_REPORT_CLAIM_COLUMNS)
+                + " FROM report_claims WHERE id = ?",
+                (int(report_row[2]),),
+            ).fetchone()
+        )
+        if report_row is None or outbox_row is None or claim_row is None:
+            raise MigrationCorruption(
+                "canonical report finalization cohort is incomplete"
+            )
+        if (
+            int(report_row[0]) != finalized.report_row_id
+            or str(report_row[1]) != finalized.report_id
+            or int(outbox_row[0]) != finalized.outbox_id
+            or int(outbox_row[2]) != finalized.report_row_id
+            or outbox_row[3] is not None
+            or str(claim_row[4]) != "FINALIZED"
+            or claim_row[9] is None
+            or int(claim_row[9]) != finalized.report_row_id
+        ):
+            raise MigrationCorruption(
+                "canonical report finalization result conflicts with stored rows"
+            )
+        report_reference = _journal_row_reference(
+            "reports", _REPORT_COLUMNS, report_row
+        )
+        pin_references = tuple(
+            _journal_row_reference(
+                "report_observations", _REPORT_OBSERVATION_COLUMNS, row
+            )
+            for row in pin_rows
+        )
+        outbox_reference = _journal_row_reference(
+            "outbox", _OUTBOX_COLUMNS, outbox_row
+        )
+        claim_reference = _journal_row_reference(
+            "report_claims", _REPORT_CLAIM_COLUMNS, claim_row
+        )
+        payload = {
+            "namespace": "stock-monitor/canonical-report-context/v1",
+            "workflow_kind": workflow_kind,
+            "economic_at": economic_at,
+            "retrieved_at": retrieved_at,
+            "material_digest": material_digest,
+            "source_digest": source_digest,
+            "finalized_result": {
+                "report_row_id": finalized.report_row_id,
+                "report_id": finalized.report_id,
+                "outbox_id": finalized.outbox_id,
+            },
+            "report_row": report_reference.row_digest,
+            "report_claim_row": claim_reference.row_digest,
+            "report_observation_rows": [
+                reference.row_digest for reference in pin_references
+            ],
+            "outbox_row": outbox_reference.row_digest,
+        }
+        return hashlib.sha256(
+            _canonical_audit_json(payload).encode("utf-8")
+        ).hexdigest()
+
+    def _read_canonical_report_context(
+        self,
+        report_id: str,
+    ) -> StoredCanonicalReportContext:
+        row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(f"context.{column}" for column in _CANONICAL_REPORT_CONTEXT_COLUMNS)
+            + ", report.report_id, report.session_date, report.report_kind, "
+            "report.created_at FROM canonical_report_contexts AS context "
+            "JOIN reports AS report ON report.id = context.report_id "
+            "WHERE report.report_id = ? COLLATE BINARY",
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("canonical report context does not exist")
+        stored_report = self.read_report(report_id)
+        if (
+            stored_report.report_row_id != int(row[1])
+            or stored_report.report_id != str(row[8])
+        ):
+            raise MigrationCorruption(
+                "canonical report context conflicts with report readback"
+            )
+        workflow_kind = str(row[2])
+        expected_report_kind = {
+            "PREMARKET": "MORNING",
+            "CLOSE": "CLOSE",
+        }.get(workflow_kind)
+        if expected_report_kind is None or str(row[10]) != expected_report_kind:
+            raise MigrationCorruption(
+                "canonical report context has an invalid workflow mapping"
+            )
+        economic_at = str(row[3])
+        retrieved_at = str(row[4])
+        material_digest = str(row[5])
+        source_digest = str(row[6])
+        record_sha256 = str(row[7])
+        parsed_economic_at = _parse_canonical_timestamp(economic_at)
+        parsed_retrieved_at = _parse_canonical_timestamp(retrieved_at)
+        try:
+            normalized_material_digest = _require_sha256(
+                material_digest, "canonical material digest"
+            )
+            normalized_source_digest = _require_sha256(
+                source_digest, "canonical source digest"
+            )
+            normalized_record_sha256 = _require_sha256(
+                record_sha256, "canonical context record hash"
+            )
+        except InvalidJournalValue as error:
+            raise MigrationCorruption(
+                "canonical report context digest is malformed"
+            ) from error
+        if (
+            economic_at > retrieved_at
+            or retrieved_at > str(row[11])
+            or economic_at[:10] != str(row[9])
+            or retrieved_at[:10] != str(row[9])
+            or normalized_material_digest != material_digest
+            or normalized_source_digest != source_digest
+            or normalized_record_sha256 != record_sha256
+        ):
+            raise MigrationCorruption("canonical report context timing is inconsistent")
+        outbox_rows = _sql(
+            self._connection,
+            "SELECT id FROM outbox WHERE origin_report_id = ? ORDER BY id",
+            (int(row[1]),),
+        ).fetchall()
+        if len(outbox_rows) != 1:
+            raise MigrationCorruption("canonical report outbox cohort is incomplete")
+        finalized = FinalizedReport(
+            report_row_id=int(row[1]),
+            report_id=str(row[8]),
+            outbox_id=int(outbox_rows[0][0]),
+            duplicate=False,
+        )
+        expected_record_sha256 = self._canonical_report_context_record_sha256(
+            finalized=finalized,
+            workflow_kind=workflow_kind,
+            economic_at=economic_at,
+            retrieved_at=retrieved_at,
+            material_digest=material_digest,
+            source_digest=source_digest,
+        )
+        if not secrets.compare_digest(record_sha256, expected_record_sha256):
+            raise MigrationCorruption(
+                "canonical report context record hash is inconsistent"
+            )
+        return StoredCanonicalReportContext(
+            context_row_id=int(row[0]),
+            report_row_id=int(row[1]),
+            workflow_kind=workflow_kind,
+            economic_at=parsed_economic_at,
+            retrieved_at=parsed_retrieved_at,
+            material_digest=material_digest,
+            source_digest=source_digest,
+            record_sha256=record_sha256,
+        )
+
+    def _finalize_canonical_report_from_plan(
+        self,
+        *,
+        claim_id: int,
+        claim_token: str,
+        publication_plan: object,
+    ) -> FinalizedCanonicalReport:
+        from .workflows import _canonical_publication_plan_values_without_callbacks
+
+        values = _canonical_publication_plan_values_without_callbacks(
+            publication_plan,
+            self,
+        )
+        if values is None:
+            raise IdempotencyConflict(
+                "canonical publication plan authority is invalid"
+            )
+        (
+            workflow_kind,
+            storage_kind,
+            session_date,
+            economic_at,
+            retrieved_at,
+            material_digest,
+            source_digest,
+            observation_ids,
+            body,
+            state_sha256,
+            report,
+            _result,
+            _material,
+            _publisher,
+        ) = values
+        observation_sha256s = getattr(report, "observation_ids", None)
+        if type(observation_sha256s) is not tuple:
+            raise IdempotencyConflict(
+                "canonical publication plan report is invalid"
+            )
+        durable_report_id = stable_report_id(
+            storage_kind,
+            session_date,
+            observation_sha256s,
+            state_sha256,
+        )
+        return self._finalize_canonical_report(
+            claim_id=claim_id,
+            claim_token=claim_token,
+            body=body,
+            state_sha256=state_sha256,
+            observation_ids=observation_ids,
+            archive_relative_path=report_archive_relative_path(
+                storage_kind,
+                session_date,
+                durable_report_id,
+            ),
+            created_at=_utc_now(),
+            outbox_destination="CODEX_TASK",
+            outbox_payload=body,
+            workflow_kind=workflow_kind,
+            economic_at=economic_at,
+            retrieved_at=retrieved_at,
+            material_digest=material_digest,
+            source_digest=source_digest,
+        )
+
+    def _finalize_canonical_report(
+        self,
+        *,
+        claim_id: int,
+        claim_token: str,
+        body: str,
+        state_sha256: str,
+        observation_ids: Sequence[int],
+        archive_relative_path: str,
+        created_at: datetime,
+        outbox_destination: str,
+        outbox_payload: str,
+        workflow_kind: str,
+        economic_at: datetime,
+        retrieved_at: datetime,
+        material_digest: str,
+        source_digest: str,
+    ) -> FinalizedCanonicalReport:
+        if type(workflow_kind) is not str or workflow_kind not in {
+            "PREMARKET",
+            "CLOSE",
+        }:
+            raise InvalidJournalValue("canonical workflow kind is invalid")
+        stored_economic_at = _canonical_timestamp(economic_at)
+        stored_retrieved_at = _canonical_timestamp(retrieved_at)
+        if stored_economic_at > stored_retrieved_at:
+            raise InvalidJournalValue(
+                "canonical economic time cannot follow retrieval"
+            )
+        material_digest = _require_sha256(
+            material_digest, "canonical material digest"
+        )
+        source_digest = _require_sha256(source_digest, "canonical source digest")
+        normalized_claim_id = _require_integer(
+            claim_id, "report claim row ID", minimum=1
+        )
+        claim_row = _sql(
+            self._connection,
+            "SELECT status, report_kind, report_id FROM report_claims WHERE id = ?",
+            (normalized_claim_id,),
+        ).fetchone()
+        if claim_row is None:
+            raise InvalidJournalValue("report claim row does not exist")
+        expected_report_kind = (
+            "MORNING" if workflow_kind == "PREMARKET" else "CLOSE"
+        )
+        if str(claim_row[1]) != expected_report_kind:
+            raise IdempotencyConflict(
+                "canonical workflow kind conflicts with report claim"
+            )
+        prior_report_row_id = (
+            None if claim_row[2] is None else int(claim_row[2])
+        )
+        if str(claim_row[0]) == "FINALIZED":
+            if prior_report_row_id is None:
+                raise MigrationCorruption(
+                    "finalized report claim lacks its report row"
+                )
+            context_row = _sql(
+                self._connection,
+                "SELECT id FROM canonical_report_contexts WHERE report_id = ?",
+                (prior_report_row_id,),
+            ).fetchone()
+            if context_row is None:
+                raise IdempotencyConflict(
+                    "finalized report lacks its canonical context"
+                )
+
+        finalized = self._finalize_report(
+            claim_id=normalized_claim_id,
+            claim_token=claim_token,
+            body=body,
+            state_sha256=state_sha256,
+            observation_ids=observation_ids,
+            archive_relative_path=archive_relative_path,
+            created_at=created_at,
+            outbox_destination=outbox_destination,
+            outbox_payload=outbox_payload,
+        )
+        record_sha256 = self._canonical_report_context_record_sha256(
+            finalized=finalized,
+            workflow_kind=workflow_kind,
+            economic_at=stored_economic_at,
+            retrieved_at=stored_retrieved_at,
+            material_digest=material_digest,
+            source_digest=source_digest,
+        )
+        immutable = (
+            workflow_kind,
+            stored_economic_at,
+            stored_retrieved_at,
+            material_digest,
+            source_digest,
+            record_sha256,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT id, workflow_kind, economic_at, retrieved_at, "
+            "material_digest, source_digest, record_sha256 "
+            "FROM canonical_report_contexts WHERE report_id = ?",
+            (finalized.report_row_id,),
+        ).fetchone()
+        if existing is None:
+            try:
+                with self._provider_monitoring_write():
+                    cursor = _sql(
+                        self._connection,
+                        "INSERT INTO canonical_report_contexts("
+                        "report_id, workflow_kind, economic_at, retrieved_at, "
+                        "material_digest, source_digest, record_sha256"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (finalized.report_row_id, *immutable),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise IdempotencyConflict(
+                    "canonical report context could not be finalized"
+                ) from error
+            context_row_id = int(cursor.lastrowid)
+        else:
+            if tuple(existing[1:]) != immutable:
+                raise IdempotencyConflict(
+                    "canonical report context conflicts with stored content"
+                )
+            context_row_id = int(existing[0])
+        context = self._read_canonical_report_context(finalized.report_id)
+        if context.context_row_id != context_row_id:
+            raise MigrationCorruption(
+                "canonical report context readback changed identity"
+            )
+        return FinalizedCanonicalReport(finalized, context)
 
     def _finalize_report(
         self,

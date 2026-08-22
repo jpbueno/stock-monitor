@@ -621,17 +621,14 @@ class CanonicalWorkflowFoundationTests(unittest.TestCase):
             publisher = CanonicalJournalWorkflowPublisher(self.journal, self.root)
             result = publisher.issue_result(material=premarket_material)
             claims_before = self.journal.count("report_claims")
-            with self.assertRaisesRegex(
-                WorkflowError,
-                "canonical Journal publication",
-            ):
-                publisher.publish(
-                    kind="PREMARKET",
-                    session_date=DAY,
-                    generated_at=premarket_values["retrieved_at"],
-                    result=result,
-                    material=premarket_material,
-                )
+            plan = publisher.prepare_publication(
+                kind="PREMARKET",
+                session_date=DAY,
+                generated_at=premarket_values["retrieved_at"],
+                result=result,
+                material=premarket_material,
+            )
+            self.assertEqual(plan.storage_kind, "MORNING")
             self.assertEqual(self.journal.count("report_claims"), claims_before)
 
         close_receipt = self._receipt(
@@ -735,17 +732,14 @@ class CanonicalWorkflowFoundationTests(unittest.TestCase):
             )
             publisher = CanonicalJournalWorkflowPublisher(self.journal, self.root)
             result = publisher.issue_result(material=close_material)
-            with self.assertRaisesRegex(
-                WorkflowError,
-                "canonical Journal publication",
-            ):
-                publisher.publish(
-                    kind="CLOSE",
-                    session_date=DAY,
-                    generated_at=RETRIEVED_AT,
-                    result=result,
-                    material=close_material,
-                )
+            plan = publisher.prepare_publication(
+                kind="CLOSE",
+                session_date=DAY,
+                generated_at=RETRIEVED_AT,
+                result=result,
+                material=close_material,
+            )
+            self.assertEqual(plan.storage_kind, "CLOSE")
 
     def test_composition_currentness_never_calls_mutable_timezone_code(self) -> None:
         premarket_receipt = self._receipt(suffix="hostile-time-premarket")

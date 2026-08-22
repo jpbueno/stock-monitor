@@ -19,6 +19,7 @@ from stock_monitor.journal import (
     APPLICATION_ID,
     Journal,
     JournalBusy,
+    JournalError,
     MigrationCorruption,
     MigrationDrift,
     ScheduledRunResultEnvelope,
@@ -331,6 +332,18 @@ class JournalMigrationTests(unittest.TestCase):
                     ),
                 )
                 with journal._immediate_connection() as connection:
+                    with self.assertRaisesRegex(
+                        JournalError,
+                        "active journal transaction",
+                    ):
+                        with journal._provider_monitoring_write():
+                            with journal._provider_monitoring_write():
+                                pass
+                    self.assertFalse(journal._provider_monitoring_write_allowed)
+                    with self.assertRaisesRegex(RuntimeError, "writer rollback"):
+                        with journal._provider_monitoring_write():
+                            raise RuntimeError("writer rollback")
+                    self.assertFalse(journal._provider_monitoring_write_allowed)
                     connection.execute(
                         "INSERT INTO source_observations VALUES "
                         "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -368,6 +381,12 @@ class JournalMigrationTests(unittest.TestCase):
                         ),
                         (1, 1, 1, 1),
                     )
+                with self.assertRaisesRegex(
+                    JournalError,
+                    "active journal transaction",
+                ):
+                    with journal._provider_monitoring_write():
+                        pass
 
     def test_scheduled_report_kind_mapping_is_exact_with_premarket_alias(self) -> None:
         cases = (

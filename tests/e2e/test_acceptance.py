@@ -87,17 +87,100 @@ def run_recorded_acceptance_matrix(
 
 
 class AcceptanceTests(unittest.TestCase):
-    def test_scheduled_prompts_use_stable_post_merge_launcher(self) -> None:
+    def test_scheduled_prompts_use_only_the_stable_unattended_launcher(
+        self,
+    ) -> None:
         content = (ROOT / "docs" / "scheduled-prompts.md").read_text(
             encoding="utf-8"
         )
         stable_launcher = (
             "/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/"
-            "scripts/run_monitor.sh"
+            "scripts/run_monitor_unattended.sh"
         )
 
         self.assertNotIn("/.worktrees/", content)
         self.assertEqual(content.count(stable_launcher), 5)
+        self.assertNotIn("scripts/run_monitor.sh", content)
+
+    def test_operator_docs_define_the_literal_private_environment(self) -> None:
+        content = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (ROOT / "README.md", ROOT / "docs" / "operations.md")
+        )
+        folded = " ".join(content.casefold().split())
+
+        self.assertIn("exactly four literal, non-empty values", folded)
+        for name in (
+            "APCA_API_KEY_ID",
+            "APCA_API_SECRET_KEY",
+            "SEC_USER_AGENT",
+            "STOCK_MONITOR_HOME",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, content)
+        self.assertIn("mode 0400 or 0600", folded)
+        self.assertIn("market-data get boundary", folded)
+        self.assertIn("not a provider-side read-only property", folded)
+        self.assertNotIn("read-only alpaca", folded)
+        self.assertNotIn("<read-only-market-data", folded)
+        for secret_name in ("APCA_API_KEY_ID", "APCA_API_SECRET_KEY"):
+            with self.subTest(secret_name=secret_name):
+                self.assertNotRegex(content, rf"{secret_name}\s*=")
+
+    def test_schedule_activation_is_current_sequential_and_fail_closed(
+        self,
+    ) -> None:
+        operations = (ROOT / "docs" / "operations.md").read_text(
+            encoding="utf-8"
+        )
+        prompts = (ROOT / "docs" / "scheduled-prompts.md").read_text(
+            encoding="utf-8"
+        )
+        combined = f"{operations}\n{prompts}"
+        folded = " ".join(combined.casefold().split())
+
+        for command in (
+            "verify universe --json",
+            "verify evidence --json",
+            "verify calendar --json",
+            "provider smoke --json",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, combined)
+        for phrase in (
+            "active Phase 1 validation authority",
+            "real manual premarket",
+            "real manual close",
+            "reviewed scheduled-mode premarket smoke",
+            "reviewed scheduled-mode close smoke",
+            "current through the next wake",
+            "PHASE1_BLOCKED_SCHEDULED_SMOKE",
+            "zero external schedules",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.casefold(), folded)
+
+        for window in (
+            "08:45:00 <= start < 09:00:00 ET",
+            "12:30:00 <= start < 12:45:00 ET",
+            "15:30:00 <= start < 15:45:00 ET",
+        ):
+            with self.subTest(window=window):
+                self.assertIn(window, operations)
+                self.assertIn(window, prompts)
+        self.assertIn("no backfill", folded)
+        self.assertIn("never request options data", folded)
+
+        ordered_gates = (
+            "1. Review the current universe",
+            "2. Run provider smoke",
+            "3. Create or read back the reviewed Phase 1 window",
+            "4. Complete and review the real manual premarket",
+            "5. While there are still zero external schedules",
+            "6. Only after all five gates pass",
+        )
+        locations = tuple(operations.index(gate) for gate in ordered_gates)
+        self.assertEqual(locations, tuple(sorted(locations)))
 
     def test_recorded_fixture_acceptance_matrix_has_exact_exit_outcomes(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -24,24 +24,31 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env`, then load it into the current shell. The launcher does not read
-the file automatically.
+Before a canonical or unattended run, edit `.env` locally so it contains
+exactly four literal, non-empty values: `APCA_API_KEY_ID`,
+`APCA_API_SECRET_KEY`, `SEC_USER_AGENT`, and `STOCK_MONITOR_HOME`. Use literal
+`NAME=value` assignments only—no quotes, interpolation, variable references,
+or command substitution—and keep the file owned by the current user at mode
+0400 or 0600. Never display or paste its values into documentation, prompts,
+commands, chat, logs, reports, or backups.
+
+The unattended launcher reads and validates that private file itself:
 
 ```sh
-set -a
-. ./.env
-set +a
-./scripts/run_monitor.sh db init --json
-./scripts/run_monitor.sh verify universe --json
-./scripts/run_monitor.sh verify calendar --json
-./scripts/run_monitor.sh provider smoke --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' db init --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify universe --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify evidence --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify calendar --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' provider smoke --json
 ```
 
-`APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` are for read-only Alpaca market
-data. `SEC_USER_AGENT` must include an application name and contact email.
-`STOCK_MONITOR_HOME` is optional; when set, it owns `.stock-monitor/` and
-`reports/`. Keep `.env`, the database, exports, and reports out of version
-control.
+`APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` are Alpaca paper-account
+credentials used only by this application's allow-listed market-data GET
+boundary. That is an application restriction, not a provider-side read-only
+property of the credentials. `SEC_USER_AGENT` must identify the application
+and a contact email. `STOCK_MONITOR_HOME` must be a non-empty absolute operator
+directory for unattended use; it owns `.stock-monitor/` and `reports/`. Keep
+`.env`, the database, exports, and reports out of version control.
 
 The provider smoke must return exit `0` before any non-fixture run. An absent
 or unactivated provider adapter fails closed; that is a blocker, not permission
@@ -60,6 +67,15 @@ report claims, outbox, or report archive.
 
 Every nonzero exit means no candidate and no authorized position action. Never
 invent a candidate from stale output or from a previous report.
+
+External scheduling stays disabled until the current universe, calendar, and
+evidence releases verify and remain current through the next wake; provider
+smoke passes; an active Phase 1 validation authority exists; real manual
+premarket and close reports are reviewed; and one reviewed scheduled-mode
+premarket smoke and one reviewed scheduled-mode close smoke pass. If any gate
+is invalid or expired, record `PHASE1_BLOCKED_SCHEDULED_SMOKE` and leave zero
+external schedules. The provider-backed monitor remains manual-only: it never
+accesses Robinhood, places an order, or requests options data.
 
 ## Operator documentation
 

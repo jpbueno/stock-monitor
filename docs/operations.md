@@ -21,6 +21,8 @@ The immutable default limits are:
   actual manual ledger.
 - Manual brokerage verification and manual execution only. The application
   must never access Robinhood and must never place an order.
+- Provider-backed workflows never request options data. Options endpoints and
+  order/account/trading endpoints remain outside the application boundary.
 
 A cash-account sale settles T+1: proceeds become reusable on the next eligible
 trading session, not immediately after the sale. Before any manual buy, verify
@@ -38,33 +40,36 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` without quoting or committing the secrets:
+Edit `.env` locally with exactly four literal, non-empty values, one assignment
+each for `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `SEC_USER_AGENT`, and
+`STOCK_MONITOR_HOME`. The right-hand sides are the real local values, but do not
+show them in this runbook, a prompt, a command, chat, logs, screenshots,
+reports, or backups. The parser accepts literal `NAME=value` data only; it does
+not remove quotes, interpolate variable references, parse shell syntax, or
+execute command-substitution text. Quotes would become part of the value and
+should not be added. `SEC_USER_AGENT` must contain an application name and
+contact email, and `STOCK_MONITOR_HOME` must be a non-empty absolute operator
+directory.
 
-```dotenv
-APCA_API_KEY_ID=<read-only-market-data-key>
-APCA_API_SECRET_KEY=<read-only-market-data-secret>
-SEC_USER_AGENT=Stock Monitor you@example.com
-STOCK_MONITOR_HOME=<optional-absolute-operator-directory>
-```
+The file must be owned by the current user, have one hard link, and have mode
+0400 or 0600. `chmod 400 .env` and `chmod 600 .env` are the two supported
+permission choices. Do not `source` or evaluate this file. The exact unattended
+launcher opens it without following symlinks, validates it, and passes only the
+four approved values to an isolated Python process. The interactive
+`scripts/run_monitor.sh` launcher deliberately does not read `.env` and must
+never be substituted into a scheduled prompt.
 
-The launcher deliberately does not parse `.env`. Load it into each interactive
-or unattended environment before invoking the launcher:
-
-```sh
-set -a
-. ./.env
-set +a
-```
-
-Do not print the environment, put secrets on a command line, place secrets in
-fixtures, or copy `.env` into reports/backups. Runtime state is stored under
-`$STOCK_MONITOR_HOME/.stock-monitor/` (or the repository root when the override
-is empty); Markdown reports are under `$STOCK_MONITOR_HOME/reports/`.
+The Alpaca values are paper-account credentials used only by this
+application's allow-listed market-data GET boundary. This is an application
+restriction, not a provider-side read-only property of the credentials. The
+application has no brokerage, account, trading, or order client. Runtime state
+is stored under `$STOCK_MONITOR_HOME/.stock-monitor/`; Markdown reports are
+under `$STOCK_MONITOR_HOME/reports/`.
 
 ## Initialize the database
 
 ```sh
-./scripts/run_monitor.sh db init --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' db init --json
 ```
 
 Exit `0` with `INITIALIZED` confirms that all known SQLite migrations were
@@ -91,23 +96,29 @@ Review the files before trusting a run:
 Then run the public validations:
 
 ```sh
-./scripts/run_monitor.sh verify universe --json
-./scripts/run_monitor.sh verify calendar --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify universe --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify evidence --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify calendar --json
 ```
 
-Both must exit `0`. An expired, incomplete, conflicting, or unverifiable
-manifest is a data block; do not substitute an older cache.
+All three must exit `0`. Verify the selected universe, calendar, and every
+subject-evidence release are current now and remain current through the next
+wake of every proposed external schedule. A release that is valid now but
+expires before the next wake does not satisfy this gate. An expired,
+incomplete, conflicting, or unverifiable manifest is a data block; do not
+substitute an older cache.
 
 ## Provider smoke
 
 ```sh
-./scripts/run_monitor.sh provider smoke --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' provider smoke --json
 ```
 
-This must remain read-only and must verify current market-data health and the
-required entitlement. Exit `0` is the only success. Exit `2`, `3`, `5`, or `10`
-blocks non-fixture use. In a build where the provider adapter is not activated,
-the command intentionally fails closed with the paper/manual boundary. Record
+This must stay within the application's GET-only market-data boundary and must
+verify current market-data health and the required entitlement. Exit `0` with
+overall `READY` is the only success. Exit `2`, `3`, `5`, or `10` blocks
+non-fixture use. In a build where the provider adapter is not activated, the
+command intentionally fails closed with the paper/manual boundary. Record
 `PHASE1_BLOCKED_CONFIGURATION_OR_ENTITLEMENT`; do not schedule the monitor and
 do not produce a live candidate.
 
@@ -137,17 +148,32 @@ bytes select a content-addressed fixture root under
 canonical operator journal or canonical operator report tree, and two different
 same-session fixtures cannot claim each other's report.
 
-Only after the source checks and provider smoke exit `0`, run without
-`--fixture`:
+Only after the current universe, calendar, and evidence checks and provider
+smoke exit `0`, create or idempotently read back the explicit Phase 1 window.
+Choose `YYYY-MM-DD` only from the reviewed calendar:
 
 ```sh
-./scripts/run_monitor.sh run premarket --json
-./scripts/run_monitor.sh run close --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' phase1 start --session YYYY-MM-DD --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' phase1 status --json
 ```
 
-Both manual runs must complete current provider/source checks and create
-reviewable reports. Otherwise record `PHASE1_BLOCKED_MANUAL_RUN` and do not
-schedule. A candidate report remains paper-plan only and still requires a
+Retain and review the exact `phase1 start` readback. `phase1 status` is useful
+diagnostic output, but it does not replace the active Phase 1 validation
+authority required by a canonical run. A missing, copied, stale, conflicting,
+or inactive authority blocks activation.
+
+Next perform a real manual premarket run and a real manual close run, without
+`--scheduled` and without a fixture, inside their applicable due windows:
+
+```sh
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close --json
+```
+
+Both runs must repeat current provider/source checks and create canonical,
+reviewable reports. Review the exact output, archive, source lineage, and
+terminal result from each. Otherwise record `PHASE1_BLOCKED_MANUAL_RUN` and do
+not schedule. A candidate report remains paper-plan only and still requires a
 separate same-session account check and manual decision.
 
 ## Manual confirmations
@@ -220,12 +246,14 @@ For recovery:
 
 1. Stop every external schedule and preserve the damaged state read-only.
 2. Restore the database and reports into a fresh `STOCK_MONITOR_HOME`.
-3. Load `.env`, run `db init`, then verify universe and calendar.
+3. Restore the literal `.env` at mode 0400 or 0600. Through the exact unattended
+   launcher, run `db init`, then verify universe, evidence, and calendar.
 4. Run all six recorded acceptance scenarios in a separate fresh test home.
 5. Run `export` and compare report IDs, hashes, row counts, and the latest
    account/position facts with the last reviewed backup.
-6. Resolve every difference through an append-only confirmation. Run a manual
-   premarket and close smoke before re-enabling schedules.
+6. Resolve every difference through an append-only confirmation. Repeat every
+   activation gate, including real manual and reviewed scheduled-mode
+   premarket and close smoke, before re-enabling schedules.
 
 If a verified backup is unavailable, initialize a new journal but do not
 reconstruct or assume actual holdings. Record the account as reconciliation
@@ -233,24 +261,64 @@ required and rebuild truth from explicit operator evidence.
 
 ## Schedule behavior
 
-Scheduling is external to the monitor. Activate it only after source review,
-provider smoke, and both real manual runs succeed. The approved heartbeats are
-weekdays at 08:45 ET for premarket, 12:30 ET for an early-close check, and
-15:30 ET for normal close. The early-close heartbeat runs a close only when the
-reviewed calendar identifies an early close. The close workflow is deduplicated
-to one report per market session, and missed runs are never backfilled.
+Scheduling is external to the monitor and remains an all-or-none activation.
+The exact half-open America/New_York due windows are:
+
+- `08:45:00 <= start < 09:00:00 ET` for premarket;
+- `12:30:00 <= start < 12:45:00 ET` for a verified early close; and
+- `15:30:00 <= start < 15:45:00 ET` for a normal close.
+
+Before the window the result is `NOT_DUE_NOOP`. At or after its end the result
+is `MISSED_RUN_NOOP`. There is no backfill, no retry with later market data, and
+no reuse of an earlier report or candidate. The nominal 08:45, 12:30, or 15:30
+time remains the economic cutoff even if dispatch begins later inside the
+window. The close path remains deduplicated to one report per market session.
+
+Complete these gates in order before creating any external schedule:
+
+1. Review the current universe, calendar, and subject evidence, run `verify
+   universe --json`, `verify evidence --json`, and `verify calendar --json`,
+   and confirm every selected release remains current through the next wake of
+   each proposed heartbeat.
+2. Run provider smoke through the exact unattended launcher and require exit
+   `0` with overall `READY`.
+3. Create or read back the reviewed Phase 1 window and confirm the canonical
+   Journal has the active Phase 1 validation authority. Diagnostic status or a
+   prior report is not a substitute for that authority.
+4. Complete and review the real manual premarket and real manual close reports
+   described above.
+5. While there are still zero external schedules, invoke the unattended
+   `--scheduled` path manually inside its due window. Review one scheduled-mode
+   premarket result and one scheduled-mode close result (normal or verified
+   early close), including exact exit, outcome, report, and source lineage:
+
+   ```sh
+   '/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run premarket --scheduled --json
+   '/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' run close --scheduled --json
+   ```
+
+   These are the required reviewed scheduled-mode premarket smoke and reviewed
+   scheduled-mode close smoke. Running the commands from a terminal exercises
+   the scheduled code path without creating an external schedule.
+6. Only after all five gates pass may the three weekday heartbeats be created:
+   08:45 premarket, 12:30 early-close check, and 15:30 normal close. Use the
+   exact prompts in `docs/scheduled-prompts.md`; immediately read back and
+   compare every schedule's name, time, timezone, project, enabled state, and
+   prompt. Never create or retain a partial set.
+
+Immediately before creation, repeat the release-validity and authority checks.
+If any gate is invalid, expired, missing, or unreviewed—or if there is no active
+Phase 1 validation authority—record `PHASE1_BLOCKED_SCHEDULED_SMOKE` and leave
+zero external schedules. Current evidence that expires before the next wake is
+expired for this gate. Do not weaken a gate because a later wake could retry.
 
 Every scheduled invocation must pass `--scheduled`; without it, `run premarket`
-and `run close` remain explicit manual runs. Premarket is selected at exactly
-08:45 America/New_York even when the caller timestamp has another UTC offset.
-`verify calendar --json` returns the current session date, open status, open,
-review, and close wall times, timezone, and the exact early-close flag.
-
-Use the prompts in `docs/scheduled-prompts.md`. Read back every external
-schedule record after creation. One successful unattended real premarket and
-one successful unattended real close report must be reviewed before recording
-`PHASE1_READY_FOR_PROSPECTIVE_VALIDATION`; otherwise the status is
-`PHASE1_BLOCKED_SCHEDULED_SMOKE`.
+and `run close` remain explicit manual runs. The prompts use only the exact
+absolute unattended launcher, disclose no environment value, never request
+options data, never access Robinhood, and never place, route, modify, or cancel
+an order. After the three schedule records are verified, the operator may
+record `PHASE1_READY_FOR_PROSPECTIVE_VALIDATION`; scheduling still confers no
+trade or promotion authority.
 
 Exit handling is exact: `0` report/no-op success, `2` configuration, `3`
 data/source unavailable, `4` policy/risk block, `5` reconciliation or manual

@@ -121,9 +121,9 @@ class JournalMigrationTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 5)
+                self.assertEqual(journal.count("schema_migrations"), 6)
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 5)
+                self.assertEqual(journal.count("schema_migrations"), 6)
 
     def test_provider_monitoring_migration_is_packaged_hashed_and_applied_fifth(self) -> None:
         packaged = importlib.resources.files("stock_monitor.sql").joinpath(
@@ -131,6 +131,16 @@ class JournalMigrationTests(unittest.TestCase):
         )
         self.assertTrue(packaged.is_file(), "packaged migration 005 is missing")
         expected_sha256 = hashlib.sha256(packaged.read_bytes()).hexdigest()
+        lineage_packaged = importlib.resources.files("stock_monitor.sql").joinpath(
+            "006_actual_position_plan_lineage.sql"
+        )
+        self.assertTrue(
+            lineage_packaged.is_file(),
+            "packaged migration 006 is missing",
+        )
+        lineage_sha256 = hashlib.sha256(
+            lineage_packaged.read_bytes()
+        ).hexdigest()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
             with Journal.open(path):
@@ -152,10 +162,73 @@ class JournalMigrationTests(unittest.TestCase):
                 (3, "003_phase2_paper.sql"),
                 (4, "004_scheduled_result_envelope.sql"),
                 (5, "005_provider_monitoring.sql"),
+                (6, "006_actual_position_plan_lineage.sql"),
             ],
         )
         self.assertEqual(str(rows[4][2]), expected_sha256)
-        self.assertEqual(user_version, 5)
+        self.assertEqual(str(rows[5][2]), lineage_sha256)
+        self.assertEqual(user_version, 6)
+
+    def test_exact_head_v5_database_upgrades_to_v6_without_drift(self) -> None:
+        expected_head_v5_sha256 = (
+            "037d42efce5c0272fcbe942449fb4c59bf55ed4ccfd89eabe58982e5adc438d1"
+        )
+        migration_names = (
+            "001_core.sql",
+            "002_phase1.sql",
+            "003_phase2_paper.sql",
+            "004_scheduled_result_envelope.sql",
+            "005_provider_monitoring.sql",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            v5_directory = root / "v5-migrations"
+            v5_directory.mkdir()
+            for name in migration_names:
+                packaged = importlib.resources.files("stock_monitor.sql").joinpath(
+                    name
+                )
+                (v5_directory / name).write_bytes(packaged.read_bytes())
+            self.assertEqual(
+                hashlib.sha256(
+                    (v5_directory / "005_provider_monitoring.sql").read_bytes()
+                ).hexdigest(),
+                expected_head_v5_sha256,
+            )
+            path = root / "journal.db"
+            with Journal.open(path, migration_directory=v5_directory) as journal:
+                self.assertEqual(journal.count("schema_migrations"), 5)
+                self.assertEqual(
+                    journal._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    5,
+                )
+
+            with Journal.open(path) as journal:
+                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(
+                    journal._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    6,
+                )
+                migration_rows = journal._connection.execute(
+                    "SELECT version, name, sha256 FROM schema_migrations "
+                    "ORDER BY version"
+                ).fetchall()
+                self.assertEqual(
+                    str(migration_rows[4][2]),
+                    expected_head_v5_sha256,
+                )
+                self.assertEqual(
+                    (int(migration_rows[5][0]), str(migration_rows[5][1])),
+                    (6, "006_actual_position_plan_lineage.sql"),
+                )
+                self.assertEqual(
+                    journal.count("actual_position_plan_bindings"),
+                    0,
+                )
 
     def test_provider_monitoring_tables_are_strict_and_have_exact_columns(self) -> None:
         expected_columns = {
@@ -190,6 +263,29 @@ class JournalMigrationTests(unittest.TestCase):
                 "source_observation_id",
                 "failure_code",
                 "received_at",
+                "record_sha256",
+            ),
+            "actual_position_plan_bindings": (
+                "id",
+                "binding_id",
+                "confirmation_execution_event_id",
+                "confirmation_event_id",
+                "signal_id",
+                "position_lifecycle_id",
+                "binding_ordinal",
+                "binding_kind",
+                "symbol",
+                "parent_order_id",
+                "fill_group_planned_shares",
+                "fill_shares",
+                "cumulative_group_shares",
+                "event_time",
+                "message_time",
+                "action_received_at",
+                "recorded_at",
+                "action_source_digest",
+                "primary_plan_digest",
+                "source_digest",
                 "record_sha256",
             ),
             "close_recommendations": (
@@ -387,6 +483,78 @@ class JournalMigrationTests(unittest.TestCase):
                 ):
                     with journal._provider_monitoring_write():
                         pass
+
+    def test_actual_position_plan_bindings_are_gated_and_append_only(
+        self,
+    ) -> None:
+        expected_triggers = {
+            "actual_position_plan_bindings_require_journal_provider_monitoring_writer",
+            "actual_position_plan_bindings_no_conflicting_insert",
+            "actual_position_plan_bindings_no_update",
+            "actual_position_plan_bindings_no_delete",
+            "actual_position_plan_bindings_validate_lineage",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "journal.db"
+            with Journal.open(path):
+                pass
+            with closing(sqlite3.connect(path)) as connection:
+                rows = connection.execute(
+                    "SELECT name, sql FROM sqlite_schema "
+                    "WHERE type = 'trigger' "
+                    "AND tbl_name = 'actual_position_plan_bindings'"
+                ).fetchall()
+                phase1_sequence_sql = str(
+                    connection.execute(
+                        "SELECT sql FROM sqlite_schema "
+                        "WHERE type = 'trigger' "
+                        "AND name = 'phase1_signal_events_validate_sequence'"
+                    ).fetchone()[0]
+                )
+                unique_index_columns = {
+                    tuple(
+                        str(column[2])
+                        for column in connection.execute(
+                            f"PRAGMA index_info('{str(index[1])}')"
+                        ).fetchall()
+                    )
+                    for index in connection.execute(
+                        "PRAGMA index_list('actual_position_plan_bindings')"
+                    ).fetchall()
+                    if int(index[2]) == 1
+                }
+
+        actual = {str(row[0]): str(row[1]) for row in rows}
+        self.assertEqual(set(actual), expected_triggers)
+        self.assertIn(
+            "journal_provider_monitoring_write_allowed() != 1",
+            actual[
+                "actual_position_plan_bindings_require_journal_provider_monitoring_writer"
+            ],
+        )
+        self.assertIn(
+            "is append-only",
+            actual["actual_position_plan_bindings_no_update"],
+        )
+        self.assertIn(
+            "is append-only",
+            actual["actual_position_plan_bindings_no_delete"],
+        )
+        self.assertIn("'PARTIAL_FILL'", phase1_sequence_sql)
+        validation_sql = actual[
+            "actual_position_plan_bindings_validate_lineage"
+        ]
+        self.assertIn("NEW.position_lifecycle_id", validation_sql)
+        self.assertIn("actual_positions AS current_position", validation_sql)
+        self.assertIn("prior_position.shares != 0", validation_sql)
+        conflict_sql = actual[
+            "actual_position_plan_bindings_no_conflicting_insert"
+        ]
+        self.assertIn("position_lifecycle_id", conflict_sql)
+        self.assertIn(
+            ("position_lifecycle_id", "binding_ordinal"),
+            unique_index_columns,
+        )
 
     def test_scheduled_report_kind_mapping_is_exact_with_premarket_alias(self) -> None:
         cases = (
@@ -1396,7 +1564,7 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA application_id").fetchone()[0], 0)
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 5)
+                self.assertEqual(journal.count("schema_migrations"), 6)
 
     def test_migration_transaction_control_cannot_escape_atomic_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1662,7 +1830,7 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(wrong_version_path):
                 pass
             with closing(sqlite3.connect(wrong_version_path)) as connection:
-                connection.execute("PRAGMA user_version = 6")
+                connection.execute("PRAGMA user_version = 7")
             with self.assertRaises(MigrationCorruption):
                 Journal.open(wrong_version_path)
 
@@ -1702,9 +1870,9 @@ class JournalMigrationTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 counts = tuple(executor.map(lambda _: open_and_count(), range(2)))
 
-            self.assertEqual(counts, (5, 5))
+            self.assertEqual(counts, (6, 6))
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 5)
+                self.assertEqual(journal.count("schema_migrations"), 6)
 
     def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1747,10 +1915,10 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertTrue(application_id_read.wait(timeout=10))
                 try:
                     with Journal.open(path) as journal:
-                        self.assertEqual(journal.count("schema_migrations"), 5)
+                        self.assertEqual(journal.count("schema_migrations"), 6)
                 finally:
                     release_preflight.set()
-                self.assertEqual(victim.result(timeout=10), 5)
+                self.assertEqual(victim.result(timeout=10), 6)
 
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1805,6 +1973,7 @@ class JournalMigrationTests(unittest.TestCase):
                 "canonical_report_contexts",
                 "actual_close_reviews",
                 "actual_close_source_bindings",
+                "actual_position_plan_bindings",
                 "close_recommendations",
                 "outbox",
                 "outbox_delivery_attempts",
@@ -3697,6 +3866,14 @@ class JournalMigrationTests(unittest.TestCase):
                 "record_sha256",
             },
             "actual_close_source_bindings": {"record_sha256"},
+            "actual_position_plan_bindings": {
+                "binding_id",
+                "position_lifecycle_id",
+                "action_source_digest",
+                "primary_plan_digest",
+                "source_digest",
+                "record_sha256",
+            },
             "close_recommendations": {
                 "recommendation_id",
                 "position_plan_digest",
@@ -4085,6 +4262,7 @@ class JournalMigrationTests(unittest.TestCase):
             "canonical_report_contexts",
             "actual_close_reviews",
             "actual_close_source_bindings",
+            "actual_position_plan_bindings",
             "close_recommendations",
             "outbox",
             "outbox_delivery_attempts",
@@ -4393,6 +4571,13 @@ class JournalMigrationTests(unittest.TestCase):
             "actual_close_source_bindings": {
                 ("review_id", "actual_close_reviews"),
                 ("source_observation_id", "source_observations"),
+            },
+            "actual_position_plan_bindings": {
+                (
+                    "confirmation_execution_event_id",
+                    "execution_events",
+                ),
+                ("signal_id", "phase1_signals"),
             },
             "close_recommendations": {
                 ("review_id", "actual_close_reviews"),
@@ -5062,6 +5247,12 @@ class JournalMigrationTests(unittest.TestCase):
                 "retrieved_at",
             },
             "actual_close_source_bindings": {"received_at"},
+            "actual_position_plan_bindings": {
+                "event_time",
+                "message_time",
+                "action_received_at",
+                "recorded_at",
+            },
             "close_recommendations": {"received_at"},
             "ledger_postings": {"occurred_at"},
             "actual_positions": {"updated_at"},

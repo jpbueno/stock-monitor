@@ -189,6 +189,7 @@ _TABLES = frozenset(
         "canonical_report_contexts",
         "actual_close_reviews",
         "actual_close_source_bindings",
+        "actual_position_plan_bindings",
         "close_recommendations",
     }
 )
@@ -304,6 +305,29 @@ _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS = (
     "source_observation_id",
     "failure_code",
     "received_at",
+    "record_sha256",
+)
+_ACTUAL_POSITION_PLAN_BINDING_COLUMNS = (
+    "id",
+    "binding_id",
+    "confirmation_execution_event_id",
+    "confirmation_event_id",
+    "signal_id",
+    "position_lifecycle_id",
+    "binding_ordinal",
+    "binding_kind",
+    "symbol",
+    "parent_order_id",
+    "fill_group_planned_shares",
+    "fill_shares",
+    "cumulative_group_shares",
+    "event_time",
+    "message_time",
+    "action_received_at",
+    "recorded_at",
+    "action_source_digest",
+    "primary_plan_digest",
+    "source_digest",
     "record_sha256",
 )
 _CLOSE_RECOMMENDATION_COLUMNS = (
@@ -1594,6 +1618,81 @@ class Phase1LifecycleEventSource:
     row_reference: JournalRowReference
     signal_evidence_id: str | None = None
     expiry_source_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualPositionPlanBindingSource:
+    """One exact ACTUAL entry action bound to one persisted PRIMARY plan."""
+
+    row_id: int
+    binding_id: str
+    confirmation_execution_event_id: int
+    confirmation_event_id: str
+    signal_id: str
+    position_lifecycle_id: str
+    binding_ordinal: int
+    binding_kind: str
+    symbol: str
+    parent_order_id: str | None
+    fill_group_planned_shares: int | None
+    fill_shares: int
+    cumulative_group_shares: int
+    event_time: datetime
+    message_time: datetime
+    action_received_at: datetime
+    recorded_at: datetime
+    action_source_digest: str
+    primary_plan_digest: str
+    source_digest: str
+    record_sha256: str
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualPositionPlanSource:
+    """One open ACTUAL lifecycle bound to one persisted PRIMARY plan."""
+
+    symbol: str
+    query_cutoff: datetime
+    actual_replay_source: JournalActualReplaySource
+    actual_position_state: object = dataclass_field(repr=False, compare=False)
+    matched_actions: tuple[JournalActionSource, ...]
+    plan_bindings: tuple[ActualPositionPlanBindingSource, ...]
+    lifecycle_events: tuple[Phase1LifecycleEventSource, ...]
+    signal_source: Phase1SignalSource
+    opening_actual_lifecycle_id: str
+    opening_actual_event_id: str
+    opening_actual_execution_event_id: int
+    position_plan_digest: str
+    row_references: tuple[JournalRowReference, ...]
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActualPositionPlanResolution:
+    """Typed fail-closed result for ACTUAL-to-PRIMARY plan resolution."""
+
+    status: str
+    source: ActualPositionPlanSource | None
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.status not in {"RESOLVED", "UNAVAILABLE", "AMBIGUOUS"}:
+            raise ValueError("INVALID_ACTUAL_POSITION_PLAN_RESOLUTION")
+        if (self.status == "RESOLVED") != (
+            type(self.source) is ActualPositionPlanSource
+        ):
+            raise ValueError("INVALID_ACTUAL_POSITION_PLAN_RESOLUTION")
+        if (
+            type(self.reason_codes) is not tuple
+            or any(
+                type(reason) is not str or not reason
+                for reason in self.reason_codes
+            )
+            or (self.status == "RESOLVED" and self.reason_codes)
+            or (self.status != "RESOLVED" and not self.reason_codes)
+        ):
+            raise ValueError("INVALID_ACTUAL_POSITION_PLAN_RESOLUTION")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3912,6 +4011,16 @@ _PHASE1_SIGNAL_SOURCE_AUTHORITIES: dict[
         int,
     ],
 ] = {}
+_ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
 _PHASE1_ENTRY_SOURCE_AUTHORITIES: dict[
     int,
     tuple[
@@ -4122,6 +4231,7 @@ _PHASE1_SOURCE_TYPES = frozenset(
     {
         Phase1PublicationSource,
         Phase1SignalSource,
+        ActualPositionPlanSource,
         Phase1EntrySource,
         Phase1ShadowFillSource,
         Phase1SignalEvidenceSource,
@@ -4142,6 +4252,7 @@ _PHASE1_SOURCE_TYPES = frozenset(
 _PHASE1_SOURCE_REGISTRIES = (
     _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
     _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+    _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES,
     _PHASE1_ENTRY_SOURCE_AUTHORITIES,
     _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
     _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
@@ -4173,6 +4284,24 @@ _PHASE1_READER_DIRECT_DEPENDENCY_FIELDS = (
             "publication_source",
             Phase1PublicationSource,
         ),),
+    ),
+    (
+        ActualPositionPlanSource,
+        (
+            _Phase1ReaderDependencyField(
+                "actual_replay_source",
+                JournalActualReplaySource,
+            ),
+            _Phase1ReaderDependencyField(
+                "matched_actions",
+                JournalActionSource,
+                many=True,
+            ),
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+        ),
     ),
     (
         Phase1EntrySource,
@@ -5552,6 +5681,30 @@ def _phase1_reader_source_registration_material(
             raise JournalError(
                 "Phase 1 reader source changed during authority registration"
             )
+    if type(source) is ActualPositionPlanSource:
+        from .reconciliation import (
+            ActualLedgerState,
+            _is_current_actual_ledger_state_authority_for_source,
+        )
+
+        actual_source = object.__getattribute__(
+            source,
+            "actual_replay_source",
+        )
+        actual_state = object.__getattribute__(
+            source,
+            "actual_position_state",
+        )
+        if (
+            type(actual_state) is not ActualLedgerState
+            or not _is_current_actual_ledger_state_authority_for_source(
+                actual_state,
+                actual_source,
+            )
+        ):
+            raise JournalError(
+                "ACTUAL position plan replay authority is unverified"
+            )
     if type(source) is Phase1EquityMarkSource:
         from .ledger import (
             Phase1CanonicalLedgerReplay,
@@ -5753,6 +5906,8 @@ def _phase1_source_registry(source: object) -> _JournalSourceRegistry | None:
         return _PHASE1_PUBLICATION_SOURCE_AUTHORITIES
     if type(source) is Phase1SignalSource:
         return _PHASE1_SIGNAL_SOURCE_AUTHORITIES
+    if type(source) is ActualPositionPlanSource:
+        return _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES
     if type(source) is Phase1EntrySource:
         return _PHASE1_ENTRY_SOURCE_AUTHORITIES
     if type(source) is Phase1ShadowFillSource:
@@ -6555,6 +6710,14 @@ def is_verified_phase1_signal_source(source: object) -> bool:
         source,
         Phase1SignalSource,
         _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_actual_position_plan_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        ActualPositionPlanSource,
+        _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES,
     )
 
 
@@ -12235,6 +12398,31 @@ class Journal:
             query_cutoff=query_cutoff,
         )
 
+    def _phase1_entry_action_is_authorized(
+        self,
+        source: object,
+    ) -> bool:
+        if type(source) is not JournalActionSource:
+            return False
+        if (
+            is_verified_journal_action_source(source)
+            and _journal_action_source_owner(source) is self
+        ):
+            return True
+        if _journal_registered_action_source_owner(source) is not self:
+            return False
+        row = _sql(
+            self._connection,
+            "SELECT confirmation_event_id, action_source_digest "
+            "FROM actual_position_plan_bindings "
+            "WHERE confirmation_execution_event_id = ?",
+            (source.execution_event_id,),
+        ).fetchone()
+        return row is not None and (
+            str(row[0]) == source.event_id
+            and str(row[1]) == source.source_digest
+        )
+
     def record_phase1_entry(
         self,
         signal_id: str,
@@ -12246,9 +12434,10 @@ class Journal:
         recorded_at: datetime,
     ) -> object:
         """Persist the one canonical entry path and issue its typed authority."""
-        if confirmation_action_source is not None and (
-            not is_verified_journal_action_source(confirmation_action_source)
-            or _journal_action_source_owner(confirmation_action_source) is not self
+        if confirmation_action_source is not None and not (
+            self._phase1_entry_action_is_authorized(
+                confirmation_action_source
+            )
         ):
             from .risk import RiskBlock
 
@@ -20977,6 +21166,797 @@ class Journal:
             source_digest=source_digest,
         )
 
+    @staticmethod
+    def _actual_position_plan_lifecycle_id(
+        opening_action: JournalActionSource,
+    ) -> str:
+        return hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": (
+                        "stock-monitor/actual-position-plan-lifecycle/v1"
+                    ),
+                    "opening_actual_event_id": opening_action.event_id,
+                    "opening_actual_execution_event_id": (
+                        opening_action.execution_event_id
+                    ),
+                    "opening_actual_lineage_id": opening_action.signal_id,
+                    "symbol": opening_action.symbol,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _actual_position_plan_binding_id(
+        *,
+        signal_id: str,
+        position_lifecycle_id: str,
+        action: JournalActionSource,
+    ) -> str:
+        return hashlib.sha256(
+            (
+                "stock-monitor/actual-position-plan-binding-id/v2\x00"
+                + signal_id
+                + "\x00"
+                + position_lifecycle_id
+                + "\x00"
+                + action.event_id
+                + "\x00"
+                + str(action.execution_event_id)
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _actual_position_plan_binding_digest(
+        values: Mapping[str, object],
+    ) -> str:
+        material = {
+            key: values[key]
+            for key in _ACTUAL_POSITION_PLAN_BINDING_COLUMNS[1:-2]
+        }
+        return hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": (
+                        "stock-monitor/actual-position-plan-binding/v1"
+                    ),
+                    "payload": material,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _actual_position_plan_binding_source_from_row(
+        self,
+        row: Sequence[object],
+    ) -> ActualPositionPlanBindingSource:
+        if len(row) != len(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding row shape is invalid"
+            )
+        values = dict(
+            zip(
+                _ACTUAL_POSITION_PLAN_BINDING_COLUMNS,
+                tuple(row),
+                strict=True,
+            )
+        )
+        expected_source_digest = (
+            self._actual_position_plan_binding_digest(values)
+        )
+        expected_record_sha256 = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    key: values[key]
+                    for key in _ACTUAL_POSITION_PLAN_BINDING_COLUMNS[1:-1]
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(values["source_digest"]) != expected_source_digest
+            or str(values["record_sha256"]) != expected_record_sha256
+        ):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding digest is invalid"
+            )
+        event_time = _parse_canonical_timestamp(str(values["event_time"]))
+        message_time = _parse_canonical_timestamp(
+            str(values["message_time"])
+        )
+        action_received_at = _parse_canonical_timestamp(
+            str(values["action_received_at"])
+        )
+        recorded_at = _parse_canonical_timestamp(str(values["recorded_at"]))
+        if not (
+            event_time <= message_time <= action_received_at <= recorded_at
+        ):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding times are invalid"
+            )
+        row_reference = _journal_row_reference(
+            "actual_position_plan_bindings",
+            _ACTUAL_POSITION_PLAN_BINDING_COLUMNS,
+            row,
+        )
+        return ActualPositionPlanBindingSource(
+            row_id=int(values["id"]),
+            binding_id=str(values["binding_id"]),
+            confirmation_execution_event_id=int(
+                values["confirmation_execution_event_id"]
+            ),
+            confirmation_event_id=str(values["confirmation_event_id"]),
+            signal_id=str(values["signal_id"]),
+            position_lifecycle_id=str(values["position_lifecycle_id"]),
+            binding_ordinal=int(values["binding_ordinal"]),
+            binding_kind=str(values["binding_kind"]),
+            symbol=str(values["symbol"]),
+            parent_order_id=(
+                None
+                if values["parent_order_id"] is None
+                else str(values["parent_order_id"])
+            ),
+            fill_group_planned_shares=(
+                None
+                if values["fill_group_planned_shares"] is None
+                else int(values["fill_group_planned_shares"])
+            ),
+            fill_shares=int(values["fill_shares"]),
+            cumulative_group_shares=int(values["cumulative_group_shares"]),
+            event_time=event_time,
+            message_time=message_time,
+            action_received_at=action_received_at,
+            recorded_at=recorded_at,
+            action_source_digest=str(values["action_source_digest"]),
+            primary_plan_digest=str(values["primary_plan_digest"]),
+            source_digest=expected_source_digest,
+            record_sha256=expected_record_sha256,
+            row_reference=row_reference,
+        )
+
+    def resolve_actual_position_plan_source(
+        self,
+        *,
+        actual_replay_source: JournalActualReplaySource,
+        actual_position_state: object,
+        symbol: str,
+        query_cutoff: datetime,
+    ) -> ActualPositionPlanResolution:
+        """Bind one current open ACTUAL lifecycle to persisted LIVE PRIMARY."""
+        from .reconciliation import (
+            ActualLedgerState,
+            is_verified_actual_ledger_state_for_source,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "ACTUAL position plan resolution requires a post-commit read"
+            )
+        normalized_symbol = _require_nonempty_text(
+            symbol,
+            "ACTUAL position plan symbol",
+        ).upper()
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        if (
+            type(actual_replay_source) is not JournalActualReplaySource
+            or type(actual_position_state) is not ActualLedgerState
+            or actual_replay_source.query_cutoff != normalized_cutoff
+            or actual_position_state.query_cutoff != normalized_cutoff
+            or not is_verified_actual_ledger_state_for_source(
+                actual_position_state,
+                actual_replay_source,
+            )
+            or _journal_replay_source_owner(actual_replay_source) is not self
+        ):
+            raise InvalidJournalValue(
+                "ACTUAL position plan replay authority is unverified"
+            )
+
+        def finish_nonresolved(
+            status: str,
+            reason_code: str,
+        ) -> ActualPositionPlanResolution:
+            if not is_verified_actual_ledger_state_for_source(
+                actual_position_state,
+                actual_replay_source,
+            ):
+                raise InvalidJournalValue(
+                    "ACTUAL position plan replay changed during resolution"
+                )
+            candidate = _journal_replay_source_authority_candidate(
+                actual_replay_source
+            )
+            if (
+                candidate is None
+                or candidate[2] is not self
+                or not _is_current_journal_authority_candidate_without_callbacks(
+                    candidate
+                )
+            ):
+                raise InvalidJournalValue(
+                    "ACTUAL position plan replay changed during resolution"
+                )
+            return ActualPositionPlanResolution(
+                status=status,
+                source=None,
+                reason_codes=(reason_code,),
+            )
+
+        positions = tuple(
+            position
+            for position in actual_position_state.positions
+            if position.symbol == normalized_symbol and position.shares > 0
+        )
+        if not positions:
+            return finish_nonresolved(
+                "UNAVAILABLE",
+                "ACTUAL_POSITION_UNAVAILABLE",
+            )
+        if len(positions) != 1:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_AMBIGUOUS",
+            )
+        position = positions[0]
+        if position.lineage_kind == "UNRELATED_POSITION":
+            return finish_nonresolved(
+                "UNAVAILABLE",
+                "ACTUAL_POSITION_PLAN_UNAVAILABLE",
+            )
+        lots = tuple(position.lots)
+        lifecycle_event_ids = tuple(position.lifecycle_event_ids)
+        if not lots or not lifecycle_event_ids:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_LINEAGE_INCONSISTENT",
+            )
+
+        actions_by_identity: dict[
+            tuple[int, str],
+            list[JournalActionSource],
+        ] = {}
+        actions_by_event_id: dict[str, list[JournalActionSource]] = {}
+        for action in actual_replay_source.actions:
+            actions_by_identity.setdefault(
+                (action.execution_event_id, action.event_id),
+                [],
+            ).append(action)
+            actions_by_event_id.setdefault(action.event_id, []).append(action)
+
+        actions_by_execution_id: dict[int, list[JournalActionSource]] = {}
+        for action in actual_replay_source.actions:
+            actions_by_execution_id.setdefault(
+                action.execution_event_id,
+                [],
+            ).append(action)
+
+        relevant_actions_by_id: dict[int, JournalActionSource] = {}
+        for lot in lots:
+            matches = actions_by_identity.get(
+                (lot.source_cursor, lot.source_event_id),
+                [],
+            )
+            if (
+                len(matches) != 1
+                or matches[0].symbol != normalized_symbol
+                or matches[0].domain_kind not in {"BOUGHT", "PARTIAL_FILL"}
+            ):
+                return finish_nonresolved(
+                    "AMBIGUOUS",
+                    "ACTUAL_POSITION_LINEAGE_INCONSISTENT",
+                )
+            relevant_actions_by_id[
+                matches[0].execution_event_id
+            ] = matches[0]
+        for lifecycle_event_id in lifecycle_event_ids:
+            matches = actions_by_event_id.get(lifecycle_event_id, [])
+            if len(matches) != 1 or matches[0].symbol != normalized_symbol:
+                return finish_nonresolved(
+                    "AMBIGUOUS",
+                    "ACTUAL_POSITION_LINEAGE_INCONSISTENT",
+                )
+            if matches[0].domain_kind in {"BOUGHT", "PARTIAL_FILL"}:
+                relevant_actions_by_id[
+                    matches[0].execution_event_id
+                ] = matches[0]
+        for action in actual_replay_source.actions:
+            if (
+                action.signal_id == position.signal_id
+                and action.symbol == normalized_symbol
+                and action.domain_kind in {"BOUGHT", "PARTIAL_FILL"}
+            ):
+                relevant_actions_by_id[
+                    action.execution_event_id
+                ] = action
+        if not relevant_actions_by_id:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_ENTRY_LINEAGE_INCONSISTENT",
+            )
+
+        binding_rows_by_action: dict[int, list[Sequence[object]]] = {
+            execution_event_id: []
+            for execution_event_id in relevant_actions_by_id
+        }
+        relevant_action_ids = tuple(binding_rows_by_action)
+        for start in range(
+            0,
+            len(relevant_action_ids),
+            _SQLITE_BIND_BATCH_SIZE,
+        ):
+            batch = relevant_action_ids[
+                start : start + _SQLITE_BIND_BATCH_SIZE
+            ]
+            rows = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+                + " FROM actual_position_plan_bindings "
+                "WHERE confirmation_execution_event_id IN ("
+                + ",".join("?" for _ in batch)
+                + ") AND recorded_at <= ? "
+                "ORDER BY confirmation_execution_event_id, id",
+                (*batch, _canonical_timestamp(normalized_cutoff)),
+            ).fetchall()
+            for row in rows:
+                binding_rows_by_action.setdefault(int(row[2]), []).append(row)
+        if any(not rows for rows in binding_rows_by_action.values()):
+            return finish_nonresolved(
+                "UNAVAILABLE",
+                "ACTUAL_POSITION_PLAN_BINDING_UNAVAILABLE",
+            )
+        if any(len(rows) != 1 for rows in binding_rows_by_action.values()):
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_BINDING_AMBIGUOUS",
+            )
+        seed_bindings = tuple(
+            self._actual_position_plan_binding_source_from_row(
+                binding_rows_by_action[execution_event_id][0]
+            )
+            for execution_event_id in relevant_action_ids
+        )
+        signal_ids = tuple(
+            dict.fromkeys(binding.signal_id for binding in seed_bindings)
+        )
+        position_lifecycle_ids = tuple(
+            dict.fromkeys(
+                binding.position_lifecycle_id for binding in seed_bindings
+            )
+        )
+        if len(signal_ids) != 1 or len(position_lifecycle_ids) != 1:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_SIGNAL_AMBIGUOUS",
+            )
+        binding_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings "
+            "WHERE signal_id = ? COLLATE BINARY "
+            "AND position_lifecycle_id = ? COLLATE BINARY "
+            "AND recorded_at <= ? "
+            "ORDER BY binding_ordinal, id",
+            (
+                signal_ids[0],
+                position_lifecycle_ids[0],
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        plan_bindings = tuple(
+            self._actual_position_plan_binding_source_from_row(row)
+            for row in binding_rows
+        )
+        if (
+            not plan_bindings
+            or tuple(
+                binding.binding_ordinal for binding in plan_bindings
+            )
+            != tuple(range(1, len(plan_bindings) + 1))
+            or plan_bindings[0].binding_kind != "LIVE_CONFIRM_ANCHOR"
+            or any(
+                binding.binding_kind != "PARTIAL_FILL_CONTINUATION"
+                for binding in plan_bindings[1:]
+            )
+            or set(relevant_action_ids)
+            != {
+                    binding.confirmation_execution_event_id
+                    for binding in plan_bindings
+                }
+        ):
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_BINDING_CHAIN_INCONSISTENT",
+            )
+
+        matched_actions_list: list[JournalActionSource] = []
+        cumulative_group_shares = 0
+        prior_execution_event_id = 0
+        for binding in plan_bindings:
+            matches = actions_by_execution_id.get(
+                binding.confirmation_execution_event_id,
+                [],
+            )
+            if len(matches) != 1:
+                return finish_nonresolved(
+                    "AMBIGUOUS",
+                    "ACTUAL_POSITION_PLAN_ACTION_AMBIGUOUS",
+                )
+            action = matches[0]
+            expected_binding_id = self._actual_position_plan_binding_id(
+                signal_id=binding.signal_id,
+                position_lifecycle_id=binding.position_lifecycle_id,
+                action=action,
+            )
+            cumulative_group_shares += binding.fill_shares
+            if (
+                not is_verified_journal_action_source(action)
+                or _journal_action_source_owner(action) is not self
+                or action.event_id != binding.confirmation_event_id
+                or action.signal_id != position.signal_id
+                or action.domain_kind not in {"BOUGHT", "PARTIAL_FILL"}
+                or action.symbol != normalized_symbol
+                or action.symbol != binding.symbol
+                or action.shares != binding.fill_shares
+                or action.parent_order_id != binding.parent_order_id
+                or action.fill_group_planned_shares
+                != binding.fill_group_planned_shares
+                or action.event_time != binding.event_time
+                or action.message_time != binding.message_time
+                or action.received_at != binding.action_received_at
+                or action.source_digest != binding.action_source_digest
+                or action.event_time > normalized_cutoff
+                or action.message_time > normalized_cutoff
+                or action.received_at > normalized_cutoff
+                or binding.recorded_at > normalized_cutoff
+                or binding.binding_id != expected_binding_id
+                or binding.signal_id != signal_ids[0]
+                or binding.position_lifecycle_id
+                != position_lifecycle_ids[0]
+                or action.execution_event_id <= prior_execution_event_id
+                or binding.cumulative_group_shares
+                != cumulative_group_shares
+            ):
+                return finish_nonresolved(
+                    "AMBIGUOUS",
+                    "ACTUAL_POSITION_PLAN_BINDING_LINEAGE_INCONSISTENT",
+                )
+            matched_actions_list.append(action)
+            prior_execution_event_id = action.execution_event_id
+        matched_actions = tuple(matched_actions_list)
+        if (
+            not matched_actions
+            or plan_bindings[0].position_lifecycle_id
+            != self._actual_position_plan_lifecycle_id(matched_actions[0])
+        ):
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_BINDING_LINEAGE_INCONSISTENT",
+            )
+
+        event_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_PHASE1_SIGNAL_EVENT_COLUMNS)
+            + " FROM phase1_signal_events "
+            "WHERE signal_id = ? COLLATE BINARY "
+            "AND event_kind = 'LIVE_CONFIRM' AND received_at <= ? "
+            "ORDER BY event_ordinal, id",
+            (
+                signal_ids[0],
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        if (
+            len(event_rows) != 1
+            or str(event_rows[0][2]) != signal_ids[0]
+            or str(event_rows[0][4]) != "LIVE_CONFIRM"
+            or str(event_rows[0][6]) != "LIVE_CONFIRMED"
+            or _parse_canonical_timestamp(str(event_rows[0][9]))
+            > normalized_cutoff
+        ):
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_ANCHOR_INCONSISTENT",
+            )
+        phase1_anchor_binding_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings "
+            "WHERE signal_id = ? COLLATE BINARY "
+            "AND confirmation_execution_event_id = ? "
+            "AND recorded_at <= ? ORDER BY id",
+            (
+                signal_ids[0],
+                int(event_rows[0][10]),
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        if len(phase1_anchor_binding_rows) != 1:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_ANCHOR_INCONSISTENT",
+            )
+        phase1_anchor_binding = (
+            self._actual_position_plan_binding_source_from_row(
+                phase1_anchor_binding_rows[0]
+            )
+        )
+        phase1_anchor_actions = actions_by_execution_id.get(
+            phase1_anchor_binding.confirmation_execution_event_id,
+            [],
+        )
+        if len(phase1_anchor_actions) != 1:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_ANCHOR_INCONSISTENT",
+            )
+        phase1_anchor_action = phase1_anchor_actions[0]
+        expected_phase1_anchor_binding_id = (
+            self._actual_position_plan_binding_id(
+                signal_id=phase1_anchor_binding.signal_id,
+                position_lifecycle_id=(
+                    phase1_anchor_binding.position_lifecycle_id
+                ),
+                action=phase1_anchor_action,
+            )
+        )
+        if (
+            phase1_anchor_binding.binding_kind != "LIVE_CONFIRM_ANCHOR"
+            or phase1_anchor_binding.binding_ordinal != 1
+            or phase1_anchor_binding.signal_id != signal_ids[0]
+            or phase1_anchor_binding.symbol != normalized_symbol
+            or phase1_anchor_binding.confirmation_event_id
+            != phase1_anchor_action.event_id
+            or not is_verified_journal_action_source(phase1_anchor_action)
+            or _journal_action_source_owner(phase1_anchor_action) is not self
+            or phase1_anchor_action.domain_kind
+            not in {"BOUGHT", "PARTIAL_FILL"}
+            or phase1_anchor_action.symbol != normalized_symbol
+            or phase1_anchor_action.shares
+            != phase1_anchor_binding.fill_shares
+            or phase1_anchor_action.parent_order_id
+            != phase1_anchor_binding.parent_order_id
+            or phase1_anchor_action.fill_group_planned_shares
+            != phase1_anchor_binding.fill_group_planned_shares
+            or phase1_anchor_action.event_time
+            != phase1_anchor_binding.event_time
+            or phase1_anchor_action.message_time
+            != phase1_anchor_binding.message_time
+            or phase1_anchor_action.received_at
+            != phase1_anchor_binding.action_received_at
+            or phase1_anchor_binding.action_source_digest
+            != phase1_anchor_action.source_digest
+            or phase1_anchor_binding.binding_id
+            != expected_phase1_anchor_binding_id
+            or phase1_anchor_binding.position_lifecycle_id
+            != self._actual_position_plan_lifecycle_id(phase1_anchor_action)
+            or phase1_anchor_binding.recorded_at > normalized_cutoff
+        ):
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_PLAN_ANCHOR_INCONSISTENT",
+            )
+
+        # This reader recomputes the entire entry/confirmation digest chain,
+        # including every selected LIVE metadata row and its exact action.
+        entry_source = self._read_phase1_entry_source(
+            signal_ids[0],
+            query_cutoff=normalized_cutoff,
+        )
+        signal_source = entry_source.signal_source
+        if (
+            signal_source.role != "PRIMARY"
+            or signal_source.symbol != normalized_symbol
+            or signal_source.query_cutoff != normalized_cutoff
+            or any(
+                binding.primary_plan_digest
+                != signal_source.primary_plan_digest
+                for binding in plan_bindings
+            )
+            or phase1_anchor_binding.primary_plan_digest
+            != signal_source.primary_plan_digest
+            or any(
+                str(row[2]) != signal_source.signal_id
+                for row in event_rows
+            )
+        ):
+            return finish_nonresolved(
+                "UNAVAILABLE",
+                "ACTUAL_POSITION_PRIMARY_PLAN_UNAVAILABLE",
+            )
+        action_actual_lineage_ids = tuple(
+            dict.fromkeys(action.signal_id for action in matched_actions)
+        )
+        if len(action_actual_lineage_ids) != 1:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_ENTRY_LINEAGE_AMBIGUOUS",
+            )
+        if matched_actions[0].domain_kind == "BOUGHT":
+            group_is_consistent = (
+                len(matched_actions) == 1
+                and plan_bindings[0].parent_order_id is None
+                and plan_bindings[0].fill_group_planned_shares is None
+                and plan_bindings[0].fill_shares
+                == signal_source.planned_shares
+                and plan_bindings[0].cumulative_group_shares
+                == signal_source.planned_shares
+            )
+        else:
+            parent_order_ids = tuple(
+                dict.fromkeys(
+                    binding.parent_order_id for binding in plan_bindings
+                )
+            )
+            fill_group_sizes = tuple(
+                dict.fromkeys(
+                    binding.fill_group_planned_shares
+                    for binding in plan_bindings
+                )
+            )
+            group_is_consistent = (
+                all(
+                    action.domain_kind == "PARTIAL_FILL"
+                    for action in matched_actions
+                )
+                and len(parent_order_ids) == 1
+                and parent_order_ids[0] is not None
+                and len(fill_group_sizes) == 1
+                and fill_group_sizes[0] == signal_source.planned_shares
+                and cumulative_group_shares <= signal_source.planned_shares
+            )
+        if not group_is_consistent:
+            return finish_nonresolved(
+                "AMBIGUOUS",
+                "ACTUAL_POSITION_ENTRY_GROUP_INCONSISTENT",
+            )
+        lifecycle_events = tuple(
+            self._phase1_lifecycle_source_from_row(row)
+            for row in event_rows
+        )
+        opening_action = matched_actions[0]
+        opening_actual_event_id = opening_action.event_id
+        opening_actual_lifecycle_id = (
+            plan_bindings[0].position_lifecycle_id
+        )
+        position_plan_digest = hashlib.sha256(
+            _canonical_audit_json(
+                {
+                    "namespace": (
+                        "stock-monitor/actual-position-plan-identity/v1"
+                    ),
+                    "opening_actual_lifecycle_id": (
+                        opening_actual_lifecycle_id
+                    ),
+                    "opening_actual_event_id": opening_actual_event_id,
+                    "primary_plan_digest": (
+                        signal_source.primary_plan_digest
+                    ),
+                    "symbol": normalized_symbol,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+
+        references_by_key: dict[
+            tuple[str, int], JournalRowReference
+        ] = {}
+        for reference in (
+            *actual_replay_source.row_references,
+            *(
+                reference
+                for action in matched_actions
+                for reference in action.row_references
+            ),
+            *(binding.row_reference for binding in plan_bindings),
+            phase1_anchor_binding.row_reference,
+            *(event.row_reference for event in lifecycle_events),
+            *signal_source.row_references,
+        ):
+            key = (reference.table, reference.row_id)
+            prior = references_by_key.get(key)
+            if prior is not None and prior != reference:
+                raise MigrationCorruption(
+                    "ACTUAL position plan row digest conflicts"
+                )
+            references_by_key[key] = reference
+        row_references = tuple(
+            sorted(
+                references_by_key.values(),
+                key=lambda reference: (reference.table, reference.row_id),
+            )
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/actual-position-plan-source/v1",
+            row_references,
+            {
+                "actual_ledger_source_digest": (
+                    actual_position_state.source_digest
+                ),
+                "actual_replay_source_digest": (
+                    actual_replay_source.source_digest
+                ),
+                "lifecycle_event_ids": [
+                    event.lifecycle_event_id for event in lifecycle_events
+                ],
+                "matched_execution_event_ids": [
+                    action.execution_event_id for action in matched_actions
+                ],
+                "plan_binding_ids": [
+                    binding.binding_id for binding in plan_bindings
+                ],
+                "phase1_anchor_binding_id": (
+                    phase1_anchor_binding.binding_id
+                ),
+                "opening_actual_event_id": opening_actual_event_id,
+                "opening_actual_execution_event_id": (
+                    opening_action.execution_event_id
+                ),
+                "opening_actual_lifecycle_id": (
+                    opening_actual_lifecycle_id
+                ),
+                "position_plan_digest": position_plan_digest,
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "signal_source_digest": signal_source.source_digest,
+                "symbol": normalized_symbol,
+            },
+        )
+        source = ActualPositionPlanSource(
+            symbol=normalized_symbol,
+            query_cutoff=normalized_cutoff,
+            actual_replay_source=actual_replay_source,
+            actual_position_state=actual_position_state,
+            matched_actions=matched_actions,
+            plan_bindings=plan_bindings,
+            lifecycle_events=lifecycle_events,
+            signal_source=signal_source,
+            opening_actual_lifecycle_id=opening_actual_lifecycle_id,
+            opening_actual_event_id=opening_actual_event_id,
+            opening_actual_execution_event_id=(
+                opening_action.execution_event_id
+            ),
+            position_plan_digest=position_plan_digest,
+            row_references=row_references,
+            source_digest=source_digest,
+        )
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES[
+                source_identity
+            ] = source_authority
+        if (
+            not is_verified_actual_position_plan_source(source)
+            or not _is_current_phase1_source_authority_without_callbacks(
+                source
+            )
+        ):
+            with _JOURNAL_SOURCE_LOCK:
+                issued = _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES.get(
+                    source_identity
+                )
+                if issued is source_authority:
+                    _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES.pop(
+                        source_identity,
+                        None,
+                    )
+            raise JournalError(
+                "ACTUAL position plan source changed during readback"
+            )
+        return ActualPositionPlanResolution(
+            status="RESOLVED",
+            source=source,
+            reason_codes=(),
+        )
+
     def _incremental_ingestion_identity(self) -> tuple[int, int, int | None]:
         """Identify one complete snapshot for a private same-process cache."""
         self._ensure_open()
@@ -25775,6 +26755,488 @@ class Journal:
             duplicate=False,
         )
 
+    def _record_actual_position_plan_binding(
+        self,
+        *,
+        signal: Mapping[str, object],
+        current_action: JournalActionSource,
+        binding_kind: str,
+        recorded_at: datetime,
+    ) -> None:
+        from .risk import RiskBlock
+
+        if not self._transaction_active:
+            raise JournalError(
+                "ACTUAL position plan binding requires an active transaction"
+            )
+        if (
+            type(current_action) is not JournalActionSource
+            or (
+                _journal_action_source_owner(current_action) is not self
+                and _journal_registered_action_source_owner(current_action)
+                is not self
+            )
+        ):
+            raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
+        signal_id = str(signal["signal_id"])
+        symbol = str(signal["symbol"])
+        planned_shares = int(signal["planned_shares"])
+        primary_plan_digest = str(signal["primary_plan_digest"])
+        actual_lineage_id = current_action.signal_id
+        normalized_recorded_at = _parse_canonical_timestamp(
+            _canonical_timestamp(recorded_at)
+        )
+        if (
+            str(signal["role"]) != "PRIMARY"
+            or binding_kind
+            not in {"LIVE_CONFIRM_ANCHOR", "PARTIAL_FILL_CONTINUATION"}
+            or current_action.domain_kind not in {"BOUGHT", "PARTIAL_FILL"}
+            or not isinstance(actual_lineage_id, str)
+            or not actual_lineage_id
+            or current_action.symbol != symbol
+            or current_action.shares is None
+            or current_action.shares <= 0
+            or current_action.event_time > normalized_recorded_at
+            or current_action.message_time > normalized_recorded_at
+            or current_action.received_at > normalized_recorded_at
+        ):
+            raise InvalidJournalValue(
+                "ACTUAL position plan binding conflicts with the PRIMARY plan"
+            )
+        if current_action.domain_kind == "BOUGHT":
+            if (
+                binding_kind != "LIVE_CONFIRM_ANCHOR"
+                or current_action.parent_order_id is not None
+                or current_action.fill_group_planned_shares is not None
+                or current_action.shares != planned_shares
+            ):
+                raise InvalidJournalValue(
+                    "ACTUAL position plan binding mixes entry groups"
+                )
+        elif (
+            current_action.parent_order_id is None
+            or current_action.fill_group_planned_shares != planned_shares
+        ):
+            raise InvalidJournalValue(
+                "ACTUAL partial fill group conflicts with the PRIMARY plan"
+            )
+        existing_action_rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings "
+            "WHERE confirmation_execution_event_id = ? ORDER BY id",
+            (current_action.execution_event_id,),
+        ).fetchall()
+        if len(existing_action_rows) > 1:
+            raise MigrationCorruption(
+                "ACTUAL position plan action binding is ambiguous"
+            )
+        existing_action_binding = (
+            None
+            if not existing_action_rows
+            else self._actual_position_plan_binding_source_from_row(
+                existing_action_rows[0]
+            )
+        )
+        if existing_action_binding is not None:
+            position_lifecycle_id = (
+                existing_action_binding.position_lifecycle_id
+            )
+        elif binding_kind == "LIVE_CONFIRM_ANCHOR":
+            position_lifecycle_id = self._actual_position_plan_lifecycle_id(
+                current_action
+            )
+        else:
+            anchor_rows = _sql(
+                self._connection,
+                "SELECT "
+                + ", ".join(
+                    f"binding.{column}"
+                    for column in _ACTUAL_POSITION_PLAN_BINDING_COLUMNS
+                )
+                + " FROM actual_position_plan_bindings AS binding "
+                "JOIN execution_events AS action "
+                "ON action.id = binding.confirmation_execution_event_id "
+                "WHERE binding.signal_id = ? COLLATE BINARY "
+                "AND binding.binding_kind = 'LIVE_CONFIRM_ANCHOR' "
+                "AND binding.binding_ordinal = 1 "
+                "AND binding.symbol = ? COLLATE BINARY "
+                "AND action.signal_id = ? COLLATE BINARY ORDER BY binding.id",
+                (signal_id, symbol, actual_lineage_id),
+            ).fetchall()
+            if len(anchor_rows) != 1:
+                raise InvalidJournalValue(
+                    "ACTUAL partial fill continuation has no exact lifecycle anchor"
+                )
+            position_lifecycle_id = str(
+                anchor_rows[0][
+                    _ACTUAL_POSITION_PLAN_BINDING_COLUMNS.index(
+                        "position_lifecycle_id"
+                    )
+                ]
+            )
+
+        earlier_entry_row = _sql(
+            self._connection,
+            "SELECT id FROM execution_events "
+            "WHERE signal_id = ? COLLATE BINARY AND symbol = ? COLLATE BINARY "
+            "AND parsed_action IN ('BOUGHT', 'PARTIAL_FILL') AND id < ? "
+            "ORDER BY id LIMIT 1",
+            (
+                current_action.signal_id,
+                symbol,
+                current_action.execution_event_id,
+            ),
+        ).fetchone()
+        if (
+            binding_kind == "LIVE_CONFIRM_ANCHOR"
+            and earlier_entry_row is not None
+        ):
+            raise InvalidJournalValue(
+                "ACTUAL position plan anchor is not the first entry action"
+            )
+
+        rows = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings "
+            "WHERE signal_id = ? COLLATE BINARY "
+            "AND position_lifecycle_id = ? COLLATE BINARY "
+            "ORDER BY binding_ordinal",
+            (signal_id, position_lifecycle_id),
+        ).fetchall()
+        bindings = tuple(
+            self._actual_position_plan_binding_source_from_row(row)
+            for row in rows
+        )
+        if tuple(
+            binding.binding_ordinal for binding in bindings
+        ) != tuple(range(1, len(bindings) + 1)):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding ordinals are incomplete"
+            )
+        prior_cumulative = 0
+        prior_actual_lineage_ids: list[str | None] = []
+        for binding in bindings:
+            prior_action = self._read_action_source(
+                execution_event_id=(
+                    binding.confirmation_execution_event_id
+                )
+            )
+            prior_cumulative += binding.fill_shares
+            if prior_action.signal_id not in prior_actual_lineage_ids:
+                prior_actual_lineage_ids.append(prior_action.signal_id)
+            if (
+                prior_action.event_id != binding.confirmation_event_id
+                or prior_action.symbol != binding.symbol
+                or prior_action.shares != binding.fill_shares
+                or prior_action.parent_order_id != binding.parent_order_id
+                or prior_action.fill_group_planned_shares
+                != binding.fill_group_planned_shares
+                or prior_action.event_time != binding.event_time
+                or prior_action.message_time != binding.message_time
+                or prior_action.received_at != binding.action_received_at
+                or prior_action.source_digest != binding.action_source_digest
+                or binding.signal_id != signal_id
+                or binding.position_lifecycle_id != position_lifecycle_id
+                or binding.symbol != symbol
+                or binding.primary_plan_digest != primary_plan_digest
+                or binding.cumulative_group_shares != prior_cumulative
+            ):
+                raise MigrationCorruption(
+                    "ACTUAL position plan binding action is inconsistent"
+                )
+        if len(prior_actual_lineage_ids) > 1:
+            raise MigrationCorruption(
+                "ACTUAL position plan bindings cross ACTUAL lineages"
+            )
+        if bindings:
+            opening_action = self._read_action_source(
+                execution_event_id=(
+                    bindings[0].confirmation_execution_event_id
+                )
+            )
+            if (
+                bindings[0].binding_kind != "LIVE_CONFIRM_ANCHOR"
+                or bindings[0].binding_ordinal != 1
+                or self._actual_position_plan_lifecycle_id(opening_action)
+                != position_lifecycle_id
+            ):
+                raise MigrationCorruption(
+                    "ACTUAL position plan lifecycle identity is inconsistent"
+                )
+        binding_action_ids = tuple(
+            binding.confirmation_execution_event_id for binding in bindings
+        )
+        if binding_action_ids != tuple(sorted(binding_action_ids)):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding action order is invalid"
+            )
+
+        matching = tuple(
+            binding
+            for binding in bindings
+            if binding.confirmation_execution_event_id
+            == current_action.execution_event_id
+        )
+        if matching:
+            if len(matching) != 1:
+                raise IdempotencyConflict(
+                    "ACTUAL position plan binding retry is ambiguous"
+                )
+            binding = matching[0]
+            expected_binding_id = self._actual_position_plan_binding_id(
+                signal_id=signal_id,
+                position_lifecycle_id=position_lifecycle_id,
+                action=current_action,
+            )
+            if (
+                binding.binding_id != expected_binding_id
+                or binding.binding_kind != binding_kind
+                or binding.position_lifecycle_id != position_lifecycle_id
+                or binding.confirmation_event_id != current_action.event_id
+                or binding.symbol != symbol
+                or binding.parent_order_id != current_action.parent_order_id
+                or binding.fill_group_planned_shares
+                != current_action.fill_group_planned_shares
+                or binding.fill_shares != current_action.shares
+                or binding.event_time != current_action.event_time
+                or binding.message_time != current_action.message_time
+                or binding.action_received_at != current_action.received_at
+                or binding.recorded_at != normalized_recorded_at
+                or binding.action_source_digest
+                != current_action.source_digest
+                or binding.primary_plan_digest != primary_plan_digest
+            ):
+                raise IdempotencyConflict(
+                    "ACTUAL position plan binding retry conflicts with stored content"
+                )
+            return
+
+        action_conflict = _sql(
+            self._connection,
+            "SELECT signal_id FROM actual_position_plan_bindings "
+            "WHERE confirmation_execution_event_id = ?",
+            (current_action.execution_event_id,),
+        ).fetchone()
+        if action_conflict is not None:
+            raise IdempotencyConflict(
+                "ACTUAL position plan action is already bound"
+            )
+        next_entry_row = (
+            None
+            if not bindings
+            else _sql(
+                self._connection,
+                "SELECT id FROM execution_events "
+                "WHERE signal_id = ? COLLATE BINARY "
+                "AND symbol = ? COLLATE BINARY "
+                "AND parsed_action IN ('BOUGHT', 'PARTIAL_FILL') "
+                "AND id > ? ORDER BY id LIMIT 1",
+                (
+                    prior_actual_lineage_ids[0],
+                    symbol,
+                    bindings[-1].confirmation_execution_event_id,
+                ),
+            ).fetchone()
+        )
+        if binding_kind == "LIVE_CONFIRM_ANCHOR":
+            if bindings:
+                raise IdempotencyConflict(
+                    "ACTUAL position plan anchor already exists"
+                )
+            prior_anchor_rows = _sql(
+                self._connection,
+                "SELECT binding.position_lifecycle_id, "
+                "binding.confirmation_execution_event_id, action.signal_id, "
+                "position.shares "
+                "FROM actual_position_plan_bindings AS binding "
+                "JOIN execution_events AS action "
+                "ON action.id = binding.confirmation_execution_event_id "
+                "LEFT JOIN actual_positions AS position "
+                "ON position.signal_id = action.signal_id "
+                "WHERE binding.signal_id = ? COLLATE BINARY "
+                "AND binding.binding_kind = 'LIVE_CONFIRM_ANCHOR' "
+                "AND binding.binding_ordinal = 1 ORDER BY binding.id",
+                (signal_id,),
+            ).fetchall()
+            live_confirmation_rows = _sql(
+                self._connection,
+                "SELECT confirmation_execution_event_id "
+                "FROM phase1_signal_events "
+                "WHERE signal_id = ? COLLATE BINARY "
+                "AND event_kind = 'LIVE_CONFIRM' "
+                "AND to_status = 'LIVE_CONFIRMED' "
+                "AND received_at <= ? ORDER BY event_ordinal, id",
+                (signal_id, _canonical_timestamp(normalized_recorded_at)),
+            ).fetchall()
+            if len(live_confirmation_rows) != 1:
+                raise MigrationCorruption(
+                    "Phase 1 LIVE confirmation anchor is ambiguous"
+                )
+            live_confirmation_action_id = int(live_confirmation_rows[0][0])
+            if not prior_anchor_rows:
+                if (
+                    live_confirmation_action_id
+                    != current_action.execution_event_id
+                ):
+                    raise InvalidJournalValue(
+                        "ACTUAL position plan anchor conflicts with LIVE confirmation"
+                    )
+            else:
+                prior_lifecycle_ids = tuple(
+                    str(row[0]) for row in prior_anchor_rows
+                )
+                prior_actual_lineage_ids = tuple(
+                    str(row[2]) for row in prior_anchor_rows
+                )
+                if (
+                    len(set(prior_lifecycle_ids)) != len(prior_lifecycle_ids)
+                    or any(row[3] is None for row in prior_anchor_rows)
+                    or any(int(row[3]) != 0 for row in prior_anchor_rows)
+                    or actual_lineage_id in prior_actual_lineage_ids
+                    or live_confirmation_action_id
+                    not in {int(row[1]) for row in prior_anchor_rows}
+                ):
+                    raise InvalidJournalValue(
+                        "ACTUAL position plan reopen conflicts with prior lifecycle"
+                    )
+                current_position_row = _sql(
+                    self._connection,
+                    "SELECT symbol, shares, last_execution_event_id "
+                    "FROM actual_positions WHERE signal_id = ? COLLATE BINARY",
+                    (actual_lineage_id,),
+                ).fetchone()
+                other_open_row = _sql(
+                    self._connection,
+                    "SELECT signal_id FROM actual_positions "
+                    "WHERE symbol = ? COLLATE BINARY AND shares > 0 "
+                    "AND signal_id != ? COLLATE BINARY ORDER BY id LIMIT 1",
+                    (symbol, actual_lineage_id),
+                ).fetchone()
+                if (
+                    current_position_row is None
+                    or str(current_position_row[0]) != symbol
+                    or int(current_position_row[1]) <= 0
+                    or int(current_position_row[2])
+                    < current_action.execution_event_id
+                    or other_open_row is not None
+                ):
+                    raise InvalidJournalValue(
+                        "ACTUAL position plan reopen is not the sole open lifecycle"
+                    )
+        elif (
+            not bindings
+            or bindings[0].binding_kind != "LIVE_CONFIRM_ANCHOR"
+            or bindings[0].parent_order_id is None
+            or current_action.domain_kind != "PARTIAL_FILL"
+            or current_action.signal_id != prior_actual_lineage_ids[0]
+            or next_entry_row is None
+            or int(next_entry_row[0])
+            != current_action.execution_event_id
+            or any(
+                binding.parent_order_id != current_action.parent_order_id
+                or binding.fill_group_planned_shares != planned_shares
+                for binding in bindings
+            )
+        ):
+            raise InvalidJournalValue(
+                "ACTUAL partial fill continuation changes entry group"
+            )
+        cumulative_group_shares = prior_cumulative + current_action.shares
+        if cumulative_group_shares > planned_shares:
+            raise InvalidJournalValue(
+                "ACTUAL partial fill continuation exceeds planned shares"
+            )
+        if bindings and normalized_recorded_at < bindings[-1].recorded_at:
+            raise InvalidJournalValue(
+                "ACTUAL position plan binding time moves backwards"
+            )
+
+        binding_id = self._actual_position_plan_binding_id(
+            signal_id=signal_id,
+            position_lifecycle_id=position_lifecycle_id,
+            action=current_action,
+        )
+        values: dict[str, object] = {
+            "binding_id": binding_id,
+            "confirmation_execution_event_id": (
+                current_action.execution_event_id
+            ),
+            "confirmation_event_id": current_action.event_id,
+            "signal_id": signal_id,
+            "position_lifecycle_id": position_lifecycle_id,
+            "binding_ordinal": len(bindings) + 1,
+            "binding_kind": binding_kind,
+            "symbol": symbol,
+            "parent_order_id": current_action.parent_order_id,
+            "fill_group_planned_shares": (
+                current_action.fill_group_planned_shares
+            ),
+            "fill_shares": current_action.shares,
+            "cumulative_group_shares": cumulative_group_shares,
+            "event_time": _canonical_timestamp(current_action.event_time),
+            "message_time": _canonical_timestamp(current_action.message_time),
+            "action_received_at": _canonical_timestamp(
+                current_action.received_at
+            ),
+            "recorded_at": _canonical_timestamp(normalized_recorded_at),
+            "action_source_digest": current_action.source_digest,
+            "primary_plan_digest": primary_plan_digest,
+        }
+        values["source_digest"] = (
+            self._actual_position_plan_binding_digest(values)
+        )
+        values["record_sha256"] = hashlib.sha256(
+            _canonical_audit_json(values).encode("utf-8")
+        ).hexdigest()
+        ordered_values = tuple(
+            values[column]
+            for column in _ACTUAL_POSITION_PLAN_BINDING_COLUMNS[1:]
+        )
+        try:
+            with self._provider_monitoring_write():
+                cursor = _sql(
+                    self._connection,
+                    "INSERT INTO actual_position_plan_bindings("
+                    + ", ".join(
+                        _ACTUAL_POSITION_PLAN_BINDING_COLUMNS[1:]
+                    )
+                    + ") VALUES ("
+                    + ", ".join("?" for _ in ordered_values)
+                    + ")",
+                    ordered_values,
+                )
+        except sqlite3.IntegrityError as error:
+            raise IdempotencyConflict(
+                "ACTUAL position plan binding conflicts with stored content"
+            ) from error
+        stored_row = _sql(
+            self._connection,
+            "SELECT "
+            + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings WHERE id = ?",
+            (int(cursor.lastrowid),),
+        ).fetchone()
+        if stored_row is None:
+            raise MigrationCorruption(
+                "ACTUAL position plan binding disappeared after insert"
+            )
+        stored = self._actual_position_plan_binding_source_from_row(stored_row)
+        if (
+            stored.binding_id != binding_id
+            or stored.position_lifecycle_id != position_lifecycle_id
+            or stored.confirmation_execution_event_id
+            != current_action.execution_event_id
+            or stored.source_digest != values["source_digest"]
+            or stored.record_sha256 != values["record_sha256"]
+        ):
+            raise MigrationCorruption(
+                "ACTUAL position plan binding readback changed"
+            )
+
     def _record_phase1_entry(
         self,
         *,
@@ -25793,9 +27255,10 @@ class Journal:
 
         if not self._transaction_active:
             raise JournalError("Phase 1 entry requires an active transaction")
-        if confirmation_action_source is not None and (
-            not is_verified_journal_action_source(confirmation_action_source)
-            or _journal_action_source_owner(confirmation_action_source) is not self
+        if confirmation_action_source is not None and not (
+            self._phase1_entry_action_is_authorized(
+                confirmation_action_source
+            )
         ):
             raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
         signal_id = _require_nonempty_text(signal_id, "Phase 1 signal ID")
@@ -25845,6 +27308,23 @@ class Journal:
             "SKIPPED_LIVE_TRACKED_PAPER",
             "SHADOW_FILLED_INFORMATIONAL",
         }
+        live_confirmation_rows = tuple(
+            row for row in event_rows if str(row[4]) == "LIVE_CONFIRM"
+        )
+        if current_status == "LIVE_CONFIRMED" and len(
+            live_confirmation_rows
+        ) != 1:
+            raise MigrationCorruption(
+                "Phase 1 LIVE confirmation anchor is ambiguous"
+            )
+        binding_only_entry_action = (
+            current_status == "LIVE_CONFIRMED"
+            and confirmation_action_source is not None
+            and confirmation_action_source.domain_kind
+            in {"BOUGHT", "PARTIAL_FILL"}
+            and confirmation_action_source.execution_event_id
+            != int(live_confirmation_rows[0][10])
+        )
         if current_status not in {
             "PUBLISHED",
             "TRIGGERED_PAPER",
@@ -25892,7 +27372,7 @@ class Journal:
                 "Phase 1 entry does not match the exact sealed cohort result"
             )
         by_id = {item.observation_id: item for item in observations}
-        metadata_context = metadata_only or (
+        metadata_context = binding_only_entry_action or metadata_only or (
             terminal_retry
             and str(event_rows[-1][5]) == "TRIGGERED_PAPER"
         )
@@ -25901,9 +27381,33 @@ class Journal:
                 raise InvalidJournalValue(
                     "Phase 1 LIVE metadata cannot repeat entry observations"
                 )
-            economic_event = event_rows[2] if terminal_retry else event_rows[-1]
+            if binding_only_entry_action:
+                live_confirmation = live_confirmation_rows[0]
+                if str(live_confirmation[5]) == "TRIGGERED_AWAITING_LIMIT":
+                    economic_event = live_confirmation
+                elif str(live_confirmation[5]) == "TRIGGERED_PAPER":
+                    paper_rows = tuple(
+                        row
+                        for row in event_rows
+                        if str(row[4]) == "PAPER_FILL"
+                        and int(row[3]) < int(live_confirmation[3])
+                    )
+                    if len(paper_rows) != 1:
+                        raise MigrationCorruption(
+                            "Phase 1 paper entry anchor is ambiguous"
+                        )
+                    economic_event = paper_rows[0]
+                else:
+                    raise MigrationCorruption(
+                        "Phase 1 LIVE confirmation anchor is inconsistent"
+                    )
+            else:
+                economic_event = (
+                    event_rows[2] if terminal_retry else event_rows[-1]
+                )
             if (
-                str(economic_event[4]) != "PAPER_FILL"
+                str(economic_event[4])
+                not in {"PAPER_FILL", "LIVE_CONFIRM"}
                 or str(economic_event[13]) != completion.completion_id
                 or economic_event[11] is None
                 or economic_event[12] is None
@@ -25960,6 +27464,7 @@ class Journal:
                 raise RiskBlock("PHASE1_CONFIRMATION_SOURCE_UNVERIFIED")
             event_kind_by_action = {
                 "BOUGHT": "LIVE_CONFIRM",
+                "PARTIAL_FILL": "LIVE_CONFIRM",
                 "SKIPPED": "LIVE_SKIP",
             }
             event_kind = event_kind_by_action.get(current_action.domain_kind)
@@ -26010,6 +27515,46 @@ class Journal:
         elif role != "PRIMARY":
             raise MigrationCorruption("Phase 1 signal role is unsupported")
 
+        if binding_only_entry_action:
+            assert confirmation_action_source is not None
+            existing_binding_kind_row = _sql(
+                self._connection,
+                "SELECT binding_kind FROM actual_position_plan_bindings "
+                "WHERE confirmation_execution_event_id = ?",
+                (confirmation_action_source.execution_event_id,),
+            ).fetchone()
+            same_lineage_anchor_rows = _sql(
+                self._connection,
+                "SELECT binding.id FROM actual_position_plan_bindings AS binding "
+                "JOIN execution_events AS action "
+                "ON action.id = binding.confirmation_execution_event_id "
+                "WHERE binding.signal_id = ? COLLATE BINARY "
+                "AND binding.binding_kind = 'LIVE_CONFIRM_ANCHOR' "
+                "AND binding.binding_ordinal = 1 "
+                "AND action.signal_id = ? COLLATE BINARY ORDER BY binding.id",
+                (signal_id, confirmation_action_source.signal_id),
+            ).fetchall()
+            if len(same_lineage_anchor_rows) > 1:
+                raise MigrationCorruption(
+                    "ACTUAL position lifecycle anchor is ambiguous"
+                )
+            if existing_binding_kind_row is not None:
+                binding_kind = str(existing_binding_kind_row[0])
+            elif (
+                confirmation_action_source.domain_kind == "PARTIAL_FILL"
+                and same_lineage_anchor_rows
+            ):
+                binding_kind = "PARTIAL_FILL_CONTINUATION"
+            else:
+                binding_kind = "LIVE_CONFIRM_ANCHOR"
+            self._record_actual_position_plan_binding(
+                signal=signal,
+                current_action=confirmation_action_source,
+                binding_kind=binding_kind,
+                recorded_at=normalized_recorded_at,
+            )
+            return
+
         if current_status != "PUBLISHED" and not metadata_only:
             last_row = event_rows[-1]
             retry_matches = False
@@ -26058,6 +27603,17 @@ class Journal:
             if not retry_matches:
                 raise IdempotencyConflict(
                     "Phase 1 entry retry conflicts with stored content"
+                )
+            if (
+                current_status == "LIVE_CONFIRMED"
+                and current_action is not None
+            ):
+                assert confirmation_action_source is not None
+                self._record_actual_position_plan_binding(
+                    signal=signal,
+                    current_action=confirmation_action_source,
+                    binding_kind="LIVE_CONFIRM_ANCHOR",
+                    recorded_at=normalized_recorded_at,
                 )
             return
 
@@ -26202,6 +27758,14 @@ class Journal:
                     received_at=normalized_recorded_at,
                     session_date=publication_session,
                 )
+                if current_action is not None and event_kind == "LIVE_CONFIRM":
+                    assert confirmation_action_source is not None
+                    self._record_actual_position_plan_binding(
+                        signal=signal,
+                        current_action=confirmation_action_source,
+                        binding_kind="LIVE_CONFIRM_ANCHOR",
+                        recorded_at=normalized_recorded_at,
+                    )
             return
 
         if current_status == "TRIGGERED_PAPER" and current_action is not None:
@@ -26263,6 +27827,14 @@ class Journal:
                     "economic_entry_lifecycle_event_id": str(prior_row[1]),
                 },
             )
+            if event_kind == "LIVE_CONFIRM":
+                assert confirmation_action_source is not None
+                self._record_actual_position_plan_binding(
+                    signal=signal,
+                    current_action=confirmation_action_source,
+                    binding_kind="LIVE_CONFIRM_ANCHOR",
+                    recorded_at=normalized_recorded_at,
+                )
             return
 
         raise InvalidJournalValue(
@@ -27448,8 +29020,10 @@ class Journal:
             action_source = self._read_action_source(
                 execution_event_id=int(metadata_row[10])
             )
-            expected_kind = (
-                "BOUGHT" if str(metadata_row[4]) == "LIVE_CONFIRM" else "SKIPPED"
+            expected_kinds = (
+                {"BOUGHT", "PARTIAL_FILL"}
+                if str(metadata_row[4]) == "LIVE_CONFIRM"
+                else {"SKIPPED"}
             )
             observation_by_id = {
                 item.observation_id: item for item in observations
@@ -27458,7 +29032,7 @@ class Journal:
             from zoneinfo import ZoneInfo
 
             if (
-                action_source.domain_kind != expected_kind
+                action_source.domain_kind not in expected_kinds
                 or action_source.symbol != signal_source.symbol
                 or action_source.event_time.astimezone(
                     ZoneInfo("America/New_York")

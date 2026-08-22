@@ -76,6 +76,7 @@ class CliTests(unittest.TestCase):
                 "SKIPPED AAPL",
             ),
             ("phase1", "status"),
+            ("phase1", "start", "--session", "2026-08-21"),
             ("replay", "diagnostic", "--fixture", str(SCENARIOS / "eligible.json")),
             ("replay", "point-in-time", "--fixture", str(SCENARIOS / "eligible.json")),
             ("option-paper", "start", "--fixture", str(SCENARIOS / "eligible.json")),
@@ -88,6 +89,114 @@ class CliTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 namespace = parser.parse_args(arguments)
                 self.assertIsNotNone(namespace.command)
+
+    def _run_phase1_start_at(
+        self,
+        session_text: str,
+        observed_at: datetime,
+    ) -> tuple[int, dict[str, object] | str]:
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, requested_timezone=None):
+                if requested_timezone is None:
+                    return observed_at
+                return observed_at.astimezone(requested_timezone)
+
+        output = io.StringIO()
+        with patch("stock_monitor.cli.datetime", FixedDateTime), patch.dict(
+            os.environ,
+            _env(self.home),
+            clear=True,
+        ), redirect_stdout(output):
+            code = main(
+                ("phase1", "start", "--session", session_text, "--json")
+            )
+        text = output.getvalue()
+        if code == 0:
+            return code, json.loads(text)
+        return code, text
+
+    def test_phase1_start_reads_back_allowlisted_idempotent_json(self):
+        first_code, first = self._run_phase1_start_at(
+            "2026-08-21",
+            datetime(2026, 8, 21, 20, 1, tzinfo=ZoneInfo("UTC")),
+        )
+        retry_code, retry = self._run_phase1_start_at(
+            "2026-08-21",
+            datetime(2026, 8, 21, 21, 1, tzinfo=ZoneInfo("UTC")),
+        )
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(retry_code, 0)
+        self.assertIsInstance(first, dict)
+        self.assertIsInstance(retry, dict)
+        assert isinstance(first, dict)
+        assert isinstance(retry, dict)
+        self.assertEqual(
+            set(first),
+            {
+                "calendar_digest",
+                "duplicate",
+                "source_digest",
+                "started_session",
+                "starting_capital",
+                "window_id",
+            },
+        )
+        self.assertEqual(first["starting_capital"], "5000.00")
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(first["window_id"], retry["window_id"])
+        self.assertEqual(first["source_digest"], retry["source_digest"])
+
+    def test_phase1_start_requires_strict_literal_date(self):
+        for session_text in (
+            "20260821",
+            "2026-W34-5",
+            " 2026-08-21",
+            "2026-08-21 ",
+            "2026-02-30",
+        ):
+            with self.subTest(session_text=session_text):
+                completed = _run(
+                    self.home / hashlib.sha256(session_text.encode()).hexdigest(),
+                    "phase1",
+                    "start",
+                    "--session",
+                    session_text,
+                    "--json",
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(
+                    completed.stdout,
+                    "CONFIGURATION REQUIRED\n"
+                    "No candidate or action was produced.\n",
+                )
+                self.assertEqual(completed.stderr, "")
+
+    def test_phase1_start_maps_closed_unclosed_and_conflicting_windows_safely(self):
+        unclosed_code, unclosed = self._run_phase1_start_at(
+            "2026-08-21",
+            datetime(2026, 8, 21, 19, 59, tzinfo=ZoneInfo("UTC")),
+        )
+        closed_code, closed = self._run_phase1_start_at(
+            "2026-08-22",
+            datetime(2026, 8, 22, 21, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        first_code, _ = self._run_phase1_start_at(
+            "2026-08-20",
+            datetime(2026, 8, 21, 21, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        conflict_code, conflict = self._run_phase1_start_at(
+            "2026-08-21",
+            datetime(2026, 8, 21, 21, 0, tzinfo=ZoneInfo("UTC")),
+        )
+
+        expected = "VERIFICATION BLOCKED\nNo candidate or action was produced.\n"
+        self.assertEqual((unclosed_code, unclosed), (4, expected))
+        self.assertEqual((closed_code, closed), (4, expected))
+        self.assertEqual(first_code, 0)
+        self.assertEqual((conflict_code, conflict), (4, expected))
 
     def test_calendar_json_exposes_exact_current_session_facts(self):
         class FixedDateTime(datetime):

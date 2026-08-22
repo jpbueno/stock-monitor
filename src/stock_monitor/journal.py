@@ -2630,6 +2630,20 @@ class StoredPhase1ValidationWindow:
     source_digest: str
     duplicate: bool
 
+    def safe_fields(self) -> dict[str, object]:
+        """Return the allowlisted operator-facing bootstrap receipt."""
+        return {
+            "window_id": self.validation_window_id,
+            "started_session": self.started_session.isoformat(),
+            "starting_capital": format(
+                money_from_micros(self.starting_capital_micros),
+                ".2f",
+            ),
+            "calendar_digest": self.calendar_digest,
+            "source_digest": self.source_digest,
+            "duplicate": self.duplicate,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class StoredPhase1Adherence:
@@ -7296,6 +7310,37 @@ class JournalTransaction:
         self._ensure_active()
         self._mark_dirty()
         return self._journal._start_phase1_validation_window(
+            window_id=window_id,
+            started_session=started_session,
+            starting_capital=starting_capital,
+            started_at=started_at,
+            received_at=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+
+    def start_or_read_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        """Read an identical genesis or create it under this immediate transaction."""
+        self._ensure_active()
+        existing = self._journal._read_phase1_validation_window_for_start(
+            window_id=window_id,
+            started_session=started_session,
+            starting_capital=starting_capital,
+            started_at=started_at,
+            received_at=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+        if existing is not None:
+            return existing
+        return self.start_phase1_validation_window(
             window_id=window_id,
             started_session=started_session,
             starting_capital=starting_capital,
@@ -13577,6 +13622,27 @@ class Journal:
         """Start one fixed-capital validation window and seed both close curves."""
         with self.transaction() as transaction:
             return transaction.start_phase1_validation_window(
+                window_id=window_id,
+                started_session=started_session,
+                starting_capital=starting_capital,
+                started_at=started_at,
+                received_at=received_at,
+                calendar_resolver=calendar_resolver,
+            )
+
+    def start_or_read_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        """Atomically read an identical Phase 1 genesis or create it once."""
+        with self.transaction() as transaction:
+            return transaction.start_or_read_phase1_validation_window(
                 window_id=window_id,
                 started_session=started_session,
                 starting_capital=starting_capital,
@@ -27692,7 +27758,7 @@ class Journal:
                 "Phase 1 source payload conflicts with stored content"
             ) from error
 
-    def _start_phase1_validation_window(
+    def _phase1_validation_window_material(
         self,
         *,
         window_id: str,
@@ -27701,7 +27767,7 @@ class Journal:
         started_at: datetime,
         received_at: datetime,
         calendar_resolver: object,
-    ) -> StoredPhase1ValidationWindow:
+    ) -> tuple[object, ...]:
         from .risk import RiskBlock, SessionCalendarResolver, _calendar_digest
 
         window_id = _require_sha256(window_id, "Phase 1 validation window ID")
@@ -27754,7 +27820,7 @@ class Journal:
                 }
             ).encode("utf-8")
         ).hexdigest()
-        immutable = (
+        return (
             window_id,
             stored_session,
             capital_micros,
@@ -27763,6 +27829,112 @@ class Journal:
             calendar_digest,
             source_digest,
         )
+
+    def _read_phase1_validation_window_for_start(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow | None:
+        from .risk import RiskBlock
+
+        requested = self._phase1_validation_window_material(
+            window_id=window_id,
+            started_session=started_session,
+            starting_capital=starting_capital,
+            started_at=started_at,
+            received_at=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+        existing = _sql(
+            self._connection,
+            "SELECT id, window_id, started_session, starting_capital_micros, "
+            "started_at, received_at, calendar_digest, source_digest, singleton_key "
+            "FROM phase1_validation_windows WHERE window_id = ? COLLATE BINARY",
+            (requested[0],),
+        ).fetchone()
+        if existing is None:
+            return None
+
+        stored = tuple(existing[1:-1])
+        requested_identity = (
+            requested[0],
+            requested[1],
+            requested[2],
+            requested[3],
+            requested[5],
+        )
+        stored_identity = (
+            stored[0],
+            stored[1],
+            stored[2],
+            stored[3],
+            stored[5],
+        )
+        if stored_identity != requested_identity or existing[-1] != 1:
+            raise IdempotencyConflict(
+                "Phase 1 validation window conflicts with stored content"
+            )
+
+        stored_received_at = _parse_canonical_timestamp(str(stored[4]))
+        try:
+            verified = self._phase1_validation_window_material(
+                window_id=window_id,
+                started_session=started_session,
+                starting_capital=starting_capital,
+                started_at=started_at,
+                received_at=stored_received_at,
+                calendar_resolver=calendar_resolver,
+            )
+        except (InvalidJournalValue, RiskBlock) as error:
+            raise MigrationCorruption(
+                "Phase 1 validation window integrity failed"
+            ) from error
+        if stored != verified:
+            raise MigrationCorruption(
+                "Phase 1 validation window integrity failed"
+            )
+        self._verify_phase1_window_baselines(immutable=verified)
+        return StoredPhase1ValidationWindow(
+            str(verified[0]),
+            started_session,
+            int(verified[2]),
+            str(verified[5]),
+            str(verified[6]),
+            True,
+        )
+
+    def _start_phase1_validation_window(
+        self,
+        *,
+        window_id: str,
+        started_session: date,
+        starting_capital: object,
+        started_at: datetime,
+        received_at: datetime,
+        calendar_resolver: object,
+    ) -> StoredPhase1ValidationWindow:
+        immutable = self._phase1_validation_window_material(
+            window_id=window_id,
+            started_session=started_session,
+            starting_capital=starting_capital,
+            started_at=started_at,
+            received_at=received_at,
+            calendar_resolver=calendar_resolver,
+        )
+        (
+            window_id,
+            stored_session,
+            capital_micros,
+            stored_started_at,
+            stored_received_at,
+            calendar_digest,
+            source_digest,
+        ) = immutable
         existing = _sql(
             self._connection,
             "SELECT id, window_id, started_session, starting_capital_micros, "

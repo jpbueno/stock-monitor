@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,7 @@ from .workflows import (
 
 
 _ET = ZoneInfo("America/New_York")
+_SESSION_DATE_LITERAL = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 
 
 class DataCommandError(RuntimeError):
@@ -35,6 +37,10 @@ class DataCommandError(RuntimeError):
 
 class CommandBoundaryError(RuntimeError):
     """A CLI request is outside an activated paper/manual-only adapter."""
+
+
+class VerificationCommandError(RuntimeError):
+    """A requested state transition failed a closed verification gate."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
     phase1 = commands.add_parser("phase1")
     phase1_commands = phase1.add_subparsers(dest="phase1_command", required=True)
     _json_flag(phase1_commands.add_parser("status"))
+    phase1_start = phase1_commands.add_parser("start")
+    phase1_start.add_argument("--session", required=True)
+    _json_flag(phase1_start)
 
     replay = commands.add_parser("replay")
     replay_commands = replay.add_subparsers(dest="replay_command", required=True)
@@ -118,6 +127,9 @@ def run(
     except (WorkflowDataError, DataCommandError):
         _print_message("DATA UNAVAILABLE\nNo candidate or action was produced.")
         return 3
+    except VerificationCommandError:
+        _print_message("VERIFICATION BLOCKED\nNo candidate or action was produced.")
+        return 4
     except WorkflowReconciliationError:
         _print_message("RECONCILIATION REQUIRED\nNo action was authorized.")
         return 5
@@ -153,7 +165,11 @@ def _dispatch(arguments: argparse.Namespace, environ: Mapping[str, str]) -> int:
     if command == "confirm":
         return _confirm(settings, arguments)
     if command == "phase1":
-        return _phase1_status(settings, arguments.json)
+        if arguments.phase1_command == "status":
+            return _phase1_status(settings, arguments.json)
+        if arguments.phase1_command == "start":
+            return _phase1_start(settings, arguments.session, arguments.json)
+        raise CommandBoundaryError("unsupported Phase 1 command")
     if command == "replay":
         raise CommandBoundaryError("recorded replay adapter is not activated")
     if command == "option-paper":
@@ -384,6 +400,57 @@ def _confirm(settings: Settings, arguments: argparse.Namespace) -> int:
         ],
     }
     _emit(payload, arguments.json)
+    return 0
+
+
+def _strict_session_date(value: object) -> date:
+    if (
+        type(value) is not str
+        or _SESSION_DATE_LITERAL.fullmatch(value) is None
+    ):
+        raise ConfigurationError("session must be a literal YYYY-MM-DD date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ConfigurationError(
+            "session must be a literal YYYY-MM-DD date"
+        ) from error
+    if parsed.isoformat() != value:
+        raise ConfigurationError("session must be a literal YYYY-MM-DD date")
+    return parsed
+
+
+def _phase1_start(settings: Settings, session_text: str, as_json: bool) -> int:
+    from .journal import IdempotencyConflict, InvalidJournalValue, Journal
+    from .market_calendar import CalendarError, load_current_market_calendar
+    from .phase1_bootstrap import bootstrap_phase1
+    from .risk import RiskBlock, SessionCalendarResolver
+
+    session_date = _strict_session_date(session_text)
+    try:
+        calendar = load_current_market_calendar(
+            settings.project_root,
+            as_of=session_date,
+        )
+    except CalendarError as error:
+        raise DataCommandError(
+            "reviewed calendar release is unavailable"
+        ) from error
+
+    try:
+        resolver = SessionCalendarResolver((calendar,))
+        with Journal.open(settings.journal_path) as journal:
+            stored = bootstrap_phase1(
+                journal,
+                session_date=session_date,
+                calendar_resolver=resolver,
+                received_at=datetime.now(timezone.utc),
+            )
+    except (IdempotencyConflict, InvalidJournalValue, RiskBlock) as error:
+        raise VerificationCommandError(
+            "Phase 1 validation window could not be verified"
+        ) from error
+    _emit(stored.safe_fields(), as_json)
     return 0
 
 

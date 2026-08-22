@@ -9,6 +9,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
@@ -26,6 +27,11 @@ from stock_monitor.journal import (
     report_archive_relative_path,
     stable_report_id,
 )
+from stock_monitor.market_calendar import load_current_market_calendar
+from stock_monitor.risk import SessionCalendarResolver, _calendar_digest
+
+
+ROOT = Path(__file__).parents[2]
 
 
 def _scheduled_result_envelope(
@@ -69,6 +75,134 @@ class JournalTests(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.db_path = Path(self._temporary_directory.name) / "state" / "journal.db"
+
+    @staticmethod
+    def _phase1_calendar_resolver() -> SessionCalendarResolver:
+        calendar = load_current_market_calendar(
+            ROOT,
+            as_of=date(2026, 8, 21),
+        )
+        return SessionCalendarResolver((calendar,))
+
+    def test_phase1_bootstrap_uses_full_calendar_digest_and_ignores_retry_receipt(self) -> None:
+        from stock_monitor.phase1_bootstrap import bootstrap_phase1
+
+        resolver = self._phase1_calendar_resolver()
+        first_receipt = datetime(2026, 8, 21, 20, 1, tzinfo=timezone.utc)
+        retry_receipt = first_receipt + timedelta(hours=1)
+
+        with Journal.open(self.db_path) as journal:
+            first = bootstrap_phase1(
+                journal,
+                session_date=date(2026, 8, 21),
+                calendar_resolver=resolver,
+                received_at=first_receipt,
+            )
+            retry = bootstrap_phase1(
+                journal,
+                session_date=date(2026, 8, 21),
+                calendar_resolver=resolver,
+                received_at=retry_receipt,
+            )
+
+            self.assertFalse(first.duplicate)
+            self.assertTrue(retry.duplicate)
+            self.assertEqual(first.validation_window_id, retry.validation_window_id)
+            self.assertEqual(first.source_digest, retry.source_digest)
+            self.assertEqual(first.calendar_digest, _calendar_digest(resolver))
+            self.assertEqual(first.safe_fields()["starting_capital"], "5000.00")
+            self.assertEqual(journal.count("phase1_validation_windows"), 1)
+            self.assertEqual(journal.count("phase1_equity_points"), 2)
+
+    def test_phase1_start_or_read_is_atomic_across_journal_connections(self) -> None:
+        from stock_monitor.phase1_bootstrap import bootstrap_phase1
+
+        resolver = self._phase1_calendar_resolver()
+        barrier = Barrier(2)
+
+        with Journal.open(self.db_path):
+            pass
+
+        def start(received_at: datetime):
+            with Journal.open(self.db_path) as journal:
+                barrier.wait()
+                return bootstrap_phase1(
+                    journal,
+                    session_date=date(2026, 8, 21),
+                    calendar_resolver=resolver,
+                    received_at=received_at,
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = tuple(
+                executor.submit(
+                    start,
+                    datetime(2026, 8, 21, 20, minute, tzinfo=timezone.utc),
+                )
+                for minute in (1, 2)
+            )
+            results = tuple(future.result() for future in futures)
+
+        self.assertEqual(sorted(result.duplicate for result in results), [False, True])
+        self.assertEqual(len({result.validation_window_id for result in results}), 1)
+        self.assertEqual(len({result.source_digest for result in results}), 1)
+        with Journal.open(self.db_path) as journal:
+            self.assertEqual(journal.count("phase1_validation_windows"), 1)
+            self.assertEqual(journal.count("phase1_equity_points"), 2)
+
+    def test_phase1_bootstrap_rejects_unclosed_and_conflicting_genesis(self) -> None:
+        from stock_monitor.phase1_bootstrap import bootstrap_phase1
+
+        resolver = self._phase1_calendar_resolver()
+        with Journal.open(self.db_path) as journal:
+            with self.assertRaisesRegex(
+                InvalidJournalValue,
+                "genesis session is not complete",
+            ):
+                bootstrap_phase1(
+                    journal,
+                    session_date=date(2026, 8, 21),
+                    calendar_resolver=resolver,
+                    received_at=datetime(
+                        2026,
+                        8,
+                        21,
+                        19,
+                        59,
+                        tzinfo=timezone.utc,
+                    ),
+                )
+            self.assertEqual(journal.count("phase1_validation_windows"), 0)
+
+            first = bootstrap_phase1(
+                journal,
+                session_date=date(2026, 8, 20),
+                calendar_resolver=resolver,
+                received_at=datetime(2026, 8, 21, 21, 0, tzinfo=timezone.utc),
+            )
+            with self.assertRaises(IdempotencyConflict):
+                bootstrap_phase1(
+                    journal,
+                    session_date=date(2026, 8, 21),
+                    calendar_resolver=resolver,
+                    received_at=datetime(2026, 8, 21, 21, 0, tzinfo=timezone.utc),
+                )
+
+            session = resolver.session(date(2026, 8, 20))
+            with self.assertRaises(IdempotencyConflict):
+                journal.start_phase1_validation_window(
+                    window_id=first.validation_window_id,
+                    started_session=date(2026, 8, 20),
+                    starting_capital=Decimal("5000.00"),
+                    started_at=datetime.combine(
+                        date(2026, 8, 20),
+                        session.close_time,
+                        session.timezone,
+                    ),
+                    received_at=datetime(2026, 8, 21, 22, 0, tzinfo=timezone.utc),
+                    calendar_resolver=resolver,
+                )
+            self.assertEqual(journal.count("phase1_validation_windows"), 1)
 
     @staticmethod
     def _seed_scheduled_run(

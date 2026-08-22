@@ -210,8 +210,16 @@ class ActualTransitionPersistenceTests(unittest.TestCase):
             "_transition_actual",
             side_effect=without_posting,
         ):
-            self.ingest(item)
-        with self.assertRaisesRegex(ValueError, "ACTUAL_POSTING_CLOSURE"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED",
+            ):
+                self.ingest(item)
+        self.assertEqual(self.journal.count("execution_events"), 1)
+        with self.assertRaisesRegex(
+            ValueError,
+            "ACTUAL_LEDGER_STATE_CONTENT_UNVERIFIED",
+        ):
             self.replay("2026-08-14T10:16:00-04:00")
 
         self.journal.close()
@@ -930,16 +938,24 @@ class ActualTransitionPersistenceTests(unittest.TestCase):
             "_resolve_actual_entry_lineage",
             side_effect=fork_second,
         ):
-            self.ingest(
-                envelope(
-                    "message:lineage-fork",
-                    "BOUGHT SPY 1 shares @ 99 AT 10:16 ET",
-                    message_time="2026-08-14T10:17:00-04:00",
-                    received_at="2026-08-14T10:17:01-04:00",
+            with self.assertRaisesRegex(
+                ValueError,
+                "INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED",
+            ):
+                self.ingest(
+                    envelope(
+                        "message:lineage-fork",
+                        "BOUGHT SPY 1 shares @ 99 AT 10:16 ET",
+                        message_time="2026-08-14T10:17:00-04:00",
+                        received_at="2026-08-14T10:17:01-04:00",
+                    )
                 )
-            )
 
-        with self.assertRaisesRegex(ValueError, "ACTUAL_LINEAGE_MISMATCH"):
+        self.assertEqual(self.journal.count("execution_events"), 2)
+        with self.assertRaisesRegex(
+            ValueError,
+            "ACTUAL_LEDGER_STATE_CONTENT_UNVERIFIED",
+        ):
             self.replay("2026-08-14T10:18:00-04:00")
 
         self.journal.close()
@@ -950,15 +966,23 @@ class ActualTransitionPersistenceTests(unittest.TestCase):
             "_resolve_actual_entry_lineage",
             return_value=("sig-forged", "PLANNED_SIGNAL"),
         ):
-            self.ingest(
-                envelope(
-                    "message:lineage-forged",
-                    "BOUGHT SPY 1 shares @ 100 AT 10:14 ET",
-                    message_time="2026-08-14T10:15:00-04:00",
-                    received_at="2026-08-14T10:15:01-04:00",
+            with self.assertRaisesRegex(
+                ValueError,
+                "INCREMENTAL_INGESTION_CHECKPOINT_UNVERIFIED",
+            ):
+                self.ingest(
+                    envelope(
+                        "message:lineage-forged",
+                        "BOUGHT SPY 1 shares @ 100 AT 10:14 ET",
+                        message_time="2026-08-14T10:15:00-04:00",
+                        received_at="2026-08-14T10:15:01-04:00",
+                    )
                 )
-            )
-        with self.assertRaisesRegex(ValueError, "ACTUAL_LINEAGE_MISMATCH"):
+        self.assertEqual(self.journal.count("execution_events"), 1)
+        with self.assertRaisesRegex(
+            ValueError,
+            "ACTUAL_LEDGER_STATE_CONTENT_UNVERIFIED",
+        ):
             self.replay("2026-08-14T10:16:00-04:00")
 
     def test_ambiguous_fee_is_account_evidence_not_strategy_pnl(self) -> None:

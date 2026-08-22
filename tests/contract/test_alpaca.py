@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import copy
+import gc
 import unittest
+import weakref
+from array import array
+from collections import deque
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import MappingProxyType, ModuleType, SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import stock_monitor.providers.alpaca as alpaca_module
@@ -13,12 +18,14 @@ from stock_monitor.providers.alpaca import (
     AlpacaMarketData,
     ProviderDataError,
     ProviderIncompleteError,
+    ProviderMalformedError,
     TimeWindow,
     is_ingestible_provider_fetch_cohort,
     is_ingestible_provider_option_chain,
     is_issued_normalized_market_fact,
     is_issued_provider_option_chain,
     is_issued_provider_fetch_cohort,
+    is_issued_provider_fetch_page_bundle,
     normalized_market_facts_share_owner,
     provider_fetch_cohorts_share_owner,
     read_provider_fetch_bundle,
@@ -37,6 +44,8 @@ SMOKE_WINDOW = TimeWindow(
     datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
     datetime(2026, 8, 13, 20, 0, tzinfo=UTC),
 )
+_GLOBAL_ROUTE_TABLE: dict[str, object] = {}
+_GLOBAL_ROUTE_HOLDER = ModuleType("alpaca_contract_route_holder")
 
 
 class RoutingTransport:
@@ -58,6 +67,1409 @@ class RoutingTransport:
 
 
 class AlpacaContractTests(unittest.TestCase):
+    @staticmethod
+    def _two_page_daily_bar_responder(
+        *,
+        terminal: bool = True,
+    ):
+        first_body = (
+            '{"bars":{"SPY":[{"t":"2026-08-12T20:00:00Z",'
+            '"o":1,"h":1,"l":1,"c":1,"v":1}]},'
+            '"next_page_token":"page-2"}'
+        )
+        second_body = (
+            '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+            '"o":2,"h":2,"l":2,"c":2,"v":2}]}'
+            + (',"next_page_token":null}' if terminal else '}')
+        )
+
+        def responder(url: str) -> tuple[int, str]:
+            token = parse_qs(urlsplit(url).query).get("page_token")
+            return (200, second_body if token == ["page-2"] else first_body)
+
+        return responder, (first_body.encode("utf-8"), second_body.encode("utf-8"))
+
+    @staticmethod
+    def _two_page_paginated_cases():
+        return (
+            (
+                "daily bars",
+                '{"bars":{"SPY":[{"t":"2026-08-12T20:00:00Z",'
+                '"o":1,"h":1,"l":1,"c":1,"v":1}]},'
+                '"next_page_token":"page-2"}',
+                '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                '"o":2,"h":2,"l":2,"c":2,"v":2}]},'
+                '"next_page_token":null}',
+                lambda client, sink: client.daily_bars(
+                    ("SPY",), WINDOW, page_sink=sink
+                ),
+            ),
+            (
+                "minute bars",
+                '{"bars":{"SPY":[{"t":"2026-08-13T19:59:00Z",'
+                '"o":1,"h":1,"l":1,"c":1,"v":1}]},'
+                '"next_page_token":"page-2"}',
+                '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                '"o":2,"h":2,"l":2,"c":2,"v":2}]},'
+                '"next_page_token":null}',
+                lambda client, sink: client.historical_minute_bars(
+                    ("SPY",), WINDOW, page_sink=sink
+                ),
+            ),
+            (
+                "trades",
+                '{"trades":{"SPY":[{"t":"2026-08-13T19:59:00Z",'
+                '"p":1,"s":1,"i":1}]},'
+                '"next_page_token":"page-2"}',
+                '{"trades":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                '"p":2,"s":1,"i":2}]},'
+                '"next_page_token":null}',
+                lambda client, sink: client.historical_trades(
+                    ("SPY",), WINDOW, page_sink=sink
+                ),
+            ),
+            (
+                "quotes",
+                '{"quotes":{"SPY":[{"t":"2026-08-13T19:59:00Z",'
+                '"bp":1,"ap":2,"i":1}]},'
+                '"next_page_token":"page-2"}',
+                '{"quotes":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                '"bp":2,"ap":3,"i":2}]},'
+                '"next_page_token":null}',
+                lambda client, sink: client.historical_quotes(
+                    ("SPY",), WINDOW, page_sink=sink
+                ),
+            ),
+            (
+                "option chain",
+                '{"snapshots":{"SPY260918C00650000":{'
+                '"latestQuote":{"t":"2026-08-14T12:58:00Z",'
+                '"bp":"1.00","ap":"1.05"}}},'
+                '"next_page_token":"page-2"}',
+                '{"snapshots":{"SPY260918C00660000":{'
+                '"latestQuote":{"t":"2026-08-14T12:59:00Z",'
+                '"bp":"0.90","ap":"0.95"}}},'
+                '"next_page_token":null}',
+                lambda client, sink: client.option_chain(
+                    "SPY", page_sink=sink
+                ),
+            ),
+        )
+
+    def test_page_sink_cannot_replace_request_dependencies_between_pages(
+        self,
+    ) -> None:
+        for name, first_body, second_body, invoke in (
+            self._two_page_paginated_cases()
+        ):
+            with self.subTest(api=name):
+                first_transport = RoutingTransport(
+                    lambda _url, body=first_body: (200, body)
+                )
+                replacement_transport = RoutingTransport(
+                    lambda _url, body=second_body: (200, body)
+                )
+                client = AlpacaMarketData(
+                    first_transport,
+                    credentials(),
+                    now=lambda: NOW,
+                )
+                pages = []
+
+                def mutating_sink(page) -> None:
+                    pages.append(page)
+                    client._transport = replacement_transport
+
+                with self.assertRaisesRegex(
+                    ProviderMalformedError,
+                    "request dependencies",
+                ):
+                    invoke(client, mutating_sink)
+
+                self.assertEqual(len(first_transport.requested_urls), 1)
+                self.assertEqual(replacement_transport.requested_urls, [])
+                self.assertEqual(len(pages), 1)
+                self.assertTrue(
+                    is_issued_provider_fetch_page_bundle(pages[0])
+                )
+                self.assertEqual(client._issued_fetch_manifests, {})
+
+    def test_page_sink_cannot_replace_instance_request_dispatch(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+        original_dispatch = client._get_json_for_request
+        exposed_secrets = []
+
+        def replacement_dispatch(url, dependencies):
+            exposed_secrets.append(dependencies.credential_secret_key)
+            return original_dispatch(url, dependencies)
+
+        def mutating_sink(_page) -> None:
+            client._get_json_for_request = replacement_dispatch
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ):
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_secrets, [])
+
+    def test_page_sink_cannot_replace_class_request_verifier(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+        original_verifier = AlpacaMarketData._require_current_request_dependencies
+
+        def mutating_sink(_page) -> None:
+            AlpacaMarketData._require_current_request_dependencies = (
+                lambda _self, _dependencies: None
+            )
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ):
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            AlpacaMarketData._require_current_request_dependencies = (
+                original_verifier
+            )
+
+        self.assertEqual(len(transport.requested_urls), 1)
+
+    def test_page_sink_cannot_replace_module_request_dispatch(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+        original_dispatch = alpaca_module.get_with_redirects
+        exposed_headers = []
+
+        def replacement_dispatch(*args, **kwargs):
+            exposed_headers.append(dict(args[3]))
+            return original_dispatch(*args, **kwargs)
+
+        def mutating_sink(_page) -> None:
+            alpaca_module.get_with_redirects = replacement_dispatch
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ):
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            alpaca_module.get_with_redirects = original_dispatch
+
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_mutate_current_time_callable_code(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+
+        def now() -> datetime:
+            return NOW
+
+        def replacement_now() -> datetime:
+            return NOW + timedelta(hours=1)
+
+        original_code = now.__code__
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=now,
+        )
+
+        def mutating_sink(_page) -> None:
+            now.__code__ = replacement_now.__code__
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ):
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            now.__code__ = original_code
+
+        self.assertEqual(len(transport.requested_urls), 1)
+
+    def test_page_sink_cannot_replace_cache_put_callback(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+
+        class RecordingCache:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def put(self, _observation, _payload) -> None:
+                self.calls += 1
+
+        cache = RecordingCache()
+        original_put = RecordingCache.put
+
+        def replacement_put(self, _observation, _payload) -> None:
+            self.calls += 1
+
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+            cache=cache,  # type: ignore[arg-type]
+        )
+
+        def mutating_sink(_page) -> None:
+            RecordingCache.put = replacement_put
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ):
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            RecordingCache.put = original_put
+
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(cache.calls, 1)
+
+    def test_page_sink_cannot_swap_mutable_transport_handler(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class MutableHandlerTransport:
+            def __init__(self) -> None:
+                self.handler = original_handler
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.handler(url, headers)
+
+        transport = MutableHandlerTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            transport.handler = replacement_handler
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_mutate_inherited_transport_get_code(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        def handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        class BaseTransport:
+            def __init__(self) -> None:
+                self.handler = handler
+                self.calls = 0
+                self.requested_urls: list[str] = []
+                self.exposed_headers: list[dict[str, str]] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.handler(url, headers)
+
+        class InheritedTransport(BaseTransport):
+            pass
+
+        def replacement_get(
+            self,
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            self.exposed_headers.append(dict(headers))
+            return self.handler(url, headers)
+
+        transport = InheritedTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+        original_code = BaseTransport.get.__code__
+
+        def mutating_sink(_page) -> None:
+            BaseTransport.get.__code__ = replacement_get.__code__
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ) as raised:
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            BaseTransport.get.__code__ = original_code
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(transport.exposed_headers, [])
+
+    def test_page_sink_cannot_swap_mutable_cache_handler(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+        replacement_payloads = []
+
+        def original_handler(_observation, payload: bytes) -> None:
+            cache.persisted_payloads.append(payload)
+
+        def replacement_handler(_observation, payload: bytes) -> None:
+            replacement_payloads.append(payload)
+
+        class MutableHandlerCache:
+            def __init__(self) -> None:
+                self.handler = original_handler
+                self.calls = 0
+                self.persisted_payloads: list[bytes] = []
+
+            def put(self, observation, payload: bytes) -> None:
+                self.calls += 1
+                self.handler(observation, payload)
+
+        cache = MutableHandlerCache()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+            cache=cache,  # type: ignore[arg-type]
+        )
+
+        def mutating_sink(_page) -> None:
+            cache.handler = replacement_handler
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(cache.calls, 1)
+        self.assertEqual(len(cache.persisted_payloads), 1)
+        self.assertEqual(replacement_payloads, [])
+
+    def test_page_sink_cannot_swap_callable_clock_delegate_or_state(
+        self,
+    ) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        class ClockState:
+            def __init__(self, value: datetime) -> None:
+                self.value = value
+                self.uses = 0
+
+        def original_delegate(state: ClockState) -> datetime:
+            state.uses += 1
+            return state.value
+
+        replacement_calls = []
+
+        def replacement_delegate(state: ClockState) -> datetime:
+            replacement_calls.append(state)
+            return state.value + timedelta(hours=1)
+
+        class MutableClock:
+            def __init__(self, state: ClockState) -> None:
+                self.delegate = original_delegate
+                self.state = state
+                self.calls = 0
+                self.returned_values: list[datetime] = []
+
+            def __call__(self) -> datetime:
+                self.calls += 1
+                value = self.delegate(self.state)
+                self.returned_values.append(value)
+                return value
+
+        for mutation in ("delegate", "state"):
+            with self.subTest(mutation=mutation):
+                transport = RoutingTransport(responder)
+                original_state = ClockState(NOW)
+                forged_state = ClockState(NOW + timedelta(hours=1))
+                clock = MutableClock(original_state)
+                client = AlpacaMarketData(
+                    transport,
+                    credentials(),
+                    now=clock,
+                )
+
+                def mutating_sink(_page) -> None:
+                    if mutation == "delegate":
+                        clock.delegate = replacement_delegate
+                    else:
+                        clock.state = forged_state
+
+                with self.assertRaisesRegex(
+                    ProviderMalformedError,
+                    "request dependencies",
+                ) as raised:
+                    client.daily_bars(
+                        ("SPY",),
+                        WINDOW,
+                        page_sink=mutating_sink,
+                    )
+
+                self.assertIsNone(raised.exception.__context__)
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertEqual(len(transport.requested_urls), 1)
+                self.assertEqual(clock.calls, 2)
+                self.assertEqual(original_state.uses, 2)
+                self.assertEqual(forged_state.uses, 0)
+                self.assertEqual(replacement_calls, [])
+
+    def test_page_sink_cannot_swap_nested_namespace_handler(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class NestedConfigTransport:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(handler=original_handler)
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.config.handler(url, headers)
+
+        transport = NestedConfigTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            transport.config.handler = replacement_handler
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_cyclic_route_table_entry(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        for route_kind in ("dict", "list"):
+            with self.subTest(route_kind=route_kind):
+                exposed_headers = []
+
+                def replacement_handler(
+                    url: str,
+                    headers: dict[str, str],
+                ) -> HttpResponse:
+                    exposed_headers.append(dict(headers))
+                    return original_handler(url, headers)
+
+                if route_kind == "dict":
+                    routes = {"active": original_handler}
+                    routes["cycle"] = routes
+                else:
+                    routes = [original_handler]
+                    routes.append(routes)
+
+                class RouteTableTransport:
+                    def __init__(self) -> None:
+                        self.routes = routes
+                        self.calls = 0
+                        self.requested_urls: list[str] = []
+
+                    def get(
+                        self,
+                        url: str,
+                        headers: dict[str, str],
+                    ) -> HttpResponse:
+                        self.calls += 1
+                        self.requested_urls.append(url)
+                        handler = (
+                            self.routes["active"]
+                            if isinstance(self.routes, dict)
+                            else self.routes[0]
+                        )
+                        return handler(url, headers)
+
+                transport = RouteTableTransport()
+                client = AlpacaMarketData(
+                    transport,
+                    credentials(),
+                    now=lambda: NOW,
+                )
+
+                def mutating_sink(_page) -> None:
+                    if isinstance(transport.routes, dict):
+                        transport.routes["active"] = replacement_handler
+                    else:
+                        transport.routes[0] = replacement_handler
+
+                with self.assertRaisesRegex(
+                    ProviderMalformedError,
+                    "request dependencies",
+                ) as raised:
+                    client.daily_bars(
+                        ("SPY",),
+                        WINDOW,
+                        page_sink=mutating_sink,
+                    )
+
+                self.assertIsNone(raised.exception.__context__)
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertEqual(transport.calls, 1)
+                self.assertEqual(len(transport.requested_urls), 1)
+                self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_deque_route_entry(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class DequeRouteTransport:
+            def __init__(self) -> None:
+                self.routes = deque([original_handler])
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.routes[0](url, headers)
+
+        transport = DequeRouteTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            transport.routes[0] = replacement_handler
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_mapping_proxy_route_entry(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class ProxyRouteTransport:
+            def __init__(self, routes: MappingProxyType) -> None:
+                self.routes = routes
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.routes["handler"](url, headers)
+
+        backing = {"handler": original_handler}
+        transport = ProxyRouteTransport(MappingProxyType(backing))
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            backing["handler"] = replacement_handler
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_array_route_selector(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class ArrayRouteTransport:
+            def __init__(self, selector: array, handlers: tuple) -> None:
+                self.selector = selector
+                self.handlers = handlers
+                self.calls = 0
+                self.requested_urls: list[str] = []
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return self.handlers[self.selector[0]](url, headers)
+
+        selector = array("b", [0])
+        transport = ArrayRouteTransport(
+            selector,
+            (original_handler, replacement_handler),
+        )
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            selector[0] = 1
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "request dependencies",
+        ) as raised:
+            client.daily_bars(
+                ("SPY",),
+                WINDOW,
+                page_sink=mutating_sink,
+            )
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_module_global_route_entry(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class GlobalRouteTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                handler = _GLOBAL_ROUTE_TABLE["handler"]
+                assert callable(handler)
+                return handler(url, headers)
+
+        _GLOBAL_ROUTE_TABLE["handler"] = original_handler
+        transport = GlobalRouteTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            _GLOBAL_ROUTE_TABLE["handler"] = replacement_handler
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ) as raised:
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            _GLOBAL_ROUTE_TABLE.clear()
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_page_sink_cannot_swap_module_holder_handler(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        exposed_headers = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        def replacement_handler(
+            url: str,
+            headers: dict[str, str],
+        ) -> HttpResponse:
+            exposed_headers.append(dict(headers))
+            return original_handler(url, headers)
+
+        class ModuleHolderTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.requested_urls: list[str] = []
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.calls += 1
+                self.requested_urls.append(url)
+                return _GLOBAL_ROUTE_HOLDER.handler(url, headers)
+
+        _GLOBAL_ROUTE_HOLDER.handler = original_handler
+        transport = ModuleHolderTransport()
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        def mutating_sink(_page) -> None:
+            _GLOBAL_ROUTE_HOLDER.handler = replacement_handler
+
+        try:
+            with self.assertRaisesRegex(
+                ProviderMalformedError,
+                "request dependencies",
+            ) as raised:
+                client.daily_bars(
+                    ("SPY",),
+                    WINDOW,
+                    page_sink=mutating_sink,
+                )
+        finally:
+            del _GLOBAL_ROUTE_HOLDER.handler
+
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(exposed_headers, [])
+
+    def test_trusted_transport_can_increment_field_named_state(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        class StatefulTransport(RoutingTransport):
+            def __init__(self) -> None:
+                super().__init__(responder)
+                self.state = 0
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                self.state += 1
+                return super().get(url, headers)
+
+        transport = StatefulTransport()
+        try:
+            cohort = AlpacaMarketData(
+                transport,
+                credentials(),
+                now=lambda: NOW,
+            ).daily_bars(("SPY",), WINDOW)
+        except ProviderMalformedError as error:
+            self.fail(f"trusted transport state was rejected: {error}")
+
+        self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+        self.assertEqual(transport.state, 2)
+        self.assertEqual(len(transport.requested_urls), 2)
+
+    def test_request_graph_does_not_evaluate_lazy_annotations(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        annotation_calls = []
+
+        def original_handler(
+            url: str,
+            _headers: dict[str, str],
+        ) -> HttpResponse:
+            status, body = responder(url)
+            return HttpResponse(
+                status=status,
+                headers=(("Content-Type", "application/json"),),
+                body=body.encode("utf-8"),
+                url=url,
+            )
+
+        if not hasattr(original_handler, "__annotate__"):
+            self.skipTest("lazy function annotations require Python 3.14")
+
+        def lazy_annotations(format_code: int) -> dict[str, str]:
+            annotation_calls.append(format_code)
+            return {"return": "HttpResponse"}
+
+        original_handler.__annotations__ = None
+        original_handler.__annotate__ = lazy_annotations
+
+        class HandlerTransport:
+            def __init__(self) -> None:
+                self.handler = original_handler
+
+            def get(
+                self,
+                url: str,
+                headers: dict[str, str],
+            ) -> HttpResponse:
+                return self.handler(url, headers)
+
+        cohort = AlpacaMarketData(
+            HandlerTransport(),
+            credentials(),
+            now=lambda: NOW,
+        ).daily_bars(("SPY",), WINDOW)
+
+        self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+        self.assertEqual(annotation_calls, [])
+
+    def test_stateful_transport_remains_api_compatible(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        class StatefulTransport(RoutingTransport):
+            def __init__(self) -> None:
+                super().__init__(responder)
+                self.calls = 0
+
+            def get(self, url: str, headers: dict[str, str]) -> HttpResponse:
+                self.calls += 1
+                return super().get(url, headers)
+
+        transport = StatefulTransport()
+        try:
+            cohort = AlpacaMarketData(
+                transport,
+                credentials(),
+                now=lambda: NOW,
+            ).daily_bars(("SPY",), WINDOW)
+        except ProviderMalformedError as error:
+            self.fail(f"stateful transport was rejected: {error}")
+
+        self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+        self.assertEqual(transport.calls, 2)
+
+    def test_page_sink_cannot_substitute_equal_receipt_components(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+
+        def replace_page(_client, bundle) -> None:
+            object.__setattr__(bundle, "page", replace(bundle.page))
+
+        def replace_payload(_client, bundle) -> None:
+            object.__setattr__(
+                bundle,
+                "payload",
+                memoryview(bundle.payload).tobytes(),
+            )
+
+        def replace_observation(client, bundle) -> None:
+            replacement = replace(bundle.observation)
+            client._observations[replacement.observation_id] = replacement
+            object.__setattr__(bundle, "observation", replacement)
+
+        for name, mutation in (
+            ("page", replace_page),
+            ("payload", replace_payload),
+            ("observation", replace_observation),
+        ):
+            with self.subTest(component=name):
+                transport = RoutingTransport(responder)
+                client = AlpacaMarketData(
+                    transport,
+                    credentials(),
+                    now=lambda: NOW,
+                )
+                pages = []
+
+                def mutating_sink(page) -> None:
+                    pages.append(page)
+                    mutation(client, page)
+
+                with self.assertRaisesRegex(
+                    ProviderMalformedError,
+                    "page authority",
+                ):
+                    client.daily_bars(
+                        ("SPY",),
+                        WINDOW,
+                        page_sink=mutating_sink,
+                    )
+
+                self.assertEqual(len(transport.requested_urls), 1)
+                self.assertEqual(len(pages), 1)
+                self.assertFalse(
+                    is_issued_provider_fetch_page_bundle(pages[0])
+                )
+
+    def test_completed_fetch_authority_releases_receipts_and_registry(
+        self,
+    ) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        client = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        )
+        cohort = client.daily_bars(("SPY",), WINDOW)
+        bundle = read_provider_fetch_bundle(cohort)
+        page = bundle.pages[0]
+        manifest = bundle.manifest
+        page_identity = id(page)
+        page_reference = weakref.ref(page)
+        manifest_reference = weakref.ref(manifest)
+
+        del bundle, cohort, manifest, page
+        gc.collect()
+
+        self.assertIsNone(manifest_reference())
+        self.assertIsNone(page_reference())
+        self.assertEqual(client._issued_fetch_manifests, {})
+        self.assertNotIn(
+            page_identity,
+            alpaca_module._ISSUED_PROVIDER_FETCH_PAGE_BUNDLES,
+        )
+
+        client_reference = weakref.ref(client)
+        del client
+        gc.collect()
+        self.assertIsNone(client_reference())
+
+    def test_valid_page_is_disclosed_before_later_page_failure(self) -> None:
+        responder, payloads = self._two_page_daily_bar_responder(
+            terminal=False
+        )
+        transport = RoutingTransport(responder)
+        pages = []
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        with self.assertRaises(ProviderIncompleteError):
+            client.daily_bars(("SPY",), WINDOW, page_sink=pages.append)
+
+        self.assertEqual(len(transport.requested_urls), 2)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].payload, payloads[0])
+        self.assertEqual(pages[0].page.page_ordinal, 1)
+        self.assertIsNone(pages[0].page.request_page_token)
+        self.assertEqual(pages[0].page.next_page_token, "page-2")
+        self.assertTrue(is_issued_provider_fetch_page_bundle(pages[0]))
+        self.assertEqual(client._issued_fetch_manifests, {})
+        with self.assertRaisesRegex(ValueError, "authority"):
+            read_provider_fetch_bundle(pages[0])
+
+    def test_valid_page_is_disclosed_before_later_transport_failure(self) -> None:
+        responder, payloads = self._two_page_daily_bar_responder()
+
+        def failing_responder(url: str) -> tuple[int, str]:
+            if parse_qs(urlsplit(url).query).get("page_token") == ["page-2"]:
+                raise HttpTransportError("transport callback canary")
+            return responder(url)
+
+        transport = RoutingTransport(failing_responder)
+        pages = []
+        client = AlpacaMarketData(
+            transport,
+            credentials(),
+            now=lambda: NOW,
+        )
+
+        with self.assertRaises(HttpTransportError):
+            client.daily_bars(("SPY",), WINDOW, page_sink=pages.append)
+
+        self.assertGreaterEqual(len(transport.requested_urls), 2)
+        self.assertTrue(
+            all(
+                parse_qs(urlsplit(url).query).get("page_token")
+                == ["page-2"]
+                for url in transport.requested_urls[1:]
+            )
+        )
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].payload, payloads[0])
+        self.assertTrue(is_issued_provider_fetch_page_bundle(pages[0]))
+        self.assertEqual(client._issued_fetch_manifests, {})
+
+    def test_complete_pagination_discloses_exact_terminal_pages_once(self) -> None:
+        responder, payloads = self._two_page_daily_bar_responder()
+        pages = []
+        cohort = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        ).daily_bars(("SPY",), WINDOW, page_sink=pages.append)
+
+        bundle = read_provider_fetch_bundle(cohort)
+        self.assertEqual(tuple(page.payload for page in pages), payloads)
+        self.assertEqual(tuple(pages), bundle.pages)
+        self.assertTrue(
+            all(
+                disclosed is terminal
+                for disclosed, terminal in zip(
+                    pages,
+                    bundle.pages,
+                    strict=True,
+                )
+            )
+        )
+        self.assertEqual(len({id(page) for page in pages}), 2)
+        self.assertTrue(
+            all(
+                is_issued_provider_fetch_page_bundle(page)
+                for page in pages
+            )
+        )
+
+    def test_page_sink_copy_and_tamper_cannot_mint_page_authority(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        copied_pages = []
+
+        def copy_sink(page) -> None:
+            copied_pages.append(copy.copy(page))
+            copied_pages.append(replace(page))
+
+        cohort = AlpacaMarketData(
+            RoutingTransport(responder),
+            credentials(),
+            now=lambda: NOW,
+        ).daily_bars(("SPY",), WINDOW, page_sink=copy_sink)
+        self.assertTrue(is_issued_provider_fetch_cohort(cohort))
+        self.assertEqual(len(copied_pages), 4)
+        self.assertTrue(
+            all(
+                not is_issued_provider_fetch_page_bundle(page)
+                for page in copied_pages
+            )
+        )
+
+        tamper_transport = RoutingTransport(responder)
+        tampered_pages = []
+
+        def tamper_sink(page) -> None:
+            tampered_pages.append(page)
+            object.__setattr__(page, "payload", b'{"secret":"changed"}')
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "page authority",
+        ):
+            AlpacaMarketData(
+                tamper_transport,
+                credentials(),
+                now=lambda: NOW,
+            ).daily_bars(("SPY",), WINDOW, page_sink=tamper_sink)
+        self.assertEqual(len(tamper_transport.requested_urls), 1)
+        self.assertEqual(len(tampered_pages), 1)
+        self.assertFalse(
+            is_issued_provider_fetch_page_bundle(tampered_pages[0])
+        )
+
+    def test_page_sink_exception_is_redacted_and_stops_pagination(self) -> None:
+        responder, _payloads = self._two_page_daily_bar_responder()
+        transport = RoutingTransport(responder)
+        pages = []
+
+        def failing_sink(page) -> None:
+            pages.append(page)
+            raise RuntimeError("fixture-secret-key callback canary")
+
+        with self.assertRaises(ProviderDataError) as raised:
+            AlpacaMarketData(
+                transport,
+                credentials(),
+                now=lambda: NOW,
+            ).daily_bars(("SPY",), WINDOW, page_sink=failing_sink)
+        self.assertNotIn("fixture-secret-key", str(raised.exception))
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(len(transport.requested_urls), 1)
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(is_issued_provider_fetch_page_bundle(pages[0]))
+
+    def test_malformed_option_page_is_not_disclosed(self) -> None:
+        body = (
+            '{"snapshots":{"SPY261332C00650000":{'
+            '"latestQuote":{"t":"2026-08-14T12:58:00Z",'
+            '"bp":"1.00","ap":"1.05"}}},'
+            '"next_page_token":null}'
+        )
+        pages = []
+
+        with self.assertRaises(ProviderMalformedError):
+            AlpacaMarketData(
+                RoutingTransport(lambda _: (200, body)),
+                credentials(),
+                now=lambda: NOW,
+            ).option_chain("SPY", page_sink=pages.append)
+
+        self.assertEqual(pages, [])
+
+    def test_invalid_page_sink_is_rejected_before_provider_access(self) -> None:
+        transport = RoutingTransport(lambda _: (200, "{}"))
+        with self.assertRaises(TypeError):
+            AlpacaMarketData(
+                transport,
+                credentials(),
+                now=lambda: NOW,
+            ).daily_bars(("SPY",), WINDOW, page_sink=object())
+        self.assertEqual(transport.requested_urls, [])
+
     def test_replay_only_scope_cannot_be_reminted_as_ingestible(self) -> None:
         client = AlpacaMarketData(
             RoutingTransport(
@@ -174,6 +1586,12 @@ class AlpacaContractTests(unittest.TestCase):
         self.assertEqual(bars["SPY"][0].feed, "sip")
         self.assertEqual(bars["SPY"][0].adjustment, "split")
         self.assertEqual(bars["QQQ"][0].timestamp.tzinfo, UTC)
+        self.assertTrue(
+            all(
+                is_issued_provider_fetch_page_bundle(page)
+                for page in read_provider_fetch_bundle(bars).pages
+            )
+        )
         self.assertEqual(transport.remaining_responses, 0)
         for url in transport.requested_urls:
             query = parse_qs(urlsplit(url).query)
@@ -728,6 +2146,14 @@ class AlpacaContractTests(unittest.TestCase):
         rendered = repr(value)
         self.assertNotIn("key-canary", rendered)
         self.assertNotIn("secret-canary", rendered)
+        dependencies = AlpacaMarketData(
+            RoutingTransport(lambda _url: (200, "{}")),
+            value,
+            now=lambda: NOW,
+        )._capture_request_dependencies()
+        rendered_dependencies = repr(dependencies)
+        self.assertNotIn("key-canary", rendered_dependencies)
+        self.assertNotIn("secret-canary", rendered_dependencies)
         with self.assertRaises(AttributeError):
             value.key_id = "replacement"  # type: ignore[misc]
 

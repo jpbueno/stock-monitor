@@ -7,11 +7,23 @@ import json
 import math
 import re
 import urllib.parse
+from array import array
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from gc import get_referents
 from threading import RLock
+from types import (
+    CellType,
+    CodeType,
+    FunctionType,
+    MappingProxyType,
+    MemberDescriptorType,
+    MethodType,
+    ModuleType,
+)
 from weakref import ReferenceType, ref
 from zoneinfo import ZoneInfo
 
@@ -420,7 +432,7 @@ class ProviderFetchCohort(Mapping[str, tuple[Bar | Quote | Trade, ...]]):
         return len(self._entries)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class ProviderFetchPageBundle:
     page: ProviderFetchPage
     payload: bytes
@@ -449,6 +461,586 @@ class _IssuedProviderFetchManifest:
     raw_pages: tuple[bytes, ...]
     observations: tuple[SourceObservation, ...]
     observation_fingerprints: tuple[str, ...]
+    page_bundles: tuple[ProviderFetchPageBundle, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedProviderFetchPageBundle:
+    reference: ReferenceType[ProviderFetchPageBundle]
+    fingerprint: str
+    observation_fingerprint: str
+    page: ProviderFetchPage
+    payload: bytes
+    observation: SourceObservation
+    owner: object
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RequestGraphNode:
+    value: object
+    kind: str
+    shape: tuple[str | bytes | int | bool, ...]
+    references: tuple[object, ...]
+    descend_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RequestGraphSnapshot:
+    roots: tuple[object, ...]
+    nodes: tuple[_RequestGraphNode, ...]
+
+
+@dataclass(slots=True, repr=False)
+class _MutableRequestGraphDependency:
+    roots: tuple[object, ...]
+    snapshot: _RequestGraphSnapshot
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _AlpacaRequestDependencies:
+    transport: GetTransport
+    credentials: AlpacaCredentials = field(repr=False)
+    credential_key_id: str = field(repr=False)
+    credential_secret_key: str = field(repr=False)
+    base_url: str
+    policy: EgressPolicy
+    policy_allowed_hosts: frozenset[str]
+    now: Callable[[], datetime]
+    cache: ContentCache | None
+    cache_put_function: Callable[[SourceObservation, bytes], object] | None = field(
+        repr=False
+    )
+    observations: dict[str, SourceObservation]
+    provider_authority_lock: object
+    issued_fetch_manifests: dict[int, _IssuedProviderFetchManifest]
+    namespace_dependencies: tuple[
+        tuple[Mapping[str, object], tuple[tuple[str, object], ...]],
+        ...,
+    ] = field(repr=False)
+    class_dependencies: tuple[
+        tuple[type, tuple[tuple[str, object], ...]],
+        ...,
+    ] = field(repr=False)
+    mro_dependencies: tuple[
+        tuple[type, tuple[type, ...]],
+        ...,
+    ] = field(repr=False)
+    instance_dependencies: tuple[
+        tuple[dict[str, object], tuple[tuple[str, object], ...]],
+        ...,
+    ] = field(repr=False)
+    graph_dependencies: tuple[
+        _MutableRequestGraphDependency,
+        ...,
+    ] = field(repr=False)
+    transport_graph_dependency: (
+        _MutableRequestGraphDependency | None
+    ) = field(repr=False)
+    cache_graph_dependency: (
+        _MutableRequestGraphDependency | None
+    ) = field(repr=False)
+    clock_graph_dependency: (
+        _MutableRequestGraphDependency | None
+    ) = field(repr=False)
+    function_dependencies: tuple[
+        tuple[
+            FunctionType,
+            object,
+            object,
+            tuple[tuple[str, object], ...] | None,
+            object,
+            object,
+        ],
+        ...,
+    ] = field(repr=False)
+    missing_dependency: object = field(repr=False)
+    request_verifier: Callable[..., None] = field(repr=False)
+    request_verifier_code: object = field(repr=False)
+    request_dispatch: Callable[..., tuple[dict[str, object], bytes]] = field(
+        repr=False
+    )
+    pages_function: Callable[
+        ..., Iterator[tuple[str, dict[str, object], bytes]]
+    ] = field(repr=False)
+    issue_page_function: Callable[..., ProviderFetchPageBundle] = field(
+        repr=False
+    )
+    require_pages_function: Callable[..., None] = field(repr=False)
+    transport_get_function: Callable[..., object] = field(repr=False)
+    get_with_redirects_function: Callable[..., object] = field(repr=False)
+    json_object_function: Callable[[bytes], dict[str, object]] = field(
+        repr=False
+    )
+    sealed_transport: object = field(repr=False)
+
+
+_REQUEST_GRAPH_MISSING = object()
+
+
+def _request_graph_global_target_is_mutable(value: object) -> bool:
+    value_type = type(value)
+    return not (
+        value is None
+        or value_type
+        in (
+            bool,
+            bytes,
+            CodeType,
+            complex,
+            date,
+            datetime,
+            Decimal,
+            float,
+            FunctionType,
+            int,
+            ModuleType,
+            str,
+            timedelta,
+            ZoneInfo,
+        )
+        or isinstance(value, type)
+    )
+
+
+def _request_graph_node(value: object) -> _RequestGraphNode:
+    value_type = type(value)
+    references: list[object] = []
+    descend_indices: list[int] = []
+
+    def reference(target: object, *, descend: bool) -> None:
+        index = len(references)
+        references.append(target)
+        if descend:
+            descend_indices.append(index)
+
+    if value_type is dict:
+        items = tuple(dict.items(value))
+        for key, item in items:
+            reference(key, descend=True)
+            reference(item, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="dict",
+            shape=(len(items),),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is list:
+        for item in list.__iter__(value):
+            reference(item, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="list",
+            shape=(len(references),),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is deque:
+        for item in deque.__iter__(value):
+            reference(item, descend=True)
+        max_length = value.maxlen
+        return _RequestGraphNode(
+            value=value,
+            kind="deque",
+            shape=(
+                max_length is None,
+                0 if max_length is None else max_length,
+                len(references),
+            ),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is MappingProxyType:
+        referents = tuple(get_referents(value))
+        if len(referents) != 1 or type(referents[0]) is not dict:
+            raise ProviderMalformedError(
+                "provider request dependency mapping proxy is unsupported"
+            )
+        reference(referents[0], descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="mappingproxy",
+            shape=(),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is array:
+        return _RequestGraphNode(
+            value=value,
+            kind="array",
+            shape=(
+                array.typecode.__get__(value, array),
+                array.tobytes(value),
+            ),
+            references=(),
+            descend_indices=(),
+        )
+    if value_type is tuple:
+        for item in tuple.__iter__(value):
+            reference(item, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="tuple",
+            shape=(len(references),),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type in (set, frozenset):
+        iterator = (
+            set.__iter__(value)
+            if value_type is set
+            else frozenset.__iter__(value)
+        )
+        for item in sorted(iterator, key=id):
+            reference(item, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="set" if value_type is set else "frozenset",
+            shape=(len(references),),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is bytearray:
+        return _RequestGraphNode(
+            value=value,
+            kind="bytearray",
+            shape=tuple(bytearray.__iter__(value)),
+            references=(),
+            descend_indices=(),
+        )
+    if value_type is FunctionType:
+        code = value.__code__
+        function_globals = value.__globals__
+        defaults = value.__defaults__
+        keyword_defaults = value.__kwdefaults__
+        closure = value.__closure__
+        attributes = value.__dict__
+        function_builtins = value.__builtins__
+        reference(code, descend=False)
+        reference(function_globals, descend=False)
+        for target in (
+            defaults,
+            keyword_defaults,
+            closure,
+            attributes,
+        ):
+            reference(target, descend=target is not None)
+        raw_referents = tuple(sorted(get_referents(value), key=id))
+        for target in raw_referents:
+            reference(
+                target,
+                descend=(
+                    target is not function_globals
+                    and target is not function_builtins
+                    and (
+                        type(target) is FunctionType
+                        or _request_graph_global_target_is_mutable(
+                            target
+                        )
+                    )
+                ),
+            )
+        names = tuple(sorted(frozenset(code.co_names)))
+        shape: list[str | bytes | int | bool] = [len(names)]
+        for name in names:
+            target = dict.get(
+                function_globals,
+                name,
+                _REQUEST_GRAPH_MISSING,
+            )
+            present = target is not _REQUEST_GRAPH_MISSING
+            shape.extend((name, present))
+            if present:
+                reference(
+                    target,
+                    descend=_request_graph_global_target_is_mutable(
+                        target
+                    ),
+                )
+                if type(target) is ModuleType:
+                    module_namespace = ModuleType.__getattribute__(
+                        target,
+                        "__dict__",
+                    )
+                    reference(module_namespace, descend=False)
+                    shape.append(len(names))
+                    for attribute_name in names:
+                        attribute = dict.get(
+                            module_namespace,
+                            attribute_name,
+                            _REQUEST_GRAPH_MISSING,
+                        )
+                        attribute_present = (
+                            attribute is not _REQUEST_GRAPH_MISSING
+                        )
+                        shape.extend(
+                            (attribute_name, attribute_present)
+                        )
+                        if attribute_present:
+                            reference(attribute, descend=True)
+                else:
+                    shape.append(0)
+        return _RequestGraphNode(
+            value=value,
+            kind="function",
+            shape=tuple(shape),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is MethodType:
+        reference(value.__self__, descend=True)
+        reference(value.__func__, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="method",
+            shape=(),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if value_type is CellType:
+        try:
+            target = value.cell_contents
+        except ValueError:
+            present = False
+        else:
+            present = True
+            reference(target, descend=True)
+        return _RequestGraphNode(
+            value=value,
+            kind="cell",
+            shape=(present,),
+            references=tuple(references),
+            descend_indices=tuple(descend_indices),
+        )
+    if (
+        value is None
+        or value_type
+        in (
+            bool,
+            bytes,
+            CodeType,
+            complex,
+            date,
+            datetime,
+            Decimal,
+            float,
+            int,
+            ModuleType,
+            str,
+            timedelta,
+            ZoneInfo,
+        )
+        or isinstance(value, type)
+    ):
+        return _RequestGraphNode(
+            value=value,
+            kind="leaf",
+            shape=(),
+            references=(),
+            descend_indices=(),
+        )
+
+    shape = []
+    reference(value_type, descend=False)
+    try:
+        namespace = object.__getattribute__(value, "__dict__")
+    except Exception:
+        namespace = _REQUEST_GRAPH_MISSING
+    has_namespace = type(namespace) is dict
+    shape.append(has_namespace)
+    if has_namespace:
+        reference(namespace, descend=True)
+
+    try:
+        hierarchy = tuple(type.__getattribute__(value_type, "__mro__"))
+    except Exception:
+        hierarchy = ()
+    shape.append(len(hierarchy))
+    for candidate in hierarchy:
+        reference(candidate, descend=False)
+        try:
+            class_namespace = type.__getattribute__(candidate, "__dict__")
+            items = tuple(class_namespace.items())
+        except Exception:
+            items = ()
+        shape.append(len(items))
+        for name, descriptor in items:
+            shape.append(name)
+            reference(descriptor, descend=type(descriptor) is FunctionType)
+            functions: tuple[object, ...]
+            if type(descriptor) in (staticmethod, classmethod):
+                functions = (descriptor.__func__,)
+            elif type(descriptor) is property:
+                functions = (
+                    descriptor.fget,
+                    descriptor.fset,
+                    descriptor.fdel,
+                )
+            else:
+                functions = ()
+            functions = tuple(
+                function
+                for function in functions
+                if type(function) is FunctionType
+            )
+            shape.append(len(functions))
+            for function in functions:
+                reference(function, descend=True)
+            if type(descriptor) is MemberDescriptorType:
+                try:
+                    slot_value = descriptor.__get__(value, value_type)
+                except AttributeError:
+                    slot_present = False
+                else:
+                    slot_present = True
+                    reference(slot_value, descend=True)
+                shape.append(slot_present)
+            else:
+                shape.append(False)
+    return _RequestGraphNode(
+        value=value,
+        kind="object",
+        shape=tuple(shape),
+        references=tuple(references),
+        descend_indices=tuple(descend_indices),
+    )
+
+
+def _capture_request_graph(
+    roots: tuple[object, ...],
+) -> _RequestGraphSnapshot:
+    nodes: list[_RequestGraphNode] = []
+    seen: dict[int, object] = {}
+    pending = list(reversed(roots))
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            if seen[identity] is value:
+                continue
+            raise ProviderMalformedError(
+                "provider request dependency identity is inconsistent"
+            )
+        seen[identity] = value
+        node = _request_graph_node(value)
+        nodes.append(node)
+        for index in reversed(node.descend_indices):
+            pending.append(node.references[index])
+    return _RequestGraphSnapshot(roots=roots, nodes=tuple(nodes))
+
+
+def _request_graph_shapes_are_exact(
+    current: tuple[str | bytes | int | bool, ...],
+    expected: tuple[str | bytes | int | bool, ...],
+) -> bool:
+    return len(current) == len(expected) and all(
+        type(current_value) is type(expected_value)
+        and current_value == expected_value
+        for current_value, expected_value in zip(
+            current,
+            expected,
+            strict=True,
+        )
+    )
+
+
+def _request_graph_snapshots_are_exact(
+    current: _RequestGraphSnapshot,
+    expected: _RequestGraphSnapshot,
+) -> bool:
+    if len(current.roots) != len(expected.roots) or any(
+        current_root is not expected_root
+        for current_root, expected_root in zip(
+            current.roots,
+            expected.roots,
+            strict=True,
+        )
+    ):
+        return False
+    if len(current.nodes) != len(expected.nodes):
+        return False
+    for current_node, expected_node in zip(
+        current.nodes,
+        expected.nodes,
+        strict=True,
+    ):
+        if (
+            current_node.value is not expected_node.value
+            or current_node.kind != expected_node.kind
+            or not _request_graph_shapes_are_exact(
+                current_node.shape,
+                expected_node.shape,
+            )
+            or current_node.descend_indices
+            != expected_node.descend_indices
+            or len(current_node.references)
+            != len(expected_node.references)
+            or any(
+                current_reference is not expected_reference
+                for current_reference, expected_reference in zip(
+                    current_node.references,
+                    expected_node.references,
+                    strict=True,
+                )
+            )
+        ):
+            return False
+    return True
+
+
+def _request_graph_dependency_is_current(
+    dependency: _MutableRequestGraphDependency,
+) -> bool:
+    try:
+        current = _capture_request_graph(dependency.roots)
+    except Exception:
+        return False
+    return _request_graph_snapshots_are_exact(
+        current,
+        dependency.snapshot,
+    )
+
+
+def _require_current_request_graph(
+    dependency: _MutableRequestGraphDependency | None,
+) -> None:
+    if dependency is not None and not _request_graph_dependency_is_current(
+        dependency
+    ):
+        raise ProviderMalformedError(
+            "provider request dependencies changed during pagination"
+        )
+
+
+def _refresh_trusted_request_graph(
+    dependency: _MutableRequestGraphDependency | None,
+) -> None:
+    if dependency is None:
+        return
+    failed = False
+    try:
+        snapshot = _capture_request_graph(dependency.roots)
+    except Exception:
+        failed = True
+        snapshot = dependency.snapshot
+    if failed:
+        raise ProviderMalformedError(
+            "provider request dependencies changed during pagination"
+        )
+    dependency.snapshot = snapshot
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _SealedRequestTransport:
+    get_function: Callable[..., object]
+    graph_dependency: _MutableRequestGraphDependency
+
+    def get(self, url: str, headers: Mapping[str, str]) -> object:
+        _require_current_request_graph(self.graph_dependency)
+        try:
+            return self.get_function(url, headers)
+        finally:
+            _refresh_trusted_request_graph(self.graph_dependency)
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +1054,11 @@ class _IssuedProviderFetchCohort:
 
 _ISSUED_NORMALIZED_MARKET_FACTS: dict[int, _IssuedNormalizedMarketFact] = {}
 _ISSUED_NORMALIZED_MARKET_FACTS_LOCK = RLock()
+_ISSUED_PROVIDER_FETCH_PAGE_BUNDLES: dict[
+    int,
+    _IssuedProviderFetchPageBundle,
+] = {}
+_ISSUED_PROVIDER_FETCH_PAGE_BUNDLES_LOCK = RLock()
 _ISSUED_PROVIDER_FETCH_COHORTS: dict[int, _IssuedProviderFetchCohort] = {}
 _ISSUED_PROVIDER_FETCH_COHORTS_LOCK = RLock()
 _REPLAY_ONLY_PROVIDER_FETCH_SCOPES: dict[
@@ -601,6 +1198,138 @@ def _provider_fetch_manifest_fingerprint(
         "stock-monitor/alpaca-issued-fetch-manifest/v1",
         _provider_fetch_manifest_payload(manifest),
     )
+
+
+def _provider_fetch_page_bundle_fingerprint(
+    bundle: ProviderFetchPageBundle,
+) -> str:
+    return _canonical_digest(
+        "stock-monitor/alpaca-issued-fetch-page-bundle/v1",
+        {
+            "page": {
+                "page_ordinal": bundle.page.page_ordinal,
+                "source_observation_id": bundle.page.source_observation_id,
+                "source_type": bundle.page.source_type,
+                "request_url": bundle.page.request_url,
+                "request_page_token": bundle.page.request_page_token,
+                "next_page_token": bundle.page.next_page_token,
+                "payload_sha256": bundle.page.payload_sha256,
+            },
+            "payload_sha256": hashlib.sha256(bundle.payload).hexdigest(),
+            "observation": _source_observation_fingerprint(
+                bundle.observation
+            ),
+        },
+    )
+
+
+def _provider_fetch_page_bundle_authority(
+    bundle: object,
+) -> _IssuedProviderFetchPageBundle | None:
+    if not isinstance(bundle, ProviderFetchPageBundle):
+        return None
+    try:
+        fingerprint = _provider_fetch_page_bundle_fingerprint(bundle)
+    except Exception:
+        return None
+    with _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES_LOCK:
+        issued = _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES.get(id(bundle))
+        owner = None if issued is None else issued.owner
+        if (
+            issued is None
+            or issued.reference() is not bundle
+            or issued.fingerprint != fingerprint
+            or bundle.page is not issued.page
+            or bundle.payload is not issued.payload
+            or bundle.observation is not issued.observation
+            or not isinstance(owner, AlpacaMarketData)
+        ):
+            return None
+        try:
+            is_current = (
+                _source_observation_fingerprint(bundle.observation)
+                == issued.observation_fingerprint
+                and owner._observations.get(
+                    bundle.page.source_observation_id
+                )
+                is bundle.observation
+                and bundle.page.source_observation_id
+                == bundle.observation.observation_id
+                and bundle.page.request_url == bundle.observation.url
+                and bundle.page.source_type == bundle.observation.source_type
+                and hashlib.sha256(bundle.payload).hexdigest()
+                == bundle.page.payload_sha256
+                and _source_observation_id_for_payload(
+                    source_type=bundle.page.source_type,
+                    url=bundle.page.request_url,
+                    retrieved_at=bundle.observation.retrieved_at,
+                    payload=bundle.payload,
+                )
+                == bundle.page.source_observation_id
+            )
+        except Exception:
+            return None
+        if not is_current:
+            return None
+        return issued
+
+
+def is_issued_provider_fetch_page_bundle(bundle: object) -> bool:
+    """Return whether *bundle* is one exact current provider-issued page."""
+    return _provider_fetch_page_bundle_authority(bundle) is not None
+
+
+def _issue_provider_fetch_page_bundle(
+    *,
+    owner: object,
+    page: ProviderFetchPage,
+    payload: bytes,
+    observation: SourceObservation,
+) -> ProviderFetchPageBundle:
+    if not isinstance(owner, AlpacaMarketData):
+        raise ProviderMalformedError("provider fetch page owner is unverified")
+    bundle = ProviderFetchPageBundle(
+        page=page,
+        payload=payload,
+        observation=observation,
+    )
+    if (
+        owner._observations.get(page.source_observation_id) is not observation
+        or page.source_observation_id != observation.observation_id
+        or page.request_url != observation.url
+        or page.source_type != observation.source_type
+        or hashlib.sha256(payload).hexdigest() != page.payload_sha256
+        or _source_observation_id_for_payload(
+            source_type=page.source_type,
+            url=page.request_url,
+            retrieved_at=observation.retrieved_at,
+            payload=payload,
+        )
+        != page.source_observation_id
+    ):
+        raise ProviderMalformedError(
+            "provider fetch page does not match its pinned observation"
+        )
+    identity = id(bundle)
+
+    def discard(dead: ReferenceType[ProviderFetchPageBundle]) -> None:
+        with _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES_LOCK:
+            current = _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES.get(identity)
+            if current is not None and current.reference is dead:
+                _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES.pop(identity, None)
+
+    authority = _IssuedProviderFetchPageBundle(
+        reference=ref(bundle, discard),
+        fingerprint=_provider_fetch_page_bundle_fingerprint(bundle),
+        observation_fingerprint=_source_observation_fingerprint(observation),
+        page=page,
+        payload=payload,
+        observation=observation,
+        owner=owner,
+    )
+    with _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES_LOCK:
+        _ISSUED_PROVIDER_FETCH_PAGE_BUNDLES[identity] = authority
+    return bundle
 
 
 def _source_observation_fingerprint(observation: SourceObservation) -> str:
@@ -944,19 +1673,7 @@ def read_provider_fetch_bundle(value: object) -> ProviderFetchBundle:
         raise ValueError("provider fetch authority is unverified")
     return ProviderFetchBundle(
         manifest=manifest,
-        pages=tuple(
-            ProviderFetchPageBundle(
-                page=page,
-                payload=payload,
-                observation=observation,
-            )
-            for page, payload, observation in zip(
-                manifest.pages,
-                issued_fetch.raw_pages,
-                issued_fetch.observations,
-                strict=True,
-            )
-        ),
+        pages=issued_fetch.page_bundles,
     )
 
 
@@ -1347,20 +2064,24 @@ def _register_provider_fetch_manifest(
     owner: object,
     manifest: ProviderFetchManifest,
     pages: tuple[tuple[str, dict[str, object], bytes, str, str], ...],
+    page_bundles: tuple[ProviderFetchPageBundle, ...],
 ) -> None:
     if not isinstance(owner, AlpacaMarketData):
         raise ProviderMalformedError("provider fetch authority owner is unverified")
-    if len(pages) != len(manifest.pages):
+    if (
+        len(pages) != len(manifest.pages)
+        or len(page_bundles) != len(manifest.pages)
+    ):
         raise ProviderMalformedError("provider fetch authority pages are incomplete")
     raw_pages: list[bytes] = []
     observations: list[SourceObservation] = []
-    for manifest_page, (
+    for manifest_page, page_bundle, (
         url,
         document,
         payload,
         observation_id,
         source_type,
-    ) in zip(manifest.pages, pages, strict=True):
+    ) in zip(manifest.pages, page_bundles, pages, strict=True):
         observation = owner._observations.get(observation_id)
         try:
             reparsed = _json_object(payload)
@@ -1385,14 +2106,34 @@ def _register_provider_fetch_manifest(
             )
             != observation_id
             or reparsed != document
+            or page_bundle.page is not manifest_page
+            or page_bundle.payload is not payload
+            or page_bundle.observation is not observation
+            or (
+                authority := _provider_fetch_page_bundle_authority(
+                    page_bundle
+                )
+            )
+            is None
+            or authority.owner is not owner
         ):
             raise ProviderMalformedError(
                 "provider fetch authority does not match pinned raw pages"
             )
         raw_pages.append(payload)
         observations.append(observation)
+    manifest_identity = id(manifest)
+    manifest_registry = owner._issued_fetch_manifests
+    authority_lock = owner._provider_authority_lock
+
+    def discard_manifest(dead: ReferenceType[ProviderFetchManifest]) -> None:
+        with authority_lock:
+            current = manifest_registry.get(manifest_identity)
+            if current is not None and current.reference is dead:
+                manifest_registry.pop(manifest_identity, None)
+
     entry = _IssuedProviderFetchManifest(
-        reference=ref(manifest),
+        reference=ref(manifest, discard_manifest),
         fingerprint=_provider_fetch_manifest_fingerprint(manifest),
         raw_pages=tuple(raw_pages),
         observations=tuple(observations),
@@ -1400,9 +2141,10 @@ def _register_provider_fetch_manifest(
             _source_observation_fingerprint(observation)
             for observation in observations
         ),
+        page_bundles=page_bundles,
     )
-    with owner._provider_authority_lock:
-        owner._issued_fetch_manifests[id(manifest)] = entry
+    with authority_lock:
+        manifest_registry[manifest_identity] = entry
 
 
 def _issued_provider_fetch_manifest(
@@ -1427,13 +2169,21 @@ def _issued_provider_fetch_manifest(
             or len(issued.raw_pages) != len(manifest.pages)
             or len(issued.observations) != len(manifest.pages)
             or len(issued.observation_fingerprints) != len(manifest.pages)
+            or len(issued.page_bundles) != len(manifest.pages)
         ):
             return None
-        for page, payload, observation, observation_fingerprint in zip(
+        for (
+            page,
+            payload,
+            observation,
+            observation_fingerprint,
+            page_bundle,
+        ) in zip(
             manifest.pages,
             issued.raw_pages,
             issued.observations,
             issued.observation_fingerprints,
+            issued.page_bundles,
             strict=True,
         ):
             try:
@@ -1441,23 +2191,33 @@ def _issued_provider_fetch_manifest(
                     _source_observation_fingerprint(observation)
                     == observation_fingerprint
                 )
-            except (TypeError, ValueError):
-                return None
-            if not is_current or (
-                hashlib.sha256(payload).hexdigest()
-                != page.payload_sha256
-                or owner._observations.get(page.source_observation_id)
-                is not observation
-                or observation.url != page.request_url
-                or observation.source_type != page.source_type
-                or _source_observation_id_for_payload(
-                    source_type=page.source_type,
-                    url=page.request_url,
-                    retrieved_at=observation.retrieved_at,
-                    payload=payload,
-                )
-                != page.source_observation_id
-            ):
+                if not is_current or (
+                    hashlib.sha256(payload).hexdigest()
+                    != page.payload_sha256
+                    or owner._observations.get(page.source_observation_id)
+                    is not observation
+                    or observation.url != page.request_url
+                    or observation.source_type != page.source_type
+                    or _source_observation_id_for_payload(
+                        source_type=page.source_type,
+                        url=page.request_url,
+                        retrieved_at=observation.retrieved_at,
+                        payload=payload,
+                    )
+                    != page.source_observation_id
+                    or page_bundle.page is not page
+                    or page_bundle.payload is not payload
+                    or page_bundle.observation is not observation
+                    or (
+                        page_authority := _provider_fetch_page_bundle_authority(
+                            page_bundle
+                        )
+                    )
+                    is None
+                    or page_authority.owner is not owner
+                ):
+                    return None
+            except Exception:
                 return None
         return issued
 
@@ -1470,10 +2230,18 @@ def _provider_fetch_manifest(
     pages: Sequence[
         tuple[str, dict[str, object], bytes, str, str]
     ],
+    page_bundles: Sequence[ProviderFetchPageBundle] | None = None,
 ) -> ProviderFetchManifest:
     values = tuple(pages)
     if not values:
         raise ProviderIncompleteError("provider fetch manifest has no pages")
+    supplied_page_bundles = (
+        None if page_bundles is None else tuple(page_bundles)
+    )
+    if supplied_page_bundles is not None and len(supplied_page_bundles) != len(
+        values
+    ):
+        raise ProviderIncompleteError("provider fetch page bundles are incomplete")
     page_sources: list[ProviderFetchPage] = []
     expected_request_token: str | None = None
     for page_ordinal, (
@@ -1506,17 +2274,31 @@ def _provider_fetch_manifest(
             type(next_token) is not str or not next_token
         ):
             raise ProviderIncompleteError("provider pagination token is malformed")
-        page_sources.append(
-            ProviderFetchPage(
-                page_ordinal=page_ordinal,
-                source_observation_id=observation_id,
-                source_type=source_type,
-                request_url=url,
-                request_page_token=request_token,
-                next_page_token=next_token,
-                payload_sha256=hashlib.sha256(payload).hexdigest(),
-            )
+        candidate_page = ProviderFetchPage(
+            page_ordinal=page_ordinal,
+            source_observation_id=observation_id,
+            source_type=source_type,
+            request_url=url,
+            request_page_token=request_token,
+            next_page_token=next_token,
+            payload_sha256=hashlib.sha256(payload).hexdigest(),
         )
+        if supplied_page_bundles is None:
+            page_sources.append(candidate_page)
+        else:
+            supplied_bundle = supplied_page_bundles[page_ordinal - 1]
+            authority = _provider_fetch_page_bundle_authority(
+                supplied_bundle
+            )
+            if (
+                authority is None
+                or authority.owner is not owner
+                or supplied_bundle.page != candidate_page
+            ):
+                raise ProviderMalformedError(
+                    "provider fetch page authority is unverified"
+                )
+            page_sources.append(supplied_bundle.page)
         expected_request_token = next_token
     if page_sources[-1].next_page_token is not None:
         raise ProviderIncompleteError(
@@ -1570,7 +2352,32 @@ def _provider_fetch_manifest(
             manifest_payload,
         ),
     )
-    _register_provider_fetch_manifest(owner, manifest, values)
+    if supplied_page_bundles is None:
+        if not isinstance(owner, AlpacaMarketData):
+            raise ProviderMalformedError(
+                "provider fetch page owner is unverified"
+            )
+        supplied_page_bundles = tuple(
+            _issue_provider_fetch_page_bundle(
+                owner=owner,
+                page=page,
+                payload=payload,
+                observation=owner._observations[observation_id],
+            )
+            for page, (
+                _url,
+                _document,
+                payload,
+                observation_id,
+                _source_type,
+            ) in zip(page_sources, values, strict=True)
+        )
+    _register_provider_fetch_manifest(
+        owner,
+        manifest,
+        values,
+        supplied_page_bundles,
+    )
     return manifest
 
 
@@ -1642,6 +2449,82 @@ def _raw_provider_item(
     )
 
 
+def _option_snapshot_from_raw_item(
+    *,
+    symbol: str,
+    value: dict[str, object],
+    observation: SourceObservation,
+    requested_symbols: tuple[str, ...],
+) -> OptionSnapshot:
+    match = _OCC_SYMBOL.fullmatch(symbol)
+    if match is None or match.group("root") not in requested_symbols:
+        raise ProviderMalformedError("indicative option snapshot is malformed")
+    quote = value.get("latestQuote")
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    observed_at: datetime | None = None
+    if quote is not None:
+        if not isinstance(quote, dict):
+            raise ProviderMalformedError("indicative option quote is malformed")
+        bid = _decimal(quote.get("bp"), "option bid", positive=False)
+        ask = _decimal(quote.get("ap"), "option ask", positive=False)
+        if bid < 0 or ask < 0:
+            raise ProviderMalformedError("indicative option quote is negative")
+        if ask < bid:
+            raise ProviderMalformedError("indicative option quote is crossed")
+        observed_at = _timestamp(quote.get("t"), "option quote")
+        if observed_at > observation.retrieved_at:
+            raise ProviderMalformedError(
+                "provider option timestamp is in the future"
+            )
+    greeks = value.get("greeks")
+    delta: Decimal | None = None
+    if greeks is not None:
+        if not isinstance(greeks, dict):
+            raise ProviderMalformedError("indicative option greeks are malformed")
+        delta = _decimal(
+            greeks.get("delta"),
+            "option delta",
+            positive=False,
+        )
+        if not Decimal("-1") <= delta <= Decimal("1"):
+            raise ProviderMalformedError(
+                "indicative option delta is outside its bounds"
+            )
+    daily_bar = value.get("dailyBar")
+    volume: int | None = None
+    if daily_bar is not None:
+        if not isinstance(daily_bar, dict):
+            raise ProviderMalformedError(
+                "indicative option daily bar is malformed"
+            )
+        volume = _integer(
+            daily_bar.get("v"),
+            "option daily volume",
+            optional=True,
+        )
+    try:
+        expiration = datetime.strptime(match.group("date"), "%y%m%d").date()
+    except ValueError:
+        raise ProviderMalformedError(
+            "indicative option expiration is malformed"
+        ) from None
+    return OptionSnapshot(
+        occ_symbol=symbol,
+        underlying=match.group("root"),
+        expiration=expiration,
+        strike=Decimal(int(match.group("strike"))) / Decimal("1000"),
+        delta=delta,
+        bid=bid,
+        ask=ask,
+        daily_volume=volume,
+        open_interest=None,
+        feed="indicative",
+        observed_at=observed_at,
+        source_observation_id=observation.observation_id,
+    )
+
+
 def _market_fact_from_raw_provider_item(
     *,
     manifest: ProviderFetchManifest,
@@ -1663,72 +2546,11 @@ def _market_fact_from_raw_provider_item(
             raise ProviderMalformedError(
                 "provider OPTION_SNAPSHOT source type is inconsistent"
             )
-        match = _OCC_SYMBOL.fullmatch(symbol)
-        if match is None or match.group("root") not in manifest.requested_symbols:
-            raise ProviderMalformedError("indicative option snapshot is malformed")
-        quote = value.get("latestQuote")
-        bid: Decimal | None = None
-        ask: Decimal | None = None
-        observed_at: datetime | None = None
-        if quote is not None:
-            if not isinstance(quote, dict):
-                raise ProviderMalformedError("indicative option quote is malformed")
-            bid = _decimal(quote.get("bp"), "option bid", positive=False)
-            ask = _decimal(quote.get("ap"), "option ask", positive=False)
-            if bid < 0 or ask < 0:
-                raise ProviderMalformedError("indicative option quote is negative")
-            if ask < bid:
-                raise ProviderMalformedError("indicative option quote is crossed")
-            observed_at = _timestamp(quote.get("t"), "option quote")
-            if observed_at > observation.retrieved_at:
-                raise ProviderMalformedError(
-                    "provider option timestamp is in the future"
-                )
-        greeks = value.get("greeks")
-        delta: Decimal | None = None
-        if greeks is not None:
-            if not isinstance(greeks, dict):
-                raise ProviderMalformedError("indicative option greeks are malformed")
-            delta = _decimal(
-                greeks.get("delta"),
-                "option delta",
-                positive=False,
-            )
-            if not Decimal("-1") <= delta <= Decimal("1"):
-                raise ProviderMalformedError(
-                    "indicative option delta is outside its bounds"
-                )
-        daily_bar = value.get("dailyBar")
-        volume: int | None = None
-        if daily_bar is not None:
-            if not isinstance(daily_bar, dict):
-                raise ProviderMalformedError(
-                    "indicative option daily bar is malformed"
-                )
-            volume = _integer(
-                daily_bar.get("v"),
-                "option daily volume",
-                optional=True,
-            )
-        try:
-            expiration = datetime.strptime(match.group("date"), "%y%m%d").date()
-        except ValueError:
-            raise ProviderMalformedError(
-                "indicative option expiration is malformed"
-            ) from None
-        return OptionSnapshot(
-            occ_symbol=symbol,
-            underlying=match.group("root"),
-            expiration=expiration,
-            strike=Decimal(int(match.group("strike"))) / Decimal("1000"),
-            delta=delta,
-            bid=bid,
-            ask=ask,
-            daily_volume=volume,
-            open_interest=None,
-            feed="indicative",
-            observed_at=observed_at,
-            source_observation_id=page.source_observation_id,
+        return _option_snapshot_from_raw_item(
+            symbol=symbol,
+            value=value,
+            observation=observation,
+            requested_symbols=manifest.requested_symbols,
         )
     timestamp = _timestamp(value.get("t"), manifest.collection[:-1])
     if manifest.collection == "bars":
@@ -1927,8 +2749,421 @@ class AlpacaMarketData:
             _IssuedProviderFetchManifest,
         ] = {}
 
-    def _current_time(self) -> datetime:
-        return _utc(self._now(), "current time")
+    def _capture_request_dependencies(self) -> _AlpacaRequestDependencies:
+        client_class = AlpacaMarketData
+        request_verifier = client_class._require_current_request_dependencies
+        request_dispatch = client_class._get_json_for_request
+        pages_function = client_class._pages
+        issue_page_function = client_class._issue_and_disclose_page
+        require_pages_function = client_class._require_current_fetch_pages
+        transport_get_function = self._transport.get
+        cache_put_function = (
+            None if self._cache is None else self._cache.put
+        )
+
+        graph_dependencies_by_root: dict[
+            int,
+            tuple[object, _MutableRequestGraphDependency],
+        ] = {}
+
+        def graph_dependency(
+            root: object | None,
+        ) -> _MutableRequestGraphDependency | None:
+            if root is None:
+                return None
+            existing = graph_dependencies_by_root.get(id(root))
+            if existing is not None and existing[0] is root:
+                return existing[1]
+            roots = (root,)
+            dependency = _MutableRequestGraphDependency(
+                roots=roots,
+                snapshot=_capture_request_graph(roots),
+            )
+            graph_dependencies_by_root[id(root)] = (root, dependency)
+            return dependency
+
+        transport_graph_dependency = graph_dependency(self._transport)
+        cache_graph_dependency = graph_dependency(self._cache)
+        clock_graph_dependency = graph_dependency(self._now)
+        assert transport_graph_dependency is not None
+        sealed_transport = _SealedRequestTransport(
+            get_function=transport_get_function,
+            graph_dependency=transport_graph_dependency,
+        )
+
+        callable_dependencies: list[object] = [
+            transport_get_function,
+            self._now,
+        ]
+        if cache_put_function is not None:
+            callable_dependencies.append(cache_put_function)
+
+        dependency_root_types = [
+            client_class,
+            type(self._transport),
+            type(self._policy),
+            type(sealed_transport),
+        ]
+        if self._cache is not None:
+            dependency_root_types.append(type(self._cache))
+        for callable_dependency in callable_dependencies:
+            if isinstance(callable_dependency, FunctionType):
+                continue
+            if isinstance(callable_dependency, MethodType):
+                callable_owner = callable_dependency.__self__
+                candidate = (
+                    callable_owner
+                    if isinstance(callable_owner, type)
+                    else type(callable_owner)
+                )
+            elif isinstance(callable_dependency, type):
+                candidate = callable_dependency
+            else:
+                candidate = type(callable_dependency)
+            dependency_root_types.append(candidate)
+        dependency_root_types = list(
+            dict.fromkeys(dependency_root_types)
+        )
+        mro_dependencies = tuple(
+            (candidate, tuple(candidate.__mro__))
+            for candidate in dependency_root_types
+        )
+        dependency_class_values = [
+            candidate
+            for _root, hierarchy in mro_dependencies
+            for candidate in hierarchy
+            if candidate is not object
+        ]
+        dependency_classes = tuple(
+            dict.fromkeys(dependency_class_values)
+        )
+        class_dependencies = tuple(
+            (candidate, tuple(candidate.__dict__.items()))
+            for candidate in dependency_classes
+        )
+        instance_dependencies = tuple(
+            (namespace, tuple(namespace.items()))
+            for namespace in (self.__dict__,)
+        )
+        dependency_functions: dict[int, FunctionType] = {}
+        for _candidate, items in class_dependencies:
+            for _name, value in items:
+                functions: tuple[object, ...]
+                if isinstance(value, (staticmethod, classmethod)):
+                    functions = (value.__func__,)
+                elif isinstance(value, property):
+                    functions = (value.fget, value.fset, value.fdel)
+                else:
+                    functions = (value,)
+                for function in functions:
+                    if isinstance(function, FunctionType):
+                        dependency_functions[id(function)] = function
+        for value in (
+            get_with_redirects,
+            _json_object,
+            request_verifier,
+            request_dispatch,
+            pages_function,
+            issue_page_function,
+            require_pages_function,
+        ):
+            if isinstance(value, FunctionType):
+                dependency_functions[id(value)] = value
+        for callable_dependency in callable_dependencies:
+            function = (
+                callable_dependency.__func__
+                if isinstance(callable_dependency, MethodType)
+                else callable_dependency
+            )
+            if isinstance(function, FunctionType):
+                dependency_functions[id(function)] = function
+        dependency_namespaces: dict[int, dict[str, object]] = {
+            id(globals()): globals(),
+        }
+        for function in tuple(dependency_functions.values()):
+            dependency_namespaces[id(function.__globals__)] = (
+                function.__globals__
+            )
+        for namespace in tuple(dependency_namespaces.values()):
+            for value in namespace.values():
+                if isinstance(value, FunctionType):
+                    dependency_functions[id(value)] = value
+        namespace_dependencies = tuple(
+            (namespace, tuple(namespace.items()))
+            for namespace in dependency_namespaces.values()
+        )
+        function_dependencies = tuple(
+            (
+                function,
+                function.__code__,
+                function.__defaults__,
+                (
+                    None
+                    if function.__kwdefaults__ is None
+                    else tuple(function.__kwdefaults__.items())
+                ),
+                function.__globals__,
+                function.__closure__,
+            )
+            for function in dependency_functions.values()
+        )
+        return _AlpacaRequestDependencies(
+            transport=self._transport,
+            credentials=self._credentials,
+            credential_key_id=self._credentials.key_id,
+            credential_secret_key=self._credentials.secret_key,
+            base_url=self._base_url,
+            policy=self._policy,
+            policy_allowed_hosts=self._policy.allowed_hosts,
+            now=self._now,
+            cache=self._cache,
+            cache_put_function=cache_put_function,
+            observations=self._observations,
+            provider_authority_lock=self._provider_authority_lock,
+            issued_fetch_manifests=self._issued_fetch_manifests,
+            namespace_dependencies=namespace_dependencies,
+            class_dependencies=class_dependencies,
+            mro_dependencies=mro_dependencies,
+            instance_dependencies=instance_dependencies,
+            graph_dependencies=tuple(
+                dependency
+                for _root, dependency in graph_dependencies_by_root.values()
+            ),
+            transport_graph_dependency=transport_graph_dependency,
+            cache_graph_dependency=cache_graph_dependency,
+            clock_graph_dependency=clock_graph_dependency,
+            function_dependencies=function_dependencies,
+            missing_dependency=object(),
+            request_verifier=request_verifier,
+            request_verifier_code=request_verifier.__code__,
+            request_dispatch=request_dispatch,
+            pages_function=pages_function,
+            issue_page_function=issue_page_function,
+            require_pages_function=require_pages_function,
+            transport_get_function=transport_get_function,
+            get_with_redirects_function=get_with_redirects,
+            json_object_function=_json_object,
+            sealed_transport=sealed_transport,
+        )
+
+    def _require_current_request_dependencies(
+        self,
+        dependencies: _AlpacaRequestDependencies,
+    ) -> None:
+        try:
+            current_transport_get = self._transport.get
+            expected_transport_get = dependencies.transport_get_function
+            transport_get_is_current = (
+                current_transport_get is expected_transport_get
+                if not isinstance(expected_transport_get, MethodType)
+                else (
+                    isinstance(current_transport_get, MethodType)
+                    and current_transport_get.__self__
+                    is expected_transport_get.__self__
+                    and current_transport_get.__func__
+                    is expected_transport_get.__func__
+                )
+            )
+            current_cache_put = (
+                None if self._cache is None else self._cache.put
+            )
+            expected_cache_put = dependencies.cache_put_function
+            cache_put_is_current = (
+                current_cache_put is expected_cache_put
+                if not isinstance(expected_cache_put, MethodType)
+                else (
+                    isinstance(current_cache_put, MethodType)
+                    and current_cache_put.__self__
+                    is expected_cache_put.__self__
+                    and current_cache_put.__func__
+                    is expected_cache_put.__func__
+                )
+            )
+            current = (
+                self._transport is dependencies.transport
+                and transport_get_is_current
+                and self._credentials is dependencies.credentials
+                and self._credentials.key_id
+                == dependencies.credential_key_id
+                and self._credentials.secret_key
+                == dependencies.credential_secret_key
+                and self._base_url == dependencies.base_url
+                and self._policy is dependencies.policy
+                and self._policy.allowed_hosts
+                == dependencies.policy_allowed_hosts
+                and self._now is dependencies.now
+                and self._cache is dependencies.cache
+                and cache_put_is_current
+                and self._observations is dependencies.observations
+                and self._provider_authority_lock
+                is dependencies.provider_authority_lock
+                and self._issued_fetch_manifests
+                is dependencies.issued_fetch_manifests
+            )
+            for candidate, expected in dependencies.mro_dependencies:
+                hierarchy = candidate.__mro__
+                if (
+                    not current
+                    or len(hierarchy) != len(expected)
+                    or any(
+                        current_class is not expected_class
+                        for current_class, expected_class in zip(
+                            hierarchy,
+                            expected,
+                            strict=True,
+                        )
+                    )
+                ):
+                    current = False
+                    break
+            for namespace, expected in dependencies.namespace_dependencies:
+                if not current or len(namespace) != len(expected):
+                    current = False
+                    break
+                for name, value in expected:
+                    if (
+                        namespace.get(
+                            name,
+                            dependencies.missing_dependency,
+                        )
+                        is not value
+                    ):
+                        current = False
+                        break
+            for candidate, expected in dependencies.class_dependencies:
+                namespace = candidate.__dict__
+                if not current or len(namespace) != len(expected):
+                    current = False
+                    break
+                for name, value in expected:
+                    if (
+                        namespace.get(
+                            name,
+                            dependencies.missing_dependency,
+                        )
+                        is not value
+                    ):
+                        current = False
+                        break
+            for namespace, expected in dependencies.instance_dependencies:
+                if not current or len(namespace) != len(expected):
+                    current = False
+                    break
+                for name, value in expected:
+                    if (
+                        namespace.get(
+                            name,
+                            dependencies.missing_dependency,
+                        )
+                        is not value
+                    ):
+                        current = False
+                        break
+            for dependency in dependencies.graph_dependencies:
+                if not current or not _request_graph_dependency_is_current(
+                    dependency
+                ):
+                    current = False
+                    break
+            for (
+                function,
+                code,
+                defaults,
+                keyword_defaults,
+                function_globals,
+                closure,
+            ) in dependencies.function_dependencies:
+                if not current or (
+                    function.__code__ is not code
+                    or function.__defaults__ is not defaults
+                    or function.__globals__ is not function_globals
+                    or function.__closure__ is not closure
+                ):
+                    current = False
+                    break
+                current_keyword_defaults = function.__kwdefaults__
+                if keyword_defaults is None:
+                    if current_keyword_defaults is not None:
+                        current = False
+                        break
+                elif (
+                    current_keyword_defaults is None
+                    or len(current_keyword_defaults)
+                    != len(keyword_defaults)
+                ):
+                    current = False
+                    break
+                else:
+                    for name, value in keyword_defaults:
+                        if (
+                            current_keyword_defaults.get(
+                                name,
+                                dependencies.missing_dependency,
+                            )
+                            is not value
+                        ):
+                            current = False
+                            break
+        except Exception:
+            current = False
+        if not current:
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            ) from None
+
+    def _get_json_for_request(
+        self,
+        url: str,
+        dependencies: _AlpacaRequestDependencies,
+    ) -> tuple[dict[str, object], bytes]:
+        request_verifier = dependencies.request_verifier
+        if request_verifier.__code__ is not dependencies.request_verifier_code:
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, dependencies)
+        response = dependencies.get_with_redirects_function(
+            dependencies.sealed_transport,
+            dependencies.policy,
+            url,
+            {
+                "APCA-API-KEY-ID": dependencies.credential_key_id,
+                "APCA-API-SECRET-KEY": (
+                    dependencies.credential_secret_key
+                ),
+                "Accept": "application/json",
+            },
+            allowed_content_types=("application/json",),
+        )
+        if request_verifier.__code__ is not dependencies.request_verifier_code:
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, dependencies)
+        return (
+            dependencies.json_object_function(response.body),
+            response.body,
+        )
+
+    def _current_time(
+        self,
+        request_dependencies: _AlpacaRequestDependencies | None = None,
+    ) -> datetime:
+        now = (
+            self._now
+            if request_dependencies is None
+            else request_dependencies.now
+        )
+        if request_dependencies is not None:
+            _require_current_request_graph(
+                request_dependencies.clock_graph_dependency
+            )
+        current = now()
+        if request_dependencies is not None:
+            _refresh_trusted_request_graph(
+                request_dependencies.clock_graph_dependency
+            )
+        return _utc(current, "current time")
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1955,8 +3190,9 @@ class AlpacaMarketData:
         source_type: str,
         feed: str,
         source_timestamp: datetime,
+        request_dependencies: _AlpacaRequestDependencies | None = None,
     ) -> str:
-        retrieved_at = self._current_time()
+        retrieved_at = self._current_time(request_dependencies)
         safe_timestamp = _utc(source_timestamp, "source timestamp")
         if safe_timestamp > retrieved_at:
             raise ProviderMalformedError("provider source timestamp is in the future")
@@ -1998,8 +3234,23 @@ class AlpacaMarketData:
             delay_seconds=delay_seconds,
         )
         self._observations[observation_id] = observation
-        if self._cache is not None:
-            self._cache.put(observation, payload)
+        cache_put_function = (
+            None
+            if request_dependencies is None
+            else request_dependencies.cache_put_function
+        )
+        if request_dependencies is None and self._cache is not None:
+            cache_put_function = self._cache.put
+        if cache_put_function is not None:
+            if request_dependencies is not None:
+                _require_current_request_graph(
+                    request_dependencies.cache_graph_dependency
+                )
+            cache_put_function(observation, payload)
+            if request_dependencies is not None:
+                _refresh_trusted_request_graph(
+                    request_dependencies.cache_graph_dependency
+                )
         return observation_id
 
     def health_attestation(self, observation_id: str) -> SourceHealthAttestation:
@@ -2011,10 +3262,17 @@ class AlpacaMarketData:
             raise ValueError("market-data observation was not issued by this client")
         return _issue_provider_health_attestation(observation)
 
-    def _validate_historical_window(self, window: TimeWindow) -> None:
+    def _validate_historical_window(
+        self,
+        window: TimeWindow,
+        request_dependencies: _AlpacaRequestDependencies | None = None,
+    ) -> None:
         if not isinstance(window, TimeWindow):
             raise TypeError("historical window has the wrong type")
-        if self._current_time() - window.end < HISTORICAL_SIP_RELEASE_DELAY:
+        if (
+            self._current_time(request_dependencies) - window.end
+            < HISTORICAL_SIP_RELEASE_DELAY
+        ):
             raise ProviderMalformedError(
                 "historical SIP window must end at least sixteen minutes ago"
             )
@@ -2025,27 +3283,41 @@ class AlpacaMarketData:
         path: str,
         query: list[tuple[str, str]],
         collection: str,
-    ) -> list[tuple[str, dict[str, object], bytes]]:
-        pages: list[tuple[str, dict[str, object], bytes]] = []
+        request_dependencies: _AlpacaRequestDependencies,
+    ) -> Iterator[tuple[str, dict[str, object], bytes]]:
+        request_verifier = request_dependencies.request_verifier
+        request_dispatch = request_dependencies.request_dispatch
         token: str | None = None
         seen_tokens: set[str] = set()
         for _ in range(_MAX_PAGES):
+            if (
+                request_verifier.__code__
+                is not request_dependencies.request_verifier_code
+            ):
+                raise ProviderMalformedError(
+                    "provider request dependencies changed during pagination"
+                )
+            request_verifier(self, request_dependencies)
             current_query = list(query)
             if token is not None:
                 current_query.append(("page_token", token))
-            url = f"{self._base_url}{path}?{urllib.parse.urlencode(current_query)}"
-            document, payload = self._get_json(url)
+            url = (
+                f"{request_dependencies.base_url}{path}?"
+                f"{urllib.parse.urlencode(current_query)}"
+            )
+            document, payload = request_dispatch(
+                self,
+                url,
+                request_dependencies,
+            )
             if collection not in document or not isinstance(document[collection], dict):
                 raise ProviderIncompleteError(
                     f"provider response is missing the {collection} collection"
                 )
             if "next_page_token" not in document:
                 raise ProviderIncompleteError("provider pagination did not terminate explicitly")
-            pages.append((url, document, payload))
             next_token = document["next_page_token"]
-            if next_token is None:
-                return pages
-            if (
+            if next_token is not None and (
                 not isinstance(next_token, str)
                 or not next_token
                 or len(next_token) > 512
@@ -2054,17 +3326,147 @@ class AlpacaMarketData:
                 or next_token in seen_tokens
             ):
                 raise ProviderIncompleteError("provider pagination token is malformed or repeated")
+            yield url, document, payload
+            if next_token is None:
+                return
             seen_tokens.add(next_token)
             token = next_token
         raise ProviderIncompleteError("provider pagination exceeded the page limit")
+
+    @staticmethod
+    def _validate_page_sink(
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None,
+    ) -> Callable[[ProviderFetchPageBundle], None] | None:
+        if page_sink is not None and not callable(page_sink):
+            raise TypeError("provider page sink must be callable")
+        return page_sink
+
+    def _issue_and_disclose_page(
+        self,
+        *,
+        page_ordinal: int,
+        url: str,
+        document: dict[str, object],
+        payload: bytes,
+        observation_id: str,
+        source_type: str,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None,
+        request_dependencies: _AlpacaRequestDependencies,
+    ) -> ProviderFetchPageBundle:
+        request_verifier = request_dependencies.request_verifier
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qs(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+        raw_request_tokens = query.get("page_token", [])
+        if len(raw_request_tokens) > 1:
+            raise ProviderIncompleteError(
+                "provider pagination successor chain is inconsistent"
+            )
+        request_token = (
+            None if not raw_request_tokens else raw_request_tokens[0]
+        )
+        next_token = document.get("next_page_token")
+        page = ProviderFetchPage(
+            page_ordinal=page_ordinal,
+            source_observation_id=observation_id,
+            source_type=source_type,
+            request_url=url,
+            request_page_token=request_token,
+            next_page_token=next_token,
+            payload_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        observation = self._observations.get(observation_id)
+        if observation is None:
+            raise ProviderMalformedError(
+                "provider fetch page observation is unavailable"
+            )
+        bundle = _issue_provider_fetch_page_bundle(
+            owner=self,
+            page=page,
+            payload=payload,
+            observation=observation,
+        )
+        if page_sink is not None:
+            sink_failed = False
+            try:
+                page_sink(bundle)
+            except Exception:
+                sink_failed = True
+            if sink_failed:
+                raise ProviderMalformedError("provider page sink failed")
+            if (
+                request_verifier.__code__
+                is not request_dependencies.request_verifier_code
+            ):
+                raise ProviderMalformedError(
+                    "provider request dependencies changed during pagination"
+                )
+            request_verifier(self, request_dependencies)
+            authority = _provider_fetch_page_bundle_authority(bundle)
+            if authority is None or authority.owner is not self:
+                raise ProviderMalformedError(
+                    "provider fetch page authority changed during disclosure"
+                )
+        return bundle
+
+    def _require_current_fetch_pages(
+        self,
+        pages: Sequence[ProviderFetchPageBundle],
+        request_dependencies: _AlpacaRequestDependencies,
+    ) -> None:
+        request_verifier = request_dependencies.request_verifier
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
+        if any(
+            (authority := _provider_fetch_page_bundle_authority(page))
+            is None
+            or authority.owner is not self
+            for page in pages
+        ):
+            raise ProviderMalformedError(
+                "provider fetch page authority changed during disclosure"
+            )
 
     def daily_bars(
         self,
         symbols: Sequence[str],
         window: TimeWindow,
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
     ) -> Mapping[str, tuple[Bar, ...]]:
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        pages_function = request_dependencies.pages_function
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         requested = _symbols(symbols)
-        self._validate_historical_window(window)
+        self._validate_historical_window(window, request_dependencies)
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
         query = [
             ("symbols", ",".join(requested)),
             ("timeframe", "1Day"),
@@ -2075,14 +3477,17 @@ class AlpacaMarketData:
             ("limit", "10000"),
         ]
         result: dict[str, list[Bar]] = {symbol: [] for symbol in requested}
-        raw_pages = self._pages(
+        raw_pages = pages_function(
+            self,
             path="/v2/stocks/bars",
             query=query,
             collection="bars",
+            request_dependencies=request_dependencies,
         )
         pinned_pages: list[
             tuple[str, dict[str, object], bytes, str, str]
         ] = []
+        issued_pages: list[ProviderFetchPageBundle] = []
         pending_sources: list[tuple[int, int, str]] = []
         for page_ordinal, (url, document, payload) in enumerate(
             raw_pages,
@@ -2129,6 +3534,7 @@ class AlpacaMarketData:
                 source_type="ALPACA_DAILY_BARS",
                 feed="sip",
                 source_timestamp=source_timestamp,
+                request_dependencies=request_dependencies,
             )
             pinned_pages.append(
                 (url, document, payload, observation_id, "ALPACA_DAILY_BARS")
@@ -2164,12 +3570,38 @@ class AlpacaMarketData:
                 pending_sources.append(
                     (page_ordinal, item_ordinal, item_path)
                 )
+            if any(
+                len({bar.timestamp for bar in bars}) != len(bars)
+                for bars in result.values()
+            ):
+                raise ProviderIncompleteError(
+                    "provider bars are missing or contain duplicate timestamps"
+                )
+            issued_pages.append(
+                issue_page_function(
+                    self,
+                    page_ordinal=page_ordinal,
+                    url=url,
+                    document=document,
+                    payload=payload,
+                    observation_id=observation_id,
+                    source_type="ALPACA_DAILY_BARS",
+                    page_sink=page_sink,
+                    request_dependencies=request_dependencies,
+                )
+            )
+            require_pages_function(
+                self,
+                issued_pages,
+                request_dependencies,
+            )
         self._complete_bars(result, expected_terminal=window.end)
         fetch_manifest = _provider_fetch_manifest(
             owner=self,
             collection="bars",
             requested_symbols=requested,
             pages=pinned_pages,
+            page_bundles=issued_pages,
         )
         issued_result: dict[str, list[Bar]] = {
             symbol: [] for symbol in requested
@@ -2230,10 +3662,26 @@ class AlpacaMarketData:
         self,
         symbols: Sequence[str],
         window: TimeWindow,
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
     ) -> Mapping[str, tuple[Bar, ...]]:
         """Return a terminal split-adjusted SIP one-minute bar cohort."""
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        pages_function = request_dependencies.pages_function
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         requested = _symbols(symbols)
-        self._validate_historical_window(window)
+        self._validate_historical_window(window, request_dependencies)
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
         query = [
             ("symbols", ",".join(requested)),
             ("timeframe", "1Min"),
@@ -2244,14 +3692,17 @@ class AlpacaMarketData:
             ("limit", "10000"),
         ]
         result: dict[str, list[Bar]] = {symbol: [] for symbol in requested}
-        raw_pages = self._pages(
+        raw_pages = pages_function(
+            self,
             path="/v2/stocks/bars",
             query=query,
             collection="bars",
+            request_dependencies=request_dependencies,
         )
         pinned_pages: list[
             tuple[str, dict[str, object], bytes, str, str]
         ] = []
+        issued_pages: list[ProviderFetchPageBundle] = []
         pending_sources: list[tuple[int, int, str]] = []
         for page_ordinal, (url, document, payload) in enumerate(
             raw_pages,
@@ -2301,6 +3752,7 @@ class AlpacaMarketData:
                 source_type="ALPACA_INTRADAY_BARS",
                 feed="sip",
                 source_timestamp=source_timestamp,
+                request_dependencies=request_dependencies,
             )
             pinned_pages.append(
                 (
@@ -2345,6 +3797,31 @@ class AlpacaMarketData:
                 pending_sources.append(
                     (page_ordinal, item_ordinal, item_path)
                 )
+            if any(
+                len({bar.timestamp for bar in bars}) != len(bars)
+                for bars in result.values()
+            ):
+                raise ProviderIncompleteError(
+                    "provider bars are missing or contain duplicate timestamps"
+                )
+            issued_pages.append(
+                issue_page_function(
+                    self,
+                    page_ordinal=page_ordinal,
+                    url=url,
+                    document=document,
+                    payload=payload,
+                    observation_id=observation_id,
+                    source_type="ALPACA_INTRADAY_BARS",
+                    page_sink=page_sink,
+                    request_dependencies=request_dependencies,
+                )
+            )
+            require_pages_function(
+                self,
+                issued_pages,
+                request_dependencies,
+            )
         completed = self._complete_bars(
             result,
             expected_terminal=window.end,
@@ -2361,6 +3838,7 @@ class AlpacaMarketData:
             collection="bars",
             requested_symbols=requested,
             pages=pinned_pages,
+            page_bundles=issued_pages,
         )
         issued_result: dict[str, list[Bar]] = {
             symbol: [] for symbol in requested
@@ -2390,10 +3868,26 @@ class AlpacaMarketData:
         self,
         symbols: Sequence[str],
         window: TimeWindow,
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
     ) -> Mapping[str, tuple[Trade, ...]]:
         """Return one complete terminal SIP trade fetch with item authority."""
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        pages_function = request_dependencies.pages_function
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         requested = _symbols(symbols)
-        self._validate_historical_window(window)
+        self._validate_historical_window(window, request_dependencies)
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
         query = [
             ("symbols", ",".join(requested)),
             ("start", _format_utc(window.start)),
@@ -2402,14 +3896,17 @@ class AlpacaMarketData:
             ("limit", "10000"),
         ]
         result: dict[str, list[Trade]] = {symbol: [] for symbol in requested}
-        raw_pages = self._pages(
+        raw_pages = pages_function(
+            self,
             path="/v2/stocks/trades",
             query=query,
             collection="trades",
+            request_dependencies=request_dependencies,
         )
         pinned_pages: list[
             tuple[str, dict[str, object], bytes, str, str]
         ] = []
+        issued_pages: list[ProviderFetchPageBundle] = []
         pending_sources: list[tuple[int, int, str]] = []
         for page_ordinal, (url, document, payload) in enumerate(
             raw_pages,
@@ -2458,6 +3955,7 @@ class AlpacaMarketData:
                     (item[1] for item in parsed_page),
                     default=window.end,
                 ),
+                request_dependencies=request_dependencies,
             )
             pinned_pages.append(
                 (
@@ -2500,6 +3998,37 @@ class AlpacaMarketData:
                 pending_sources.append(
                     (page_ordinal, item_ordinal, item_path)
                 )
+            if any(
+                len(
+                    {
+                        (trade.timestamp, trade.sequence)
+                        for trade in trades
+                    }
+                )
+                != len(trades)
+                for trades in result.values()
+            ):
+                raise ProviderIncompleteError(
+                    "provider trades do not form a complete terminal cohort"
+                )
+            issued_pages.append(
+                issue_page_function(
+                    self,
+                    page_ordinal=page_ordinal,
+                    url=url,
+                    document=document,
+                    payload=payload,
+                    observation_id=observation_id,
+                    source_type="ALPACA_HISTORICAL_TRADES",
+                    page_sink=page_sink,
+                    request_dependencies=request_dependencies,
+                )
+            )
+            require_pages_function(
+                self,
+                issued_pages,
+                request_dependencies,
+            )
         completed: dict[str, tuple[Trade, ...]] = {}
         for symbol in sorted(result):
             ordered = tuple(
@@ -2521,6 +4050,7 @@ class AlpacaMarketData:
             collection="trades",
             requested_symbols=requested,
             pages=pinned_pages,
+            page_bundles=issued_pages,
         )
         issued_result: dict[str, list[Trade]] = {
             symbol: [] for symbol in requested
@@ -2555,9 +4085,25 @@ class AlpacaMarketData:
         self,
         symbols: Sequence[str],
         window: TimeWindow,
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
     ) -> Mapping[str, tuple[Quote, ...]]:
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        pages_function = request_dependencies.pages_function
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         requested = _symbols(symbols)
-        self._validate_historical_window(window)
+        self._validate_historical_window(window, request_dependencies)
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
         query = [
             ("symbols", ",".join(requested)),
             ("start", _format_utc(window.start)),
@@ -2566,14 +4112,17 @@ class AlpacaMarketData:
             ("limit", "10000"),
         ]
         result: dict[str, list[Quote]] = {symbol: [] for symbol in requested}
-        raw_pages = self._pages(
+        raw_pages = pages_function(
+            self,
             path="/v2/stocks/quotes",
             query=query,
             collection="quotes",
+            request_dependencies=request_dependencies,
         )
         pinned_pages: list[
             tuple[str, dict[str, object], bytes, str, str]
         ] = []
+        issued_pages: list[ProviderFetchPageBundle] = []
         pending_sources: list[tuple[int, int, str]] = []
         for page_ordinal, (url, document, payload) in enumerate(
             raw_pages,
@@ -2620,6 +4169,7 @@ class AlpacaMarketData:
                 source_type="ALPACA_HISTORICAL_QUOTES",
                 feed="sip",
                 source_timestamp=source_timestamp,
+                request_dependencies=request_dependencies,
             )
             pinned_pages.append(
                 (
@@ -2650,6 +4200,31 @@ class AlpacaMarketData:
                 pending_sources.append(
                     (page_ordinal, item_ordinal, item_path)
                 )
+            if any(
+                len({quote.timestamp for quote in quotes}) != len(quotes)
+                for quotes in result.values()
+            ):
+                raise ProviderIncompleteError(
+                    "provider quotes contain duplicate timestamps"
+                )
+            issued_pages.append(
+                issue_page_function(
+                    self,
+                    page_ordinal=page_ordinal,
+                    url=url,
+                    document=document,
+                    payload=payload,
+                    observation_id=observation_id,
+                    source_type="ALPACA_HISTORICAL_QUOTES",
+                    page_sink=page_sink,
+                    request_dependencies=request_dependencies,
+                )
+            )
+            require_pages_function(
+                self,
+                issued_pages,
+                request_dependencies,
+            )
         completed: dict[str, tuple[Quote, ...]] = {}
         for symbol in sorted(result):
             ordered = tuple(sorted(result[symbol], key=lambda item: item.timestamp))
@@ -2663,6 +4238,7 @@ class AlpacaMarketData:
             collection="quotes",
             requested_symbols=requested,
             pages=pinned_pages,
+            page_bundles=issued_pages,
         )
         issued_result: dict[str, list[Quote]] = {
             symbol: [] for symbol in requested
@@ -2810,17 +4386,39 @@ class AlpacaMarketData:
             issued_result[fact.symbol] = fact
         return issued_result
 
-    def option_chain(self, underlying: str) -> ProviderOptionChain:
+    def option_chain(
+        self,
+        underlying: str,
+        *,
+        page_sink: Callable[[ProviderFetchPageBundle], None] | None = None,
+    ) -> ProviderOptionChain:
+        page_sink = self._validate_page_sink(page_sink)
+        request_dependencies = self._capture_request_dependencies()
+        request_verifier = request_dependencies.request_verifier
+        pages_function = request_dependencies.pages_function
+        issue_page_function = request_dependencies.issue_page_function
+        require_pages_function = request_dependencies.require_pages_function
         symbol = _symbols([underlying])[0]
+        if (
+            request_verifier.__code__
+            is not request_dependencies.request_verifier_code
+        ):
+            raise ProviderMalformedError(
+                "provider request dependencies changed during pagination"
+            )
+        request_verifier(self, request_dependencies)
         query = [("feed", "indicative"), ("limit", "1000")]
-        raw_pages = self._pages(
+        raw_pages = pages_function(
+            self,
             path=f"/v1beta1/options/snapshots/{urllib.parse.quote(symbol)}",
             query=query,
             collection="snapshots",
+            request_dependencies=request_dependencies,
         )
         pinned_pages: list[
             tuple[str, dict[str, object], bytes, str, str]
         ] = []
+        issued_pages: list[ProviderFetchPageBundle] = []
         pending_sources: list[tuple[int, int, str]] = []
         seen_occ_symbols: set[str] = set()
         for page_ordinal, (url, document, payload) in enumerate(
@@ -2858,7 +4456,11 @@ class AlpacaMarketData:
                 payload=payload,
                 source_type="ALPACA_OPTION_SNAPSHOTS",
                 feed="indicative",
-                source_timestamp=max(observed_values, default=self._current_time()),
+                source_timestamp=max(
+                    observed_values,
+                    default=self._current_time(request_dependencies),
+                ),
+                request_dependencies=request_dependencies,
             )
             pinned_pages.append(
                 (
@@ -2869,6 +4471,35 @@ class AlpacaMarketData:
                     "ALPACA_OPTION_SNAPSHOTS",
                 )
             )
+            observation = self._observations[observation_id]
+            for occ_symbol in sorted(raw):
+                value = raw[occ_symbol]
+                assert isinstance(occ_symbol, str)
+                assert isinstance(value, dict)
+                _option_snapshot_from_raw_item(
+                    symbol=occ_symbol,
+                    value=value,
+                    observation=observation,
+                    requested_symbols=(symbol,),
+                )
+            issued_pages.append(
+                issue_page_function(
+                    self,
+                    page_ordinal=page_ordinal,
+                    url=url,
+                    document=document,
+                    payload=payload,
+                    observation_id=observation_id,
+                    source_type="ALPACA_OPTION_SNAPSHOTS",
+                    page_sink=page_sink,
+                    request_dependencies=request_dependencies,
+                )
+            )
+            require_pages_function(
+                self,
+                issued_pages,
+                request_dependencies,
+            )
         if not pending_sources:
             raise ProviderIncompleteError("indicative option snapshot response is empty")
         fetch_manifest = _provider_fetch_manifest(
@@ -2876,6 +4507,7 @@ class AlpacaMarketData:
             collection="snapshots",
             requested_symbols=(symbol,),
             pages=pinned_pages,
+            page_bundles=issued_pages,
         )
         snapshots: dict[str, OptionSnapshot] = {}
         for page_ordinal, item_ordinal, item_path in pending_sources:
@@ -3016,6 +4648,7 @@ __all__ = [
     "is_ingestible_provider_fetch_cohort",
     "is_ingestible_provider_option_chain",
     "is_issued_normalized_market_fact",
+    "is_issued_provider_fetch_page_bundle",
     "is_issued_provider_option_chain",
     "is_issued_provider_fetch_cohort",
     "normalized_market_facts_share_owner",

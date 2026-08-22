@@ -434,6 +434,8 @@ class WorkflowPublisher(Protocol):
 class CanonicalWorkflowAdapter(Protocol):
     """Separate provider-backed adapter with fixed economic and retrieval times."""
 
+    def market_session(self, day: date) -> SessionWindow | None: ...
+
     def premarket_material(
         self,
         session_date: date,
@@ -729,6 +731,130 @@ class WorkflowContext:
 
     def __post_init__(self) -> None:
         require_aware_timestamp(self.now, "workflow time")
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalWorkflowContext:
+    """Explicit non-fixture authorities for one provider-backed run."""
+
+    adapter: CanonicalWorkflowAdapter
+    publisher: CanonicalWorkflowPublisher
+    scheduler: ScheduledWorkflowStore | None
+    now: datetime
+
+    def __post_init__(self) -> None:
+        require_aware_timestamp(self.now, "canonical workflow time")
+
+
+def _canonical_noop(outcome: str, reason: str) -> WorkflowResult:
+    return WorkflowResult(
+        outcome=outcome,
+        message=outcome.replace("_", " "),
+        exit_code=0,
+        reason_codes=(reason,),
+        execution_mode="CANONICAL",
+    )
+
+
+def _canonical_data_unavailable(reason: str) -> WorkflowResult:
+    return WorkflowResult(
+        outcome="DATA_UNAVAILABLE",
+        message="DATA UNAVAILABLE - NO CANDIDATE OR ACTION WAS PRODUCED",
+        exit_code=3,
+        reason_codes=(reason,),
+        execution_mode="CANONICAL",
+    )
+
+
+def _run_canonical(
+    context: CanonicalWorkflowContext,
+    *,
+    kind: str,
+) -> WorkflowResult:
+    """Run one canonical workflow only inside its no-backfill due window."""
+    if type(context) is not CanonicalWorkflowContext:
+        raise TypeError("canonical workflow requires its exact context")
+    if kind not in {"PREMARKET", "CLOSE"}:
+        raise ValueError("canonical workflow kind is unsupported")
+    now_et = context.now.astimezone(_NEW_YORK)
+    try:
+        session = context.adapter.market_session(now_et.date())
+    except WorkflowDataError as error:
+        return _canonical_data_unavailable(
+            _safe_reason(error, "DATA_UNAVAILABLE")
+        )
+    if session is None:
+        return _canonical_noop("MARKET_CLOSED_NOOP", "MARKET_CLOSED")
+    if type(session) is not SessionWindow or session.session_date != now_et.date():
+        raise WorkflowError("canonical market session is unverified")
+    wake = session.review_time if kind == "CLOSE" else time(8, 45)
+    economic_at = datetime.combine(
+        session.session_date,
+        wake,
+        tzinfo=_NEW_YORK,
+    )
+    if now_et < economic_at:
+        return _canonical_noop("NOT_DUE_NOOP", "NOT_DUE")
+    if now_et >= economic_at + timedelta(minutes=15):
+        return _canonical_noop("MISSED_RUN_NOOP", "MISSED_RUN")
+    try:
+        material = (
+            context.adapter.close_material(
+                session.session_date,
+                review_at=economic_at,
+                retrieved_at=context.now,
+            )
+            if kind == "CLOSE"
+            else context.adapter.premarket_material(
+                session.session_date,
+                decision_at=economic_at,
+                retrieved_at=context.now,
+            )
+        )
+    except WorkflowDataError as error:
+        return _canonical_data_unavailable(
+            _safe_reason(error, "DATA_UNAVAILABLE")
+        )
+    result = context.publisher.issue_result(material=material)
+    if type(result) is not WorkflowResult or result.execution_mode != "CANONICAL":
+        raise WorkflowError("canonical workflow result is unverified")
+    published = context.publisher.publish(
+        kind=kind,
+        session_date=session.session_date,
+        generated_at=context.now,
+        result=result,
+        material=material,
+    )
+    if type(published) is not PublishedWorkflow:
+        raise WorkflowError("canonical publication result is unverified")
+    if published.status == "IN_PROGRESS":
+        return WorkflowResult(
+            outcome="PUBLICATION_INCOMPLETE",
+            message="PUBLICATION INCOMPLETE - NO REPORT WAS EMITTED",
+            exit_code=10,
+            reason_codes=("PUBLICATION_INCOMPLETE",),
+            execution_mode="CANONICAL",
+        )
+    return replace(
+        result,
+        report_id=published.report_id,
+        report_row_id=published.report_row_id,
+        report_path=published.report_path,
+    )
+
+
+def run_canonical_premarket(
+    context: CanonicalWorkflowContext,
+) -> WorkflowResult:
+    """Run the provider-backed premarket monitor without placing an order."""
+    return _run_canonical(context, kind="PREMARKET")
+
+
+def run_canonical_close(
+    context: CanonicalWorkflowContext,
+) -> WorkflowResult:
+    """Run the provider-backed actual-close monitor without placing an order."""
+    return _run_canonical(context, kind="CLOSE")
 
 
 def run_premarket(context: WorkflowContext) -> WorkflowResult:
@@ -3036,6 +3162,7 @@ __all__ = [
     "CanonicalJournalWorkflowPublisher",
     "CanonicalPublicationPlan",
     "CanonicalWorkflowAdapter",
+    "CanonicalWorkflowContext",
     "CanonicalWorkflowPublisher",
     "CloseSnapshot",
     "JournalWorkflowPublisher",
@@ -3054,6 +3181,8 @@ __all__ = [
     "WorkflowPublisher",
     "WorkflowReconciliationError",
     "WorkflowResult",
+    "run_canonical_close",
+    "run_canonical_premarket",
     "run_close",
     "run_premarket",
 ]

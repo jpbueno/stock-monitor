@@ -36,6 +36,8 @@ from zoneinfo import ZoneInfo
 from .domain import DomainValidationError, require_aware_timestamp
 from .workflows import (
     CandidateSummary,
+    CanonicalJournalWorkflowPublisher,
+    CanonicalWorkflowContext,
     JournalWorkflowPublisher,
     PublishedWorkflow,
     Report,
@@ -44,6 +46,8 @@ from .workflows import (
     WorkflowError,
     WorkflowResult,
     archive_report,
+    run_canonical_close,
+    run_canonical_premarket,
     run_close,
     run_premarket,
 )
@@ -138,7 +142,7 @@ class JournalScheduledRunStore:
 def _run_scheduled_with_authority(
     kind: RunKind,
     now: datetime,
-    context: WorkflowContext,
+    context: WorkflowContext | CanonicalWorkflowContext,
     *,
     claim_run: object,
     complete_run: object,
@@ -152,6 +156,9 @@ def _run_scheduled_with_authority(
     result_builder: object,
     close_workflow: object,
     premarket_workflow: object,
+    canonical_context_type: type[CanonicalWorkflowContext],
+    canonical_close_workflow: object,
+    canonical_premarket_workflow: object,
     replace_value: object,
     require_timestamp: object,
     domain_error_type: type[DomainValidationError],
@@ -289,15 +296,28 @@ def _run_scheduled_with_authority(
         )
         return missed
 
-    run_context = replace_value(context, now=intended_at)
+    canonical = type(context) is canonical_context_type
+    if canonical and context.now is not now:
+        abandon_run(context.scheduler, completion_authority)
+        raise workflow_error_type(
+            "canonical scheduled retrieval time is unverified"
+        )
+    run_context = context if canonical else replace_value(context, now=intended_at)
     if not workflow_dependencies_current(run_context):
         abandon_run(context.scheduler, completion_authority)
         raise workflow_error_type("scheduled workflow authority was replaced")
-    result = (
-        close_workflow(run_context)
-        if kind is run_kind_type.CLOSE
-        else premarket_workflow(run_context)
-    )
+    if canonical:
+        result = (
+            canonical_close_workflow(run_context)
+            if kind is run_kind_type.CLOSE
+            else canonical_premarket_workflow(run_context)
+        )
+    else:
+        result = (
+            close_workflow(run_context)
+            if kind is run_kind_type.CLOSE
+            else premarket_workflow(run_context)
+        )
     if (
         result_class.__init__ is not result_initializer
         or not workflow_dependencies_current(run_context)
@@ -405,7 +425,9 @@ def _healed_publication_matches_stored_result(
     return healed.report_path == stored.report_path
 
 
-def _execution_mode(context: WorkflowContext) -> str:
+def _execution_mode(
+    context: WorkflowContext | CanonicalWorkflowContext,
+) -> str:
     return getattr(context.adapter, "execution_mode", "CANONICAL")
 
 
@@ -423,6 +445,9 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     workflow_error_type = WorkflowError
     close_workflow = run_close
     premarket_workflow = run_premarket
+    canonical_context_type = CanonicalWorkflowContext
+    canonical_close_workflow = run_canonical_close
+    canonical_premarket_workflow = run_canonical_premarket
     replace_value = replace
     require_timestamp = require_aware_timestamp
     domain_error_type = DomainValidationError
@@ -446,6 +471,16 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     workflow_functions = (
         (close_workflow, close_workflow.__code__, workflow_globals),
         (premarket_workflow, premarket_workflow.__code__, workflow_globals),
+        (
+            canonical_close_workflow,
+            canonical_close_workflow.__code__,
+            canonical_close_workflow.__globals__,
+        ),
+        (
+            canonical_premarket_workflow,
+            canonical_premarket_workflow.__code__,
+            canonical_premarket_workflow.__globals__,
+        ),
     )
     workflow_dependency_records: list[
         tuple[dict[str, object], str, object, object | None]
@@ -485,7 +520,10 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
 
     capture_workflow_dependencies(close_workflow)
     capture_workflow_dependencies(premarket_workflow)
+    capture_workflow_dependencies(canonical_close_workflow)
+    capture_workflow_dependencies(canonical_premarket_workflow)
     capture_workflow_dependencies(JournalWorkflowPublisher.publish)
+    capture_workflow_dependencies(CanonicalJournalWorkflowPublisher.publish)
     adapter_type = workflow_globals.get("RecordedScenarioAdapter")
     adapter_method_names = (
         "validate_configuration",
@@ -512,7 +550,12 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     publisher_method = JournalWorkflowPublisher.publish
     publisher_method_code = publisher_method.__code__
 
-    def workflow_dependencies_current(context: WorkflowContext) -> bool:
+    canonical_publisher_method = CanonicalJournalWorkflowPublisher.publish
+    canonical_publisher_method_code = canonical_publisher_method.__code__
+
+    def workflow_dependencies_current(
+        context: WorkflowContext | CanonicalWorkflowContext,
+    ) -> bool:
         if any(
             function.__code__ is not code
             or function.__globals__ is not namespace
@@ -536,6 +579,13 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
         if type(publisher) is JournalWorkflowPublisher and (
             JournalWorkflowPublisher.publish is not publisher_method
             or publisher_method.__code__ is not publisher_method_code
+        ):
+            return False
+        if type(publisher) is CanonicalJournalWorkflowPublisher and (
+            CanonicalJournalWorkflowPublisher.publish
+            is not canonical_publisher_method
+            or canonical_publisher_method.__code__
+            is not canonical_publisher_method_code
         ):
             return False
         return True
@@ -578,7 +628,9 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             object_setattr(result, name, value)
         return result
 
-    def execution_mode(context: WorkflowContext) -> str:
+    def execution_mode(
+        context: WorkflowContext | CanonicalWorkflowContext,
+    ) -> str:
         value = getattr(context.adapter, "execution_mode", "CANONICAL")
         if type(value) is not str:
             raise workflow_error_type("scheduled execution mode is unverified")
@@ -680,7 +732,8 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
         stored: WorkflowResult,
     ) -> bool:
         if (
-            type(publisher) is not JournalWorkflowPublisher
+            type(publisher)
+            not in {JournalWorkflowPublisher, CanonicalJournalWorkflowPublisher}
             or type(healed) is not PublishedWorkflow
             or healed.status != "ALREADY_EMITTED"
             or healed.report_id != stored.report_id
@@ -763,7 +816,7 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     def protected_run_scheduled(
         kind: RunKind,
         now: datetime,
-        context: WorkflowContext,
+        context: WorkflowContext | CanonicalWorkflowContext,
     ) -> WorkflowResult:
         return run_implementation(
             kind,
@@ -781,6 +834,9 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             result_builder=construct_result,
             close_workflow=close_workflow,
             premarket_workflow=premarket_workflow,
+            canonical_context_type=canonical_context_type,
+            canonical_close_workflow=canonical_close_workflow,
+            canonical_premarket_workflow=canonical_premarket_workflow,
             replace_value=replace_value,
             require_timestamp=require_timestamp,
             domain_error_type=domain_error_type,
@@ -799,10 +855,19 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             workflow_dependencies_current=workflow_dependencies_current,
         )
 
+    def protected_run_canonical_scheduled(
+        kind: RunKind,
+        now: datetime,
+        context: CanonicalWorkflowContext,
+    ) -> WorkflowResult:
+        if type(context) is not canonical_context_type:
+            raise TypeError("canonical scheduling requires its exact context")
+        return protected_run_scheduled(kind, now, context)
+
     configure(
         candidate=candidate_type,
         workflow_result=result_type,
-        publisher=JournalWorkflowPublisher,
+        publisher=(JournalWorkflowPublisher, CanonicalJournalWorkflowPublisher),
         published=PublishedWorkflow,
         report=Report,
         archive=archive_report,
@@ -825,6 +890,9 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
             ("result_builder", construct_result),
             ("close_workflow", close_workflow),
             ("premarket_workflow", premarket_workflow),
+            ("canonical_context_type", canonical_context_type),
+            ("canonical_close_workflow", canonical_close_workflow),
+            ("canonical_premarket_workflow", canonical_premarket_workflow),
             ("replace_value", replace_value),
             ("require_timestamp", require_timestamp),
             ("domain_error_type", domain_error_type),
@@ -847,6 +915,9 @@ def _install_scheduled_boundary_from_journal(values: object) -> None:
     JournalScheduledRunStore.start = protected_store_start
     JournalScheduledRunStore.complete = protected_store_complete
     globals()["run_scheduled"] = protected_run_scheduled
+    globals()["run_canonical_scheduled"] = (
+        protected_run_canonical_scheduled
+    )
     for name in (
         "_scheduled_journal_bootstrap_token",
         "_accept_scheduled_journal_boundary",
@@ -869,4 +940,9 @@ from . import journal as _journal_bootstrap  # noqa: E402
 del _journal_bootstrap
 
 
-__all__ = ["JournalScheduledRunStore", "RunKind", "run_scheduled"]
+__all__ = [
+    "JournalScheduledRunStore",
+    "RunKind",
+    "run_canonical_scheduled",
+    "run_scheduled",
+]

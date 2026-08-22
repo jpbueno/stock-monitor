@@ -37844,7 +37844,8 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
     publisher_records: dict[int, tuple[object, Journal, Path, Path]] = {}
     candidate_type: type[object] | None = None
     workflow_result_type: type[object] | None = None
-    publisher_type: type[object] | None = None
+    publisher_types: tuple[type[object], ...] = ()
+    canonical_publisher_type: type[object] | None = None
     published_type: type[object] | None = None
     report_type: type[object] | None = None
     archive_function: Callable[..., object] | None = None
@@ -38327,7 +38328,7 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
         *,
         candidate: type[object],
         workflow_result: type[object],
-        publisher: type[object],
+        publisher: tuple[type[object], ...],
         published: type[object],
         report: type[object],
         archive: Callable[..., object],
@@ -38339,7 +38340,8 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
         store_complete: Callable[..., object],
         dependencies: tuple[tuple[str, object], ...],
     ) -> None:
-        nonlocal candidate_type, workflow_result_type, publisher_type
+        nonlocal candidate_type, workflow_result_type, publisher_types
+        nonlocal canonical_publisher_type
         nonlocal published_type, report_type, archive_function, archive_code
         nonlocal workflow_error_type
         nonlocal runner_code, wrapper_code, runner_globals, runner_dependencies
@@ -38348,7 +38350,17 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
             raise InvalidJournalValue("scheduled authority is already configured")
         candidate_type = candidate
         workflow_result_type = workflow_result
-        publisher_type = publisher
+        if (
+            type(publisher) is not tuple
+            or len(publisher) != 2
+            or any(type(candidate) is not type for candidate in publisher)
+            or publisher[0] is publisher[1]
+        ):
+            raise InvalidJournalValue(
+                "scheduled publisher authorities are malformed"
+            )
+        publisher_types = publisher
+        canonical_publisher_type = publisher[1]
         published_type = published
         report_type = report
         archive_function = archive
@@ -38385,7 +38397,8 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
                 "scheduled healing requires the exact run_scheduled authority"
             )
 
-        publisher.heal_finalized = deny_raw_heal
+        for publisher_candidate in publisher_types:
+            publisher_candidate.heal_finalized = deny_raw_heal
 
     def require_runner_stack(*, through_store: bool = True) -> None:
         frame = inspect.currentframe()
@@ -38434,7 +38447,7 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
         *,
         mint: bool,
     ) -> tuple[object, Journal, Path, Path] | None:
-        if publisher_type is None or type(value) is not publisher_type:
+        if type(value) not in publisher_types:
             return None
         if getattr(value, "journal", None) is not journal:
             return None
@@ -38459,6 +38472,19 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
         ):
             return None
         return prior
+
+    def scheduled_report_kind(
+        run_kind: object,
+        *,
+        publisher: object | None = None,
+        execution_mode: object | None = None,
+    ) -> object:
+        canonical = (
+            canonical_publisher_type is not None
+            and publisher is not None
+            and type(publisher) is canonical_publisher_type
+        ) or execution_mode == "CANONICAL"
+        return "MORNING" if run_kind == "PREMARKET" and canonical else run_kind
 
     def archive_is_current(
         bound: tuple[object, Journal, Path, Path],
@@ -38646,7 +38672,8 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
             "run.report_id, run.report_path, claim.status, claim.report_id "
             "FROM scheduled_runs AS run LEFT JOIN report_claims AS claim "
             "ON claim.session_date = run.session_date "
-            "AND claim.report_kind = run.run_kind "
+            "AND (claim.report_kind = run.run_kind OR "
+            "(run.run_kind = 'PREMARKET' AND claim.report_kind = 'MORNING')) "
             "WHERE run.run_key = ? COLLATE BINARY",
             (canonical_key,),
         ).fetchone()
@@ -38740,7 +38767,11 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
                 or row[11] != envelope.report_content_sha256
                 or row[12] != envelope.report_state_sha256
                 or row[13] != str(session_date)
-                or row[14] != run_kind
+                or row[14]
+                != scheduled_report_kind(
+                    run_kind,
+                    execution_mode=envelope.execution_mode,
+                )
                 or tuple(int(pin[0]) for pin in pins)
                 != envelope.report_observation_row_ids
                 or tuple(str(pin[1]) for pin in pins)
@@ -39026,7 +39057,12 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
                     raise InvalidJournalValue("report row does not exist")
                 if tuple(str(value) for value in report[:3]) != (
                     str(row[1]),
-                    str(row[0]),
+                    str(
+                        scheduled_report_kind(
+                            row[0],
+                            publisher=bound_publisher[0],
+                        )
+                    ),
                     report_path,
                 ):
                     raise InvalidJournalValue(
@@ -39196,9 +39232,13 @@ def _make_scheduled_journal_boundary() -> tuple[Callable[..., object], ...]:
             material = journal.read_report(report_id)
         except JournalError:
             return None
+        expected_report_kind = scheduled_report_kind(
+            kind,
+            publisher=bound[0],
+        )
         if (
             material.report_row_id != report_row_id
-            or material.report_kind != kind
+            or material.report_kind != expected_report_kind
             or material.session_date != session_date
             or material.archive_relative_path != report_path
             or material.body != stored.message

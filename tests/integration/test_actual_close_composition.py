@@ -3162,8 +3162,8 @@ class ActualCloseCompositionTests(unittest.TestCase):
             {"include_iex": False},
             {"iex_offset": timedelta(minutes=-5, microseconds=-1)},
             {
-                "iex_offset": timedelta(microseconds=1),
-                "retrieved_offset": timedelta(seconds=1),
+                "iex_offset": timedelta(minutes=1),
+                "retrieved_offset": timedelta(minutes=1, microseconds=1),
             },
             {"iex_bid": "20.28", "iex_ask": "20.27"},
         )

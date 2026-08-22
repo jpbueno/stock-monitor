@@ -15,6 +15,8 @@ from .config import ConfigurationError, Settings, load_settings
 from .domain import DomainValidationError, require_aware_timestamp
 from .provider_smoke import run_provider_smoke
 from .workflows import (
+    CanonicalJournalWorkflowPublisher,
+    CanonicalWorkflowContext,
     JournalWorkflowPublisher,
     RecordedScenarioAdapter,
     WorkflowBoundaryError,
@@ -22,6 +24,8 @@ from .workflows import (
     WorkflowDataError,
     WorkflowReconciliationError,
     WorkflowResult,
+    run_canonical_close,
+    run_canonical_premarket,
     run_close,
     run_premarket,
 )
@@ -277,9 +281,14 @@ def _verify(settings: Settings, kind: str, as_json: bool) -> int:
 
 def _run_workflow(settings: Settings, arguments: argparse.Namespace) -> int:
     if arguments.fixture is None:
-        raise CommandBoundaryError(
-            "live collection requires an explicitly configured workflow adapter"
-        )
+        return _run_canonical_workflow(settings, arguments)
+    return _run_recorded_workflow(settings, arguments)
+
+
+def _run_recorded_workflow(
+    settings: Settings,
+    arguments: argparse.Namespace,
+) -> int:
     adapter = RecordedScenarioAdapter.load(arguments.fixture)
     from .journal import Journal
 
@@ -314,6 +323,79 @@ def _run_workflow(settings: Settings, arguments: argparse.Namespace) -> int:
                 run_close(context)
                 if arguments.run_command == "close"
                 else run_premarket(context)
+            )
+    _emit_result(result, arguments.json)
+    return result.exit_code
+
+
+def _open_canonical_adapter(
+    settings: Settings,
+    journal: object,
+    *,
+    now: datetime,
+) -> object:
+    """Open the exact provider coordinator without a fixture fallback."""
+    try:
+        from .provider_adapter import ProviderWorkflowAdapter
+    except ImportError as error:
+        raise CommandBoundaryError(
+            "canonical provider workflow adapter is unavailable"
+        ) from error
+    return ProviderWorkflowAdapter.open(
+        settings=settings,
+        journal=journal,
+        now=now,
+    )
+
+
+def _run_canonical_workflow(
+    settings: Settings,
+    arguments: argparse.Namespace,
+) -> int:
+    from .journal import Journal
+    from .scheduled import JournalScheduledRunStore, RunKind
+
+    reports_root = Path(os.path.abspath(settings.reports_root))
+    if reports_root != settings.reports_root or reports_root.is_symlink():
+        raise CommandBoundaryError("canonical report root is unverified")
+    try:
+        reports_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise CommandBoundaryError("canonical report root is unavailable") from error
+    if reports_root.is_symlink() or not reports_root.is_dir():
+        raise CommandBoundaryError("canonical report root is unverified")
+
+    now = datetime.now(_ET)
+    with Journal.open(settings.journal_path) as journal:
+        adapter = _open_canonical_adapter(settings, journal, now=now)
+        scheduler = (
+            JournalScheduledRunStore(journal)
+            if arguments.scheduled
+            else None
+        )
+        context = CanonicalWorkflowContext(
+            adapter=adapter,
+            publisher=CanonicalJournalWorkflowPublisher(
+                journal,
+                reports_root,
+            ),
+            scheduler=scheduler,
+            now=now,
+        )
+        kind = (
+            RunKind.CLOSE
+            if arguments.run_command == "close"
+            else RunKind.PREMARKET
+        )
+        if arguments.scheduled:
+            from .scheduled import run_canonical_scheduled
+
+            result = run_canonical_scheduled(kind, now, context)
+        else:
+            result = (
+                run_canonical_close(context)
+                if kind is RunKind.CLOSE
+                else run_canonical_premarket(context)
             )
     _emit_result(result, arguments.json)
     return result.exit_code

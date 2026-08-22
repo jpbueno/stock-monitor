@@ -12,6 +12,7 @@ from contextlib import redirect_stdout
 
 import stock_monitor.cli as cli
 from stock_monitor.provider_smoke import ProviderSmokeResult
+from stock_monitor.workflows import WorkflowResult
 
 
 ROOT = Path(__file__).parents[2]
@@ -173,6 +174,105 @@ class ProviderCliTests(unittest.TestCase):
         self.assertNotIn(CANARY, combined)
         self.assertNotIn(self.environment["APCA_API_KEY_ID"], combined)
         self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
+
+    def test_canonical_adapter_opens_only_the_shallow_provider_graph(self) -> None:
+        from stock_monitor.provider_adapter import ProviderWorkflowAdapter
+
+        settings = object()
+        journal = object()
+        adapter = object()
+        with patch.object(
+            ProviderWorkflowAdapter,
+            "open",
+            return_value=adapter,
+        ) as opened:
+            result = cli._open_canonical_adapter(
+                settings,
+                journal,
+                now=NOW,
+            )
+
+        self.assertIs(result, adapter)
+        opened.assert_called_once_with(
+            settings=settings,
+            journal=journal,
+            now=NOW,
+        )
+
+    def test_run_without_fixture_selects_only_canonical_dispatch(self) -> None:
+        output = io.StringIO()
+        adapter = object()
+        observed_contexts = []
+
+        def canonical_run(context):
+            observed_contexts.append(context)
+            return WorkflowResult(
+                outcome="MARKET_CLOSED_NOOP",
+                message="MARKET CLOSED NOOP",
+                exit_code=0,
+                reason_codes=("MARKET_CLOSED",),
+                execution_mode="CANONICAL",
+            )
+
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.cli._open_canonical_adapter",
+            return_value=adapter,
+        ) as opened, patch(
+            "stock_monitor.cli.run_canonical_premarket",
+            side_effect=canonical_run,
+        ), patch(
+            "stock_monitor.cli.RecordedScenarioAdapter.load",
+            side_effect=AssertionError("fixture adapter must not be loaded"),
+        ), redirect_stdout(output):
+            code = cli.run(
+                ("run", "premarket", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["execution_mode"], "CANONICAL")
+        self.assertEqual(payload["outcome"], "MARKET_CLOSED_NOOP")
+        self.assertEqual(len(observed_contexts), 1)
+        self.assertIs(observed_contexts[0].adapter, adapter)
+        self.assertIsNone(observed_contexts[0].scheduler)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_scheduled_no_fixture_uses_only_canonical_scheduler(self) -> None:
+        output = io.StringIO()
+        adapter = object()
+        observed = []
+
+        def scheduled(kind, now, context):
+            observed.append((kind, now, context))
+            return WorkflowResult(
+                outcome="NOT_DUE_NOOP",
+                message="NOT DUE NOOP",
+                exit_code=0,
+                reason_codes=("NOT_DUE",),
+                execution_mode="CANONICAL",
+            )
+
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.cli._open_canonical_adapter",
+            return_value=adapter,
+        ), patch(
+            "stock_monitor.scheduled.run_canonical_scheduled",
+            side_effect=scheduled,
+        ), patch(
+            "stock_monitor.scheduled.run_scheduled",
+            side_effect=AssertionError("fixture scheduler must not be used"),
+        ), redirect_stdout(output):
+            code = cli.run(
+                ("run", "premarket", "--scheduled", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["outcome"], "NOT_DUE_NOOP")
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0][2].adapter, adapter)
+        self.assertIsNotNone(observed[0][2].scheduler)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import NamedTuple, Self
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import ReferenceType, ref
+from zoneinfo import ZoneInfo
 
 from .domain import money_from_micros, money_to_micros, stable_execution_event_identity
 
@@ -56,8 +57,46 @@ _SCHEDULED_RESULT_EXIT_CODES = frozenset({0, 2, 3, 4, 5, 10})
 _PHASE1_ALPACA_SOURCE_CONTRACTS = {
     "ALPACA_HISTORICAL_TRADES": ("trades", "/v2/stocks/trades", "SIP", True),
     "ALPACA_HISTORICAL_QUOTES": ("quotes", "/v2/stocks/quotes", "SIP", True),
+    "ALPACA_INTRADAY_BARS": ("bars", "/v2/stocks/bars", "SIP", True),
     "ALPACA_DAILY_BARS": ("bars", "/v2/stocks/bars", "SIP", True),
     "ALPACA_LATEST_QUOTES": ("quotes", "/v2/stocks/quotes/latest", "IEX", False),
+}
+_ACTUAL_CLOSE_SOURCE_ROLES = (
+    "SIP_QUOTE",
+    "SIP_MINUTE_BAR",
+    "SIP_DAILY_BAR",
+    "IEX_FRESHNESS",
+    "EVENT_EVIDENCE",
+    "PRIMARY_HALT_FEED",
+    "TRADER_ALERT_HALT",
+    "OPERATIONAL_STATUS",
+    "CROSS_CHECK_CALENDAR",
+)
+_ACTUAL_CLOSE_SYMBOL_ROLES = _ACTUAL_CLOSE_SOURCE_ROLES[:5]
+_ACTUAL_CLOSE_GLOBAL_ROLES = _ACTUAL_CLOSE_SOURCE_ROLES[5:]
+_ACTUAL_CLOSE_MARKET_ROLE_TYPES = {
+    "SIP_QUOTE": "ALPACA_HISTORICAL_QUOTES",
+    "SIP_MINUTE_BAR": "ALPACA_INTRADAY_BARS",
+    "SIP_DAILY_BAR": "ALPACA_DAILY_BARS",
+    "IEX_FRESHNESS": "ALPACA_LATEST_QUOTES",
+}
+_ACTUAL_CLOSE_GLOBAL_REFERENCE_URLS = {
+    "PRIMARY_HALT_FEED": (
+        "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts",
+        "Nasdaq",
+    ),
+    "TRADER_ALERT_HALT": (
+        "https://www.nasdaqtrader.com/rss.aspx?categorylist=2&feed=currentheadlines",
+        "Nasdaq",
+    ),
+    "OPERATIONAL_STATUS": (
+        "https://www.nyse.com/api/notifications/public/alerts?2=3",
+        "New York Stock Exchange",
+    ),
+    "CROSS_CHECK_CALENDAR": (
+        "https://www.nasdaqtrader.com/Trader.aspx?id=Calendar",
+        "Nasdaq",
+    ),
 }
 _PHASE1_EXIT_FEE_SCHEDULE_VERSION = "PHASE1_US_EQUITY_EXIT_V1"
 _PHASE1_EXIT_FEE_MICROS = 1_000_000
@@ -1220,6 +1259,107 @@ class SourceObservationReceipt:
     details_json: str
     row_reference: JournalRowReference
     payload_row_reference: JournalRowReference
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActualCloseReceiptBinding:
+    """Requested role/scope for one exact current observation receipt."""
+
+    symbol: str | None
+    source_role: str
+    receipt: SourceObservationReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class ActualCloseFailureBinding:
+    """Explicit fail-closed source result for one exact role and scope."""
+
+    symbol: str | None
+    source_role: str
+    failure_code: str
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ActualCloseReviewBindingSource:
+    """One exact persisted receipt-or-failure member of a close review."""
+
+    row_id: int
+    review_id: str
+    binding_ordinal: int
+    symbol: str | None
+    source_role: str
+    source_observation_id: int | None
+    failure_code: str | None
+    received_at: datetime
+    record_sha256: str
+    receipt: SourceObservationReceipt | None
+    row_reference: JournalRowReference
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualCloseReviewSource:
+    """Exact durable close-review material and its receipt/failure manifest."""
+
+    row_id: int
+    review_id: str
+    session_date: date
+    review_at: datetime
+    mark_cutoff: datetime
+    query_cutoff: datetime
+    retrieved_at: datetime
+    expected_binding_count: int
+    bindings: tuple[ActualCloseReviewBindingSource, ...]
+    receipts: tuple[SourceObservationReceipt, ...]
+    source_digest: str
+    record_sha256: str
+    row_reference: JournalRowReference
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class CloseRecommendationSource:
+    """One durable stop/action recommendation bound to an ACTUAL lifecycle."""
+
+    row_id: int
+    recommendation_id: str
+    review_id: str
+    session_date: date
+    symbol: str
+    position_plan_digest: str
+    signal_id: str
+    opening_actual_lifecycle_id: str
+    opening_actual_event_id: str
+    opening_actual_execution_event_id: int
+    initial_stop_micros: int
+    prior_recommended_stop_micros: int | None
+    recommended_stop_micros: int
+    action: str
+    reason_codes: tuple[str, ...]
+    received_at: datetime
+    query_cutoff: datetime
+    review_source: ActualCloseReviewSource
+    signal_source: Phase1SignalSource
+    anchor_binding: ActualPositionPlanBindingSource
+    source_digest: str
+    record_sha256: str
+    row_reference: JournalRowReference
+    row_references: tuple[JournalRowReference, ...]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class LatestCloseRecommendationSource:
+    """Authoritative zero-or-one latest recommendation as of one cutoff."""
+
+    symbol: str
+    position_plan_digest: str
+    query_cutoff: datetime
+    position_plan_source: ActualPositionPlanSource
+    recommendation: CloseRecommendationSource | None
+    eligible_recommendation_ids: tuple[str, ...]
+    recommendation_highwater: int
+    row_references: tuple[JournalRowReference, ...]
     source_digest: str
 
 
@@ -4021,6 +4161,36 @@ _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES: dict[
         int,
     ],
 ] = {}
+_ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
+_LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[
+        ReferenceType[object],
+        tuple[object, ...],
+        ReferenceType[object],
+        int,
+        int,
+    ],
+] = {}
 _PHASE1_ENTRY_SOURCE_AUTHORITIES: dict[
     int,
     tuple[
@@ -4232,6 +4402,9 @@ _PHASE1_SOURCE_TYPES = frozenset(
         Phase1PublicationSource,
         Phase1SignalSource,
         ActualPositionPlanSource,
+        ActualCloseReviewSource,
+        CloseRecommendationSource,
+        LatestCloseRecommendationSource,
         Phase1EntrySource,
         Phase1ShadowFillSource,
         Phase1SignalEvidenceSource,
@@ -4253,6 +4426,9 @@ _PHASE1_SOURCE_REGISTRIES = (
     _PHASE1_PUBLICATION_SOURCE_AUTHORITIES,
     _PHASE1_SIGNAL_SOURCE_AUTHORITIES,
     _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES,
+    _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES,
+    _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
+    _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
     _PHASE1_ENTRY_SOURCE_AUTHORITIES,
     _PHASE1_SHADOW_FILL_SOURCE_AUTHORITIES,
     _PHASE1_SIGNAL_EVIDENCE_SOURCE_AUTHORITIES,
@@ -4300,6 +4476,43 @@ _PHASE1_READER_DIRECT_DEPENDENCY_FIELDS = (
             _Phase1ReaderDependencyField(
                 "signal_source",
                 Phase1SignalSource,
+            ),
+        ),
+    ),
+    (
+        ActualCloseReviewSource,
+        (
+            _Phase1ReaderDependencyField(
+                "receipts",
+                SourceObservationReceipt,
+                many=True,
+            ),
+        ),
+    ),
+    (
+        CloseRecommendationSource,
+        (
+            _Phase1ReaderDependencyField(
+                "review_source",
+                ActualCloseReviewSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "signal_source",
+                Phase1SignalSource,
+            ),
+        ),
+    ),
+    (
+        LatestCloseRecommendationSource,
+        (
+            _Phase1ReaderDependencyField(
+                "position_plan_source",
+                ActualPositionPlanSource,
+            ),
+            _Phase1ReaderDependencyField(
+                "recommendation",
+                CloseRecommendationSource,
+                optional=True,
             ),
         ),
     ),
@@ -5628,6 +5841,10 @@ def _phase1_reader_nested_authority_candidates(
             candidate = _journal_action_source_authority_candidate(dependency)
         elif type(dependency) is JournalActualReplaySource:
             candidate = _journal_replay_source_authority_candidate(dependency)
+        elif type(dependency) is SourceObservationReceipt:
+            candidate = _source_observation_receipt_authority_candidate(
+                dependency
+            )
         else:
             candidate = None
         if candidate is None:
@@ -5908,6 +6125,12 @@ def _phase1_source_registry(source: object) -> _JournalSourceRegistry | None:
         return _PHASE1_SIGNAL_SOURCE_AUTHORITIES
     if type(source) is ActualPositionPlanSource:
         return _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES
+    if type(source) is ActualCloseReviewSource:
+        return _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES
+    if type(source) is CloseRecommendationSource:
+        return _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES
+    if type(source) is LatestCloseRecommendationSource:
+        return _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES
     if type(source) is Phase1EntrySource:
         return _PHASE1_ENTRY_SOURCE_AUTHORITIES
     if type(source) is Phase1ShadowFillSource:
@@ -6718,6 +6941,30 @@ def is_verified_actual_position_plan_source(source: object) -> bool:
         source,
         ActualPositionPlanSource,
         _ACTUAL_POSITION_PLAN_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_actual_close_review_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        ActualCloseReviewSource,
+        _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_close_recommendation_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        CloseRecommendationSource,
+        _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
+    )
+
+
+def is_verified_latest_close_recommendation_source(source: object) -> bool:
+    return _is_verified_phase1_source(
+        source,
+        LatestCloseRecommendationSource,
+        _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
     )
 
 
@@ -8344,6 +8591,1778 @@ class Journal:
         return candidate is not None and (
             _current_journal_source_authority_owner((candidate,)) is self
         )
+
+    def _actual_close_receipt_binding_material(
+        self,
+        binding: ActualCloseReceiptBinding,
+        *,
+        review_at: datetime,
+        mark_cutoff: datetime,
+        query_cutoff: datetime,
+    ) -> dict[str, object]:
+        if type(binding) is not ActualCloseReceiptBinding:
+            raise InvalidJournalValue(
+                "actual close receipt bindings must be exact binding values"
+            )
+        role = _actual_close_role(binding.source_role)
+        symbol = _actual_close_scope(binding.symbol, role)
+        receipt = binding.receipt
+        candidate = _source_observation_receipt_authority_candidate(receipt)
+        if candidate is None or (
+            _current_journal_source_authority_owner((candidate,)) is not self
+        ):
+            raise InvalidJournalValue(
+                "actual close receipt is not current for this Journal"
+            )
+        if (
+            receipt.health_result != "OK"
+            or receipt.retrieved_at < review_at
+            or receipt.retrieved_at > query_cutoff
+            or receipt.source_time > query_cutoff
+            or (
+                role not in _ACTUAL_CLOSE_MARKET_ROLE_TYPES
+                and receipt.source_time > review_at
+            )
+        ):
+            raise InvalidJournalValue(
+                "actual close receipt chronology or health is invalid"
+            )
+        source_row, payload_row = self._phase1_core_source_rows(
+            source_observation_id=receipt.row_id,
+        )
+        if (
+            receipt.row_reference
+            != _journal_row_reference(
+                "source_observations",
+                _SOURCE_OBSERVATION_COLUMNS,
+                source_row,
+            )
+            or receipt.payload_row_reference
+            != _journal_row_reference(
+                "phase1_source_payloads",
+                _PHASE1_SOURCE_PAYLOAD_COLUMNS,
+                payload_row,
+            )
+            or bytes(payload_row[3]) != receipt.source_payload
+        ):
+            raise InvalidJournalValue(
+                "actual close receipt conflicts with durable source rows"
+            )
+        details = _canonical_stored_details(
+            receipt.details_json,
+            label="actual close source receipt",
+        )
+        if role in _ACTUAL_CLOSE_MARKET_ROLE_TYPES:
+            expected_type = _ACTUAL_CLOSE_MARKET_ROLE_TYPES[role]
+            if receipt.source_type != expected_type:
+                raise InvalidJournalValue(
+                    "actual close market role conflicts with source type"
+                )
+            collection, _collection_is_list = (
+                _validate_phase1_alpaca_page_contract(
+                    source_row,
+                    receipt.source_payload,
+                )
+            )
+            metadata = _phase1_recompute_alpaca_page_metadata(
+                payload=receipt.source_payload,
+                request_url=receipt.source_uri,
+                source_type=receipt.source_type,
+                retrieved_at=receipt.retrieved_at,
+            )
+            if (
+                details
+                != {
+                    "source_observation_id": (
+                        metadata.source_observation_id
+                    )
+                }
+                or receipt.source_time != metadata.source_time
+                or receipt.delay_seconds != metadata.delay_seconds
+                or receipt.provider_sequence is not None
+                or (role != "IEX_FRESHNESS" and receipt.source_time > mark_cutoff)
+                or (role == "IEX_FRESHNESS" and receipt.source_time > review_at)
+            ):
+                raise InvalidJournalValue(
+                    "actual close market receipt metadata is inconsistent"
+                )
+            parsed = urlsplit(receipt.source_uri)
+            query: dict[str, list[str]] = {}
+            for name, value in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            ):
+                query.setdefault(name, []).append(value)
+            expected_feed = "iex" if role == "IEX_FRESHNESS" else "sip"
+            expected_timeframe = {
+                "SIP_MINUTE_BAR": "1Min",
+                "SIP_DAILY_BAR": "1Day",
+            }.get(role)
+            try:
+                document = json.loads(receipt.source_payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise InvalidJournalValue(
+                    "actual close market receipt payload is invalid"
+                ) from error
+            if (
+                query.get("symbols") != [symbol]
+                or query.get("feed") != [expected_feed]
+                or (
+                    expected_timeframe is not None
+                    and query.get("timeframe") != [expected_timeframe]
+                )
+                or set(document[collection]) != {symbol}
+            ):
+                raise InvalidJournalValue(
+                    "actual close market receipt scope is inconsistent"
+                )
+        elif role == "EVENT_EVIDENCE":
+            expected_detail_keys = {
+                "accession",
+                "issuer_cik",
+                "source_observation_id",
+                "source_role",
+                "symbol",
+                "timestamp_source",
+            }
+            if set(details) != expected_detail_keys or details["symbol"] != symbol:
+                raise InvalidJournalValue(
+                    "actual close event evidence details are inconsistent"
+                )
+            source_type = receipt.source_type
+            issuer_cik = details["issuer_cik"]
+            accession = details["accession"]
+            source_role = details["source_role"]
+            if source_type == "SEC_SUBMISSIONS":
+                valid = (
+                    type(issuer_cik) is str
+                    and re.fullmatch(r"[0-9]{10}", issuer_cik) is not None
+                    and accession is None
+                    and source_role is None
+                    and receipt.provider
+                    == "U.S. Securities and Exchange Commission"
+                    and receipt.feed == "SEC_SUBMISSIONS_METADATA"
+                    and receipt.source_uri
+                    == f"https://data.sec.gov/submissions/CIK{issuer_cik}.json"
+                )
+            elif source_type == "SEC_ARCHIVE":
+                parsed_archive = urlsplit(receipt.source_uri)
+                try:
+                    archive_port = parsed_archive.port
+                except ValueError:
+                    archive_port = -1
+                archive_path_matches = False
+                if (
+                    type(issuer_cik) is str
+                    and re.fullmatch(r"[0-9]{10}", issuer_cik) is not None
+                    and type(accession) is str
+                    and re.fullmatch(
+                        r"[0-9]{10}-[0-9]{2}-[0-9]{6}",
+                        accession,
+                    )
+                    is not None
+                ):
+                    archive_path_matches = re.fullmatch(
+                        rf"/Archives/edgar/data/{int(issuer_cik)}/"
+                        rf"{accession.replace('-', '')}/"
+                        r"[A-Za-z0-9][A-Za-z0-9._-]*",
+                        parsed_archive.path,
+                    ) is not None
+                valid = (
+                    type(issuer_cik) is str
+                    and re.fullmatch(r"[0-9]{10}", issuer_cik) is not None
+                    and type(accession) is str
+                    and re.fullmatch(
+                        r"[0-9]{10}-[0-9]{2}-[0-9]{6}",
+                        accession,
+                    )
+                    is not None
+                    and source_role is None
+                    and receipt.provider
+                    == "U.S. Securities and Exchange Commission"
+                    and receipt.feed == "SEC_FILING_METADATA"
+                    and parsed_archive.scheme == "https"
+                    and parsed_archive.hostname == "www.sec.gov"
+                    and parsed_archive.netloc
+                    in {"www.sec.gov", "www.sec.gov:443"}
+                    and archive_port in (None, 443)
+                    and parsed_archive.username is None
+                    and parsed_archive.password is None
+                    and not parsed_archive.query
+                    and not parsed_archive.fragment
+                    and archive_path_matches
+                )
+            elif source_type == "OFFICIAL_REFERENCE":
+                from . import evidence as evidence_module
+
+                authority = evidence_module._SCOPED_REFERENCE_AUTHORITIES.get(
+                    source_role
+                )
+                valid = (
+                    source_role
+                    in {
+                        f"ISSUER_IR:{symbol}",
+                        f"CORPORATE_ACTION:{symbol}",
+                    }
+                    and receipt.feed == "PRIMARY_METADATA"
+                    and authority is not None
+                    and authority[0] == issuer_cik
+                    and (receipt.source_uri, receipt.provider) in authority[1]
+                    and accession is None
+                )
+            else:
+                valid = False
+            if not valid:
+                raise InvalidJournalValue(
+                    "actual close event evidence source identity is invalid"
+                )
+        else:
+            expected_url, expected_provider = (
+                _ACTUAL_CLOSE_GLOBAL_REFERENCE_URLS[role]
+            )
+            if (
+                receipt.source_type != "OFFICIAL_REFERENCE"
+                or receipt.source_uri != expected_url
+                or receipt.provider != expected_provider
+                or receipt.feed
+                not in (
+                    {"PRIMARY_METADATA", "UNAVAILABLE"}
+                    if role == "OPERATIONAL_STATUS"
+                    else {"PRIMARY_METADATA"}
+                )
+                or details.get("source_role") != role
+                or details.get("symbol") is not None
+                or set(details)
+                != {
+                    "accession",
+                    "issuer_cik",
+                    "source_observation_id",
+                    "source_role",
+                    "symbol",
+                    "timestamp_source",
+                }
+            ):
+                raise InvalidJournalValue(
+                    "actual close official reference identity is invalid"
+                )
+        if not _is_current_journal_source_authority_without_callbacks(receipt):
+            raise InvalidJournalValue(
+                "actual close receipt changed during validation"
+            )
+        return {
+            "failure_code": None,
+            "received_at": _canonical_timestamp(receipt.retrieved_at),
+            "receipt": receipt,
+            "receipt_source_digest": receipt.source_digest,
+            "source_observation_id": receipt.row_id,
+            "source_role": role,
+            "symbol": symbol,
+        }
+
+    def _actual_close_failure_binding_material(
+        self,
+        binding: ActualCloseFailureBinding,
+        *,
+        session_date: date,
+        review_at: datetime,
+        query_cutoff: datetime,
+    ) -> dict[str, object]:
+        if type(binding) is not ActualCloseFailureBinding:
+            raise InvalidJournalValue(
+                "actual close failure bindings must be exact binding values"
+            )
+        role = _actual_close_role(binding.source_role)
+        symbol = _actual_close_scope(binding.symbol, role)
+        failure_code = _actual_close_failure_code(binding.failure_code)
+        received_at = _parse_canonical_timestamp(
+            _canonical_timestamp(binding.received_at)
+        )
+        if (
+            received_at < review_at
+            or received_at > query_cutoff
+            or received_at.astimezone(ZoneInfo("America/New_York")).date()
+            != session_date
+        ):
+            raise InvalidJournalValue(
+                "actual close failure chronology is invalid"
+            )
+        return {
+            "failure_code": failure_code,
+            "received_at": _canonical_timestamp(received_at),
+            "receipt": None,
+            "receipt_source_digest": None,
+            "source_observation_id": None,
+            "source_role": role,
+            "symbol": symbol,
+        }
+
+    @staticmethod
+    def _actual_close_alpaca_page_chain(
+        materials: Sequence[Mapping[str, object]],
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return one exact provider-token page chain in request order."""
+        if not materials:
+            raise InvalidJournalValue(
+                "actual close market page chain is empty"
+            )
+        first_receipt = materials[0]["receipt"]
+        symbol = materials[0]["symbol"]
+        if (
+            type(first_receipt) is not SourceObservationReceipt
+            or type(symbol) is not str
+        ):
+            raise InvalidJournalValue(
+                "actual close market page chain is malformed"
+            )
+        source_type = first_receipt.source_type
+        collection = _PHASE1_ALPACA_SOURCE_CONTRACTS[source_type][0]
+        pages_by_request_token: dict[
+            str | None,
+            tuple[Mapping[str, object], object],
+        ] = {}
+        request_digests: set[str] = set()
+        request_urls: list[str] = []
+        for material in materials:
+            receipt = material["receipt"]
+            if (
+                type(receipt) is not SourceObservationReceipt
+                or receipt.source_type != source_type
+                or material["symbol"] != symbol
+            ):
+                raise InvalidJournalValue(
+                    "actual close market pages disagree on role or scope"
+                )
+            parsed = urlsplit(receipt.source_uri)
+            try:
+                pairs = parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+                document = json.loads(receipt.source_payload.decode("utf-8"))
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
+                raise InvalidJournalValue(
+                    "actual close market pagination is malformed"
+                ) from error
+            query: dict[str, list[str]] = {}
+            for name, value in pairs:
+                query.setdefault(name, []).append(value)
+            token_values = query.get("page_token", [])
+            if (
+                len(token_values) > 1
+                or (token_values and not token_values[0])
+            ):
+                raise InvalidJournalValue(
+                    "actual close market request token is malformed"
+                )
+            request_token = token_values[0] if token_values else None
+            if request_token in pages_by_request_token:
+                raise InvalidJournalValue(
+                    "actual close market request token is duplicated"
+                )
+            if (
+                type(document) is not dict
+                or "next_page_token" not in document
+                and source_type != "ALPACA_LATEST_QUOTES"
+            ):
+                raise InvalidJournalValue(
+                    "actual close market response token is missing"
+                )
+            next_token = document.get("next_page_token")
+            if next_token is not None and (
+                type(next_token) is not str
+                or not next_token
+                or len(next_token) > 512
+                or not next_token.isascii()
+                or not next_token.isprintable()
+            ):
+                raise InvalidJournalValue(
+                    "actual close market response token is malformed"
+                )
+            pages_by_request_token[request_token] = (material, next_token)
+            request_digests.add(
+                _phase1_provider_request_digest(
+                    collection=collection,
+                    requested_symbols=(symbol,),
+                    request_url=receipt.source_uri,
+                )
+            )
+            request_urls.append(receipt.source_uri)
+        if len(request_digests) != 1:
+            raise InvalidJournalValue(
+                "actual close market pages disagree on their base request"
+            )
+        if source_type == "ALPACA_LATEST_QUOTES":
+            page = pages_by_request_token.get(None)
+            if (
+                len(pages_by_request_token) != 1
+                or page is None
+                or page[1] is not None
+            ):
+                raise InvalidJournalValue(
+                    "actual close latest quote must be one terminal page"
+                )
+            return (page[0],)
+        _phase1_historical_request_window(tuple(request_urls))
+        ordered: list[Mapping[str, object]] = []
+        request_token: str | None = None
+        prior_retrieved_at: datetime | None = None
+        while True:
+            page = pages_by_request_token.pop(request_token, None)
+            if page is None:
+                raise InvalidJournalValue(
+                    "actual close market page chain is disconnected"
+                )
+            material, next_token = page
+            receipt = material["receipt"]
+            assert type(receipt) is SourceObservationReceipt
+            if (
+                prior_retrieved_at is not None
+                and receipt.retrieved_at < prior_retrieved_at
+            ):
+                raise InvalidJournalValue(
+                    "actual close market page retrieval order regresses"
+                )
+            ordered.append(material)
+            prior_retrieved_at = receipt.retrieved_at
+            if next_token is None:
+                break
+            request_token = str(next_token)
+        if pages_by_request_token:
+            raise InvalidJournalValue(
+                "actual close market page chain has extra or terminal pages"
+            )
+        return tuple(ordered)
+
+    def _actual_close_validate_and_order_materials(
+        self,
+        materials: Sequence[Mapping[str, object]],
+    ) -> list[Mapping[str, object]]:
+        """Require one complete role result per scope and canonicalize it."""
+        grouped: dict[
+            tuple[str | None, str],
+            list[Mapping[str, object]],
+        ] = {}
+        symbols: set[str] = set()
+        for material in materials:
+            symbol = material["symbol"]
+            role = str(material["source_role"])
+            if type(symbol) is str:
+                symbols.add(symbol)
+            grouped.setdefault((symbol, role), []).append(material)
+        expected_scopes = {
+            *((None, role) for role in _ACTUAL_CLOSE_GLOBAL_ROLES),
+            *(
+                (symbol, role)
+                for symbol in symbols
+                for role in _ACTUAL_CLOSE_SYMBOL_ROLES
+            ),
+        }
+        if set(grouped) != expected_scopes:
+            raise InvalidJournalValue(
+                "actual close review source roles are incomplete"
+            )
+        ordered: list[Mapping[str, object]] = []
+        for scope in sorted(
+            grouped,
+            key=lambda value: (
+                _ACTUAL_CLOSE_SOURCE_ROLES.index(value[1]),
+                "" if value[0] is None else value[0],
+            ),
+        ):
+            group = grouped[scope]
+            receipt_materials = [
+                material
+                for material in group
+                if material["receipt"] is not None
+            ]
+            failure_materials = [
+                material
+                for material in group
+                if material["failure_code"] is not None
+            ]
+            if bool(receipt_materials) == bool(failure_materials) or (
+                failure_materials and len(failure_materials) != 1
+            ):
+                raise InvalidJournalValue(
+                    "actual close scoped role must contain receipt pages XOR failure"
+                )
+            if failure_materials:
+                ordered.extend(failure_materials)
+            elif scope[1] in _ACTUAL_CLOSE_MARKET_ROLE_TYPES:
+                ordered.extend(
+                    self._actual_close_alpaca_page_chain(receipt_materials)
+                )
+            else:
+                ordered.extend(
+                    sorted(
+                        receipt_materials,
+                        key=lambda material: (
+                            material["receipt"].source_uri,
+                            material["receipt"].observation_sha256,
+                        ),
+                    )
+                )
+        return ordered
+
+    @staticmethod
+    def _actual_close_review_identity_material(
+        *,
+        session_date: str,
+        review_at: str,
+        mark_cutoff: str,
+        query_cutoff: str,
+        retrieved_at: str,
+        bindings: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "bindings": [
+                {
+                    "binding_ordinal": ordinal,
+                    "failure_code": binding["failure_code"],
+                    "received_at": binding["received_at"],
+                    "receipt_source_digest": binding["receipt_source_digest"],
+                    "source_observation_id": binding["source_observation_id"],
+                    "source_role": binding["source_role"],
+                    "symbol": binding["symbol"],
+                }
+                for ordinal, binding in enumerate(bindings, start=1)
+            ],
+            "mark_cutoff": mark_cutoff,
+            "query_cutoff": query_cutoff,
+            "retrieved_at": retrieved_at,
+            "review_at": review_at,
+            "session_date": session_date,
+        }
+
+    def append_actual_close_review(
+        self,
+        *,
+        session_date: date,
+        review_at: datetime,
+        mark_cutoff: datetime,
+        query_cutoff: datetime,
+        retrieved_at: datetime,
+        receipt_bindings: Sequence[ActualCloseReceiptBinding],
+        failure_bindings: Sequence[ActualCloseFailureBinding],
+    ) -> ActualCloseReviewSource:
+        """Append a deterministic receipt/failure manifest and reread it."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "actual close reviews require an outermost transaction"
+            )
+        if type(receipt_bindings) is not tuple or type(failure_bindings) is not tuple:
+            raise InvalidJournalValue(
+                "actual close bindings must be exact tuples"
+            )
+        session_text = _canonical_date(session_date)
+        normalized_review = _parse_canonical_timestamp(
+            _canonical_timestamp(review_at)
+        )
+        normalized_mark = _parse_canonical_timestamp(
+            _canonical_timestamp(mark_cutoff)
+        )
+        normalized_query = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        normalized_retrieved = _parse_canonical_timestamp(
+            _canonical_timestamp(retrieved_at)
+        )
+        if not (
+            normalized_mark < normalized_review
+            <= normalized_query
+            <= normalized_retrieved
+        ) or any(
+            value.date() != session_date
+            or value.astimezone(ZoneInfo("America/New_York")).date()
+            != session_date
+            for value in (
+                normalized_mark,
+                normalized_review,
+                normalized_query,
+                normalized_retrieved,
+            )
+        ):
+            raise InvalidJournalValue(
+                "actual close review chronology is invalid"
+            )
+        materials = [
+            self._actual_close_receipt_binding_material(
+                binding,
+                review_at=normalized_review,
+                mark_cutoff=normalized_mark,
+                query_cutoff=normalized_query,
+            )
+            for binding in receipt_bindings
+        ]
+        materials.extend(
+            self._actual_close_failure_binding_material(
+                binding,
+                session_date=session_date,
+                review_at=normalized_review,
+                query_cutoff=normalized_query,
+            )
+            for binding in failure_bindings
+        )
+        if len(
+            {
+                material["source_observation_id"]
+                for material in materials
+                if material["source_observation_id"] is not None
+            }
+        ) != len(receipt_bindings):
+            raise InvalidJournalValue(
+                "actual close receipt bindings must be unique"
+            )
+        failure_scopes = [
+            (material["symbol"], material["source_role"])
+            for material in materials
+            if material["failure_code"] is not None
+        ]
+        if len(failure_scopes) != len(set(failure_scopes)):
+            raise InvalidJournalValue(
+                "actual close failure roles must be unique per scope"
+            )
+        receipt_scopes = {
+            (material["symbol"], material["source_role"])
+            for material in materials
+            if material["source_observation_id"] is not None
+        }
+        if receipt_scopes.intersection(failure_scopes):
+            raise InvalidJournalValue(
+                "actual close scoped role must contain receipts XOR failure"
+            )
+        materials = self._actual_close_validate_and_order_materials(materials)
+        timing = {
+            "mark_cutoff": _canonical_timestamp(normalized_mark),
+            "query_cutoff": _canonical_timestamp(normalized_query),
+            "retrieved_at": _canonical_timestamp(normalized_retrieved),
+            "review_at": _canonical_timestamp(normalized_review),
+            "session_date": session_text,
+        }
+        identity_material = self._actual_close_review_identity_material(
+            **timing,
+            bindings=materials,
+        )
+        review_id = _actual_close_semantic_digest(
+            "stock-monitor/actual-close-review-id/v1",
+            identity_material,
+        )
+        source_digest = _actual_close_semantic_digest(
+            "stock-monitor/actual-close-review-source/v1",
+            {"review_id": review_id, **identity_material},
+        )
+        review_material = {
+            "expected_binding_count": len(materials),
+            "mark_cutoff": timing["mark_cutoff"],
+            "query_cutoff": timing["query_cutoff"],
+            "retrieved_at": timing["retrieved_at"],
+            "review_at": timing["review_at"],
+            "review_id": review_id,
+            "session_date": session_text,
+            "source_digest": source_digest,
+        }
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(review_material).encode("utf-8")
+        ).hexdigest()
+        binding_values: list[tuple[object, ...]] = []
+        for ordinal, material in enumerate(materials, start=1):
+            record_material = {
+                "binding_ordinal": ordinal,
+                "failure_code": material["failure_code"],
+                "received_at": material["received_at"],
+                "review_id": review_id,
+                "source_observation_id": material["source_observation_id"],
+                "source_role": material["source_role"],
+                "symbol": material["symbol"],
+            }
+            binding_values.append(
+                (
+                    *(
+                        record_material[column]
+                        for column in _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS[1:-1]
+                    ),
+                    hashlib.sha256(
+                        _canonical_audit_json(record_material).encode("utf-8")
+                    ).hexdigest(),
+                )
+            )
+        with self.transaction():
+            candidates = tuple(
+                _source_observation_receipt_authority_candidate(
+                    material["receipt"]
+                )
+                for material in materials
+                if material["receipt"] is not None
+            )
+            if any(candidate is None for candidate in candidates) or (
+                candidates
+                and _current_journal_source_authority_owner(
+                    tuple(candidate for candidate in candidates if candidate is not None)
+                )
+                is not self
+            ):
+                raise InvalidJournalValue(
+                    "actual close receipt set changed before write"
+                )
+            existing = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_ACTUAL_CLOSE_REVIEW_COLUMNS)
+                + " FROM actual_close_reviews WHERE session_date = ? "
+                "AND query_cutoff = ?",
+                (session_text, timing["query_cutoff"]),
+            ).fetchone()
+            if existing is not None:
+                existing_bindings = _sql(
+                    self._connection,
+                    "SELECT " + ", ".join(_ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS)
+                    + " FROM actual_close_source_bindings WHERE review_id = ? "
+                    "ORDER BY binding_ordinal",
+                    (review_id,),
+                ).fetchall()
+                if tuple(existing[1:]) != (
+                    review_id,
+                    session_text,
+                    timing["review_at"],
+                    timing["mark_cutoff"],
+                    timing["query_cutoff"],
+                    timing["retrieved_at"],
+                    len(materials),
+                    source_digest,
+                    record_sha256,
+                ) or tuple(tuple(row[1:]) for row in existing_bindings) != tuple(
+                    binding_values
+                ):
+                    raise IdempotencyConflict(
+                        "actual close review conflicts with stored content"
+                    )
+            else:
+                if any(
+                    not _is_current_journal_source_authority_without_callbacks(
+                        material["receipt"]
+                    )
+                    for material in materials
+                    if material["receipt"] is not None
+                ):
+                    raise InvalidJournalValue(
+                        "actual close receipt changed during write validation"
+                    )
+                try:
+                    with self._provider_monitoring_write():
+                        _sql(
+                            self._connection,
+                            "INSERT INTO actual_close_reviews("
+                            + ", ".join(_ACTUAL_CLOSE_REVIEW_COLUMNS[1:])
+                            + ") VALUES ("
+                            + ", ".join("?" for _ in _ACTUAL_CLOSE_REVIEW_COLUMNS[1:])
+                            + ")",
+                            tuple(review_material[column] for column in _ACTUAL_CLOSE_REVIEW_COLUMNS[1:-1])
+                            + (record_sha256,),
+                        )
+                        for values in binding_values:
+                            _sql(
+                                self._connection,
+                                "INSERT INTO actual_close_source_bindings("
+                                + ", ".join(_ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS[1:])
+                                + ") VALUES ("
+                                + ", ".join("?" for _ in _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS[1:])
+                                + ")",
+                                values,
+                            )
+                except sqlite3.IntegrityError as error:
+                    raise IdempotencyConflict(
+                        "actual close review conflicts with stored content"
+                    ) from error
+        return self.read_actual_close_review_source(
+            review_id,
+            query_cutoff=normalized_query,
+        )
+
+    def read_actual_close_review_source(
+        self,
+        review_id: str,
+        *,
+        query_cutoff: datetime,
+    ) -> ActualCloseReviewSource:
+        """Read and authenticate one complete close-review binding manifest."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "actual close review source requires a post-commit read"
+            )
+        review_id = _require_sha256(review_id, "actual close review ID")
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_ACTUAL_CLOSE_REVIEW_COLUMNS)
+            + " FROM actual_close_reviews WHERE review_id = ? COLLATE BINARY",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("actual close review does not exist")
+        stored = dict(zip(_ACTUAL_CLOSE_REVIEW_COLUMNS, tuple(row), strict=True))
+        stored_cutoff = _parse_canonical_timestamp(str(stored["query_cutoff"]))
+        if stored_cutoff != normalized_cutoff:
+            raise InvalidJournalValue(
+                "actual close review query cutoff is not exact"
+            )
+        binding_rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS)
+            + " FROM actual_close_source_bindings WHERE review_id = ? "
+            "ORDER BY binding_ordinal, id",
+            (review_id,),
+        ).fetchall()
+        expected_count = int(stored["expected_binding_count"])
+        if len(binding_rows) != expected_count or tuple(
+            int(binding_row[2]) for binding_row in binding_rows
+        ) != tuple(range(1, expected_count + 1)):
+            raise MigrationCorruption(
+                "actual close review binding manifest is incomplete"
+            )
+        receipt_ids = tuple(
+            int(binding_row[5])
+            for binding_row in binding_rows
+            if binding_row[5] is not None
+        )
+        receipts = self.read_source_observation_receipts(receipt_ids)
+        receipts_by_id = {receipt.row_id: receipt for receipt in receipts}
+        normalized_review = _parse_canonical_timestamp(str(stored["review_at"]))
+        normalized_mark = _parse_canonical_timestamp(str(stored["mark_cutoff"]))
+        normalized_retrieved = _parse_canonical_timestamp(
+            str(stored["retrieved_at"])
+        )
+        material_rows: list[dict[str, object]] = []
+        binding_sources: list[ActualCloseReviewBindingSource] = []
+        for binding_row in binding_rows:
+            binding_stored = dict(
+                zip(
+                    _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS,
+                    tuple(binding_row),
+                    strict=True,
+                )
+            )
+            receipt = (
+                None
+                if binding_stored["source_observation_id"] is None
+                else receipts_by_id.get(int(binding_stored["source_observation_id"]))
+            )
+            input_binding: ActualCloseReceiptBinding | ActualCloseFailureBinding
+            if receipt is not None:
+                input_binding = ActualCloseReceiptBinding(
+                    None if binding_stored["symbol"] is None else str(binding_stored["symbol"]),
+                    str(binding_stored["source_role"]),
+                    receipt,
+                )
+                material = self._actual_close_receipt_binding_material(
+                    input_binding,
+                    review_at=normalized_review,
+                    mark_cutoff=normalized_mark,
+                    query_cutoff=stored_cutoff,
+                )
+            elif binding_stored["failure_code"] is not None:
+                input_binding = ActualCloseFailureBinding(
+                    None if binding_stored["symbol"] is None else str(binding_stored["symbol"]),
+                    str(binding_stored["source_role"]),
+                    str(binding_stored["failure_code"]),
+                    _parse_canonical_timestamp(str(binding_stored["received_at"])),
+                )
+                material = self._actual_close_failure_binding_material(
+                    input_binding,
+                    session_date=date.fromisoformat(str(stored["session_date"])),
+                    review_at=normalized_review,
+                    query_cutoff=stored_cutoff,
+                )
+            else:
+                raise MigrationCorruption(
+                    "actual close review binding is neither receipt nor failure"
+                )
+            record_material = {
+                column: binding_stored[column]
+                for column in _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS[1:-1]
+            }
+            if (
+                int(binding_stored["binding_ordinal"])
+                != len(material_rows) + 1
+                or str(binding_stored["received_at"]) != material["received_at"]
+                or binding_stored["source_observation_id"]
+                != material["source_observation_id"]
+                or binding_stored["failure_code"] != material["failure_code"]
+                or str(binding_stored["record_sha256"])
+                != hashlib.sha256(
+                    _canonical_audit_json(record_material).encode("utf-8")
+                ).hexdigest()
+            ):
+                raise MigrationCorruption(
+                    "actual close review binding integrity failed"
+                )
+            material_rows.append(material)
+            binding_sources.append(
+                ActualCloseReviewBindingSource(
+                    row_id=int(binding_stored["id"]),
+                    review_id=review_id,
+                    binding_ordinal=int(binding_stored["binding_ordinal"]),
+                    symbol=material["symbol"],
+                    source_role=str(material["source_role"]),
+                    source_observation_id=material["source_observation_id"],
+                    failure_code=material["failure_code"],
+                    received_at=_parse_canonical_timestamp(str(material["received_at"])),
+                    record_sha256=str(binding_stored["record_sha256"]),
+                    receipt=receipt,
+                    row_reference=_journal_row_reference(
+                        "actual_close_source_bindings",
+                        _ACTUAL_CLOSE_SOURCE_BINDING_COLUMNS,
+                        binding_row,
+                    ),
+                )
+            )
+        try:
+            canonical_material_rows = (
+                self._actual_close_validate_and_order_materials(material_rows)
+            )
+        except InvalidJournalValue as error:
+            raise MigrationCorruption(
+                "actual close review binding cohort is invalid"
+            ) from error
+        if material_rows != canonical_material_rows:
+            raise MigrationCorruption(
+                "actual close review binding order is not deterministic"
+            )
+        identity_material = self._actual_close_review_identity_material(
+            session_date=str(stored["session_date"]),
+            review_at=str(stored["review_at"]),
+            mark_cutoff=str(stored["mark_cutoff"]),
+            query_cutoff=str(stored["query_cutoff"]),
+            retrieved_at=str(stored["retrieved_at"]),
+            bindings=material_rows,
+        )
+        expected_review_id = _actual_close_semantic_digest(
+            "stock-monitor/actual-close-review-id/v1",
+            identity_material,
+        )
+        expected_source_digest = _actual_close_semantic_digest(
+            "stock-monitor/actual-close-review-source/v1",
+            {"review_id": expected_review_id, **identity_material},
+        )
+        review_material = {
+            column: stored[column]
+            for column in _ACTUAL_CLOSE_REVIEW_COLUMNS[1:-1]
+        }
+        expected_record = hashlib.sha256(
+            _canonical_audit_json(review_material).encode("utf-8")
+        ).hexdigest()
+        if (
+            review_id != expected_review_id
+            or str(stored["source_digest"]) != expected_source_digest
+            or str(stored["record_sha256"]) != expected_record
+        ):
+            raise MigrationCorruption(
+                "actual close review identity or integrity failed"
+            )
+        review_reference = _journal_row_reference(
+            "actual_close_reviews",
+            _ACTUAL_CLOSE_REVIEW_COLUMNS,
+            row,
+        )
+        references = (
+            review_reference,
+            *(binding.row_reference for binding in binding_sources),
+            *(reference for receipt in receipts for reference in (
+                receipt.row_reference,
+                receipt.payload_row_reference,
+            )),
+        )
+        references = tuple(
+            sorted(
+                {(reference.table, reference.row_id): reference for reference in references}.values(),
+                key=lambda reference: (reference.table, reference.row_id),
+            )
+        )
+        source = ActualCloseReviewSource(
+            row_id=int(stored["id"]),
+            review_id=review_id,
+            session_date=date.fromisoformat(str(stored["session_date"])),
+            review_at=normalized_review,
+            mark_cutoff=normalized_mark,
+            query_cutoff=stored_cutoff,
+            retrieved_at=normalized_retrieved,
+            expected_binding_count=expected_count,
+            bindings=tuple(binding_sources),
+            receipts=receipts,
+            source_digest=expected_source_digest,
+            record_sha256=expected_record,
+            row_reference=review_reference,
+            row_references=references,
+        )
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES[source_identity] = (
+                source_authority
+            )
+        if not (
+            is_verified_actual_close_review_source(source)
+            and _is_current_phase1_source_authority_without_callbacks(source)
+        ):
+            with _JOURNAL_SOURCE_LOCK:
+                if _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES.get(source_identity) is source_authority:
+                    _ACTUAL_CLOSE_REVIEW_SOURCE_AUTHORITIES.pop(source_identity, None)
+            raise JournalError(
+                "actual close review source changed during readback"
+            )
+        return source
+
+    def owns_actual_close_review_source(self, source: object) -> bool:
+        candidate = _phase1_source_authority_candidate(source)
+        return type(source) is ActualCloseReviewSource and candidate is not None and (
+            _current_journal_source_authority_owner((candidate,)) is self
+        )
+
+    def is_current_actual_close_review_source(self, source: object) -> bool:
+        return self.owns_actual_close_review_source(source)
+
+    def _close_recommendation_plan_identity(
+        self,
+        *,
+        symbol: str,
+        position_plan_digest: str,
+        query_cutoff: datetime,
+    ) -> tuple[ActualPositionPlanBindingSource, Phase1SignalSource]:
+        rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_ACTUAL_POSITION_PLAN_BINDING_COLUMNS)
+            + " FROM actual_position_plan_bindings "
+            "WHERE symbol = ? COLLATE BINARY "
+            "AND binding_kind = 'LIVE_CONFIRM_ANCHOR' "
+            "AND recorded_at <= ? ORDER BY id",
+            (symbol, _canonical_timestamp(query_cutoff)),
+        ).fetchall()
+        matches: list[ActualPositionPlanBindingSource] = []
+        for row in rows:
+            binding = self._actual_position_plan_binding_source_from_row(row)
+            digest = hashlib.sha256(
+                _canonical_audit_json(
+                    {
+                        "namespace": (
+                            "stock-monitor/actual-position-plan-identity/v1"
+                        ),
+                        "opening_actual_lifecycle_id": (
+                            binding.position_lifecycle_id
+                        ),
+                        "opening_actual_event_id": (
+                            binding.confirmation_event_id
+                        ),
+                        "primary_plan_digest": binding.primary_plan_digest,
+                        "symbol": symbol,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            if digest == position_plan_digest:
+                matches.append(binding)
+        if len(matches) != 1:
+            raise MigrationCorruption(
+                "close recommendation plan identity is missing or ambiguous"
+            )
+        anchor = matches[0]
+        signal_source = self._read_phase1_signal_source(
+            anchor.signal_id,
+            query_cutoff=query_cutoff,
+        )
+        if (
+            anchor.binding_ordinal != 1
+            or anchor.symbol != symbol
+            or signal_source.role != "PRIMARY"
+            or signal_source.symbol != symbol
+            or signal_source.primary_plan_digest != anchor.primary_plan_digest
+        ):
+            raise MigrationCorruption(
+                "close recommendation primary plan identity is inconsistent"
+            )
+        return anchor, signal_source
+
+    @staticmethod
+    def _close_recommendation_source_digest(
+        *,
+        recommendation_id: str,
+        review_source_digest: str,
+        position_plan_digest: str,
+        signal_id: str,
+        opening_actual_lifecycle_id: str,
+        opening_actual_event_id: str,
+        opening_actual_execution_event_id: int,
+        initial_stop_micros: int,
+        prior_recommended_stop_micros: int | None,
+        recommended_stop_micros: int,
+        action: str,
+        reason_codes: tuple[str, ...],
+        received_at: str,
+    ) -> str:
+        return _actual_close_semantic_digest(
+            "stock-monitor/close-recommendation-source/v1",
+            {
+                "action": action,
+                "initial_stop_micros": initial_stop_micros,
+                "opening_actual_event_id": opening_actual_event_id,
+                "opening_actual_execution_event_id": (
+                    opening_actual_execution_event_id
+                ),
+                "opening_actual_lifecycle_id": opening_actual_lifecycle_id,
+                "position_plan_digest": position_plan_digest,
+                "prior_recommended_stop_micros": (
+                    prior_recommended_stop_micros
+                ),
+                "reason_codes": list(reason_codes),
+                "received_at": received_at,
+                "recommendation_id": recommendation_id,
+                "recommended_stop_micros": recommended_stop_micros,
+                "review_source_digest": review_source_digest,
+                "signal_id": signal_id,
+            },
+        )
+
+    def append_close_recommendation(
+        self,
+        decision_source: object,
+    ) -> CloseRecommendationSource:
+        """Persist only one exact issued ACTUAL close decision authority."""
+        from .risk import (
+            ActualCloseDecisionSource,
+            _is_current_actual_close_decision_source_without_callbacks,
+            is_issued_actual_close_decision_source,
+        )
+
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "close recommendations require an outermost transaction"
+            )
+        if type(decision_source) is not ActualCloseDecisionSource or not (
+            is_issued_actual_close_decision_source(decision_source)
+        ):
+            raise InvalidJournalValue(
+                "close recommendation requires an issued close decision"
+            )
+        review_source = decision_source.review_source
+        position_plan_source = decision_source.position_plan_source
+        latest_source = decision_source.latest_recommendation_source
+        replay_recommendation = decision_source.replay_recommendation
+        review_candidate = _phase1_source_authority_candidate(review_source)
+        plan_candidate = _phase1_source_authority_candidate(
+            position_plan_source
+        )
+        latest_candidate = _phase1_source_authority_candidate(latest_source)
+        if (
+            type(review_source) is not ActualCloseReviewSource
+            or type(position_plan_source) is not ActualPositionPlanSource
+            or type(latest_source) is not LatestCloseRecommendationSource
+            or review_candidate is None
+            or plan_candidate is None
+            or latest_candidate is None
+            or _current_journal_source_authority_owner(
+                (review_candidate, plan_candidate, latest_candidate)
+            )
+            is not self
+        ):
+            raise InvalidJournalValue(
+                "close recommendation inputs are not exact current sources"
+            )
+        if (
+            review_source.query_cutoff != position_plan_source.query_cutoff
+            or latest_source.query_cutoff != position_plan_source.query_cutoff
+            or latest_source.position_plan_source is not position_plan_source
+            or not any(
+                binding.symbol == position_plan_source.symbol
+                for binding in review_source.bindings
+            )
+        ):
+            raise InvalidJournalValue(
+                "close recommendation review conflicts with position plan"
+            )
+        stop_micros = _require_integer(
+            decision_source.recommended_stop_micros,
+            "close recommendation stop",
+            minimum=1,
+        )
+        action = decision_source.action
+        if action not in {"HOLD", "EXIT", "TIGHTEN_STOP"}:
+            raise InvalidJournalValue(
+                "close recommendation action is unsupported"
+            )
+        reasons = _close_recommendation_reason_codes(
+            decision_source.reason_codes
+        )
+        normalized_received = _parse_canonical_timestamp(
+            _canonical_timestamp(decision_source.received_at)
+        )
+        if (
+            normalized_received != review_source.retrieved_at
+            or normalized_received > position_plan_source.query_cutoff
+            or normalized_received.date() != review_source.session_date
+            or normalized_received.astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            != review_source.session_date
+        ):
+            raise InvalidJournalValue(
+                "close recommendation receipt chronology is invalid"
+            )
+        signal_source = position_plan_source.signal_source
+        anchor = position_plan_source.plan_bindings[0]
+        initial_stop_micros = signal_source.recommended_stop_micros
+        if (
+            anchor.binding_kind != "LIVE_CONFIRM_ANCHOR"
+            or anchor.binding_ordinal != 1
+            or anchor.position_lifecycle_id
+            != position_plan_source.opening_actual_lifecycle_id
+            or anchor.confirmation_event_id
+            != position_plan_source.opening_actual_event_id
+            or anchor.confirmation_execution_event_id
+            != position_plan_source.opening_actual_execution_event_id
+        ):
+            raise InvalidJournalValue(
+                "close recommendation plan anchor is inconsistent"
+            )
+        if replay_recommendation is not None:
+            if latest_source.recommendation is not replay_recommendation:
+                raise InvalidJournalValue(
+                    "close recommendation replay is not exact"
+                )
+            prior_stop = replay_recommendation.prior_recommended_stop_micros
+        else:
+            prior_stop = (
+                None
+                if latest_source.recommendation is None
+                else latest_source.recommendation.recommended_stop_micros
+            )
+        stop_baseline = max(
+            initial_stop_micros,
+            initial_stop_micros if prior_stop is None else prior_stop,
+        )
+        if (
+            stop_micros < stop_baseline
+            or (action == "HOLD" and stop_micros != stop_baseline)
+            or (action == "TIGHTEN_STOP" and stop_micros <= stop_baseline)
+        ):
+            raise InvalidJournalValue(
+                "close recommendation action conflicts with durable stop history"
+            )
+        received_text = _canonical_timestamp(normalized_received)
+        identity_material = {
+            "action": action,
+            "position_plan_digest": position_plan_source.position_plan_digest,
+            "reason_codes": list(reasons),
+            "received_at": received_text,
+            "recommended_stop_micros": stop_micros,
+            "review_id": review_source.review_id,
+            "session_date": review_source.session_date.isoformat(),
+            "symbol": position_plan_source.symbol,
+        }
+        recommendation_id = _actual_close_semantic_digest(
+            "stock-monitor/close-recommendation-id/v1",
+            identity_material,
+        )
+        source_digest = self._close_recommendation_source_digest(
+            recommendation_id=recommendation_id,
+            review_source_digest=review_source.source_digest,
+            position_plan_digest=position_plan_source.position_plan_digest,
+            signal_id=signal_source.signal_id,
+            opening_actual_lifecycle_id=(
+                position_plan_source.opening_actual_lifecycle_id
+            ),
+            opening_actual_event_id=position_plan_source.opening_actual_event_id,
+            opening_actual_execution_event_id=(
+                position_plan_source.opening_actual_execution_event_id
+            ),
+            initial_stop_micros=initial_stop_micros,
+            prior_recommended_stop_micros=prior_stop,
+            recommended_stop_micros=stop_micros,
+            action=action,
+            reason_codes=reasons,
+            received_at=received_text,
+        )
+        reasons_json = _canonical_json(list(reasons))
+        record_material = {
+            "action": action,
+            "position_plan_digest": position_plan_source.position_plan_digest,
+            "reasons_json": reasons_json,
+            "received_at": received_text,
+            "recommendation_id": recommendation_id,
+            "recommended_stop_micros": stop_micros,
+            "review_id": review_source.review_id,
+            "session_date": review_source.session_date.isoformat(),
+            "source_digest": source_digest,
+            "symbol": position_plan_source.symbol,
+        }
+        record_sha256 = hashlib.sha256(
+            _canonical_audit_json(record_material).encode("utf-8")
+        ).hexdigest()
+        values = tuple(
+            record_sha256 if column == "record_sha256" else record_material[column]
+            for column in _CLOSE_RECOMMENDATION_COLUMNS[1:]
+        )
+        with self.transaction():
+            review_candidate = _phase1_source_authority_candidate(review_source)
+            plan_candidate = _phase1_source_authority_candidate(
+                position_plan_source
+            )
+            latest_candidate = _phase1_source_authority_candidate(
+                latest_source
+            )
+            if (
+                review_candidate is None
+                or plan_candidate is None
+                or latest_candidate is None
+                or _current_journal_source_authority_owner(
+                    (review_candidate, plan_candidate, latest_candidate)
+                )
+                is not self
+            ):
+                raise InvalidJournalValue(
+                    "close recommendation inputs changed before write"
+                )
+            existing = _sql(
+                self._connection,
+                "SELECT " + ", ".join(_CLOSE_RECOMMENDATION_COLUMNS)
+                + " FROM close_recommendations WHERE session_date = ? "
+                "AND symbol = ? COLLATE BINARY "
+                "AND position_plan_digest = ? COLLATE BINARY",
+                (
+                    review_source.session_date.isoformat(),
+                    position_plan_source.symbol,
+                    position_plan_source.position_plan_digest,
+                ),
+            ).fetchone()
+            # No caller-dispatchable validation remains after this exact
+            # decision/root/source seal and before a new append-only insert.
+            if not _is_current_actual_close_decision_source_without_callbacks(
+                decision_source
+            ):
+                raise InvalidJournalValue(
+                    "close recommendation decision changed during validation"
+                )
+            if existing is not None:
+                if tuple(existing[1:]) != values:
+                    raise IdempotencyConflict(
+                        "close recommendation conflicts with stored content"
+                    )
+            else:
+                if replay_recommendation is not None:
+                    raise InvalidJournalValue(
+                        "close recommendation replay has no stored decision"
+                    )
+                try:
+                    with self._provider_monitoring_write():
+                        _sql(
+                            self._connection,
+                            "INSERT INTO close_recommendations("
+                            + ", ".join(_CLOSE_RECOMMENDATION_COLUMNS[1:])
+                            + ") VALUES ("
+                            + ", ".join("?" for _ in _CLOSE_RECOMMENDATION_COLUMNS[1:])
+                            + ")",
+                            values,
+                        )
+                except sqlite3.IntegrityError as error:
+                    raise IdempotencyConflict(
+                        "close recommendation conflicts with stored content"
+                    ) from error
+            self._clear_sqlite_callbacks_before_authority_commit()
+            if not _is_current_actual_close_decision_source_without_callbacks(
+                decision_source
+            ):
+                raise InvalidJournalValue(
+                    "close recommendation decision changed during write"
+                )
+        return self.read_close_recommendation_source(
+            recommendation_id,
+            query_cutoff=position_plan_source.query_cutoff,
+        )
+
+    def read_close_recommendation_source(
+        self,
+        recommendation_id: str,
+        *,
+        query_cutoff: datetime,
+        position_plan_source: ActualPositionPlanSource | None = None,
+    ) -> CloseRecommendationSource:
+        """Read one durable recommendation without accepting caller identity."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "close recommendation source requires a post-commit read"
+            )
+        recommendation_id = _require_sha256(
+            recommendation_id,
+            "close recommendation ID",
+        )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        row = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_CLOSE_RECOMMENDATION_COLUMNS)
+            + " FROM close_recommendations "
+            "WHERE recommendation_id = ? COLLATE BINARY",
+            (recommendation_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidJournalValue("close recommendation does not exist")
+        stored = dict(zip(_CLOSE_RECOMMENDATION_COLUMNS, tuple(row), strict=True))
+        received_at = _parse_canonical_timestamp(str(stored["received_at"]))
+        if received_at > normalized_cutoff:
+            raise InvalidJournalValue("close recommendation is lookahead")
+        review_row = _sql(
+            self._connection,
+            "SELECT query_cutoff FROM actual_close_reviews "
+            "WHERE review_id = ? COLLATE BINARY",
+            (str(stored["review_id"]),),
+        ).fetchone()
+        if review_row is None:
+            raise MigrationCorruption(
+                "close recommendation review is missing"
+            )
+        review_source = self.read_actual_close_review_source(
+            str(stored["review_id"]),
+            query_cutoff=_parse_canonical_timestamp(str(review_row[0])),
+        )
+        if not (
+            received_at == review_source.retrieved_at
+            and received_at <= review_source.query_cutoff
+        ):
+            raise MigrationCorruption(
+                "close recommendation receipt is outside its review window"
+            )
+        symbol = str(stored["symbol"])
+        position_plan_digest = str(stored["position_plan_digest"])
+        anchor, signal_source = self._close_recommendation_plan_identity(
+            symbol=symbol,
+            position_plan_digest=position_plan_digest,
+            query_cutoff=normalized_cutoff,
+        )
+        if position_plan_source is not None:
+            plan_candidate = _phase1_source_authority_candidate(
+                position_plan_source
+            )
+            if (
+                type(position_plan_source) is not ActualPositionPlanSource
+                or plan_candidate is None
+                or _current_journal_source_authority_owner((plan_candidate,))
+                is not self
+                or position_plan_source.query_cutoff != normalized_cutoff
+                or position_plan_source.symbol != symbol
+                or position_plan_source.position_plan_digest
+                != position_plan_digest
+                or position_plan_source.signal_source.signal_id
+                != signal_source.signal_id
+            ):
+                raise InvalidJournalValue(
+                    "close recommendation position plan is not exact"
+                )
+        try:
+            raw_reasons = json.loads(str(stored["reasons_json"]))
+        except json.JSONDecodeError as error:
+            raise MigrationCorruption(
+                "close recommendation reasons are invalid JSON"
+            ) from error
+        if type(raw_reasons) is not list:
+            raise MigrationCorruption(
+                "close recommendation reasons are not an array"
+            )
+        try:
+            reasons = _close_recommendation_reason_codes(tuple(raw_reasons))
+        except InvalidJournalValue as error:
+            raise MigrationCorruption(
+                "close recommendation reasons are invalid"
+            ) from error
+        prior_row = _sql(
+            self._connection,
+            "SELECT recommended_stop_micros FROM close_recommendations "
+            "WHERE symbol = ? COLLATE BINARY "
+            "AND position_plan_digest = ? COLLATE BINARY "
+            "AND received_at < ? ORDER BY received_at DESC, id DESC LIMIT 1",
+            (symbol, position_plan_digest, str(stored["received_at"])),
+        ).fetchone()
+        prior_stop = None if prior_row is None else int(prior_row[0])
+        initial_stop = signal_source.recommended_stop_micros
+        stop_micros = int(stored["recommended_stop_micros"])
+        stop_baseline = max(
+            initial_stop,
+            initial_stop if prior_stop is None else prior_stop,
+        )
+        action = str(stored["action"])
+        if (
+            stop_micros < stop_baseline
+            or (action == "HOLD" and stop_micros != stop_baseline)
+            or (action == "TIGHTEN_STOP" and stop_micros <= stop_baseline)
+        ):
+            raise MigrationCorruption(
+                "close recommendation action conflicts with stop history"
+            )
+        expected_recommendation_id = _actual_close_semantic_digest(
+            "stock-monitor/close-recommendation-id/v1",
+            {
+                "action": action,
+                "position_plan_digest": position_plan_digest,
+                "reason_codes": list(reasons),
+                "received_at": str(stored["received_at"]),
+                "recommended_stop_micros": stop_micros,
+                "review_id": str(stored["review_id"]),
+                "session_date": str(stored["session_date"]),
+                "symbol": symbol,
+            },
+        )
+        if recommendation_id != expected_recommendation_id:
+            raise MigrationCorruption(
+                "close recommendation semantic identity is inconsistent"
+            )
+        expected_source_digest = self._close_recommendation_source_digest(
+            recommendation_id=recommendation_id,
+            review_source_digest=review_source.source_digest,
+            position_plan_digest=position_plan_digest,
+            signal_id=signal_source.signal_id,
+            opening_actual_lifecycle_id=anchor.position_lifecycle_id,
+            opening_actual_event_id=anchor.confirmation_event_id,
+            opening_actual_execution_event_id=(
+                anchor.confirmation_execution_event_id
+            ),
+            initial_stop_micros=initial_stop,
+            prior_recommended_stop_micros=prior_stop,
+            recommended_stop_micros=stop_micros,
+            action=action,
+            reason_codes=reasons,
+            received_at=str(stored["received_at"]),
+        )
+        record_material = {
+            column: stored[column]
+            for column in _CLOSE_RECOMMENDATION_COLUMNS[1:-1]
+        }
+        expected_record = hashlib.sha256(
+            _canonical_audit_json(record_material).encode("utf-8")
+        ).hexdigest()
+        if (
+            str(stored["source_digest"]) != expected_source_digest
+            or str(stored["record_sha256"]) != expected_record
+            or review_source.session_date.isoformat()
+            != str(stored["session_date"])
+            or review_source.review_id != str(stored["review_id"])
+        ):
+            raise MigrationCorruption(
+                "close recommendation identity or integrity failed"
+            )
+        recommendation_reference = _journal_row_reference(
+            "close_recommendations",
+            _CLOSE_RECOMMENDATION_COLUMNS,
+            row,
+        )
+        references = (
+            recommendation_reference,
+            *review_source.row_references,
+            anchor.row_reference,
+            *signal_source.row_references,
+        )
+        references = tuple(
+            sorted(
+                {(reference.table, reference.row_id): reference for reference in references}.values(),
+                key=lambda reference: (reference.table, reference.row_id),
+            )
+        )
+        source = CloseRecommendationSource(
+            row_id=int(stored["id"]),
+            recommendation_id=recommendation_id,
+            review_id=str(stored["review_id"]),
+            session_date=date.fromisoformat(str(stored["session_date"])),
+            symbol=symbol,
+            position_plan_digest=position_plan_digest,
+            signal_id=signal_source.signal_id,
+            opening_actual_lifecycle_id=anchor.position_lifecycle_id,
+            opening_actual_event_id=anchor.confirmation_event_id,
+            opening_actual_execution_event_id=(
+                anchor.confirmation_execution_event_id
+            ),
+            initial_stop_micros=initial_stop,
+            prior_recommended_stop_micros=prior_stop,
+            recommended_stop_micros=stop_micros,
+            action=action,
+            reason_codes=reasons,
+            received_at=received_at,
+            query_cutoff=normalized_cutoff,
+            review_source=review_source,
+            signal_source=signal_source,
+            anchor_binding=anchor,
+            source_digest=expected_source_digest,
+            record_sha256=expected_record,
+            row_reference=recommendation_reference,
+            row_references=references,
+        )
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
+                source,
+                self,
+            )
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES[source_identity] = (
+                source_authority
+            )
+        if not (
+            is_verified_close_recommendation_source(source)
+            and _is_current_phase1_source_authority_without_callbacks(source)
+            and (
+                position_plan_source is None
+                or _is_current_phase1_source_authority_without_callbacks(
+                    position_plan_source
+                )
+            )
+        ):
+            with _JOURNAL_SOURCE_LOCK:
+                if _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES.get(source_identity) is source_authority:
+                    _CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES.pop(source_identity, None)
+            raise JournalError(
+                "close recommendation source changed during readback"
+            )
+        return source
+
+    def read_latest_close_recommendation_source(
+        self,
+        *,
+        position_plan_source: ActualPositionPlanSource,
+        query_cutoff: datetime,
+    ) -> LatestCloseRecommendationSource:
+        """Issue exact positive-or-negative recommendation history authority."""
+        self._ensure_open()
+        if self._transaction_active:
+            raise JournalError(
+                "latest close recommendation requires a post-commit read"
+            )
+        normalized_cutoff = _parse_canonical_timestamp(
+            _canonical_timestamp(query_cutoff)
+        )
+        plan_candidate = _phase1_source_authority_candidate(
+            position_plan_source
+        )
+        if (
+            type(position_plan_source) is not ActualPositionPlanSource
+            or plan_candidate is None
+            or _current_journal_source_authority_owner((plan_candidate,))
+            is not self
+            or position_plan_source.query_cutoff != normalized_cutoff
+        ):
+            raise InvalidJournalValue(
+                "latest recommendation requires an exact current position plan"
+            )
+        rows = _sql(
+            self._connection,
+            "SELECT " + ", ".join(_CLOSE_RECOMMENDATION_COLUMNS)
+            + " FROM close_recommendations WHERE symbol = ? COLLATE BINARY "
+            "AND position_plan_digest = ? COLLATE BINARY "
+            "AND received_at <= ? ORDER BY received_at, id",
+            (
+                position_plan_source.symbol,
+                position_plan_source.position_plan_digest,
+                _canonical_timestamp(normalized_cutoff),
+            ),
+        ).fetchall()
+        recommendation_sources = tuple(
+            self.read_close_recommendation_source(
+                str(row[1]),
+                query_cutoff=normalized_cutoff,
+                position_plan_source=position_plan_source,
+            )
+            for row in rows
+        )
+        latest = None if not recommendation_sources else recommendation_sources[-1]
+        ids = tuple(source.recommendation_id for source in recommendation_sources)
+        references = (
+            *position_plan_source.row_references,
+            *(source.row_reference for source in recommendation_sources),
+        )
+        references = tuple(
+            sorted(
+                {(reference.table, reference.row_id): reference for reference in references}.values(),
+                key=lambda reference: (reference.table, reference.row_id),
+            )
+        )
+        source_digest = _journal_bundle_digest(
+            "stock-monitor/latest-close-recommendation-source/v1",
+            references,
+            {
+                "eligible_recommendation_ids": list(ids),
+                "position_plan_digest": position_plan_source.position_plan_digest,
+                "query_cutoff": _canonical_timestamp(normalized_cutoff),
+                "symbol": position_plan_source.symbol,
+            },
+        )
+        history = LatestCloseRecommendationSource(
+            symbol=position_plan_source.symbol,
+            position_plan_digest=position_plan_source.position_plan_digest,
+            query_cutoff=normalized_cutoff,
+            position_plan_source=position_plan_source,
+            recommendation=latest,
+            eligible_recommendation_ids=ids,
+            recommendation_highwater=(
+                0 if not recommendation_sources else max(source.row_id for source in recommendation_sources)
+            ),
+            row_references=references,
+            source_digest=source_digest,
+        )
+        source_identity, source_authority = (
+            _phase1_reader_source_registration_material(
+                _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES,
+                history,
+                self,
+            )
+        )
+        with _JOURNAL_SOURCE_LOCK:
+            _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES[source_identity] = (
+                source_authority
+            )
+        if not (
+            is_verified_latest_close_recommendation_source(history)
+            and _is_current_phase1_source_authority_without_callbacks(history)
+            and _is_current_phase1_source_authority_without_callbacks(
+                position_plan_source
+            )
+        ):
+            with _JOURNAL_SOURCE_LOCK:
+                if _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES.get(source_identity) is source_authority:
+                    _LATEST_CLOSE_RECOMMENDATION_SOURCE_AUTHORITIES.pop(source_identity, None)
+            raise JournalError(
+                "latest close recommendation changed during readback"
+            )
+        return history
+
+    def owns_close_recommendation_source(self, source: object) -> bool:
+        candidate = _phase1_source_authority_candidate(source)
+        return type(source) is CloseRecommendationSource and candidate is not None and (
+            _current_journal_source_authority_owner((candidate,)) is self
+        )
+
+    def is_current_close_recommendation_source(self, source: object) -> bool:
+        return self.owns_close_recommendation_source(source)
+
+    def owns_latest_close_recommendation_source(self, source: object) -> bool:
+        candidate = _phase1_source_authority_candidate(source)
+        return type(source) is LatestCloseRecommendationSource and candidate is not None and (
+            _current_journal_source_authority_owner((candidate,)) is self
+        )
+
+    def is_current_latest_close_recommendation_source(
+        self,
+        source: object,
+    ) -> bool:
+        return self.owns_latest_close_recommendation_source(source)
 
     def start_phase2_window(
         self,
@@ -33975,6 +35994,21 @@ class Journal:
         finally:
             self._provider_monitoring_write_allowed = False
 
+    def _clear_sqlite_callbacks_before_authority_commit(self) -> None:
+        """Remove raw-connection hooks before an authority-bearing commit.
+
+        The Journal connection is private implementation state.  A caller that
+        installs SQLite tracing, authorization, or progress hooks on that raw
+        connection cannot retain those hooks across a close-recommendation
+        commit because SQLite may dispatch them after the final authority seal.
+        """
+        try:
+            self._connection.set_trace_callback(None)
+            self._connection.set_authorizer(None)
+            self._connection.set_progress_handler(None, 0)
+        except sqlite3.Error as error:
+            raise _translate_sqlite_error(error) from error
+
     @contextmanager
     def _phase2_adherence_write(self) -> Iterator[None]:
         if not self._transaction_active or self._phase2_adherence_write_allowed:
@@ -34729,6 +36763,78 @@ def _require_nonempty_text(value: object, name: str) -> str:
     if type(value) is not str or not value:
         raise InvalidJournalValue(f"{name} must be a non-empty string")
     return value
+
+
+def _actual_close_role(value: object) -> str:
+    role = _require_nonempty_text(value, "actual close source role")
+    if role not in _ACTUAL_CLOSE_SOURCE_ROLES:
+        raise InvalidJournalValue("actual close source role is unsupported")
+    return role
+
+
+def _actual_close_scope(value: object, role: str) -> str | None:
+    symbol: str | None
+    if value is None:
+        symbol = None
+    elif type(value) is str and re.fullmatch(
+        r"[A-Z][A-Z0-9.-]{0,15}",
+        value,
+    ):
+        symbol = value
+    else:
+        raise InvalidJournalValue("actual close source symbol is invalid")
+    symbol_scoped = role in {
+        *_ACTUAL_CLOSE_MARKET_ROLE_TYPES,
+        "EVENT_EVIDENCE",
+    }
+    if symbol_scoped != (symbol is not None):
+        raise InvalidJournalValue(
+            "actual close source scope conflicts with its role"
+        )
+    return symbol
+
+
+def _actual_close_failure_code(value: object) -> str:
+    code = _require_nonempty_text(value, "actual close source failure code")
+    if (
+        len(code) > 128
+        or re.fullmatch(r"[A-Z][A-Z0-9_]*", code) is None
+    ):
+        raise InvalidJournalValue(
+            "actual close source failure code is invalid"
+        )
+    return code
+
+
+def _close_recommendation_reason_codes(value: object) -> tuple[str, ...]:
+    if type(value) is not tuple or not value:
+        raise InvalidJournalValue(
+            "close recommendation reasons must be a nonempty exact tuple"
+        )
+    result = tuple(
+        _actual_close_failure_code(reason)
+        for reason in value
+    )
+    if len(result) != len(set(result)):
+        raise InvalidJournalValue(
+            "close recommendation reasons must be unique"
+        )
+    return result
+
+
+def _actual_close_semantic_digest(
+    namespace: str,
+    material: Mapping[str, object],
+) -> str:
+    return hashlib.sha256(
+        _canonical_audit_json(
+            {
+                "namespace": namespace,
+                "payload": dict(material),
+                "version": 1,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _canonical_token(value: object, name: str) -> str:

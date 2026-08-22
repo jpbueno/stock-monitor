@@ -148,12 +148,17 @@ def _session_reviewed_evidence(
     symbol: str,
     issuer_cik: str | None,
     review_at: datetime | None = None,
+    source_retrieved_at: datetime | None = None,
     adverse: bool = False,
     binary_event_coverage: str | None = None,
 ):
     """Issue exact, session-unique reviewed evidence from raw source documents."""
     as_of = aware_et(session_date, "08:45") if review_at is None else review_at
-    retrieved_at = as_of - timedelta(hours=1)
+    retrieved_at = (
+        as_of - timedelta(hours=1)
+        if source_retrieved_at is None
+        else source_retrieved_at
+    )
     is_etf = subject_kind == "ETF"
     coverage = (
         "NOT_APPLICABLE" if is_etf else "CONFIRMED_CLEAR"
@@ -264,7 +269,7 @@ def _session_reviewed_evidence(
             f"{session_date.isoformat()}-{sequence:03d}"
         ),
         "reviewed_at": task5_fixture_module._iso_timestamp(
-            as_of - timedelta(minutes=5)
+            max(as_of - timedelta(minutes=5), retrieved_at)
         ),
         "schema_version": 3,
         "source_bindings": [
@@ -1495,6 +1500,7 @@ def _persist_signal_evidence(
     review_at: datetime = _EVIDENCE_AS_OF,
     signal_source: object | None = None,
     binary_event_coverage: str = "CONFIRMED_CLEAR",
+    source_retrieved_at: datetime | None = None,
 ):
     if signal_source is None:
         signal_source = _published_signal_source(journal)
@@ -1508,6 +1514,7 @@ def _persist_signal_evidence(
         review_at=review_at,
         adverse=adverse,
         binary_event_coverage=binary_event_coverage,
+        source_retrieved_at=source_retrieved_at,
     )
     registry_row_id, binding_row_ids = _pin_reviewed_evidence_material(
         journal,

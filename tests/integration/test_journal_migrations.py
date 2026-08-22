@@ -121,11 +121,11 @@ class JournalMigrationTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(journal.count("schema_migrations"), 7)
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(journal.count("schema_migrations"), 7)
 
-    def test_provider_monitoring_migration_is_packaged_hashed_and_applied_fifth(self) -> None:
+    def test_provider_monitoring_migrations_are_packaged_hashed_and_ordered(self) -> None:
         packaged = importlib.resources.files("stock_monitor.sql").joinpath(
             "005_provider_monitoring.sql"
         )
@@ -140,6 +140,16 @@ class JournalMigrationTests(unittest.TestCase):
         )
         lineage_sha256 = hashlib.sha256(
             lineage_packaged.read_bytes()
+        ).hexdigest()
+        chronology_packaged = importlib.resources.files(
+            "stock_monitor.sql"
+        ).joinpath("007_provider_monitoring_review_chronology.sql")
+        self.assertTrue(
+            chronology_packaged.is_file(),
+            "packaged migration 007 is missing",
+        )
+        chronology_sha256 = hashlib.sha256(
+            chronology_packaged.read_bytes()
         ).hexdigest()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "journal.db"
@@ -163,13 +173,15 @@ class JournalMigrationTests(unittest.TestCase):
                 (4, "004_scheduled_result_envelope.sql"),
                 (5, "005_provider_monitoring.sql"),
                 (6, "006_actual_position_plan_lineage.sql"),
+                (7, "007_provider_monitoring_review_chronology.sql"),
             ],
         )
         self.assertEqual(str(rows[4][2]), expected_sha256)
         self.assertEqual(str(rows[5][2]), lineage_sha256)
-        self.assertEqual(user_version, 6)
+        self.assertEqual(str(rows[6][2]), chronology_sha256)
+        self.assertEqual(user_version, 7)
 
-    def test_exact_head_v5_database_upgrades_to_v6_without_drift(self) -> None:
+    def test_exact_head_v5_database_upgrades_to_current_without_drift(self) -> None:
         expected_head_v5_sha256 = (
             "037d42efce5c0272fcbe942449fb4c59bf55ed4ccfd89eabe58982e5adc438d1"
         )
@@ -206,12 +218,12 @@ class JournalMigrationTests(unittest.TestCase):
                 )
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(journal.count("schema_migrations"), 7)
                 self.assertEqual(
                     journal._connection.execute(
                         "PRAGMA user_version"
                     ).fetchone()[0],
-                    6,
+                    7,
                 )
                 migration_rows = journal._connection.execute(
                     "SELECT version, name, sha256 FROM schema_migrations "
@@ -226,9 +238,249 @@ class JournalMigrationTests(unittest.TestCase):
                     (6, "006_actual_position_plan_lineage.sql"),
                 )
                 self.assertEqual(
+                    (int(migration_rows[6][0]), str(migration_rows[6][1])),
+                    (7, "007_provider_monitoring_review_chronology.sql"),
+                )
+                self.assertEqual(
                     journal.count("actual_position_plan_bindings"),
                     0,
                 )
+
+    def test_exact_head_v6_database_upgrades_review_chronology_only(self) -> None:
+        expected_head_v6_sha256 = (
+            "5920c18c25d8b9db357e5d339a400c9fef5d1d29cfdc5f7d7745350988a7181c"
+        )
+        migration_names = (
+            "001_core.sql",
+            "002_phase1.sql",
+            "003_phase2_paper.sql",
+            "004_scheduled_result_envelope.sql",
+            "005_provider_monitoring.sql",
+            "006_actual_position_plan_lineage.sql",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            v6_directory = root / "v6-migrations"
+            v6_directory.mkdir()
+            for name in migration_names:
+                packaged = importlib.resources.files(
+                    "stock_monitor.sql"
+                ).joinpath(name)
+                (v6_directory / name).write_bytes(packaged.read_bytes())
+            self.assertEqual(
+                hashlib.sha256(
+                    (
+                        v6_directory
+                        / "006_actual_position_plan_lineage.sql"
+                    ).read_bytes()
+                ).hexdigest(),
+                expected_head_v6_sha256,
+            )
+            path = root / "journal.db"
+            with Journal.open(
+                path,
+                migration_directory=v6_directory,
+            ) as journal:
+                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(
+                    journal._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    6,
+                )
+                migration_rows_before = journal._connection.execute(
+                    "SELECT version, name, sha256 FROM schema_migrations "
+                    "ORDER BY version"
+                ).fetchall()
+                schema_before = {
+                    (str(row[0]), str(row[1])): row[2]
+                    for row in journal._connection.execute(
+                        "SELECT type, name, sql FROM sqlite_schema "
+                        "WHERE name NOT LIKE 'sqlite_%'"
+                    )
+                }
+
+            chronology_packaged = importlib.resources.files(
+                "stock_monitor.sql"
+            ).joinpath("007_provider_monitoring_review_chronology.sql")
+            chronology_sha256 = hashlib.sha256(
+                chronology_packaged.read_bytes()
+            ).hexdigest()
+            with Journal.open(path) as journal:
+                self.assertEqual(journal.count("schema_migrations"), 7)
+                self.assertEqual(
+                    journal._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    7,
+                )
+                migration_rows_after = journal._connection.execute(
+                    "SELECT version, name, sha256 FROM schema_migrations "
+                    "ORDER BY version"
+                ).fetchall()
+                schema_after = {
+                    (str(row[0]), str(row[1])): row[2]
+                    for row in journal._connection.execute(
+                        "SELECT type, name, sql FROM sqlite_schema "
+                        "WHERE name NOT LIKE 'sqlite_%'"
+                    )
+                }
+            self.assertEqual(
+                migration_rows_after[:6],
+                migration_rows_before,
+            )
+            self.assertEqual(
+                tuple(migration_rows_after[6]),
+                (
+                    7,
+                    "007_provider_monitoring_review_chronology.sql",
+                    chronology_sha256,
+                ),
+            )
+            changed_objects = {
+                key
+                for key in schema_before
+                if schema_before[key] != schema_after.get(key)
+            } | (set(schema_after) - set(schema_before))
+            self.assertEqual(
+                changed_objects,
+                {
+                    (
+                        "trigger",
+                        "actual_close_source_bindings_validate_receipt",
+                    )
+                },
+            )
+            trigger_sql = str(
+                schema_after[
+                    (
+                        "trigger",
+                        "actual_close_source_bindings_validate_receipt",
+                    )
+                ]
+            )
+            self.assertIn(
+                "NEW.received_at >= review.review_at",
+                trigger_sql,
+            )
+            self.assertIn(
+                "NEW.received_at <= review.query_cutoff",
+                trigger_sql,
+            )
+            self.assertNotIn(
+                "NEW.received_at >= review.retrieved_at",
+                trigger_sql,
+            )
+
+            with closing(
+                sqlite3.connect(path, isolation_level=None)
+            ) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.create_function(
+                    "journal_provider_monitoring_write_allowed",
+                    0,
+                    lambda: 1,
+                )
+                source_rows = (
+                    (
+                        1,
+                        "1" * 64,
+                        "2" * 64,
+                        "https://example.invalid/before-cutoff",
+                        "TEST",
+                        "fixture",
+                        None,
+                        "2026-08-14T19:29:00.000000Z",
+                        "2026-08-14T19:30:30.000000Z",
+                        None,
+                        90,
+                        "OK",
+                        "{}",
+                    ),
+                    (
+                        2,
+                        "3" * 64,
+                        "4" * 64,
+                        "https://example.invalid/after-cutoff",
+                        "TEST",
+                        "fixture",
+                        None,
+                        "2026-08-14T19:29:00.000000Z",
+                        "2026-08-14T19:31:01.000000Z",
+                        None,
+                        121,
+                        "OK",
+                        "{}",
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO source_observations VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    source_rows,
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_reviews VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "5" * 64,
+                        "2026-08-14",
+                        "2026-08-14T19:30:00.000000Z",
+                        "2026-08-14T19:14:00.000000Z",
+                        "2026-08-14T19:31:00.000000Z",
+                        "2026-08-14T19:31:05.000000Z",
+                        1,
+                        "6" * 64,
+                        "7" * 64,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO actual_close_source_bindings VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        1,
+                        "5" * 64,
+                        1,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        1,
+                        None,
+                        "2026-08-14T19:30:30.000000Z",
+                        "8" * 64,
+                    ),
+                )
+                for binding in (
+                    (
+                        2,
+                        "5" * 64,
+                        2,
+                        "AAPL",
+                        "SIP_QUOTE",
+                        2,
+                        None,
+                        "2026-08-14T19:31:01.000000Z",
+                        "9" * 64,
+                    ),
+                    (
+                        3,
+                        "5" * 64,
+                        3,
+                        None,
+                        "OPERATIONAL_STATUS",
+                        None,
+                        "SOURCE_UNAVAILABLE",
+                        "2026-08-14T19:31:01.000000Z",
+                        "a" * 64,
+                    ),
+                ):
+                    with self.subTest(binding=binding[0]), self.assertRaises(
+                        sqlite3.IntegrityError
+                    ):
+                        connection.execute(
+                            "INSERT INTO actual_close_source_bindings VALUES "
+                            "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            binding,
+                        )
 
     def test_provider_monitoring_tables_are_strict_and_have_exact_columns(self) -> None:
         expected_columns = {
@@ -384,7 +636,7 @@ class JournalMigrationTests(unittest.TestCase):
                             "2026-08-14",
                             "2026-08-14T19:30:00.000000Z",
                             "2026-08-14T19:14:00.000000Z",
-                            "2026-08-14T19:30:30.000000Z",
+                            "2026-08-14T19:31:00.000000Z",
                             "2026-08-14T19:31:00.000000Z",
                             1,
                             "6" * 64,
@@ -855,7 +1107,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "Alpaca",
                         "SIP",
                         "2026-08-14T19:13:58.000000Z",
-                        "2026-08-14T19:30:45.000000Z",
+                        "2026-08-14T19:29:59.000000Z",
                         None,
                         960,
                         "OK",
@@ -928,8 +1180,8 @@ class JournalMigrationTests(unittest.TestCase):
                         "2026-08-14",
                         "2026-08-14T19:30:00.000000Z",
                         "2026-08-14T19:14:00.000000Z",
-                        "2026-08-14T19:30:30.000000Z",
-                        timestamp,
+                        "2026-08-14T19:32:00.000000Z",
+                        "2026-08-14T19:32:00.000000Z",
                         5,
                         "d" * 64,
                         "e" * 64,
@@ -1150,7 +1402,7 @@ class JournalMigrationTests(unittest.TestCase):
                         "IEX_FRESHNESS",
                         3,
                         None,
-                        "2026-08-14T19:30:45.000000Z",
+                        "2026-08-14T19:29:59.000000Z",
                         "c" * 64,
                     ),
                     (
@@ -1564,7 +1816,7 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA application_id").fetchone()[0], 0)
 
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(journal.count("schema_migrations"), 7)
 
     def test_migration_transaction_control_cannot_escape_atomic_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1830,7 +2082,7 @@ class JournalMigrationTests(unittest.TestCase):
             with Journal.open(wrong_version_path):
                 pass
             with closing(sqlite3.connect(wrong_version_path)) as connection:
-                connection.execute("PRAGMA user_version = 7")
+                connection.execute("PRAGMA user_version = 8")
             with self.assertRaises(MigrationCorruption):
                 Journal.open(wrong_version_path)
 
@@ -1870,9 +2122,9 @@ class JournalMigrationTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 counts = tuple(executor.map(lambda _: open_and_count(), range(2)))
 
-            self.assertEqual(counts, (6, 6))
+            self.assertEqual(counts, (7, 7))
             with Journal.open(path) as journal:
-                self.assertEqual(journal.count("schema_migrations"), 6)
+                self.assertEqual(journal.count("schema_migrations"), 7)
 
     def test_ownership_preflight_uses_one_snapshot_during_first_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1915,10 +2167,10 @@ class JournalMigrationTests(unittest.TestCase):
                 self.assertTrue(application_id_read.wait(timeout=10))
                 try:
                     with Journal.open(path) as journal:
-                        self.assertEqual(journal.count("schema_migrations"), 6)
+                        self.assertEqual(journal.count("schema_migrations"), 7)
                 finally:
                     release_preflight.set()
-                self.assertEqual(victim.result(timeout=10), 6)
+                self.assertEqual(victim.result(timeout=10), 7)
 
     def test_open_retries_a_transient_wal_mode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

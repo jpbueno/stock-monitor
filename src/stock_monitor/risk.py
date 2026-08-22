@@ -30,12 +30,21 @@ from .evidence import (
     is_reviewed_evidence_decision,
 )
 from .journal import (
+    ActualCloseReviewSource,
+    ActualPositionPlanSource,
+    CloseRecommendationSource,
     JournalAccountCheckWindowSource,
     JournalActionSource,
     JournalActualReplaySource,
+    LatestCloseRecommendationSource,
+    SourceObservationReceipt,
+    is_verified_actual_close_review_source,
+    is_verified_actual_position_plan_source,
     is_verified_journal_action_source,
     is_verified_journal_replay_source,
     is_verified_journal_window_source,
+    is_verified_latest_close_recommendation_source,
+    phase2_sources_share_owner,
 )
 from .market_calendar import (
     CalendarError,
@@ -91,6 +100,18 @@ _CONFIRMED_BUY_AUTHORITIES: dict[
     tuple[ReferenceType[object], object],
 ] = {}
 _POSITION_EVENT_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], object],
+] = {}
+_ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], object],
+] = {}
+_ACTUAL_POSITION_EVENT_AUTHORITIES: dict[
+    int,
+    tuple[ReferenceType[object], object],
+] = {}
+_ACTUAL_CLOSE_DECISION_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[object], object],
 ] = {}
@@ -2539,15 +2560,24 @@ def _phase1_derived_sources_are_current(value: object) -> bool:
     from . import journal as journal_module
 
     verifier_names = {
+        "ACTUAL_CLOSE_REVIEW": "is_verified_actual_close_review_source",
+        "ACTUAL_POSITION_PLAN": "is_verified_actual_position_plan_source",
         "BREAKER_HISTORY": "is_verified_phase1_breaker_history_source",
         "CANONICAL_REPLAY": "is_verified_phase1_canonical_replay_source",
         "EQUITY_MARK": "is_verified_phase1_equity_mark_source",
         "EXIT_REVIEW": "is_verified_phase1_exit_review_source",
         "EXIT_REVIEW_MARKET": "is_verified_phase1_exit_review_market_source",
+        "LATEST_CLOSE_RECOMMENDATION": (
+            "is_verified_latest_close_recommendation_source"
+        ),
         "SIGNAL_EVIDENCE": "is_verified_phase1_signal_evidence_source",
         "SIGNAL_SOURCE": "is_verified_phase1_signal_source",
     }
     for source, kind in resolved:
+        if kind == "SOURCE_OBSERVATION_RECEIPT":
+            if journal_module._journal_any_source_owner(source) is None:
+                return False
+            continue
         verifier = getattr(journal_module, verifier_names.get(kind, ""), None)
         if verifier is None or not verifier(source):
             return False
@@ -6250,6 +6280,1417 @@ def is_issued_position_event_context(context: object) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ActualCloseBar:
+    timestamp: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    adjustment: str = "split"
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualCloseMarketSource:
+    """Exact delayed-SIP close material backed by current Journal receipts."""
+
+    review_source: ActualCloseReviewSource = field(repr=False, compare=False)
+    position_plan_source: ActualPositionPlanSource = field(
+        repr=False,
+        compare=False,
+    )
+    symbol: str
+    review_at: datetime
+    query_cutoff: datetime
+    cutoff: datetime
+    observed_at: datetime
+    sip_bid: Decimal
+    sip_ask: Decimal
+    previous_session_low: Decimal
+    current_session_low: Decimal
+    atr14: Decimal
+    iex_observed_at: datetime
+    observation_receipts: tuple[SourceObservationReceipt, ...]
+    calendar_digest: str
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.review_source) is not ActualCloseReviewSource
+            or type(self.position_plan_source) is not ActualPositionPlanSource
+            or self.review_source.review_at != self.review_at
+            or self.review_source.query_cutoff != self.query_cutoff
+            or self.position_plan_source.symbol != self.symbol
+            or self.position_plan_source.query_cutoff != self.query_cutoff
+            or type(self.symbol) is not str
+            or not self.symbol
+            or self.symbol != self.symbol.upper()
+        ):
+            raise RiskBlock("INVALID_ACTUAL_CLOSE_SYMBOL")
+        review_at = _require_aware(
+            self.review_at,
+            "INVALID_ACTUAL_CLOSE_TIME",
+        )
+        query_cutoff = _require_aware(
+            self.query_cutoff,
+            "INVALID_ACTUAL_CLOSE_QUERY_CUTOFF",
+        )
+        cutoff = _require_aware(
+            self.cutoff,
+            "INVALID_ACTUAL_CLOSE_TIME",
+        )
+        observed_at = _require_aware(
+            self.observed_at,
+            "INVALID_ACTUAL_CLOSE_TIME",
+        )
+        iex_observed_at = _require_aware(
+            self.iex_observed_at,
+            "INVALID_ACTUAL_CLOSE_TIME",
+        )
+        if (
+            query_cutoff < review_at
+            or cutoff > review_at
+            or observed_at > cutoff
+            or cutoff - observed_at > timedelta(minutes=5)
+            or review_at - observed_at > timedelta(minutes=21)
+            or not review_at - timedelta(minutes=5)
+            <= iex_observed_at
+            <= review_at
+        ):
+            raise RiskBlock("INVALID_ACTUAL_CLOSE_TIME")
+        for attribute, code in (
+            ("sip_bid", "ACTUAL_CLOSE_MARK_UNAVAILABLE"),
+            ("sip_ask", "ACTUAL_CLOSE_MARK_UNAVAILABLE"),
+            ("previous_session_low", "INVALID_TRAILING_STOP_CONTEXT"),
+            ("current_session_low", "INVALID_TRAILING_STOP_CONTEXT"),
+            ("atr14", "INVALID_TRAILING_STOP_CONTEXT"),
+        ):
+            object.__setattr__(
+                self,
+                attribute,
+                _require_money(
+                    getattr(self, attribute),
+                    reason_code=code,
+                    positive=True,
+                ),
+            )
+        if self.sip_ask < self.sip_bid:
+            raise RiskBlock("ACTUAL_CLOSE_SIP_CROSSED")
+        if (
+            type(self.observation_receipts) is not tuple
+            or not self.observation_receipts
+            or any(
+                type(receipt) is not SourceObservationReceipt
+                for receipt in self.observation_receipts
+            )
+            or len({id(receipt) for receipt in self.observation_receipts})
+            != len(self.observation_receipts)
+            or len({receipt.row_id for receipt in self.observation_receipts})
+            != len(self.observation_receipts)
+        ):
+            raise RiskBlock("ACTUAL_CLOSE_RECEIPT_SET_INVALID")
+        for digest in (self.calendar_digest, self.source_digest):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise RiskBlock("INVALID_ACTUAL_CLOSE_DIGEST")
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualPositionEventContext:
+    """One source-backed ACTUAL position revision at a fixed close review."""
+
+    review_source: ActualCloseReviewSource = field(repr=False, compare=False)
+    position_plan_source: ActualPositionPlanSource = field(
+        repr=False,
+        compare=False,
+    )
+    latest_recommendation_source: LatestCloseRecommendationSource = field(
+        repr=False,
+        compare=False,
+    )
+    position: Position
+    review_at: datetime
+    query_cutoff: datetime
+    observed_at: datetime
+    previous_session_low: Decimal
+    current_session_low: Decimal
+    atr14: Decimal
+    iex_age: timedelta
+    holding_sessions: int
+    event_exit_required: bool | None
+    thesis_invalidated: bool | None
+    evidence_status: str
+    actual_close_source_digest: str
+    event_evidence_digest: str
+    event_evidence_source_row_ids: tuple[int, ...]
+    position_plan_digest: str
+    review_source_digest: str
+    latest_recommendation_source_digest: str
+    policy_digest: str
+    calendar_digest: str
+    review_cursor: int
+    context_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.review_source) is not ActualCloseReviewSource
+            or type(self.position_plan_source) is not ActualPositionPlanSource
+            or type(self.latest_recommendation_source)
+            is not LatestCloseRecommendationSource
+            or type(self.position) is not Position
+            or self.position.ledger_name != "ACTUAL"
+            or self.review_source.review_at != self.review_at
+            or self.review_source.query_cutoff != self.query_cutoff
+            or self.position_plan_source.query_cutoff != self.query_cutoff
+            or self.latest_recommendation_source.query_cutoff
+            != self.query_cutoff
+        ):
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        source_row_ids = tuple(self.event_evidence_source_row_ids)
+        object.__setattr__(
+            self,
+            "event_evidence_source_row_ids",
+            source_row_ids,
+        )
+        if (
+            not source_row_ids
+            or len(source_row_ids) != len(set(source_row_ids))
+            or any(type(row_id) is not int or row_id < 1 for row_id in source_row_ids)
+        ):
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        review_at = _require_aware(
+            self.review_at,
+            "INVALID_ACTUAL_POSITION_CONTEXT",
+        )
+        query_cutoff = _require_aware(
+            self.query_cutoff,
+            "INVALID_ACTUAL_POSITION_CONTEXT",
+        )
+        observed_at = _require_aware(
+            self.observed_at,
+            "INVALID_ACTUAL_POSITION_CONTEXT",
+        )
+        if query_cutoff < review_at or observed_at > review_at:
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        if (
+            type(self.iex_age) is not timedelta
+            or not timedelta() <= self.iex_age <= timedelta(minutes=5)
+        ):
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        _require_positive_int(
+            self.holding_sessions,
+            "INVALID_HOLDING_SESSION_COUNT",
+        )
+        _require_positive_int(self.review_cursor, "INVALID_MARK_LINEAGE")
+        if any(
+            value is not None and type(value) is not bool
+            for value in (self.event_exit_required, self.thesis_invalidated)
+        ):
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        if self.evidence_status not in {
+            "CLEAR",
+            "EXIT_REQUIRED",
+            "UNRESOLVED",
+            "UNAVAILABLE",
+        }:
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        if (
+            self.evidence_status == "CLEAR"
+            and (self.event_exit_required, self.thesis_invalidated)
+            != (False, False)
+        ) or (
+            self.evidence_status == "EXIT_REQUIRED"
+            and True not in (self.event_exit_required, self.thesis_invalidated)
+        ) or (
+            self.evidence_status in {"UNRESOLVED", "UNAVAILABLE"}
+            and (self.event_exit_required, self.thesis_invalidated)
+            == (False, False)
+        ):
+            raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+        for attribute in (
+            "previous_session_low",
+            "current_session_low",
+            "atr14",
+        ):
+            object.__setattr__(
+                self,
+                attribute,
+                _require_money(
+                    getattr(self, attribute),
+                    reason_code="INVALID_TRAILING_STOP_CONTEXT",
+                    positive=True,
+                ),
+            )
+        for digest in (
+            self.actual_close_source_digest,
+            self.event_evidence_digest,
+            self.position_plan_digest,
+            self.review_source_digest,
+            self.latest_recommendation_source_digest,
+            self.policy_digest,
+            self.calendar_digest,
+            self.context_digest,
+        ):
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise RiskBlock("INVALID_ACTUAL_POSITION_CONTEXT")
+
+
+def _actual_close_timestamp(value: object) -> datetime:
+    if type(value) is not str or not value:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID") from None
+    return _require_aware(parsed, "ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID").astimezone(
+        UTC
+    )
+
+
+def _actual_close_decimal(value: object) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    try:
+        parsed = Decimal(str(value))
+        return _require_money(
+            parsed,
+            reason_code="ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID",
+            positive=True,
+        )
+    except (DomainValidationError, ValueError):
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID") from None
+
+
+def _actual_close_integer(value: object, *, optional: bool = False) -> int | None:
+    if value is None and optional:
+        return None
+    if type(value) is not int or value < 0:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    return value
+
+
+def _actual_close_bar(
+    value: object,
+    *,
+    expected_feed: str,
+) -> _ActualCloseBar:
+    if type(value) is not dict:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    payload_feed = value.get("feed")
+    if payload_feed is not None and payload_feed != expected_feed:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_FEED_MISMATCH")
+    timestamp = _actual_close_timestamp(value.get("t"))
+    open_price = _actual_close_decimal(value.get("o"))
+    high = _actual_close_decimal(value.get("h"))
+    low = _actual_close_decimal(value.get("l"))
+    close = _actual_close_decimal(value.get("c"))
+    volume = _actual_close_integer(value.get("v"))
+    assert volume is not None
+    if high < max(open_price, close, low) or low > min(open_price, close, high):
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    return _ActualCloseBar(
+        timestamp=timestamp,
+        open=open_price,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+    )
+
+
+def _actual_close_quote(
+    value: object,
+    *,
+    expected_feed: str,
+) -> tuple[datetime, Decimal, Decimal, int | None]:
+    if type(value) is not dict:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+    payload_feed = value.get("feed")
+    if payload_feed is not None and payload_feed != expected_feed:
+        raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_FEED_MISMATCH")
+    timestamp = _actual_close_timestamp(value.get("t"))
+    bid = _actual_close_decimal(value.get("bp"))
+    ask = _actual_close_decimal(value.get("ap"))
+    sequence = _actual_close_integer(value.get("i"), optional=True)
+    if ask < bid:
+        raise RiskBlock("ACTUAL_CLOSE_SIP_CROSSED")
+    return timestamp, bid, ask, sequence
+
+
+def _actual_close_utc_text(value: datetime) -> str:
+    normalized = value.astimezone(UTC)
+    if normalized.microsecond:
+        return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return normalized.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _actual_close_pages(
+    receipts: tuple[SourceObservationReceipt, ...],
+    *,
+    query_cutoff: datetime,
+) -> dict[str, tuple[tuple[SourceObservationReceipt, dict[str, object], dict[str, list[str]]], ...]]:
+    """Validate receipt metadata and return terminal provider page chains."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from .providers.alpaca import recompute_alpaca_page_metadata
+    from .providers.http import ProviderResponseError
+
+    expected_feed = {
+        "ALPACA_DAILY_BARS": "sip",
+        "ALPACA_INTRADAY_BARS": "sip",
+        "ALPACA_HISTORICAL_QUOTES": "sip",
+        "ALPACA_LATEST_QUOTES": "iex",
+    }
+    grouped: dict[
+        str,
+        list[
+            tuple[
+                SourceObservationReceipt,
+                dict[str, object],
+                dict[str, list[str]],
+            ]
+        ],
+    ] = {source_type: [] for source_type in expected_feed}
+    for receipt in receipts:
+        source_type = receipt.source_type
+        feed = expected_feed.get(source_type)
+        if feed is None:
+            raise RiskBlock("ACTUAL_CLOSE_RECEIPT_ROLE_INVALID")
+        try:
+            metadata = recompute_alpaca_page_metadata(
+                payload=receipt.source_payload,
+                request_url=receipt.source_uri,
+                source_type=source_type,
+                retrieved_at=receipt.retrieved_at,
+            )
+            document = json.loads(receipt.source_payload.decode("utf-8"))
+            parsed = urlsplit(receipt.source_uri)
+            query = parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+            details = json.loads(receipt.details_json)
+        except (
+            ProviderResponseError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_RECEIPT_INVALID") from None
+        if (
+            type(document) is not dict
+            or type(details) is not dict
+            or details
+            != {"source_observation_id": metadata.source_observation_id}
+            or receipt.provider.lower() != "alpaca"
+            or receipt.feed is None
+            or receipt.feed.lower() != feed
+            or receipt.provider_sequence is not None
+            or receipt.health_result != "OK"
+            or receipt.payload_sha256 != metadata.payload_sha256
+            or receipt.source_time != metadata.source_time
+            or receipt.retrieved_at != metadata.retrieved_at
+            or receipt.delay_seconds != metadata.delay_seconds
+            or receipt.retrieved_at > query_cutoff
+            or receipt.source_time > receipt.retrieved_at
+            or parsed.scheme != "https"
+            or parsed.netloc != "data.alpaca.markets"
+            or parsed.fragment
+        ):
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_RECEIPT_INVALID")
+        grouped[source_type].append((receipt, document, query))
+    if any(not pages for pages in grouped.values()):
+        raise RiskBlock("ACTUAL_CLOSE_RECEIPT_SET_INCOMPLETE")
+    if len(grouped["ALPACA_LATEST_QUOTES"]) != 1:
+        raise RiskBlock("ACTUAL_CLOSE_IEX_COHORT_INVALID")
+
+    ordered_groups: dict[
+        str,
+        tuple[
+            tuple[
+                SourceObservationReceipt,
+                dict[str, object],
+                dict[str, list[str]],
+            ],
+            ...,
+        ],
+    ] = {}
+    for source_type, pages in grouped.items():
+        if source_type == "ALPACA_LATEST_QUOTES":
+            page = pages[0]
+            if "page_token" in page[2] or (
+                "next_page_token" in page[1]
+                and page[1]["next_page_token"] is not None
+            ):
+                raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+            ordered_groups[source_type] = (page,)
+            continue
+        by_request_token: dict[
+            str | None,
+            tuple[
+                SourceObservationReceipt,
+                dict[str, object],
+                dict[str, list[str]],
+            ],
+        ] = {}
+        for page in pages:
+            token_values = page[2].get("page_token", [])
+            if len(token_values) > 1 or (token_values and not token_values[0]):
+                raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+            token = token_values[0] if token_values else None
+            if token in by_request_token:
+                raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+            by_request_token[token] = page
+        ordered: list[
+            tuple[
+                SourceObservationReceipt,
+                dict[str, object],
+                dict[str, list[str]],
+            ]
+        ] = []
+        token: str | None = None
+        while token in by_request_token:
+            page = by_request_token.pop(token)
+            ordered.append(page)
+            document = page[1]
+            if "next_page_token" not in document:
+                raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+            next_token = document["next_page_token"]
+            if next_token is None:
+                token = None
+                break
+            if (
+                type(next_token) is not str
+                or not next_token
+                or len(next_token) > 512
+                or not next_token.isascii()
+                or not next_token.isprintable()
+            ):
+                raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+            token = next_token
+        if by_request_token or not ordered or ordered[-1][1]["next_page_token"] is not None:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAGINATION_INVALID")
+        if any(
+            current[0].retrieved_at < prior[0].retrieved_at
+            for prior, current in zip(ordered, ordered[1:])
+        ):
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_RETRIEVAL_ORDER_INVALID")
+        ordered_groups[source_type] = tuple(ordered)
+    return ordered_groups
+
+
+def _actual_close_exact_query(
+    pages: tuple[
+        tuple[SourceObservationReceipt, dict[str, object], dict[str, list[str]]],
+        ...,
+    ],
+    expected: dict[str, str],
+) -> None:
+    allowed = {*expected, "page_token"}
+    for _receipt, _document, query in pages:
+        if set(query) - allowed or set(expected) - set(query) or any(
+            len(values) != 1 for values in query.values()
+        ) or any(query.get(name) != [value] for name, value in expected.items()):
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_REQUEST_INVALID")
+
+
+def _actual_close_sources_share_owner(*sources: object) -> bool:
+    return bool(sources) and all(
+        phase2_sources_share_owner(sources[0], source)
+        for source in sources
+    )
+
+
+def _is_current_actual_close_market_source_without_callbacks(
+    source: object,
+) -> bool:
+    if type(source) is not ActualCloseMarketSource:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES,
+        source,
+    )
+    if (
+        children is None
+        or len(children) != 3
+        or children[0] is not source.review_source
+        or children[1] is not source.position_plan_source
+        or type(children[0]) is not ActualCloseReviewSource
+        or type(children[1]) is not ActualPositionPlanSource
+        or type(children[2]) is not SessionCalendarResolver
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES,
+        source,
+        exact_type=ActualCloseMarketSource,
+        children=children,
+    )
+
+
+def is_issued_actual_close_market_source(source: object) -> bool:
+    if type(source) is not ActualCloseMarketSource:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES,
+        source,
+    )
+    if children is None or len(children) != 3:
+        return False
+    review_source, position_plan_source, calendar_resolver = children
+    receipts = source.observation_receipts
+    try:
+        if (
+            review_source is not source.review_source
+            or position_plan_source is not source.position_plan_source
+            or type(review_source) is not ActualCloseReviewSource
+            or type(position_plan_source) is not ActualPositionPlanSource
+            or not is_verified_actual_close_review_source(review_source)
+            or not is_verified_actual_position_plan_source(position_plan_source)
+            or any(type(receipt) is not SourceObservationReceipt for receipt in receipts)
+            or type(calendar_resolver) is not SessionCalendarResolver
+            or not calendar_resolver.release_verified
+            or _calendar_digest(calendar_resolver) != source.calendar_digest
+            or not _actual_close_sources_share_owner(
+                review_source,
+                position_plan_source,
+                *receipts,
+            )
+        ):
+            return False
+    except Exception:
+        return False
+    return _is_current_actual_close_market_source_without_callbacks(source)
+
+
+def issue_actual_close_market_source(
+    review_source: ActualCloseReviewSource,
+    position_plan_source: ActualPositionPlanSource,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+) -> ActualCloseMarketSource:
+    """Issue one exact delayed-SIP close source from a durable review."""
+    from .indicators import IndicatorError, wilder_atr
+
+    if type(review_source) is not ActualCloseReviewSource or not (
+        is_verified_actual_close_review_source(review_source)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_REVIEW_UNVERIFIED")
+    if type(position_plan_source) is not ActualPositionPlanSource or not (
+        is_verified_actual_position_plan_source(position_plan_source)
+    ):
+        raise RiskBlock("ACTUAL_POSITION_PLAN_UNVERIFIED")
+    if type(calendar_resolver) is not SessionCalendarResolver or not (
+        calendar_resolver.release_verified
+    ):
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    symbol = position_plan_source.symbol
+    review_at = _require_aware(
+        review_source.review_at,
+        "INVALID_ACTUAL_CLOSE_TIME",
+    )
+    query_cutoff = _require_aware(
+        review_source.query_cutoff,
+        "INVALID_ACTUAL_CLOSE_QUERY_CUTOFF",
+    )
+    if (
+        query_cutoff < review_at
+        or position_plan_source.query_cutoff != query_cutoff
+        or not _actual_close_sources_share_owner(
+            review_source,
+            position_plan_source,
+        )
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_REVIEW_PLAN_MISMATCH")
+    review_session = review_at.astimezone(_ET).date()
+    try:
+        schedule = calendar_resolver.session(review_session)
+    except RiskBlock:
+        raise RiskBlock("ACTUAL_CLOSE_REVIEW_SESSION_INVALID") from None
+    expected_review = datetime.combine(
+        review_session,
+        schedule.review_time,
+        tzinfo=schedule.timezone,
+    )
+    if review_at != expected_review:
+        raise RiskBlock("ACTUAL_CLOSE_REVIEW_TIME_INVALID")
+    session_open = datetime.combine(
+        review_session,
+        schedule.open_time,
+        tzinfo=schedule.timezone,
+    )
+    session_close = datetime.combine(
+        review_session,
+        schedule.close_time,
+        tzinfo=schedule.timezone,
+    )
+    cutoff = min(review_at - timedelta(minutes=16), session_close)
+    if review_source.mark_cutoff != cutoff:
+        raise RiskBlock("ACTUAL_CLOSE_MARK_CUTOFF_MISMATCH")
+    quote_start = cutoff - timedelta(minutes=5)
+    required_roles = (
+        "SIP_DAILY_BAR",
+        "SIP_MINUTE_BAR",
+        "SIP_QUOTE",
+        "IEX_FRESHNESS",
+    )
+    scoped_bindings = tuple(
+        binding
+        for role in required_roles
+        for binding in review_source.bindings
+        if binding.symbol == symbol and binding.source_role == role
+    )
+    if (
+        {binding.source_role for binding in scoped_bindings}
+        != set(required_roles)
+        or any(
+            binding.failure_code is not None or binding.receipt is None
+            for binding in scoped_bindings
+        )
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_MARKET_REVIEW_INCOMPLETE")
+    receipts = tuple(
+        binding.receipt
+        for binding in scoped_bindings
+        if binding.receipt is not None
+    )
+    if (
+        not receipts
+        or any(type(receipt) is not SourceObservationReceipt for receipt in receipts)
+        or len({id(receipt) for receipt in receipts}) != len(receipts)
+        or len({receipt.row_id for receipt in receipts}) != len(receipts)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_RECEIPT_SET_INVALID")
+
+    previous_sessions = [calendar_resolver.previous_session(review_session)]
+    while len(previous_sessions) < 14:
+        previous_sessions.append(
+            calendar_resolver.previous_session(previous_sessions[-1])
+        )
+    previous_sessions.reverse()
+    first_daily_schedule = calendar_resolver.session(previous_sessions[0])
+    last_daily_schedule = calendar_resolver.session(previous_sessions[-1])
+    daily_start = datetime.combine(
+        previous_sessions[0],
+        first_daily_schedule.open_time,
+        tzinfo=first_daily_schedule.timezone,
+    )
+    daily_end = datetime.combine(
+        previous_sessions[-1],
+        last_daily_schedule.close_time,
+        tzinfo=last_daily_schedule.timezone,
+    )
+    pages = _actual_close_pages(receipts, query_cutoff=query_cutoff)
+    receipt_role_order = (
+        "ALPACA_DAILY_BARS",
+        "ALPACA_INTRADAY_BARS",
+        "ALPACA_HISTORICAL_QUOTES",
+        "ALPACA_LATEST_QUOTES",
+    )
+    receipts = tuple(
+        page[0]
+        for source_type in receipt_role_order
+        for page in pages[source_type]
+    )
+    daily_pages = pages["ALPACA_DAILY_BARS"]
+    intraday_pages = pages["ALPACA_INTRADAY_BARS"]
+    quote_pages = pages["ALPACA_HISTORICAL_QUOTES"]
+    iex_pages = pages["ALPACA_LATEST_QUOTES"]
+    delayed_release_at = cutoff + timedelta(minutes=16)
+    if any(
+        receipt.retrieved_at < delayed_release_at
+        for role in (daily_pages, intraday_pages, quote_pages)
+        for receipt, _document, _query in role
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SIP_RELEASE_DELAY_UNSATISFIED")
+    _actual_close_exact_query(
+        daily_pages,
+        {
+            "symbols": symbol,
+            "timeframe": "1Day",
+            "start": _actual_close_utc_text(daily_start),
+            "end": _actual_close_utc_text(daily_end),
+            "adjustment": "split",
+            "feed": "sip",
+            "limit": "10000",
+        },
+    )
+    _actual_close_exact_query(
+        intraday_pages,
+        {
+            "symbols": symbol,
+            "timeframe": "1Min",
+            "start": _actual_close_utc_text(session_open),
+            "end": _actual_close_utc_text(cutoff),
+            "adjustment": "split",
+            "feed": "sip",
+            "limit": "10000",
+        },
+    )
+    _actual_close_exact_query(
+        quote_pages,
+        {
+            "symbols": symbol,
+            "start": _actual_close_utc_text(quote_start),
+            "end": _actual_close_utc_text(cutoff),
+            "feed": "sip",
+            "limit": "10000",
+        },
+    )
+    _actual_close_exact_query(
+        iex_pages,
+        {"symbols": symbol, "feed": "iex"},
+    )
+
+    daily_bars: list[_ActualCloseBar] = []
+    for _receipt, document, _query in daily_pages:
+        if set(document) != {"bars", "next_page_token"}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        collection = document.get("bars")
+        if type(collection) is not dict or set(collection) != {symbol}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        values = collection[symbol]
+        if type(values) is not list:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        daily_bars.extend(
+            _actual_close_bar(value, expected_feed="sip")
+            for value in values
+        )
+    daily_bars.sort(key=lambda bar: bar.timestamp)
+    if (
+        len(daily_bars) != 14
+        or len({bar.timestamp for bar in daily_bars}) != len(daily_bars)
+        or any(bar.volume <= 0 for bar in daily_bars)
+        or tuple(bar.timestamp.astimezone(_ET).date() for bar in daily_bars)
+        != tuple(previous_sessions)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_DAILY_HISTORY_INCOMPLETE")
+
+    intraday_bars: list[_ActualCloseBar] = []
+    for _receipt, document, _query in intraday_pages:
+        if set(document) != {"bars", "next_page_token"}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        collection = document.get("bars")
+        if type(collection) is not dict or set(collection) != {symbol}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        values = collection[symbol]
+        if type(values) is not list:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        intraday_bars.extend(
+            _actual_close_bar(value, expected_feed="sip")
+            for value in values
+        )
+    intraday_bars.sort(key=lambda bar: bar.timestamp)
+    if (
+        not intraday_bars
+        or len({bar.timestamp for bar in intraday_bars}) != len(intraday_bars)
+        or any(bar.volume <= 0 for bar in intraday_bars)
+        or any(
+            not session_open <= bar.timestamp <= cutoff
+            or bar.timestamp.astimezone(_ET).date() != review_session
+            for bar in intraday_bars
+        )
+        or intraday_bars[-1].timestamp < cutoff - timedelta(minutes=5)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_INTRADAY_HISTORY_INCOMPLETE")
+
+    quotes: list[tuple[datetime, Decimal, Decimal, int | None]] = []
+    for _receipt, document, _query in quote_pages:
+        if set(document) != {"quotes", "next_page_token"}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        collection = document.get("quotes")
+        if type(collection) is not dict or set(collection) != {symbol}:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        values = collection[symbol]
+        if type(values) is not list:
+            raise RiskBlock("ACTUAL_CLOSE_PROVIDER_PAYLOAD_INVALID")
+        quotes.extend(
+            _actual_close_quote(value, expected_feed="sip")
+            for value in values
+        )
+    quotes.sort(key=lambda quote: (quote[0], -1 if quote[3] is None else quote[3]))
+    if (
+        not quotes
+        or len({quote[0] for quote in quotes}) != len(quotes)
+        or any(not quote_start <= quote[0] <= cutoff for quote in quotes)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SIP_QUOTE_UNAVAILABLE")
+    observed_at, sip_bid, sip_ask, _sequence = quotes[-1]
+    if (
+        sip_bid <= _ZERO
+        or sip_ask < sip_bid
+        or cutoff - observed_at > timedelta(minutes=5)
+        or review_at - observed_at > timedelta(minutes=21)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SIP_STALE")
+
+    _iex_receipt, iex_document, _iex_query = iex_pages[0]
+    if set(iex_document) not in (
+        {"quotes"},
+        {"quotes", "next_page_token"},
+    ) or iex_document.get("next_page_token") is not None:
+        raise RiskBlock("ACTUAL_CLOSE_IEX_COHORT_INVALID")
+    iex_collection = iex_document.get("quotes")
+    if type(iex_collection) is not dict or set(iex_collection) != {symbol}:
+        raise RiskBlock("ACTUAL_CLOSE_IEX_COHORT_INVALID")
+    iex_observed_at, _iex_bid, _iex_ask, _iex_sequence = _actual_close_quote(
+        iex_collection[symbol],
+        expected_feed="iex",
+    )
+    if not review_at - timedelta(minutes=5) <= iex_observed_at <= review_at:
+        raise RiskBlock("ACTUAL_CLOSE_IEX_STALE")
+
+    calendar_digest = _calendar_digest(calendar_resolver)
+    try:
+        raw_atr14 = wilder_atr(tuple(daily_bars), 14)
+    except IndicatorError:
+        raise RiskBlock("ACTUAL_CLOSE_INDICATOR_INVALID") from None
+    atr14 = raw_atr14.quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_CEILING,
+    )
+    previous_session_low = daily_bars[-1].low
+    current_session_low = min(bar.low for bar in intraday_bars)
+    if not _actual_close_sources_share_owner(
+        review_source,
+        position_plan_source,
+        *receipts,
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_RECEIPT_OWNER_MISMATCH")
+    from . import journal as journal_module
+
+    if (
+        not journal_module._is_current_journal_source_authority_without_callbacks(
+            review_source
+        )
+        or not journal_module._is_current_journal_source_authority_without_callbacks(
+            position_plan_source
+        )
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_RECEIPT_STALE")
+    digest_payload = {
+        "version": 2,
+        "symbol": symbol,
+        "review_at": _actual_close_utc_text(review_at),
+        "query_cutoff": _actual_close_utc_text(query_cutoff),
+        "cutoff": _actual_close_utc_text(cutoff),
+        "observed_at": _actual_close_utc_text(observed_at),
+        "sip_bid_micros": money_to_micros(sip_bid),
+        "sip_ask_micros": money_to_micros(sip_ask),
+        "previous_session_low_micros": money_to_micros(previous_session_low),
+        "current_session_low_micros": money_to_micros(current_session_low),
+        "atr14_micros": money_to_micros(atr14),
+        "iex_observed_at": _actual_close_utc_text(iex_observed_at),
+        "receipt_source_digests": [receipt.source_digest for receipt in receipts],
+        "review_source_digest": review_source.source_digest,
+        "position_plan_digest": position_plan_source.position_plan_digest,
+        "calendar_digest": calendar_digest,
+    }
+    source_digest = sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    source = ActualCloseMarketSource(
+        review_source=review_source,
+        position_plan_source=position_plan_source,
+        symbol=symbol,
+        review_at=review_at,
+        query_cutoff=query_cutoff,
+        cutoff=cutoff,
+        observed_at=observed_at,
+        sip_bid=sip_bid,
+        sip_ask=sip_ask,
+        previous_session_low=previous_session_low,
+        current_session_low=current_session_low,
+        atr14=atr14,
+        iex_observed_at=iex_observed_at,
+        observation_receipts=receipts,
+        calendar_digest=calendar_digest,
+        source_digest=source_digest,
+    )
+    _install_risk_authority(
+        _ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES,
+        source,
+        exact_type=ActualCloseMarketSource,
+        children=(review_source, position_plan_source, calendar_resolver),
+        phase1_bindings=(
+            (review_source, "ACTUAL_CLOSE_REVIEW"),
+            (position_plan_source, "ACTUAL_POSITION_PLAN"),
+        ),
+    )
+    return source
+
+
+def _is_current_phase1_signal_evidence_without_callbacks(
+    evidence: object,
+) -> bool:
+    if type(evidence) is not Phase1SignalEvidenceAuthority:
+        return False
+    children = _registered_risk_authority_children(
+        _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+        evidence,
+    )
+    if children is None or not _phase1_bound_sources(evidence):
+        return False
+    return (
+        _phase1_derived_sources_are_current_without_callbacks(evidence)
+        and _is_current_risk_authority_without_callbacks(
+            _PHASE1_SIGNAL_EVIDENCE_AUTHORITIES,
+            evidence,
+            exact_type=Phase1SignalEvidenceAuthority,
+            children=children,
+        )
+    )
+
+
+def _is_current_actual_position_event_context_without_callbacks(
+    context: object,
+) -> bool:
+    if type(context) is not ActualPositionEventContext:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+    )
+    if (
+        children is None
+        or len(children) != 6
+        or type(children[0]) is not ActualCloseMarketSource
+        or type(children[1]) is not ActualPositionPlanSource
+        or type(children[2]) is not Phase1SignalEvidenceAuthority
+        or type(children[3]) is not LatestCloseRecommendationSource
+        or type(children[4]) is not Policy
+        or type(children[5]) is not SessionCalendarResolver
+        or children[0].review_source is not context.review_source
+        or children[1] is not context.position_plan_source
+        or children[3] is not context.latest_recommendation_source
+        or not _is_current_actual_close_market_source_without_callbacks(children[0])
+        or not _is_current_phase1_signal_evidence_without_callbacks(children[2])
+        or _policy_digest(children[4]) != context.policy_digest
+        or _calendar_digest(children[5]) != context.calendar_digest
+    ):
+        return False
+    return _is_current_risk_authority_without_callbacks(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+        exact_type=ActualPositionEventContext,
+        children=children,
+    )
+
+
+def is_issued_actual_position_event_context(context: object) -> bool:
+    if type(context) is not ActualPositionEventContext:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+    )
+    if children is None or len(children) != 6:
+        return False
+    (
+        market_source,
+        plan_source,
+        event_evidence,
+        latest_recommendation_source,
+        policy,
+        calendar_resolver,
+    ) = children
+    evidence_bindings = _phase1_bound_sources(event_evidence)
+    try:
+        if (
+            type(market_source) is not ActualCloseMarketSource
+            or type(plan_source) is not ActualPositionPlanSource
+            or type(event_evidence) is not Phase1SignalEvidenceAuthority
+            or type(latest_recommendation_source)
+            is not LatestCloseRecommendationSource
+            or type(policy) is not Policy
+            or type(calendar_resolver) is not SessionCalendarResolver
+            or not is_issued_actual_close_market_source(market_source)
+            or not is_verified_actual_position_plan_source(plan_source)
+            or not is_issued_phase1_signal_evidence_authority(event_evidence)
+            or not is_verified_latest_close_recommendation_source(
+                latest_recommendation_source
+            )
+            or len(evidence_bindings) != 1
+            or evidence_bindings[0][1] != "SIGNAL_EVIDENCE"
+            or not _actual_close_sources_share_owner(
+                plan_source,
+                evidence_bindings[0][0],
+                latest_recommendation_source,
+                *market_source.observation_receipts,
+            )
+            or market_source.review_source is not context.review_source
+            or plan_source is not context.position_plan_source
+            or latest_recommendation_source
+            is not context.latest_recommendation_source
+            or event_evidence.event_exit_required
+            is not context.event_exit_required
+            or event_evidence.thesis_invalidated
+            is not context.thesis_invalidated
+            or event_evidence.status != context.evidence_status
+            or event_evidence.source_digest != context.event_evidence_digest
+            or latest_recommendation_source.source_digest
+            != context.latest_recommendation_source_digest
+            or market_source.review_source.source_digest
+            != context.review_source_digest
+            or _policy_digest(policy) != context.policy_digest
+            or _calendar_digest(calendar_resolver) != context.calendar_digest
+        ):
+            return False
+    except Exception:
+        return False
+    return _is_current_actual_position_event_context_without_callbacks(context)
+
+
+def issue_actual_position_event_context(
+    market_source: ActualCloseMarketSource,
+    position_plan_source: ActualPositionPlanSource,
+    event_evidence: Phase1SignalEvidenceAuthority,
+    latest_recommendation_source: LatestCloseRecommendationSource,
+    *,
+    calendar_resolver: SessionCalendarResolver,
+    policy: Policy,
+) -> ActualPositionEventContext:
+    """Issue the exact open ACTUAL position revision for one close source."""
+    from . import journal as journal_module
+    from .reconciliation import (
+        ActualLedgerState,
+        ActualPositionState,
+        is_verified_actual_ledger_state_for_source,
+    )
+
+    if type(market_source) is not ActualCloseMarketSource or not (
+        is_issued_actual_close_market_source(market_source)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SOURCE_UNVERIFIED")
+    if type(position_plan_source) is not ActualPositionPlanSource or not (
+        is_verified_actual_position_plan_source(position_plan_source)
+    ):
+        raise RiskBlock("ACTUAL_POSITION_PLAN_UNVERIFIED")
+    if type(event_evidence) is not Phase1SignalEvidenceAuthority or not (
+        is_issued_phase1_signal_evidence_authority(event_evidence)
+    ):
+        raise RiskBlock("ACTUAL_POSITION_EVENT_EVIDENCE_UNVERIFIED")
+    if type(latest_recommendation_source) is not LatestCloseRecommendationSource or not (
+        is_verified_latest_close_recommendation_source(
+            latest_recommendation_source
+        )
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_RECOMMENDATION_HISTORY_UNVERIFIED")
+    if type(calendar_resolver) is not SessionCalendarResolver or not (
+        calendar_resolver.release_verified
+    ):
+        raise RiskBlock("CALENDAR_RELEASE_AUTHORITY_UNVERIFIED")
+    if type(policy) is not Policy:
+        raise TypeError("actual position context requires a Policy")
+    policy.validate()
+    event_exit_required = event_evidence.event_exit_required
+    thesis_invalidated = event_evidence.thesis_invalidated
+    evidence_status = event_evidence.status
+
+    plan = position_plan_source
+    signal_source = plan.signal_source
+    replay_source = plan.actual_replay_source
+    actual_state = plan.actual_position_state
+    evidence_bindings = _phase1_bound_sources(event_evidence)
+    review_source = market_source.review_source
+    if (
+        market_source.position_plan_source is not position_plan_source
+        or plan.symbol != market_source.symbol
+        or plan.query_cutoff != market_source.query_cutoff
+        or replay_source.query_cutoff != market_source.query_cutoff
+        or type(actual_state) is not ActualLedgerState
+        or actual_state.query_cutoff != market_source.query_cutoff
+        or not is_verified_actual_ledger_state_for_source(
+            actual_state,
+            replay_source,
+        )
+        or signal_source.role != "PRIMARY"
+        or signal_source.symbol != market_source.symbol
+        or signal_source.query_cutoff != market_source.query_cutoff
+        or event_evidence.signal_id != signal_source.signal_id
+        or event_evidence.symbol != signal_source.symbol
+        or event_evidence.role != "PRIMARY"
+        or event_evidence.review_at != market_source.review_at
+        or event_evidence.signal_source_digest != signal_source.source_digest
+        or len(evidence_bindings) != 1
+        or evidence_bindings[0][1] != "SIGNAL_EVIDENCE"
+        or getattr(evidence_bindings[0][0], "query_cutoff", None)
+        != market_source.query_cutoff
+        or getattr(evidence_bindings[0][0], "review_at", None)
+        != market_source.review_at
+        or latest_recommendation_source.position_plan_source
+        is not position_plan_source
+        or latest_recommendation_source.symbol != plan.symbol
+        or latest_recommendation_source.position_plan_digest
+        != plan.position_plan_digest
+        or latest_recommendation_source.query_cutoff
+        != market_source.query_cutoff
+    ):
+        raise RiskBlock("ACTUAL_POSITION_PLAN_MISMATCH")
+    evidence_source = evidence_bindings[0][0]
+    review_event_bindings = tuple(
+        binding
+        for binding in review_source.bindings
+        if binding.symbol == plan.symbol
+        and binding.source_role == "EVENT_EVIDENCE"
+    )
+    review_event_row_ids = tuple(
+        binding.source_observation_id
+        for binding in review_event_bindings
+        if binding.receipt is not None
+    )
+    if (
+        not review_event_bindings
+        or any(
+            binding.failure_code is not None or binding.receipt is None
+            for binding in review_event_bindings
+        )
+        or len(review_event_row_ids) != len(set(review_event_row_ids))
+        or set(review_event_row_ids)
+        != set(getattr(evidence_source, "source_observation_row_ids", ()))
+    ):
+        raise RiskBlock("ACTUAL_POSITION_EVENT_EVIDENCE_REVIEW_MISMATCH")
+    if not _actual_close_sources_share_owner(
+        plan,
+        review_source,
+        evidence_source,
+        latest_recommendation_source,
+        *market_source.observation_receipts,
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_OWNER_MISMATCH")
+    calendar_digest = _calendar_digest(calendar_resolver)
+    policy_digest = _policy_digest(policy)
+    if (
+        market_source.calendar_digest != calendar_digest
+        or signal_source.calendar_digest != calendar_digest
+        or signal_source.policy_digest != policy_digest
+        or event_evidence.calendar_digest != calendar_digest
+        or actual_state.calendar_digest != calendar_digest
+        or actual_state.policy_digest != policy_digest
+    ):
+        raise RiskBlock("ACTUAL_POSITION_POLICY_CALENDAR_MISMATCH")
+
+    actual_entry_lineage_ids = tuple(
+        dict.fromkeys(
+            action.signal_id for action in plan.matched_actions
+        )
+    )
+    if (
+        len(actual_entry_lineage_ids) != 1
+        or actual_entry_lineage_ids[0] is None
+    ):
+        raise RiskBlock("ACTUAL_POSITION_PLAN_AMBIGUOUS")
+    matches = tuple(
+        position
+        for position in actual_state.positions
+        if type(position) is ActualPositionState
+        and position.symbol == market_source.symbol
+        and position.shares > 0
+        and position.signal_id == actual_entry_lineage_ids[0]
+    )
+    if len(matches) != 1:
+        raise RiskBlock("ACTUAL_POSITION_PLAN_AMBIGUOUS")
+    actual_position = matches[0]
+    lifecycle_event_ids = tuple(actual_position.lifecycle_event_ids)
+    lifecycle_actions = tuple(
+        action
+        for action in replay_source.actions
+        if getattr(action, "event_id", None) in lifecycle_event_ids
+    )
+    if (
+        not lifecycle_event_ids
+        or len(lifecycle_event_ids) != len(set(lifecycle_event_ids))
+        or len(lifecycle_actions) != len(lifecycle_event_ids)
+        or {action.event_id for action in lifecycle_actions}
+        != set(lifecycle_event_ids)
+        or any(
+            action.event_time > market_source.review_at
+            for action in lifecycle_actions
+        )
+        or any(
+            action.event_time > market_source.review_at
+            for action in plan.matched_actions
+        )
+        or any(
+            lot.acquired_at > market_source.review_at
+            or lot.source_event_id not in lifecycle_event_ids
+            for lot in actual_position.lots
+        )
+    ):
+        raise RiskBlock("ACTUAL_POSITION_ECONOMIC_LOOKAHEAD")
+    if not actual_position.lots or actual_position.cost_basis_micros <= 0:
+        raise RiskBlock("ACTUAL_POSITION_PLAN_UNAVAILABLE")
+    opening_events = tuple(
+        event
+        for event in plan.lifecycle_events
+        if event.confirmation_execution_event_id
+        == plan.opening_actual_execution_event_id
+    )
+    if len(opening_events) != 1:
+        raise RiskBlock("ACTUAL_POSITION_OPENING_LINEAGE_AMBIGUOUS")
+    entered_session = opening_events[0].event_time.astimezone(_ET).date()
+    review_session = market_source.review_at.astimezone(_ET).date()
+    if (
+        not calendar_resolver.is_open(entered_session)
+        or entered_session > review_session
+    ):
+        raise RiskBlock("ACTUAL_POSITION_ENTRY_SESSION_INVALID")
+    holding_sessions = calendar_resolver.count_sessions(
+        entered_session,
+        review_session,
+    )
+    review_cursor = replay_source.terminal_cursor
+    if review_cursor is None:
+        raise RiskBlock("ACTUAL_POSITION_REPLAY_INCOMPLETE")
+    shares = actual_position.shares
+    entry_micros = (actual_position.cost_basis_micros + shares - 1) // shares
+    initial_stop_micros = signal_source.recommended_stop_micros
+    durable_stop_micros = (
+        initial_stop_micros
+        if latest_recommendation_source.recommendation is None
+        else latest_recommendation_source.recommendation.recommended_stop_micros
+    )
+    recommended_stop_micros = max(
+        initial_stop_micros,
+        (
+            initial_stop_micros
+            if actual_position.recommended_stop_micros is None
+            else actual_position.recommended_stop_micros
+        ),
+        durable_stop_micros,
+    )
+    position = Position(
+        signal_id=signal_source.signal_id,
+        symbol=market_source.symbol,
+        entry=money_from_micros(entry_micros),
+        shares=shares,
+        initial_stop=money_from_micros(initial_stop_micros),
+        recommended_stop=money_from_micros(recommended_stop_micros),
+        user_confirmed_stop=(
+            None
+            if actual_position.user_stop_micros is None
+            else money_from_micros(actual_position.user_stop_micros)
+        ),
+        target=money_from_micros(signal_source.target_micros),
+        tick_size=money_from_micros(signal_source.tick_size_micros),
+        entered_session=entered_session,
+        ledger_name="ACTUAL",
+        profit_target_taken=actual_position.cumulative_sale_proceeds_micros > 0,
+    )
+    iex_age = market_source.review_at - market_source.iex_observed_at
+    context_payload = {
+        "version": 2,
+        "position_digest": _position_revision_digest(position),
+        "review_at": _actual_close_utc_text(market_source.review_at),
+        "query_cutoff": _actual_close_utc_text(market_source.query_cutoff),
+        "observed_at": _actual_close_utc_text(market_source.observed_at),
+        "holding_sessions": holding_sessions,
+        "event_exit_required": event_exit_required,
+        "thesis_invalidated": thesis_invalidated,
+        "evidence_status": evidence_status,
+        "actual_close_source_digest": market_source.source_digest,
+        "event_evidence_digest": event_evidence.source_digest,
+        "event_evidence_source_row_ids": list(review_event_row_ids),
+        "position_plan_digest": plan.position_plan_digest,
+        "review_source_digest": review_source.source_digest,
+        "latest_recommendation_source_digest": (
+            latest_recommendation_source.source_digest
+        ),
+        "policy_digest": policy_digest,
+        "calendar_digest": calendar_digest,
+        "review_cursor": review_cursor,
+    }
+    context_digest = sha256(
+        json.dumps(
+            context_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        not _is_current_actual_close_market_source_without_callbacks(market_source)
+        or not journal_module._is_current_journal_source_authority_without_callbacks(
+            plan
+        )
+        or not _is_current_phase1_signal_evidence_without_callbacks(
+            event_evidence
+        )
+        or not journal_module._is_current_journal_source_authority_without_callbacks(
+            latest_recommendation_source
+        )
+        or _policy_digest(policy) != policy_digest
+        or _calendar_digest(calendar_resolver) != calendar_digest
+    ):
+        raise RiskBlock("ACTUAL_POSITION_CONTEXT_STALE")
+    context = ActualPositionEventContext(
+        review_source=review_source,
+        position_plan_source=plan,
+        latest_recommendation_source=latest_recommendation_source,
+        position=position,
+        review_at=market_source.review_at,
+        query_cutoff=market_source.query_cutoff,
+        observed_at=market_source.observed_at,
+        previous_session_low=market_source.previous_session_low,
+        current_session_low=market_source.current_session_low,
+        atr14=market_source.atr14,
+        iex_age=iex_age,
+        holding_sessions=holding_sessions,
+        event_exit_required=event_exit_required,
+        thesis_invalidated=thesis_invalidated,
+        evidence_status=evidence_status,
+        actual_close_source_digest=market_source.source_digest,
+        event_evidence_digest=event_evidence.source_digest,
+        event_evidence_source_row_ids=review_event_row_ids,
+        position_plan_digest=plan.position_plan_digest,
+        review_source_digest=review_source.source_digest,
+        latest_recommendation_source_digest=(
+            latest_recommendation_source.source_digest
+        ),
+        policy_digest=policy_digest,
+        calendar_digest=calendar_digest,
+        review_cursor=review_cursor,
+        context_digest=context_digest,
+    )
+    _install_risk_authority(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+        exact_type=ActualPositionEventContext,
+        children=(
+            market_source,
+            plan,
+            event_evidence,
+            latest_recommendation_source,
+            policy,
+            calendar_resolver,
+        ),
+        phase1_bindings=(
+            (plan, "ACTUAL_POSITION_PLAN"),
+            (review_source, "ACTUAL_CLOSE_REVIEW"),
+            (
+                latest_recommendation_source,
+                "LATEST_CLOSE_RECOMMENDATION",
+            ),
+            *evidence_bindings,
+        ),
+    )
+    return context
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class MarketMark:
     """Validated mark plus explicit session and event-exit authority.
@@ -6400,26 +7841,30 @@ def _market_mark_fingerprint(mark: MarketMark) -> tuple[object, ...]:
     )
 
 
-def is_issued_market_mark(mark: object) -> bool:
+def _is_current_market_mark_without_callbacks(mark: object) -> bool:
+    """Recheck an issued mark and its exact context without public hooks."""
     if type(mark) is not MarketMark:
         return False
     children = _registered_risk_authority_children(_MARK_AUTHORITIES, mark)
-    if (
-        children is None
-        or len(children) != 1
-        or type(children[0]) is not PositionEventContext
-        or not is_issued_position_event_context(children[0])
-        or not _is_current_risk_authority_without_callbacks(
+    if children is None or len(children) != 1:
+        return False
+    context = children[0]
+    if type(context) is ActualPositionEventContext:
+        if not _is_current_actual_position_event_context_without_callbacks(
+            context
+        ):
+            return False
+    elif type(context) is PositionEventContext:
+        if not _is_current_risk_authority_without_callbacks(
             _POSITION_EVENT_AUTHORITIES,
-            children[0],
+            context,
             exact_type=PositionEventContext,
             children=tuple(
-                source
-                for source, _kind in _phase1_bound_sources(children[0])
+                source for source, _kind in _phase1_bound_sources(context)
             ),
-        )
-        or not _phase1_derived_sources_are_current(mark)
-    ):
+        ):
+            return False
+    else:
         return False
     if _phase1_bound_sources(mark) and not (
         _phase1_derived_sources_are_current_without_callbacks(mark)
@@ -6431,6 +7876,42 @@ def is_issued_market_mark(mark: object) -> bool:
         exact_type=MarketMark,
         children=children,
     )
+
+
+def is_issued_market_mark(mark: object) -> bool:
+    if type(mark) is not MarketMark:
+        return False
+    children = _registered_risk_authority_children(_MARK_AUTHORITIES, mark)
+    if children is None or len(children) != 1:
+        return False
+    context = children[0]
+    if type(context) is ActualPositionEventContext:
+        if (
+            not is_issued_actual_position_event_context(context)
+            or not _is_current_actual_position_event_context_without_callbacks(
+                context
+            )
+        ):
+            return False
+    elif type(context) is PositionEventContext:
+        if (
+            not is_issued_position_event_context(context)
+            or not _is_current_risk_authority_without_callbacks(
+                _POSITION_EVENT_AUTHORITIES,
+                context,
+                exact_type=PositionEventContext,
+                children=tuple(
+                    source
+                    for source, _kind in _phase1_bound_sources(context)
+                ),
+            )
+        ):
+            return False
+    else:
+        return False
+    if not _phase1_derived_sources_are_current(mark):
+        return False
+    return _is_current_market_mark_without_callbacks(mark)
 
 
 def build_market_mark(
@@ -6546,6 +8027,79 @@ def build_market_mark(
             exact_type=MarketMark,
             children=(position_event_context,),
         )
+    return mark
+
+
+def issue_actual_close_mark(
+    source: ActualCloseMarketSource,
+    context: ActualPositionEventContext,
+) -> MarketMark:
+    """Issue a conservative SIP-bid mark at the fixed economic review time."""
+    if type(source) is not ActualCloseMarketSource or not (
+        is_issued_actual_close_market_source(source)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SOURCE_UNVERIFIED")
+    if type(context) is not ActualPositionEventContext or not (
+        is_issued_actual_position_event_context(context)
+    ):
+        raise RiskBlock("ACTUAL_POSITION_CONTEXT_UNVERIFIED")
+    context_children = _registered_risk_authority_children(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+    )
+    if (
+        context_children is None
+        or len(context_children) != 6
+        or context_children[0] is not source
+        or source.symbol != context.position.symbol
+        or source.review_at != context.review_at
+        or source.query_cutoff != context.query_cutoff
+        or source.observed_at != context.observed_at
+        or source.previous_session_low != context.previous_session_low
+        or source.current_session_low != context.current_session_low
+        or source.atr14 != context.atr14
+        or source.source_digest != context.actual_close_source_digest
+        or source.sip_bid <= _ZERO
+        or source.sip_ask < source.sip_bid
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SOURCE_MISMATCH")
+    # Both public checks above may exercise owner/calendar/policy callbacks.
+    # No copied market scalar is trusted until these hook-free exact rechecks.
+    if (
+        not _is_current_actual_close_market_source_without_callbacks(source)
+        or not _is_current_actual_position_event_context_without_callbacks(
+            context
+        )
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_SOURCE_STALE")
+    position = context.position
+    mark = MarketMark(
+        price=source.sip_bid,
+        at=context.review_at,
+        holding_sessions=context.holding_sessions,
+        previous_session_low=context.previous_session_low,
+        current_session_low=context.current_session_low,
+        atr14=context.atr14,
+        event_exit_required=context.event_exit_required,
+        thesis_invalidated=context.thesis_invalidated,
+        event_evidence_status=context.evidence_status,
+        context_verified=True,
+        holding_sessions_verified=True,
+        ledger_name=position.ledger_name,
+        signal_id=position.signal_id,
+        symbol=position.symbol,
+        position_digest=_position_revision_digest(position),
+        event_context_digest=context.context_digest,
+        calendar_digest=context.calendar_digest,
+        review_cursor=context.review_cursor,
+    )
+    _install_risk_authority(
+        _MARK_AUTHORITIES,
+        mark,
+        exact_type=MarketMark,
+        children=(context,),
+        phase1_bindings=_phase1_bound_sources(context),
+    )
     return mark
 
 
@@ -7040,9 +8594,30 @@ def evaluate_position(
 ) -> PositionAction:
     """Evaluate an adapter-authorized close mark without mutating state."""
     _validate_position_evaluation(position, mark, policy)
+    mark_is_issued = (
+        is_issued_market_mark(mark)
+        and _is_current_market_mark_without_callbacks(mark)
+    )
     r_multiple = _position_r_multiple(position, mark)
+    mark_children = (
+        _registered_risk_authority_children(_MARK_AUTHORITIES, mark)
+        if mark_is_issued
+        else None
+    )
+    position_is_authority_bound = (
+        mark_children is not None
+        and len(mark_children) == 1
+        and (
+            type(mark_children[0]) is PositionEventContext
+            or (
+                type(mark_children[0]) is ActualPositionEventContext
+                and mark_children[0].position is position
+            )
+        )
+    )
     position_revision_matches = (
-        mark.ledger_name == position.ledger_name
+        position_is_authority_bound
+        and mark.ledger_name == position.ledger_name
         and mark.signal_id == position.signal_id
         and mark.symbol == position.symbol
         and mark.position_digest == _position_revision_digest(position)
@@ -7050,12 +8625,12 @@ def evaluate_position(
     if (
         not mark.context_verified
         or not mark.holding_sessions_verified
-        or not is_issued_market_mark(mark)
+        or not mark_is_issued
         or not position_revision_matches
     ):
         reasons = (
             ("POSITION_REVISION_MISMATCH",)
-            if is_issued_market_mark(mark) and not position_revision_matches
+            if mark_is_issued and not position_revision_matches
             else ("POSITION_CONTEXT_UNVERIFIED",)
         )
         return _position_action(
@@ -7063,6 +8638,19 @@ def evaluate_position(
             mark,
             status="POSITION_UNVERIFIED",
             reasons=reasons,
+            recommended_stop=position.recommended_stop,
+            shares_to_exit=0,
+            r_multiple=r_multiple,
+        )
+    if mark.event_evidence_status in {"UNRESOLVED", "UNAVAILABLE"} and not (
+        mark.price <= position.recommended_stop
+        or mark.holding_sessions >= MAX_HOLD_SESSIONS
+    ):
+        return _position_action(
+            position,
+            mark,
+            status="POSITION_UNVERIFIED",
+            reasons=(f"EVENT_EVIDENCE_{mark.event_evidence_status}",),
             recommended_stop=position.recommended_stop,
             shares_to_exit=0,
             r_multiple=r_multiple,
@@ -7253,6 +8841,336 @@ def _evaluate_position_formula(
         shares_to_exit=0,
         r_multiple=r_multiple,
     )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ActualCloseDecisionSource:
+    """Exact persistable ACTUAL close decision from one issued review."""
+
+    context: ActualPositionEventContext = field(repr=False, compare=False)
+    mark: MarketMark = field(repr=False, compare=False)
+    policy: Policy = field(repr=False, compare=False)
+    position_action: PositionAction = field(repr=False, compare=False)
+    review_source: ActualCloseReviewSource = field(repr=False, compare=False)
+    position_plan_source: ActualPositionPlanSource = field(
+        repr=False,
+        compare=False,
+    )
+    latest_recommendation_source: LatestCloseRecommendationSource = field(
+        repr=False,
+        compare=False,
+    )
+    replay_recommendation: CloseRecommendationSource | None = field(
+        repr=False,
+        compare=False,
+    )
+    session_date: date
+    review_id: str
+    symbol: str
+    signal_id: str
+    position_plan_digest: str
+    action: str
+    reason_codes: tuple[str, ...]
+    recommended_stop_micros: int
+    received_at: datetime
+    policy_digest: str
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        reasons = _freeze_reason_codes(
+            self.reason_codes,
+            "INVALID_ACTUAL_CLOSE_DECISION",
+        )
+        object.__setattr__(self, "reason_codes", reasons)
+        received_at = _require_aware(
+            self.received_at,
+            "INVALID_ACTUAL_CLOSE_DECISION",
+        )
+        if (
+            type(self.context) is not ActualPositionEventContext
+            or type(self.mark) is not MarketMark
+            or type(self.policy) is not Policy
+            or type(self.position_action) is not PositionAction
+            or type(self.review_source) is not ActualCloseReviewSource
+            or type(self.position_plan_source) is not ActualPositionPlanSource
+            or type(self.latest_recommendation_source)
+            is not LatestCloseRecommendationSource
+            or (
+                self.replay_recommendation is not None
+                and type(self.replay_recommendation)
+                is not CloseRecommendationSource
+            )
+            or self.context.review_source is not self.review_source
+            or self.context.position_plan_source is not self.position_plan_source
+            or self.context.latest_recommendation_source
+            is not self.latest_recommendation_source
+            or self.context.position.symbol != self.symbol
+            or self.context.position.signal_id != self.signal_id
+            or self.position_plan_source.position_plan_digest
+            != self.position_plan_digest
+            or self.review_source.review_id != self.review_id
+            or self.review_source.session_date != self.session_date
+            or received_at != self.review_source.retrieved_at
+            or received_at > self.review_source.query_cutoff
+            or received_at.astimezone(_ET).date() != self.session_date
+            or self.action not in {"HOLD", "TIGHTEN_STOP", "EXIT"}
+            or not reasons
+            or self.recommended_stop_micros
+            != money_to_micros(self.position_action.recommended_stop)
+            or not _is_sha256_digest(self.policy_digest)
+            or not _is_sha256_digest(self.source_digest)
+        ):
+            raise RiskBlock("INVALID_ACTUAL_CLOSE_DECISION")
+        mapped_action = {
+            "PROVISIONAL_HOLD": "HOLD",
+            "PROVISIONAL_TIGHTEN_STOP": "TIGHTEN_STOP",
+            "PROVISIONAL_EXIT": "EXIT",
+        }.get(self.position_action.status)
+        replay = self.replay_recommendation
+        if replay is None:
+            if mapped_action != self.action:
+                raise RiskBlock("INVALID_ACTUAL_CLOSE_DECISION")
+        elif (
+            self.latest_recommendation_source.recommendation is not replay
+            or replay.review_id != self.review_id
+            or replay.position_plan_digest != self.position_plan_digest
+            or replay.signal_id != self.signal_id
+            or replay.symbol != self.symbol
+            or replay.action != self.action
+            or replay.reason_codes != reasons
+            or replay.recommended_stop_micros
+            != self.recommended_stop_micros
+            or replay.received_at != received_at
+        ):
+            raise RiskBlock("INVALID_ACTUAL_CLOSE_DECISION")
+
+
+def _actual_close_decision_document(
+    source: ActualCloseDecisionSource,
+) -> dict[str, object]:
+    return {
+        "action": source.action,
+        "context_digest": source.context.context_digest,
+        "mark": list(_market_mark_fingerprint(source.mark)),
+        "policy_digest": source.policy_digest,
+        "position_action": {
+            "reason_codes": list(source.position_action.reason_codes),
+            "recommended_stop_micros": money_to_micros(
+                source.position_action.recommended_stop
+            ),
+            "remaining_shares": source.position_action.remaining_shares,
+            "shares_to_exit": source.position_action.shares_to_exit,
+            "status": source.position_action.status,
+        },
+        "position_plan_digest": source.position_plan_digest,
+        "reason_codes": list(source.reason_codes),
+        "received_at": _actual_close_utc_text(source.received_at),
+        "recommended_stop_micros": source.recommended_stop_micros,
+        "review_id": source.review_id,
+        "replay_recommendation_id": (
+            None
+            if source.replay_recommendation is None
+            else source.replay_recommendation.recommendation_id
+        ),
+        "review_source_digest": source.review_source.source_digest,
+        "session_date": source.session_date.isoformat(),
+        "signal_id": source.signal_id,
+        "symbol": source.symbol,
+        "version": 1,
+    }
+
+
+def _is_current_actual_close_decision_source_without_callbacks(
+    source: object,
+) -> bool:
+    if type(source) is not ActualCloseDecisionSource:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_CLOSE_DECISION_AUTHORITIES,
+        source,
+    )
+    if (
+        children is None
+        or len(children) != 4
+        or children[0] is not source.context
+        or children[1] is not source.mark
+        or children[2] is not source.policy
+        or children[3] is not source.position_action
+        or not _is_current_actual_position_event_context_without_callbacks(
+            source.context
+        )
+        or not _is_current_market_mark_without_callbacks(source.mark)
+        or _policy_digest(source.policy) != source.policy_digest
+    ):
+        return False
+    try:
+        expected_digest = sha256(
+            json.dumps(
+                _actual_close_decision_document(source),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        return False
+    return expected_digest == source.source_digest and (
+        _is_current_risk_authority_without_callbacks(
+            _ACTUAL_CLOSE_DECISION_AUTHORITIES,
+            source,
+            exact_type=ActualCloseDecisionSource,
+            children=children,
+        )
+    )
+
+
+def is_issued_actual_close_decision_source(source: object) -> bool:
+    if type(source) is not ActualCloseDecisionSource:
+        return False
+    children = _registered_risk_authority_children(
+        _ACTUAL_CLOSE_DECISION_AUTHORITIES,
+        source,
+    )
+    try:
+        if (
+            children is None
+            or len(children) != 4
+            or children[0] is not source.context
+            or children[1] is not source.mark
+            or children[2] is not source.policy
+            or children[3] is not source.position_action
+            or not is_issued_actual_position_event_context(source.context)
+            or not is_issued_market_mark(source.mark)
+            or _policy_digest(source.policy) != source.policy_digest
+        ):
+            return False
+        expected_action = evaluate_position(
+            source.context.position,
+            source.mark,
+            source.policy,
+        )
+    except Exception:
+        return False
+    return (
+        _position_action_fingerprint(expected_action)
+        == _position_action_fingerprint(source.position_action)
+        and _is_current_actual_close_decision_source_without_callbacks(source)
+    )
+
+
+def issue_actual_close_decision(
+    context: ActualPositionEventContext,
+    mark: MarketMark,
+    policy: Policy,
+) -> ActualCloseDecisionSource:
+    """Evaluate and issue the only decision accepted by Journal persistence."""
+    if type(context) is not ActualPositionEventContext or not (
+        is_issued_actual_position_event_context(context)
+    ):
+        raise RiskBlock("ACTUAL_POSITION_CONTEXT_UNVERIFIED")
+    if type(mark) is not MarketMark or not is_issued_market_mark(mark):
+        raise RiskBlock("ACTUAL_CLOSE_MARK_UNVERIFIED")
+    children = _registered_risk_authority_children(
+        _ACTUAL_POSITION_EVENT_AUTHORITIES,
+        context,
+    )
+    mark_children = _registered_risk_authority_children(
+        _MARK_AUTHORITIES,
+        mark,
+    )
+    if (
+        type(policy) is not Policy
+        or children is None
+        or len(children) != 6
+        or children[4] is not policy
+        or mark_children != (context,)
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_POLICY_CONTEXT_MISMATCH")
+    policy.validate()
+    action_source = evaluate_position(context.position, mark, policy)
+    review_source = context.review_source
+    if review_source.retrieved_at > review_source.query_cutoff:
+        raise RiskBlock("ACTUAL_CLOSE_DECISION_REVIEW_NOT_SETTLED")
+    replay_recommendation = (
+        context.latest_recommendation_source.recommendation
+    )
+    if (
+        replay_recommendation is not None
+        and replay_recommendation.review_id == review_source.review_id
+    ):
+        mapped_action = replay_recommendation.action
+        reasons = replay_recommendation.reason_codes
+        recommended_stop_micros = (
+            replay_recommendation.recommended_stop_micros
+        )
+    else:
+        replay_recommendation = None
+        mapped_action = {
+            "PROVISIONAL_HOLD": "HOLD",
+            "PROVISIONAL_TIGHTEN_STOP": "TIGHTEN_STOP",
+            "PROVISIONAL_EXIT": "EXIT",
+        }.get(action_source.status)
+        if mapped_action is None:
+            raise RiskBlock(f"ACTUAL_CLOSE_DECISION_{action_source.status}")
+        reasons = tuple(action_source.reason_codes)
+        if mapped_action == "HOLD" and not reasons:
+            reasons = ("PLAN_UNCHANGED",)
+        if not reasons:
+            raise RiskBlock("ACTUAL_CLOSE_DECISION_REASONS_UNAVAILABLE")
+        recommended_stop_micros = money_to_micros(
+            action_source.recommended_stop
+        )
+    policy_digest = _policy_digest(policy)
+    source = ActualCloseDecisionSource(
+        context=context,
+        mark=mark,
+        policy=policy,
+        position_action=action_source,
+        review_source=review_source,
+        position_plan_source=context.position_plan_source,
+        latest_recommendation_source=(
+            context.latest_recommendation_source
+        ),
+        replay_recommendation=replay_recommendation,
+        session_date=review_source.session_date,
+        review_id=review_source.review_id,
+        symbol=context.position.symbol,
+        signal_id=context.position.signal_id,
+        position_plan_digest=context.position_plan_digest,
+        action=mapped_action,
+        reason_codes=reasons,
+        recommended_stop_micros=recommended_stop_micros,
+        received_at=review_source.retrieved_at,
+        policy_digest=policy_digest,
+        source_digest="0" * 64,
+    )
+    source = replace(
+        source,
+        source_digest=sha256(
+            json.dumps(
+                _actual_close_decision_document(source),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+    if not (
+        _is_current_actual_position_event_context_without_callbacks(context)
+        and _is_current_market_mark_without_callbacks(mark)
+        and _policy_digest(policy) == policy_digest
+    ):
+        raise RiskBlock("ACTUAL_CLOSE_DECISION_INPUT_STALE")
+    _install_risk_authority(
+        _ACTUAL_CLOSE_DECISION_AUTHORITIES,
+        source,
+        exact_type=ActualCloseDecisionSource,
+        children=(context, mark, policy, action_source),
+        phase1_bindings=_phase1_bound_sources(context),
+    )
+    return source
 
 
 def _phase1_exit_execution_result_from_observations(
@@ -10459,7 +12377,27 @@ _install_risk_authority = _risk_authority_installer_factory(
         (
             _MARK_AUTHORITIES,
             MarketMark,
-            frozenset({build_market_mark.__code__}),
+            frozenset(
+                {
+                    build_market_mark.__code__,
+                    issue_actual_close_mark.__code__,
+                }
+            ),
+        ),
+        (
+            _ACTUAL_CLOSE_MARKET_SOURCE_AUTHORITIES,
+            ActualCloseMarketSource,
+            frozenset({issue_actual_close_market_source.__code__}),
+        ),
+        (
+            _ACTUAL_POSITION_EVENT_AUTHORITIES,
+            ActualPositionEventContext,
+            frozenset({issue_actual_position_event_context.__code__}),
+        ),
+        (
+            _ACTUAL_CLOSE_DECISION_AUTHORITIES,
+            ActualCloseDecisionSource,
+            frozenset({issue_actual_close_decision.__code__}),
         ),
         (
             _POSITION_EVENT_AUTHORITIES,
@@ -10517,6 +12455,9 @@ __all__ = [
     "AccountCheck",
     "AccountCheckDecision",
     "ActualBreakerRefreshAuthority",
+    "ActualCloseDecisionSource",
+    "ActualCloseMarketSource",
+    "ActualPositionEventContext",
     "BreakerState",
     "ClosedTrade",
     "CONSECUTIVE_LOSS_LIMIT",
@@ -10558,6 +12499,9 @@ __all__ = [
     "evaluate_position_addition",
     "evaluate_position_diagnostic",
     "is_issued_journal_event_window",
+    "is_issued_actual_close_market_source",
+    "is_issued_actual_close_decision_source",
+    "is_issued_actual_position_event_context",
     "is_issued_actual_breaker_refresh_authority",
     "is_issued_portfolio_risk_authority",
     "is_issued_long_plan_decision",
@@ -10569,6 +12513,10 @@ __all__ = [
     "is_issued_phase1_position_evidence_authority",
     "is_issued_phase1_signal_evidence_authority",
     "is_issued_position_event_context",
+    "issue_actual_close_mark",
+    "issue_actual_close_decision",
+    "issue_actual_close_market_source",
+    "issue_actual_position_event_context",
     "phase1_signal_evidence_manifest",
     "plan_long",
     "plan_long_diagnostic",

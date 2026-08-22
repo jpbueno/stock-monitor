@@ -273,8 +273,9 @@ silently relabeled with the later review date.
 The initial 2026-08-22 evidence package intentionally records the exact NYSE
 operational-status response available at review time with no primary
 publication timestamp. Its subject coverage is `UNKNOWN` and incomplete for
-both required coverage kinds, even though the covered date interval is
-explicit. It is provenance/readback material only: it cannot authorize
+the product-relevant event class; the opposite product event class is
+`NOT_APPLICABLE` and complete. Both covered date intervals are explicit. This
+package is provenance/readback material only: it cannot authorize
 `CONFIRMED_CLEAR`, a candidate, an unattended action, or a successful
 canonical premarket decision. A later human-reviewed, primary-source repin is
 required before activation can clear those gates.

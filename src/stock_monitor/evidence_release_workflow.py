@@ -10,12 +10,23 @@ import os
 import re
 import secrets
 import stat
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from stock_monitor.domain import require_aware_timestamp
+from stock_monitor.evidence import (
+    ADVERSE_TAGS,
+    ETF_POSITIVE_EVENT_TYPES,
+    POSITIVE_EVENT_TYPES,
+    EvidenceCoverageAttestation,
+    EvidenceRecord,
+    EvidenceRegistryError,
+    EvidenceSourceBinding,
+    load_evidence_release,
+)
 from stock_monitor.evidence_authorities import (
     EVIDENCE_AUTHORITIES,
     EvidenceAuthority,
@@ -28,6 +39,10 @@ from stock_monitor.universe import UniverseRecord, UniverseSnapshot, load_curren
 _CURRENT_RELEASE = Path("data/evidence/current.json")
 _MAX_PARENT_RELEASE_BYTES = 4_194_304
 _MAX_SOURCE_BYTES = 4_194_304
+_MAX_REVIEW_INPUT_BYTES = 1_048_576
+_MAX_PROPOSAL_BYTES = 1_048_576
+_MAX_REVIEW_TEMPLATE_BYTES = 1_048_576
+_MAX_SOURCE_ARTIFACT_BYTES = 6_000_000
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _DIRECTORY_OPEN_FLAGS = (
@@ -53,6 +68,12 @@ _STABLE_STAT_FIELDS = (
     "st_mtime_ns",
     "st_ctime_ns",
 )
+_STABLE_DIRECTORY_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+)
 _SAFE_REASON_CODES = frozenset(
     {
         "SEC_COLLECTOR_UNAVAILABLE",
@@ -60,6 +81,71 @@ _SAFE_REASON_CODES = frozenset(
         "SOURCE_RESULT_INVALID",
     }
 )
+_EVENT_CLASSES = frozenset({"BINARY_EVENT", "ETF_ACTION"})
+_PROPOSAL_FIELDS = {
+    "created_at",
+    "kind",
+    "observations",
+    "parent_release_sha256",
+    "reviewer_template_sha256",
+    "schema_version",
+    "source_failures",
+    "subjects",
+    "universe_sha256",
+}
+_PROPOSAL_OBSERVATION_FIELDS = {
+    "accession",
+    "artifact_path",
+    "content_sha256",
+    "event_class",
+    "issuer_cik",
+    "observation_id",
+    "published_at",
+    "publisher",
+    "retrieved_at",
+    "role",
+    "source_type",
+    "symbol",
+    "timestamp_source",
+    "url",
+}
+_REVIEW_FIELDS = {
+    "coverage_end",
+    "coverage_start",
+    "kind",
+    "proposal_sha256",
+    "review_by",
+    "reviewed_at",
+    "schema_version",
+    "subjects",
+    "universe_sha256",
+}
+_REVIEW_SUBJECT_FIELDS = {
+    "coverage_attestations",
+    "event_class",
+    "issuer_cik",
+    "records",
+    "subject_kind",
+    "symbol",
+}
+_REVIEW_RECORD_FIELDS = {
+    "adverse_tags",
+    "classification_ambiguous",
+    "conflicts",
+    "event_date",
+    "event_kind",
+    "event_type",
+    "fact",
+    "published_at",
+    "source_observation_ids",
+}
+_REVIEW_COVERAGE_FIELDS = {
+    "complete",
+    "conflicts",
+    "coverage",
+    "event_class",
+    "source_observation_ids",
+}
 
 
 class EvidenceWorkflowError(RuntimeError):
@@ -78,6 +164,22 @@ class EvidenceProposalSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceCandidateSummary:
+    status: str
+    candidate_sha256: str
+    proposal_sha256: str
+    review_input_sha256: str
+    release_sha256: str
+    universe_sha256: str
+    reviewed_at: datetime
+    review_by: datetime
+    symbols: tuple[str, ...]
+    coverage: tuple[tuple[str, str, str], ...]
+    reason_codes: tuple[str, ...]
+    candidate_path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class _CollectedObservation:
     observation_id: str
     symbol: str
@@ -93,6 +195,27 @@ class _CollectedObservation:
     source_type: str
     accession: str | None
     body: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedProposal:
+    created_at: datetime
+    parent_release_sha256: str
+    universe_sha256: str
+    subjects: tuple[dict[str, object], ...]
+    observations: tuple[_CollectedObservation, ...]
+    artifact_payloads: dict[str, bytes] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledCandidate:
+    review_input_sha256: str
+    reviewed_at: datetime
+    review_by: datetime
+    release_sha256: str
+    release_files: dict[str, bytes] = field(repr=False)
+    symbols: tuple[str, ...]
+    coverage: tuple[tuple[str, str, str], ...]
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -892,6 +1015,63 @@ def _stable_directory(before: os.stat_result, after: os.stat_result) -> None:
         raise EvidenceWorkflowError("evidence proposal directory changed during read")
 
 
+def _stable_review_input_directory(
+    before: os.stat_result,
+    after: os.stat_result,
+) -> None:
+    if any(
+        getattr(before, field) != getattr(after, field)
+        for field in _STABLE_DIRECTORY_IDENTITY_FIELDS
+    ):
+        raise EvidenceWorkflowError(
+            "evidence review input directory changed during read"
+        )
+
+
+def _verify_review_input_leaf_binding(
+    directory_descriptor: int,
+    name: str,
+    opened_leaf: os.stat_result,
+) -> None:
+    try:
+        linked_leaf = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise EvidenceWorkflowError(
+            "evidence review input path binding changed"
+        ) from None
+    if (
+        linked_leaf.st_dev != opened_leaf.st_dev
+        or linked_leaf.st_ino != opened_leaf.st_ino
+    ):
+        raise EvidenceWorkflowError("evidence review input path binding changed")
+
+
+def _verify_review_input_directory_binding(
+    parent_descriptor: int,
+    name: str,
+    opened_directory: os.stat_result,
+) -> None:
+    try:
+        linked_directory = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise EvidenceWorkflowError(
+            "evidence review input path binding changed"
+        ) from None
+    if not stat.S_ISDIR(linked_directory.st_mode) or any(
+        getattr(linked_directory, field) != getattr(opened_directory, field)
+        for field in _STABLE_DIRECTORY_IDENTITY_FIELDS
+    ):
+        raise EvidenceWorkflowError("evidence review input path binding changed")
+
+
 def _read_private_at(
     directory_descriptor: int,
     name: str,
@@ -1086,8 +1266,1524 @@ def prepare_evidence_proposal(
     )
 
 
+def _strict_workflow_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise EvidenceWorkflowError("evidence document contains duplicate fields")
+        result[name] = value
+    return result
+
+
+def _canonical_document(payload: bytes, name: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload, object_pairs_hook=_strict_workflow_object)
+    except EvidenceWorkflowError:
+        raise
+    except (UnicodeError, json.JSONDecodeError):
+        raise EvidenceWorkflowError(f"{name} JSON is malformed") from None
+    if not isinstance(value, dict) or _canonical_bytes(value) != payload:
+        raise EvidenceWorkflowError(f"{name} is not canonical JSON")
+    return value
+
+
+def _workflow_timestamp(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise EvidenceWorkflowError(f"{name} is malformed")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        normalized = require_aware_timestamp(parsed, name).astimezone(UTC)
+    except (TypeError, ValueError, OverflowError):
+        raise EvidenceWorkflowError(f"{name} is malformed") from None
+    if _utc_text(normalized) != value:
+        raise EvidenceWorkflowError(f"{name} is not canonical UTC")
+    return normalized
+
+
+def _workflow_optional_timestamp(
+    value: object,
+    name: str,
+) -> datetime | None:
+    if value is None:
+        return None
+    return _workflow_timestamp(value, name)
+
+
+def _workflow_date(value: object, name: str) -> date:
+    if not isinstance(value, str):
+        raise EvidenceWorkflowError(f"{name} is malformed")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise EvidenceWorkflowError(f"{name} is malformed") from None
+    if parsed.isoformat() != value:
+        raise EvidenceWorkflowError(f"{name} is malformed")
+    return parsed
+
+
+def _read_private_bytes_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    try:
+        descriptor = os.open(name, _FILE_OPEN_FLAGS, dir_fd=directory_descriptor)
+    except OSError:
+        raise EvidenceWorkflowError("evidence workflow file is unsafe") from None
+    try:
+        return _read_stable_regular_descriptor(
+            descriptor,
+            maximum_bytes=maximum_bytes,
+            private=True,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _read_private_absolute_file(path: Path, *, maximum_bytes: int) -> bytes:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise EvidenceWorkflowError("evidence review input path must be absolute")
+    parts = path.parts
+    if not parts or parts[0] != os.sep or any(
+        component in {"", ".", ".."} for component in parts[1:]
+    ):
+        raise EvidenceWorkflowError("evidence review input path is unsafe")
+    descriptors: list[int] = []
+    directory_details: list[os.stat_result] = []
+    directory_bindings: list[tuple[int, str, os.stat_result]] = []
+    try:
+        current = os.open(os.sep, _DIRECTORY_OPEN_FLAGS)
+        descriptors.append(current)
+        directory_details.append(os.fstat(current))
+        for component in parts[1:-1]:
+            parent = current
+            current = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=parent)
+            descriptors.append(current)
+            details = os.fstat(current)
+            if not stat.S_ISDIR(details.st_mode):
+                raise EvidenceWorkflowError(
+                    "evidence review input directory is unsafe"
+                )
+            directory_details.append(details)
+            directory_bindings.append((parent, component, details))
+        leaf = os.open(parts[-1], _FILE_OPEN_FLAGS, dir_fd=current)
+        descriptors.append(leaf)
+        payload = _read_stable_regular_descriptor(
+            leaf,
+            maximum_bytes=maximum_bytes,
+            private=True,
+        )
+        opened_leaf = os.fstat(leaf)
+        _verify_review_input_leaf_binding(current, parts[-1], opened_leaf)
+        for before, descriptor in zip(
+            directory_details,
+            descriptors[: len(directory_details)],
+            strict=True,
+        ):
+            _stable_review_input_directory(before, os.fstat(descriptor))
+        _verify_review_input_leaf_binding(current, parts[-1], opened_leaf)
+        for parent, component, opened_directory in directory_bindings:
+            _verify_review_input_directory_binding(
+                parent,
+                component,
+                opened_directory,
+            )
+        return payload
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("evidence review input is unavailable") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _expected_review_template(
+    subjects: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    values: list[dict[str, object]] = []
+    for subject in subjects:
+        relevant = subject["event_class"]
+        opposite = "ETF_ACTION" if relevant == "BINARY_EVENT" else "BINARY_EVENT"
+        values.append(
+            {
+                "coverage_attestations": [
+                    {
+                        "complete": False,
+                        "coverage": "UNKNOWN",
+                        "event_class": relevant,
+                    },
+                    {
+                        "complete": True,
+                        "coverage": "NOT_APPLICABLE",
+                        "event_class": opposite,
+                    },
+                ],
+                "event_class": relevant,
+                "issuer_cik": subject["issuer_cik"],
+                "records": [],
+                "subject_kind": subject["subject_kind"],
+                "symbol": subject["symbol"],
+            }
+        )
+    return {
+        "kind": "EVIDENCE_REVIEW_INPUT_TEMPLATE",
+        "schema_version": 1,
+        "subjects": values,
+    }
+
+
+def _decode_artifact(
+    payload: bytes,
+    *,
+    expected_sha256: str,
+) -> bytes:
+    document = _canonical_document(payload, "evidence proposal artifact")
+    if (
+        set(document)
+        != {"body", "content_sha256", "encoding", "kind", "schema_version"}
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["kind"] != "RAW_SOURCE_ARTIFACT"
+        or document["encoding"] != "base64"
+        or document["content_sha256"] != expected_sha256
+        or not isinstance(document["body"], str)
+        or not document["body"].isascii()
+    ):
+        raise EvidenceWorkflowError("evidence proposal artifact schema is invalid")
+    try:
+        body = base64.b64decode(document["body"], validate=True)
+    except (ValueError, TypeError):
+        raise EvidenceWorkflowError("evidence proposal artifact is invalid") from None
+    if (
+        not body
+        or len(body) > _MAX_SOURCE_BYTES
+        or base64.b64encode(body).decode("ascii") != document["body"]
+        or hashlib.sha256(body).hexdigest() != expected_sha256
+    ):
+        raise EvidenceWorkflowError("evidence proposal artifact is invalid")
+    return body
+
+
+def _decode_verified_proposal(
+    *,
+    proposal_payload: bytes,
+    template_payload: bytes,
+    artifact_payloads: dict[str, bytes],
+    proposal_sha256: str,
+    universe: UniverseSnapshot,
+    parent_release_sha256: str,
+) -> _VerifiedProposal:
+    if hashlib.sha256(proposal_payload).hexdigest() != proposal_sha256:
+        raise EvidenceWorkflowError("evidence proposal checksum mismatch")
+    document = _canonical_document(proposal_payload, "evidence proposal")
+    if (
+        set(document) != _PROPOSAL_FIELDS
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["kind"] != "UNREVIEWED_EVIDENCE_PROPOSAL"
+        or document["parent_release_sha256"] != parent_release_sha256
+        or document["universe_sha256"] != universe._release_pin
+        or not isinstance(document["subjects"], list)
+        or not isinstance(document["observations"], list)
+        or document["source_failures"] != []
+        or not isinstance(document["reviewer_template_sha256"], str)
+        or _SHA256.fullmatch(document["reviewer_template_sha256"]) is None
+    ):
+        raise EvidenceWorkflowError("evidence proposal schema is invalid or partial")
+    created_at = _workflow_timestamp(document["created_at"], "proposal created_at")
+    eligible = universe.eligible_records()
+    expected_subjects = tuple(_subject_document(record) for record in eligible)
+    if document["subjects"] != list(expected_subjects):
+        raise EvidenceWorkflowError("evidence proposal subjects are invalid")
+    template = _canonical_document(template_payload, "evidence review template")
+    if (
+        hashlib.sha256(template_payload).hexdigest()
+        != document["reviewer_template_sha256"]
+        or template != _expected_review_template(expected_subjects)
+    ):
+        raise EvidenceWorkflowError("evidence review template is invalid")
+
+    expected_artifacts: set[str] = set()
+    observations: list[_CollectedObservation] = []
+    identifiers: set[str] = set()
+    raw_observations = document["observations"]
+    if len(raw_observations) != len(EVIDENCE_AUTHORITIES):
+        raise EvidenceWorkflowError("evidence proposal observations are incomplete")
+    for raw, authority in zip(
+        raw_observations,
+        EVIDENCE_AUTHORITIES,
+        strict=True,
+    ):
+        expected_type = (
+            "SEC_SUBMISSIONS"
+            if authority.role.startswith("SEC_SUBMISSIONS:")
+            else "OFFICIAL_REFERENCE"
+        )
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != _PROPOSAL_OBSERVATION_FIELDS
+            or raw["symbol"] != authority.symbol
+            or raw["issuer_cik"] != authority.issuer_cik
+            or not isinstance(raw["url"], str)
+            or raw["url"] not in authority.allowed_final_urls
+            or raw["publisher"] != authority.publisher
+            or raw["role"] != authority.role
+            or raw["event_class"] != authority.event_class
+            or raw["source_type"] != expected_type
+            or raw["accession"] is not None
+            or not isinstance(raw["observation_id"], str)
+            or _IDENTIFIER.fullmatch(raw["observation_id"]) is None
+            or raw["observation_id"] in identifiers
+            or not isinstance(raw["content_sha256"], str)
+            or _SHA256.fullmatch(raw["content_sha256"]) is None
+            or raw["artifact_path"]
+            != f"artifacts/{raw['content_sha256']}.json"
+        ):
+            raise EvidenceWorkflowError("evidence proposal observation is invalid")
+        published_at = _workflow_optional_timestamp(
+            raw["published_at"],
+            "proposal observation published_at",
+        )
+        retrieved_at = _workflow_timestamp(
+            raw["retrieved_at"],
+            "proposal observation retrieved_at",
+        )
+        if published_at is not None and published_at > retrieved_at:
+            raise EvidenceWorkflowError("evidence proposal observation time is invalid")
+        if expected_type == "OFFICIAL_REFERENCE":
+            if published_at is not None or raw["timestamp_source"] != "UNAVAILABLE":
+                raise EvidenceWorkflowError(
+                    "generic proposal observation metadata is invalid"
+                )
+        elif not (
+            (
+                published_at is not None
+                and raw["timestamp_source"] == "SEC_SUBMISSIONS_METADATA"
+            )
+            or (
+                published_at is None
+                and raw["timestamp_source"] == "UNAVAILABLE"
+            )
+        ):
+            raise EvidenceWorkflowError("SEC proposal observation metadata is invalid")
+        content_sha256 = raw["content_sha256"]
+        assert isinstance(content_sha256, str)
+        artifact_payload = artifact_payloads.get(content_sha256)
+        if artifact_payload is None:
+            raise EvidenceWorkflowError("evidence proposal artifact is missing")
+        body = _decode_artifact(
+            artifact_payload,
+            expected_sha256=content_sha256,
+        )
+        identifiers.add(raw["observation_id"])
+        expected_artifacts.add(content_sha256)
+        observations.append(
+            _CollectedObservation(
+                observation_id=raw["observation_id"],
+                symbol=authority.symbol,
+                issuer_cik=authority.issuer_cik,
+                url=raw["url"],
+                publisher=authority.publisher,
+                role=authority.role,
+                event_class=authority.event_class,
+                retrieved_at=retrieved_at,
+                published_at=published_at,
+                timestamp_source=raw["timestamp_source"],
+                content_sha256=content_sha256,
+                source_type=expected_type,
+                accession=None,
+                body=body,
+            )
+        )
+    if set(artifact_payloads) != expected_artifacts:
+        raise EvidenceWorkflowError("evidence proposal artifact inventory is invalid")
+    return _VerifiedProposal(
+        created_at=created_at,
+        parent_release_sha256=parent_release_sha256,
+        universe_sha256=universe._release_pin,
+        subjects=expected_subjects,
+        observations=tuple(observations),
+        artifact_payloads=artifact_payloads,
+    )
+
+
+def _load_verified_proposal(
+    *,
+    state_root: Path,
+    proposal_sha256: str,
+    universe: UniverseSnapshot,
+    parent_release_sha256: str,
+) -> _VerifiedProposal:
+    if not isinstance(proposal_sha256, str) or _SHA256.fullmatch(
+        proposal_sha256
+    ) is None:
+        raise EvidenceWorkflowError("evidence proposal checksum is malformed")
+    state_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    root_descriptor: int | None = None
+    artifacts_descriptor: int | None = None
+    try:
+        state_descriptor, parent_descriptor = _open_proposal_parent(state_root)
+        fcntl.flock(parent_descriptor, fcntl.LOCK_SH)
+        parent_before = os.fstat(parent_descriptor)
+        _verify_parent_binding(state_root, state_descriptor, parent_descriptor)
+        try:
+            root_descriptor = os.open(
+                proposal_sha256,
+                _DIRECTORY_OPEN_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+        except OSError:
+            raise EvidenceWorkflowError("evidence proposal is unavailable") from None
+        root_before = os.fstat(root_descriptor)
+        _validate_private_directory_details(root_before)
+        linked_root = os.stat(
+            proposal_sha256,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            linked_root.st_dev != root_before.st_dev
+            or linked_root.st_ino != root_before.st_ino
+            or _directory_names(root_descriptor)
+            != {"artifacts", "proposal.json", "review-template.json"}
+        ):
+            raise EvidenceWorkflowError("evidence proposal tree is unsafe")
+        proposal_payload = _read_private_bytes_at(
+            root_descriptor,
+            "proposal.json",
+            maximum_bytes=_MAX_PROPOSAL_BYTES,
+        )
+        template_payload = _read_private_bytes_at(
+            root_descriptor,
+            "review-template.json",
+            maximum_bytes=_MAX_REVIEW_TEMPLATE_BYTES,
+        )
+        proposal_document = _canonical_document(
+            proposal_payload,
+            "evidence proposal",
+        )
+        raw_observations = proposal_document.get("observations")
+        if (
+            not isinstance(raw_observations, list)
+            or len(raw_observations) != len(EVIDENCE_AUTHORITIES)
+        ):
+            raise EvidenceWorkflowError("evidence proposal schema is invalid")
+        digests: set[str] = set()
+        for value in raw_observations:
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("content_sha256"), str)
+                or _SHA256.fullmatch(value["content_sha256"]) is None
+            ):
+                raise EvidenceWorkflowError("evidence proposal observation is invalid")
+            digests.add(value["content_sha256"])
+        try:
+            artifacts_descriptor = os.open(
+                "artifacts",
+                _DIRECTORY_OPEN_FLAGS,
+                dir_fd=root_descriptor,
+            )
+        except OSError:
+            raise EvidenceWorkflowError("evidence proposal artifacts are unsafe") from None
+        artifacts_before = os.fstat(artifacts_descriptor)
+        _validate_private_directory_details(artifacts_before)
+        expected_names = {f"{digest}.json" for digest in digests}
+        if _directory_names(artifacts_descriptor) != expected_names:
+            raise EvidenceWorkflowError("evidence proposal artifact inventory is invalid")
+        artifact_payloads = {
+            digest: _read_private_bytes_at(
+                artifacts_descriptor,
+                f"{digest}.json",
+                maximum_bytes=_MAX_SOURCE_ARTIFACT_BYTES,
+            )
+            for digest in sorted(digests)
+        }
+        if (
+            _directory_names(root_descriptor)
+            != {"artifacts", "proposal.json", "review-template.json"}
+            or _directory_names(artifacts_descriptor) != expected_names
+        ):
+            raise EvidenceWorkflowError("evidence proposal tree changed during read")
+        _stable_directory(root_before, os.fstat(root_descriptor))
+        _stable_directory(artifacts_before, os.fstat(artifacts_descriptor))
+        _stable_directory(parent_before, os.fstat(parent_descriptor))
+        linked_root = os.stat(
+            proposal_sha256,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            linked_root.st_dev != root_before.st_dev
+            or linked_root.st_ino != root_before.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence proposal path binding changed")
+        _verify_parent_binding(state_root, state_descriptor, parent_descriptor)
+        return _decode_verified_proposal(
+            proposal_payload=proposal_payload,
+            template_payload=template_payload,
+            artifact_payloads=artifact_payloads,
+            proposal_sha256=proposal_sha256,
+            universe=universe,
+            parent_release_sha256=parent_release_sha256,
+        )
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+            raise EvidenceWorkflowError(
+                "evidence proposal could not be read safely"
+            ) from None
+    finally:
+        if artifacts_descriptor is not None:
+            os.close(artifacts_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        if parent_descriptor is not None:
+            try:
+                fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+
+
+def _review_string_tuple(
+    value: object,
+    name: str,
+    *,
+    nonempty: bool = False,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or (nonempty and not value)
+        or any(not isinstance(item, str) for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise EvidenceWorkflowError(f"{name} is malformed")
+    return tuple(value)
+
+
+def _derived_identifier(prefix: str, value: object) -> str:
+    return f"{prefix}-{hashlib.sha256(_canonical_bytes(value)).hexdigest()[:24]}"
+
+
+def _record_release_document(value: EvidenceRecord) -> dict[str, object]:
+    return {
+        "accession": value.accession,
+        "adverse_tags": list(value.adverse_tags),
+        "classification_ambiguous": value.classification_ambiguous,
+        "conflicts": list(value.conflicts),
+        "content_hash": value.content_hash,
+        "event_date": value.event_date.isoformat() if value.event_date else None,
+        "event_kind": value.event_kind,
+        "event_type": value.event_type,
+        "fact": value.fact,
+        "issuer_cik": value.issuer_cik,
+        "primary_url": value.primary_url,
+        "published_at": _utc_text(value.published_at),
+        "publisher": value.publisher,
+        "record_id": value.record_id,
+        "retrieved_at": _utc_text(value.retrieved_at),
+        "source_observation_ids": list(value.source_observation_ids),
+        "symbol": value.symbol,
+    }
+
+
+def _binding_release_document(
+    value: EvidenceSourceBinding,
+) -> dict[str, object]:
+    document = value.document
+    return {
+        "accession": document.accession,
+        "checked_at": _utc_text(value.checked_at),
+        "content_hash": document.content_hash,
+        "healthy": value.healthy,
+        "issuer_cik": value.issuer_cik,
+        "primary_url": document.url,
+        "published_at": (
+            _utc_text(document.published_at)
+            if document.published_at is not None
+            else None
+        ),
+        "publisher": document.publisher,
+        "retrieved_at": _utc_text(document.retrieved_at),
+        "source_observation_id": document.source_observation_id,
+        "source_role": document.source_role,
+        "source_type": document.source_type,
+        "symbol": value.symbol,
+        "timestamp_source": document.timestamp_source,
+        "valid_until": _utc_text(value.valid_until),
+    }
+
+
+def _coverage_release_document(
+    value: EvidenceCoverageAttestation,
+) -> dict[str, object]:
+    return {
+        "checked_at": _utc_text(value.checked_at),
+        "complete": value.complete,
+        "conflicts": list(value.conflicts),
+        "coverage": value.coverage,
+        "coverage_end": value.coverage_end.isoformat(),
+        "coverage_kind": value.coverage_kind,
+        "coverage_start": value.coverage_start.isoformat(),
+        "healthy": value.healthy,
+        "issuer_cik": value.issuer_cik,
+        "source_observation_ids": list(value.source_observation_ids),
+        "subject_kind": value.subject_kind,
+        "symbol": value.symbol,
+        "valid_until": _utc_text(value.valid_until),
+    }
+
+
+def _source_binding(
+    observation: _CollectedObservation,
+    *,
+    reviewed_at: datetime,
+    review_by: datetime,
+) -> EvidenceSourceBinding:
+    try:
+        document = SourceDocument(
+            url=observation.url,
+            published_at=observation.published_at,
+            retrieved_at=observation.retrieved_at,
+            content_hash=observation.content_sha256,
+            body=observation.body,
+            source_observation_id=observation.observation_id,
+            publisher=observation.publisher,
+            source_type=observation.source_type,
+            timestamp_source=observation.timestamp_source,
+            accession=observation.accession,
+            source_role=(
+                None
+                if observation.source_type == "SEC_SUBMISSIONS"
+                else observation.role
+            ),
+        )
+        return EvidenceSourceBinding.from_document(
+            document,
+            symbol=observation.symbol,
+            issuer_cik=observation.issuer_cik,
+            checked_at=reviewed_at,
+            valid_until=review_by,
+            healthy=True,
+        )
+    except (TypeError, ValueError):
+        raise EvidenceWorkflowError(
+            "evidence proposal observation cannot form a safe binding"
+        ) from None
+
+
+def _compile_review_candidate(
+    *,
+    proposal: _VerifiedProposal,
+    proposal_sha256: str,
+    review_payload: bytes,
+    universe: UniverseSnapshot,
+    current: datetime,
+) -> _CompiledCandidate:
+    review_input_sha256 = hashlib.sha256(review_payload).hexdigest()
+    document = _canonical_document(review_payload, "evidence review input")
+    if (
+        set(document) != _REVIEW_FIELDS
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["kind"] != "EVIDENCE_REVIEW_INPUT"
+        or document["proposal_sha256"] != proposal_sha256
+        or document["universe_sha256"] != proposal.universe_sha256
+        or not isinstance(document["subjects"], list)
+    ):
+        raise EvidenceWorkflowError("evidence review input schema is invalid")
+    reviewed_at = _workflow_timestamp(document["reviewed_at"], "reviewed_at")
+    review_by = _workflow_timestamp(document["review_by"], "review_by")
+    if (
+        proposal.created_at > reviewed_at
+        or not reviewed_at <= current < review_by
+        or not timedelta(0) < review_by - reviewed_at <= timedelta(hours=24)
+    ):
+        raise EvidenceWorkflowError("evidence review window is invalid")
+    coverage_start = _workflow_date(document["coverage_start"], "coverage_start")
+    coverage_end = _workflow_date(document["coverage_end"], "coverage_end")
+    if (
+        coverage_start > coverage_end
+        or not coverage_start <= current.date() <= coverage_end
+    ):
+        raise EvidenceWorkflowError("evidence coverage dates are invalid")
+
+    raw_subjects = document["subjects"]
+    eligible = universe.eligible_records()
+    if len(raw_subjects) != len(eligible):
+        raise EvidenceWorkflowError("evidence review subjects are incomplete")
+    observations_by_id = {
+        value.observation_id: value for value in proposal.observations
+    }
+    release_files: dict[str, bytes] = {}
+    manifest_subjects: list[dict[str, object]] = []
+    coverage_summary: list[tuple[str, str, str]] = []
+    used_artifacts: set[str] = set()
+    global_fact_ids: set[str] = set()
+    global_coverage_ids: set[str] = set()
+    global_fact_bodies: set[tuple[str, str]] = set()
+    global_coverage_bodies: set[tuple[str, str]] = set()
+
+    for raw_subject, universe_record, proposal_subject in zip(
+        raw_subjects,
+        eligible,
+        proposal.subjects,
+        strict=True,
+    ):
+        if (
+            not isinstance(raw_subject, dict)
+            or set(raw_subject) != _REVIEW_SUBJECT_FIELDS
+            or raw_subject["symbol"] != proposal_subject["symbol"]
+            or raw_subject["issuer_cik"] != proposal_subject["issuer_cik"]
+            or raw_subject["subject_kind"] != proposal_subject["subject_kind"]
+            or raw_subject["event_class"] != proposal_subject["event_class"]
+            or not isinstance(raw_subject["records"], list)
+            or not isinstance(raw_subject["coverage_attestations"], list)
+        ):
+            raise EvidenceWorkflowError("evidence review subject is invalid")
+        symbol = universe_record.symbol
+        issuer_cik = universe_record.issuer_cik
+        subject_kind = proposal_subject["subject_kind"]
+        relevant = proposal_subject["event_class"]
+        assert isinstance(subject_kind, str) and isinstance(relevant, str)
+        opposite = "ETF_ACTION" if relevant == "BINARY_EVENT" else "BINARY_EVENT"
+
+        coverage_by_class: dict[
+            str,
+            tuple[str, bool, tuple[str, ...]],
+        ] = {}
+        for raw_coverage in raw_subject["coverage_attestations"]:
+            if (
+                not isinstance(raw_coverage, dict)
+                or set(raw_coverage) != _REVIEW_COVERAGE_FIELDS
+                or type(raw_coverage["complete"]) is not bool
+                or raw_coverage["conflicts"] != []
+                or not isinstance(raw_coverage["event_class"], str)
+                or raw_coverage["event_class"] not in _EVENT_CLASSES
+                or not isinstance(raw_coverage["coverage"], str)
+            ):
+                raise EvidenceWorkflowError("evidence review coverage is invalid")
+            event_class = raw_coverage["event_class"]
+            assert isinstance(event_class, str)
+            if event_class in coverage_by_class:
+                raise EvidenceWorkflowError("evidence review coverage is duplicated")
+            source_ids = _review_string_tuple(
+                raw_coverage["source_observation_ids"],
+                "coverage source observations",
+                nonempty=True,
+            )
+            for identifier in source_ids:
+                observation = observations_by_id.get(identifier)
+                if (
+                    observation is None
+                    or observation.symbol != symbol
+                    or observation.issuer_cik != issuer_cik
+                    or observation.source_type != "OFFICIAL_REFERENCE"
+                ):
+                    raise EvidenceWorkflowError(
+                        "coverage source observation is not proposal-bound"
+                    )
+            coverage_by_class[event_class] = (
+                raw_coverage["coverage"],
+                raw_coverage["complete"],
+                source_ids,
+            )
+        if set(coverage_by_class) != _EVENT_CLASSES:
+            raise EvidenceWorkflowError("evidence review coverage is incomplete")
+        if coverage_by_class[relevant][:2] != ("UNKNOWN", False) or (
+            coverage_by_class[opposite][:2] != ("NOT_APPLICABLE", True)
+        ):
+            raise EvidenceWorkflowError("evidence review coverage state is unsafe")
+
+        records: list[EvidenceRecord] = []
+        subject_fact_ids: set[str] = set()
+        for raw_record in raw_subject["records"]:
+            if (
+                not isinstance(raw_record, dict)
+                or set(raw_record) != _REVIEW_RECORD_FIELDS
+                or type(raw_record["classification_ambiguous"]) is not bool
+            ):
+                raise EvidenceWorkflowError("evidence review record is invalid")
+            source_ids = _review_string_tuple(
+                raw_record["source_observation_ids"],
+                "record source observations",
+                nonempty=True,
+            )
+            if len(source_ids) != 1:
+                raise EvidenceWorkflowError(
+                    "evidence review record requires one source observation"
+                )
+            observation = observations_by_id.get(source_ids[0])
+            if (
+                observation is None
+                or observation.symbol != symbol
+                or observation.issuer_cik != issuer_cik
+            ):
+                raise EvidenceWorkflowError(
+                    "record source observation is not proposal-bound"
+                )
+            published_at = _workflow_timestamp(
+                raw_record["published_at"],
+                "record published_at",
+            )
+            if published_at > observation.retrieved_at or (
+                observation.published_at is not None
+                and published_at != observation.published_at
+            ):
+                raise EvidenceWorkflowError("record publication time is invalid")
+            allowed_types = (
+                POSITIVE_EVENT_TYPES
+                if subject_kind == "STOCK"
+                else ETF_POSITIVE_EVENT_TYPES
+            )
+            event_type = raw_record["event_type"]
+            if event_type is not None and event_type not in allowed_types:
+                raise EvidenceWorkflowError("record event type is unsupported")
+            adverse_tags = _review_string_tuple(
+                raw_record["adverse_tags"],
+                "record adverse tags",
+            )
+            if any(value not in ADVERSE_TAGS for value in adverse_tags):
+                raise EvidenceWorkflowError("record adverse tags are unsupported")
+            if event_type is None and not adverse_tags:
+                raise EvidenceWorkflowError(
+                    "record requires a positive event type or adverse tag"
+                )
+            conflicts = _review_string_tuple(
+                raw_record["conflicts"],
+                "record conflicts",
+            )
+            raw_event_date = raw_record["event_date"]
+            event_date = (
+                None
+                if raw_event_date is None
+                else _workflow_date(raw_event_date, "record event_date")
+            )
+            event_kind = raw_record["event_kind"]
+            if (event_date is None) != (event_kind is None) or (
+                event_kind is not None and event_kind != relevant
+            ):
+                raise EvidenceWorkflowError("record event kind is invalid")
+            record_id = _derived_identifier(
+                "record",
+                {
+                    "proposal_sha256": proposal_sha256,
+                    "record": raw_record,
+                    "symbol": symbol,
+                },
+            )
+            try:
+                record = EvidenceRecord(
+                    record_id=record_id,
+                    symbol=symbol,
+                    issuer_cik=issuer_cik,
+                    primary_url=observation.url,
+                    publisher=observation.publisher,
+                    published_at=published_at,
+                    retrieved_at=observation.retrieved_at,
+                    event_type=event_type,
+                    fact=raw_record["fact"],
+                    content_hash=observation.content_sha256,
+                    source_observation_ids=source_ids,
+                    accession=observation.accession,
+                    adverse_tags=adverse_tags,
+                    conflicts=conflicts,
+                    classification_ambiguous=raw_record[
+                        "classification_ambiguous"
+                    ],
+                    event_date=event_date,
+                    event_kind=event_kind,
+                )
+            except (TypeError, ValueError):
+                raise EvidenceWorkflowError("evidence review record is invalid") from None
+            if record_id in {value.record_id for value in records}:
+                raise EvidenceWorkflowError("evidence review record is duplicated")
+            records.append(record)
+            subject_fact_ids.update(source_ids)
+
+        subject_coverage_ids = {
+            identifier
+            for _, _, identifiers in coverage_by_class.values()
+            for identifier in identifiers
+        }
+        fact_bodies = {
+            (
+                observations_by_id[identifier].url,
+                observations_by_id[identifier].content_sha256,
+            )
+            for identifier in subject_fact_ids
+        }
+        coverage_bodies = {
+            (
+                observations_by_id[identifier].url,
+                observations_by_id[identifier].content_sha256,
+            )
+            for identifier in subject_coverage_ids
+        }
+        if subject_fact_ids & subject_coverage_ids or fact_bodies & coverage_bodies:
+            raise EvidenceWorkflowError(
+                "evidence facts and coverage require distinct proposal observations"
+            )
+        global_fact_ids.update(subject_fact_ids)
+        global_coverage_ids.update(subject_coverage_ids)
+        global_fact_bodies.update(fact_bodies)
+        global_coverage_bodies.update(coverage_bodies)
+
+        used_ids = subject_fact_ids | subject_coverage_ids
+        used_observations = [observations_by_id[value] for value in sorted(used_ids)]
+        if any(
+            observation.retrieved_at > reviewed_at
+            or review_by - observation.retrieved_at > timedelta(hours=24)
+            for observation in used_observations
+        ):
+            raise EvidenceWorkflowError("evidence review source window is invalid")
+        bindings = [
+            _source_binding(
+                observation,
+                reviewed_at=reviewed_at,
+                review_by=review_by,
+            )
+            for observation in used_observations
+        ]
+        coverage_values: list[EvidenceCoverageAttestation] = []
+        for event_class in (relevant, opposite):
+            coverage_state, complete, source_ids = coverage_by_class[event_class]
+            try:
+                value = EvidenceCoverageAttestation(
+                    subject_kind=subject_kind,
+                    symbol=symbol,
+                    issuer_cik=issuer_cik,
+                    coverage_kind=event_class,
+                    coverage=coverage_state,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    source_observation_ids=source_ids,
+                    checked_at=reviewed_at,
+                    valid_until=review_by,
+                    healthy=True,
+                    complete=complete,
+                    conflicts=(),
+                )
+            except (TypeError, ValueError):
+                raise EvidenceWorkflowError("evidence review coverage is invalid") from None
+            coverage_values.append(value)
+            coverage_summary.append((symbol, event_class, coverage_state))
+        registry_id = _derived_identifier(
+            f"registry-{symbol.lower()}",
+            {
+                "proposal_sha256": proposal_sha256,
+                "review_input_sha256": review_input_sha256,
+                "symbol": symbol,
+            },
+        )
+        child_document: dict[str, object] = {
+            "coverage_attestations": [
+                _coverage_release_document(value) for value in coverage_values
+            ],
+            "kind": "REVIEWED_EVIDENCE_BUNDLE",
+            "records": [_record_release_document(value) for value in records],
+            "registry_id": registry_id,
+            "reviewed_at": _utc_text(reviewed_at),
+            "schema_version": 3,
+            "source_bindings": [
+                _binding_release_document(value) for value in bindings
+            ],
+            "subject": {
+                "issuer_cik": issuer_cik,
+                "subject_kind": subject_kind,
+                "symbol": symbol,
+            },
+        }
+        child_payload = _canonical_bytes(child_document)
+        child_sha256 = hashlib.sha256(child_payload).hexdigest()
+        release_files[f"subjects/{symbol}.json"] = child_payload
+        manifest_subjects.append(
+            {
+                "issuer_cik": issuer_cik,
+                "path": f"subjects/{symbol}.json",
+                "sha256": child_sha256,
+                "subject_kind": subject_kind,
+                "symbol": symbol,
+            }
+        )
+        for observation in used_observations:
+            used_artifacts.add(observation.content_sha256)
+
+    if global_fact_ids & global_coverage_ids or (
+        global_fact_bodies & global_coverage_bodies
+    ):
+        raise EvidenceWorkflowError(
+            "evidence facts and coverage require distinct proposal source bodies"
+        )
+    for digest in sorted(used_artifacts):
+        release_files[f"sources/{digest}.json"] = proposal.artifact_payloads[digest]
+    release_id = _derived_identifier(
+        "candidate-release",
+        {
+            "proposal_sha256": proposal_sha256,
+            "review_input_sha256": review_input_sha256,
+        },
+    )
+    release_document: dict[str, object] = {
+        "kind": "REVIEWED_EVIDENCE_RELEASE",
+        "release_id": release_id,
+        "review_by": _utc_text(review_by),
+        "reviewed_at": _utc_text(reviewed_at),
+        "schema_version": 1,
+        "subjects": manifest_subjects,
+        "universe_sha256": proposal.universe_sha256,
+    }
+    release_payload = _canonical_bytes(release_document)
+    release_sha256 = hashlib.sha256(release_payload).hexdigest()
+    release_files["current.json"] = release_payload
+    _validate_compiled_release(
+        release_files,
+        release_sha256=release_sha256,
+        current=current,
+        universe=universe,
+    )
+    return _CompiledCandidate(
+        review_input_sha256=review_input_sha256,
+        reviewed_at=reviewed_at,
+        review_by=review_by,
+        release_sha256=release_sha256,
+        release_files=release_files,
+        symbols=tuple(record.symbol for record in eligible),
+        coverage=tuple(sorted(coverage_summary)),
+    )
+
+
+def _validate_compiled_release(
+    release_files: dict[str, bytes],
+    *,
+    release_sha256: str,
+    current: datetime,
+    universe: UniverseSnapshot,
+) -> None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="evidence-candidate-validation-") as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            (root / "subjects").mkdir(mode=0o700)
+            (root / "sources").mkdir(mode=0o700)
+            for relative, payload in sorted(release_files.items()):
+                path = root / relative
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    written = 0
+                    while written < len(payload):
+                        count = os.write(descriptor, payload[written:])
+                        if count <= 0:
+                            raise OSError("short candidate validation write")
+                        written += count
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            load_evidence_release(
+                root / "current.json",
+                expected_sha256=release_sha256,
+                as_of=current,
+                universe=universe,
+            )
+    except (EvidenceRegistryError, OSError, TypeError, ValueError):
+        raise EvidenceWorkflowError(
+            "compiled evidence candidate release is invalid"
+        ) from None
+
+
+def _open_candidate_parent(state_root: Path) -> tuple[int, int]:
+    state_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    try:
+        root_before = state_root.lstat()
+        state_descriptor = os.open(state_root, _DIRECTORY_OPEN_FLAGS)
+        root_opened = os.fstat(state_descriptor)
+        _validate_private_directory_details(root_opened)
+        if (
+            root_before.st_dev != root_opened.st_dev
+            or root_before.st_ino != root_opened.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence state root changed during open")
+        created = False
+        try:
+            os.mkdir("evidence-candidates", 0o700, dir_fd=state_descriptor)
+            created = True
+            os.fsync(state_descriptor)
+        except FileExistsError:
+            pass
+        parent_descriptor = os.open(
+            "evidence-candidates",
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=state_descriptor,
+        )
+        if created:
+            os.fchmod(parent_descriptor, 0o700)
+        _validate_private_directory_details(os.fstat(parent_descriptor))
+        return state_descriptor, parent_descriptor
+    except EvidenceWorkflowError:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+        raise
+    except OSError:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+        raise EvidenceWorkflowError("evidence candidate storage is unavailable") from None
+
+
+def _verify_candidate_parent_binding(
+    state_root: Path,
+    state_descriptor: int,
+    parent_descriptor: int,
+) -> None:
+    opened_root = os.fstat(state_descriptor)
+    opened_parent = os.fstat(parent_descriptor)
+    _validate_private_directory_details(opened_root)
+    _validate_private_directory_details(opened_parent)
+    try:
+        path_root = state_root.lstat()
+        linked_parent = os.stat(
+            "evidence-candidates",
+            dir_fd=state_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise EvidenceWorkflowError("evidence candidate path binding changed") from None
+    if (
+        not stat.S_ISDIR(path_root.st_mode)
+        or path_root.st_dev != opened_root.st_dev
+        or path_root.st_ino != opened_root.st_ino
+        or not stat.S_ISDIR(linked_parent.st_mode)
+        or linked_parent.st_dev != opened_parent.st_dev
+        or linked_parent.st_ino != opened_parent.st_ino
+        or linked_parent.st_uid != opened_parent.st_uid
+        or stat.S_IMODE(linked_parent.st_mode) != 0o700
+    ):
+        raise EvidenceWorkflowError("evidence candidate path binding changed")
+
+
+def _verify_candidate_tree(
+    parent_descriptor: int,
+    root_name: str,
+    *,
+    candidate_payload: bytes,
+    release_files: dict[str, bytes],
+) -> None:
+    descriptors: list[int] = []
+    try:
+        root = os.open(root_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+        descriptors.append(root)
+        root_before = os.fstat(root)
+        _validate_private_directory_details(root_before)
+        linked_root = os.stat(
+            root_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(linked_root.st_mode)
+            or linked_root.st_dev != root_before.st_dev
+            or linked_root.st_ino != root_before.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence candidate path binding changed")
+        release = os.open("release", _DIRECTORY_OPEN_FLAGS, dir_fd=root)
+        descriptors.append(release)
+        release_before = os.fstat(release)
+        _validate_private_directory_details(release_before)
+        subjects = os.open("subjects", _DIRECTORY_OPEN_FLAGS, dir_fd=release)
+        descriptors.append(subjects)
+        subjects_before = os.fstat(subjects)
+        _validate_private_directory_details(subjects_before)
+        sources = os.open("sources", _DIRECTORY_OPEN_FLAGS, dir_fd=release)
+        descriptors.append(sources)
+        sources_before = os.fstat(sources)
+        _validate_private_directory_details(sources_before)
+
+        subject_files = {
+            relative.removeprefix("subjects/"): payload
+            for relative, payload in release_files.items()
+            if relative.startswith("subjects/")
+        }
+        source_files = {
+            relative.removeprefix("sources/"): payload
+            for relative, payload in release_files.items()
+            if relative.startswith("sources/")
+        }
+        if (
+            _directory_names(root) != {"candidate.json", "release"}
+            or _directory_names(release) != {"current.json", "sources", "subjects"}
+            or _directory_names(subjects) != set(subject_files)
+            or _directory_names(sources) != set(source_files)
+        ):
+            raise EvidenceWorkflowError("evidence candidate tree content collision")
+        _read_private_at(root, "candidate.json", candidate_payload)
+        _read_private_at(release, "current.json", release_files["current.json"])
+        for name, payload in sorted(subject_files.items()):
+            _read_private_at(subjects, name, payload)
+        for name, payload in sorted(source_files.items()):
+            _read_private_at(sources, name, payload)
+        if (
+            _directory_names(root) != {"candidate.json", "release"}
+            or _directory_names(release) != {"current.json", "sources", "subjects"}
+            or _directory_names(subjects) != set(subject_files)
+            or _directory_names(sources) != set(source_files)
+        ):
+            raise EvidenceWorkflowError("evidence candidate tree content collision")
+        _stable_directory(root_before, os.fstat(root))
+        _stable_directory(release_before, os.fstat(release))
+        _stable_directory(subjects_before, os.fstat(subjects))
+        _stable_directory(sources_before, os.fstat(sources))
+        linked_root = os.stat(
+            root_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            linked_root.st_dev != root_before.st_dev
+            or linked_root.st_ino != root_before.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence candidate path binding changed")
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("evidence candidate tree is unsafe") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _remove_directory_contents(descriptor: int, *, depth: int = 0) -> None:
+    if depth > 8:
+        raise OSError("candidate cleanup nesting is unsafe")
+    for name in _directory_names(descriptor):
+        details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(details.st_mode):
+            try:
+                child = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            except OSError:
+                os.rmdir(name, dir_fd=descriptor)
+                continue
+            try:
+                _remove_directory_contents(child, depth=depth + 1)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+    os.fsync(descriptor)
+
+
+def _remove_candidate_tree_at(parent_descriptor: int, name: str) -> None:
+    try:
+        root = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+    except OSError:
+        return
+    try:
+        _remove_directory_contents(root)
+    except (EvidenceWorkflowError, OSError):
+        return
+    finally:
+        os.close(root)
+    try:
+        os.rmdir(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except OSError:
+        pass
+
+
+def _remove_matching_candidate_tree_at(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+) -> None:
+    try:
+        details = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError:
+        return
+    if (details.st_dev, details.st_ino) == identity:
+        _remove_candidate_tree_at(parent_descriptor, name)
+
+
+def _write_candidate_tree(
+    *,
+    state_root: Path,
+    proposal_sha256: str,
+    proposal: _VerifiedProposal,
+    compiled: _CompiledCandidate,
+) -> tuple[str, Path]:
+    inventory = [
+        {
+            "path": relative,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for relative, payload in sorted(compiled.release_files.items())
+    ]
+    candidate_document: dict[str, object] = {
+        "inventory": inventory,
+        "kind": "EVIDENCE_RELEASE_CANDIDATE",
+        "parent_release_sha256": proposal.parent_release_sha256,
+        "proposal_sha256": proposal_sha256,
+        "release_sha256": compiled.release_sha256,
+        "review_input_sha256": compiled.review_input_sha256,
+        "schema_version": 1,
+        "universe_sha256": proposal.universe_sha256,
+    }
+    candidate_payload = _canonical_bytes(candidate_document)
+    candidate_sha256 = hashlib.sha256(candidate_payload).hexdigest()
+    state_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    published = False
+    try:
+        state_descriptor, parent_descriptor = _open_candidate_parent(state_root)
+        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
+        _verify_candidate_parent_binding(
+            state_root,
+            state_descriptor,
+            parent_descriptor,
+        )
+        if _entry_exists(parent_descriptor, candidate_sha256):
+            _verify_candidate_tree(
+                parent_descriptor,
+                candidate_sha256,
+                candidate_payload=candidate_payload,
+                release_files=compiled.release_files,
+            )
+            _verify_candidate_parent_binding(
+                state_root,
+                state_descriptor,
+                parent_descriptor,
+            )
+            return (
+                candidate_sha256,
+                state_root
+                / "evidence-candidates"
+                / candidate_sha256
+                / "candidate.json",
+            )
+
+        temporary_name, temporary = _create_private_directory(
+            parent_descriptor,
+            prefix=f".{candidate_sha256}.",
+        )
+        try:
+            temporary_details = os.fstat(temporary)
+            temporary_identity = (temporary_details.st_dev, temporary_details.st_ino)
+            os.mkdir("release", 0o700, dir_fd=temporary)
+            release = os.open("release", _DIRECTORY_OPEN_FLAGS, dir_fd=temporary)
+            try:
+                os.fchmod(release, 0o700)
+                _validate_private_directory_details(os.fstat(release))
+                os.mkdir("subjects", 0o700, dir_fd=release)
+                os.mkdir("sources", 0o700, dir_fd=release)
+                subjects: int | None = None
+                sources: int | None = None
+                try:
+                    subjects = os.open(
+                        "subjects",
+                        _DIRECTORY_OPEN_FLAGS,
+                        dir_fd=release,
+                    )
+                    sources = os.open(
+                        "sources",
+                        _DIRECTORY_OPEN_FLAGS,
+                        dir_fd=release,
+                    )
+                    os.fchmod(subjects, 0o700)
+                    os.fchmod(sources, 0o700)
+                    _validate_private_directory_details(os.fstat(subjects))
+                    _validate_private_directory_details(os.fstat(sources))
+                    _atomic_write_at(temporary, "candidate.json", candidate_payload)
+                    _atomic_write_at(
+                        release,
+                        "current.json",
+                        compiled.release_files["current.json"],
+                    )
+                    for relative, payload in sorted(compiled.release_files.items()):
+                        if relative.startswith("subjects/"):
+                            _atomic_write_at(
+                                subjects,
+                                relative.removeprefix("subjects/"),
+                                payload,
+                            )
+                        elif relative.startswith("sources/"):
+                            _atomic_write_at(
+                                sources,
+                                relative.removeprefix("sources/"),
+                                payload,
+                            )
+                    os.fsync(subjects)
+                    os.fsync(sources)
+                finally:
+                    if sources is not None:
+                        os.close(sources)
+                    if subjects is not None:
+                        os.close(subjects)
+                os.fsync(release)
+            finally:
+                os.close(release)
+            os.fsync(temporary)
+        finally:
+            os.close(temporary)
+
+        if _entry_exists(parent_descriptor, candidate_sha256):
+            _verify_candidate_tree(
+                parent_descriptor,
+                candidate_sha256,
+                candidate_payload=candidate_payload,
+                release_files=compiled.release_files,
+            )
+            _remove_candidate_tree_at(parent_descriptor, temporary_name)
+            temporary_name = None
+        else:
+            os.replace(
+                temporary_name,
+                candidate_sha256,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            temporary_name = None
+            published = True
+            destination = os.stat(
+                candidate_sha256,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if temporary_identity != (destination.st_dev, destination.st_ino):
+                raise EvidenceWorkflowError(
+                    "evidence candidate publication changed identity"
+                )
+            os.fsync(parent_descriptor)
+        _verify_candidate_tree(
+            parent_descriptor,
+            candidate_sha256,
+            candidate_payload=candidate_payload,
+            release_files=compiled.release_files,
+        )
+        _verify_candidate_parent_binding(
+            state_root,
+            state_descriptor,
+            parent_descriptor,
+        )
+        return (
+            candidate_sha256,
+            state_root
+            / "evidence-candidates"
+            / candidate_sha256
+            / "candidate.json",
+        )
+    except EvidenceWorkflowError:
+        if parent_descriptor is not None and temporary_name is not None:
+            _remove_candidate_tree_at(parent_descriptor, temporary_name)
+        if parent_descriptor is not None and published and temporary_identity is not None:
+            _remove_matching_candidate_tree_at(
+                parent_descriptor,
+                candidate_sha256,
+                temporary_identity,
+            )
+        raise
+    except Exception:
+        if parent_descriptor is not None and temporary_name is not None:
+            _remove_candidate_tree_at(parent_descriptor, temporary_name)
+        if parent_descriptor is not None and published and temporary_identity is not None:
+            _remove_matching_candidate_tree_at(
+                parent_descriptor,
+                candidate_sha256,
+                temporary_identity,
+            )
+        raise EvidenceWorkflowError("evidence candidate storage failed") from None
+    finally:
+        if parent_descriptor is not None:
+            try:
+                fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+
+
+def inspect_evidence_candidate(
+    *,
+    project_root: Path,
+    state_root: Path,
+    proposal_sha256: str,
+    review_input_path: Path,
+    as_of: datetime,
+) -> EvidenceCandidateSummary:
+    """Compile reviewer input into an immutable, non-authoritative candidate."""
+    project_root = _validate_root(project_root, private=False)
+    state_root = _validate_root(state_root, private=True)
+    try:
+        current = require_aware_timestamp(as_of, "candidate as_of").astimezone(UTC)
+    except (TypeError, ValueError, OverflowError):
+        raise EvidenceWorkflowError("evidence candidate time is invalid") from None
+    try:
+        universe = load_current_universe(project_root, as_of=current.date())
+    except (OSError, TypeError, ValueError):
+        raise EvidenceWorkflowError("evidence universe is invalid") from None
+    parent_release_sha256 = _current_release_digest(project_root)
+    proposal = _load_verified_proposal(
+        state_root=state_root,
+        proposal_sha256=proposal_sha256,
+        universe=universe,
+        parent_release_sha256=parent_release_sha256,
+    )
+    review_payload = _read_private_absolute_file(
+        review_input_path,
+        maximum_bytes=_MAX_REVIEW_INPUT_BYTES,
+    )
+    compiled = _compile_review_candidate(
+        proposal=proposal,
+        proposal_sha256=proposal_sha256,
+        review_payload=review_payload,
+        universe=universe,
+        current=current,
+    )
+    candidate_sha256, candidate_path = _write_candidate_tree(
+        state_root=state_root,
+        proposal_sha256=proposal_sha256,
+        proposal=proposal,
+        compiled=compiled,
+    )
+    return EvidenceCandidateSummary(
+        status="AWAITING_DIGEST_APPROVAL",
+        candidate_sha256=candidate_sha256,
+        proposal_sha256=proposal_sha256,
+        review_input_sha256=compiled.review_input_sha256,
+        release_sha256=compiled.release_sha256,
+        universe_sha256=proposal.universe_sha256,
+        reviewed_at=compiled.reviewed_at,
+        review_by=compiled.review_by,
+        symbols=compiled.symbols,
+        coverage=compiled.coverage,
+        reason_codes=("RELEVANT_COVERAGE_UNKNOWN",),
+        candidate_path=candidate_path,
+    )
+
+
 __all__ = [
+    "EvidenceCandidateSummary",
     "EvidenceProposalSummary",
     "EvidenceWorkflowError",
+    "inspect_evidence_candidate",
     "prepare_evidence_proposal",
 ]

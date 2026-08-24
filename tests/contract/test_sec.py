@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from stock_monitor.evidence import EvidenceSourceBinding
 from stock_monitor.providers.cache import ContentCache
 from stock_monitor.providers.http import HttpResponse, NetworkPolicyError
 from stock_monitor.providers.sec import (
@@ -194,8 +195,22 @@ class SecContractTests(unittest.TestCase):
             accepted = datetime(2026, 8, 13, 20, 1, 2, tzinfo=UTC)
             self.assertEqual(submission.published_at, accepted)
             self.assertEqual(archive.published_at, accepted)
+            self.assertEqual(
+                submission.timestamp_source,
+                "SEC_SUBMISSIONS_METADATA",
+            )
             self.assertEqual(archive.accession, "0000320193-26-000001")
-            self.assertEqual(archive.timestamp_source, "SEC_ACCEPTANCE_METADATA")
+            self.assertEqual(archive.timestamp_source, "SEC_FILING_METADATA")
+            for document in (submission, archive):
+                binding = EvidenceSourceBinding.from_document(
+                    document,
+                    symbol="AAPL",
+                    issuer_cik="0000320193",
+                    checked_at=document.retrieved_at,
+                    valid_until=document.retrieved_at + timedelta(hours=1),
+                    healthy=True,
+                )
+                self.assertIs(binding.document, document)
             self.assertNotEqual(
                 archive.published_at,
                 datetime(1999, 1, 1, tzinfo=UTC),

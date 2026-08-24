@@ -20,6 +20,7 @@ from types import MappingProxyType
 from urllib.parse import parse_qsl, urlsplit
 
 from stock_monitor.domain import require_aware_timestamp
+from stock_monitor.evidence_authorities import scoped_reference_authorities
 from stock_monitor.providers.cache import SourceDocument
 from stock_monitor.universe import UniverseSnapshot, is_verified_universe_snapshot
 
@@ -89,92 +90,7 @@ _REFERENCE_ROLE_URLS = {
         "Nasdaq",
     ),
 }
-_SCOPED_REFERENCE_AUTHORITIES = {
-    "ISSUER_IR:AAPL": (
-        "0000320193",
-        frozenset(
-            {
-                (
-                    "https://investor.apple.com/investor-relations/faq/default.aspx",
-                    "Apple Inc.",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:AMD": (
-        "0000002488",
-        frozenset(
-            {
-                (
-                    "https://ir.amd.com/contacts-faq/faq",
-                    "Advanced Micro Devices, Inc.",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:NVDA": (
-        "0001045810",
-        frozenset(
-            {
-                (
-                    "https://investor.nvidia.com/investor-resources/faqs/default.aspx",
-                    "NVIDIA Corporation",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:QQQ": (
-        None,
-        frozenset(
-            {
-                (
-                    "https://www.invesco.com/qqq-etf/en/home.html",
-                    "Invesco",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:SPY": (
-        None,
-        frozenset(
-            {
-                (
-                    "https://www.ssga.com/us/en/intermediary/etfs/"
-                    "state-street-spdr-sp-500-etf-trust-spy",
-                    "State Street Global Advisors",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:VTI": (
-        None,
-        frozenset(
-            {
-                (
-                    "https://investor.vanguard.com/investment-products/etfs/"
-                    "profile/vti",
-                    "Vanguard",
-                ),
-                (
-                    "https://personal1.vanguard.com/pub/Pdf/p961.pdf",
-                    "Vanguard",
-                ),
-            }
-        ),
-    ),
-    "ISSUER_IR:XLK": (
-        None,
-        frozenset(
-            {
-                (
-                    "https://www.ssga.com/us/en/intermediary/etfs/"
-                    "state-street-technology-select-sector-spdr-etf-xlk",
-                    "State Street Global Advisors",
-                ),
-            }
-        ),
-    ),
-}
+_SCOPED_REFERENCE_AUTHORITIES = scoped_reference_authorities()
 _CLEAR_COVERAGE_AUTHORITIES: dict[
     str,
     frozenset[tuple[str, str]],

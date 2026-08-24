@@ -435,7 +435,9 @@ class SecClient:
             source_type="SEC_SUBMISSIONS",
             published_at=published_at,
             timestamp_source=(
-                "SEC_ACCEPTANCE_METADATA" if published_at is not None else "UNAVAILABLE"
+                "SEC_SUBMISSIONS_METADATA"
+                if published_at is not None
+                else "UNAVAILABLE"
             ),
         )
         self._archive_metadata.update(staged_archives)
@@ -495,7 +497,7 @@ class SecClient:
             body=response.body,
             source_type="SEC_ARCHIVE",
             published_at=published_at,
-            timestamp_source="SEC_ACCEPTANCE_METADATA",
+            timestamp_source="SEC_FILING_METADATA",
             accession=accession,
         )
 

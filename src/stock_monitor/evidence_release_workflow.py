@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+from stock_monitor import evidence as evidence_module
 from stock_monitor.domain import require_aware_timestamp
 from stock_monitor.evidence import (
     ADVERSE_TAGS,
@@ -43,8 +44,11 @@ _MAX_REVIEW_INPUT_BYTES = 1_048_576
 _MAX_PROPOSAL_BYTES = 1_048_576
 _MAX_REVIEW_TEMPLATE_BYTES = 1_048_576
 _MAX_SOURCE_ARTIFACT_BYTES = 6_000_000
+_MAX_CANDIDATE_FILES = 4_096
+_MAX_CANDIDATE_TOTAL_BYTES = 67_108_864
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,14}\Z")
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -146,6 +150,17 @@ _REVIEW_COVERAGE_FIELDS = {
     "event_class",
     "source_observation_ids",
 }
+_CANDIDATE_FIELDS = {
+    "inventory",
+    "kind",
+    "parent_release_sha256",
+    "proposal_sha256",
+    "release_sha256",
+    "review_input_sha256",
+    "schema_version",
+    "universe_sha256",
+}
+_CANDIDATE_INVENTORY_FIELDS = {"path", "sha256"}
 
 
 class EvidenceWorkflowError(RuntimeError):
@@ -177,6 +192,15 @@ class EvidenceCandidateSummary:
     coverage: tuple[tuple[str, str, str], ...]
     reason_codes: tuple[str, ...]
     candidate_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceInstallSummary:
+    status: str
+    candidate_sha256: str
+    release_sha256: str
+    installed_at: datetime
+    symbols: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +240,15 @@ class _CompiledCandidate:
     release_files: dict[str, bytes] = field(repr=False)
     symbols: tuple[str, ...]
     coverage: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedCandidate:
+    candidate_sha256: str
+    parent_release_sha256: str
+    release_sha256: str
+    universe_sha256: str
+    release_files: dict[str, bytes] = field(repr=False)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -2349,6 +2382,40 @@ def _open_candidate_parent(state_root: Path) -> tuple[int, int]:
         raise EvidenceWorkflowError("evidence candidate storage is unavailable") from None
 
 
+def _open_existing_candidate_parent(state_root: Path) -> tuple[int, int]:
+    state_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    try:
+        root_before = state_root.lstat()
+        state_descriptor = os.open(state_root, _DIRECTORY_OPEN_FLAGS)
+        root_opened = os.fstat(state_descriptor)
+        _validate_private_directory_details(root_opened)
+        if (
+            root_before.st_dev != root_opened.st_dev
+            or root_before.st_ino != root_opened.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence state root changed during open")
+        parent_descriptor = os.open(
+            "evidence-candidates",
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=state_descriptor,
+        )
+        _validate_private_directory_details(os.fstat(parent_descriptor))
+        return state_descriptor, parent_descriptor
+    except EvidenceWorkflowError:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+        raise
+    except OSError:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+        raise EvidenceWorkflowError("evidence candidate storage is unavailable") from None
+
+
 def _verify_candidate_parent_binding(
     state_root: Path,
     state_descriptor: int,
@@ -2468,6 +2535,947 @@ def _verify_candidate_tree(
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+
+
+def _candidate_inventory(
+    document: dict[str, object],
+) -> tuple[tuple[str, str], ...]:
+    raw_inventory = document["inventory"]
+    if (
+        not isinstance(raw_inventory, list)
+        or not raw_inventory
+        or len(raw_inventory) > _MAX_CANDIDATE_FILES
+    ):
+        raise EvidenceWorkflowError("evidence candidate inventory is invalid")
+    inventory: list[tuple[str, str]] = []
+    for item in raw_inventory:
+        if not isinstance(item, dict) or set(item) != _CANDIDATE_INVENTORY_FIELDS:
+            raise EvidenceWorkflowError("evidence candidate inventory is invalid")
+        path = item["path"]
+        digest = item["sha256"]
+        if (
+            not isinstance(path, str)
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise EvidenceWorkflowError("evidence candidate inventory is invalid")
+        if path == "current.json":
+            pass
+        elif path.startswith("subjects/"):
+            name = path.removeprefix("subjects/")
+            if (
+                not name.endswith(".json")
+                or _SYMBOL.fullmatch(name.removesuffix(".json")) is None
+            ):
+                raise EvidenceWorkflowError("evidence candidate path is invalid")
+        elif path.startswith("sources/"):
+            name = path.removeprefix("sources/")
+            if (
+                not name.endswith(".json")
+                or _SHA256.fullmatch(name.removesuffix(".json")) is None
+            ):
+                raise EvidenceWorkflowError("evidence candidate path is invalid")
+        else:
+            raise EvidenceWorkflowError("evidence candidate path is invalid")
+        inventory.append((path, digest))
+    paths = tuple(path for path, _ in inventory)
+    if (
+        paths != tuple(sorted(paths))
+        or len(set(paths)) != len(paths)
+        or paths.count("current.json") != 1
+    ):
+        raise EvidenceWorkflowError("evidence candidate inventory is invalid")
+    return tuple(inventory)
+
+
+def _verify_private_child_directory_binding(
+    parent_descriptor: int,
+    name: str,
+    opened: os.stat_result,
+) -> None:
+    try:
+        linked = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise EvidenceWorkflowError("evidence candidate path binding changed") from None
+    if (
+        not stat.S_ISDIR(linked.st_mode)
+        or linked.st_dev != opened.st_dev
+        or linked.st_ino != opened.st_ino
+        or linked.st_uid != opened.st_uid
+        or linked.st_mode != opened.st_mode
+    ):
+        raise EvidenceWorkflowError("evidence candidate path binding changed")
+
+
+def _read_candidate_release_tree(
+    candidate_descriptor: int,
+    inventory: tuple[tuple[str, str], ...],
+) -> dict[str, bytes]:
+    descriptors: list[int] = []
+    try:
+        release = os.open(
+            "release",
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=candidate_descriptor,
+        )
+        descriptors.append(release)
+        release_before = os.fstat(release)
+        _validate_private_directory_details(release_before)
+        subjects = os.open("subjects", _DIRECTORY_OPEN_FLAGS, dir_fd=release)
+        descriptors.append(subjects)
+        subjects_before = os.fstat(subjects)
+        _validate_private_directory_details(subjects_before)
+        sources = os.open("sources", _DIRECTORY_OPEN_FLAGS, dir_fd=release)
+        descriptors.append(sources)
+        sources_before = os.fstat(sources)
+        _validate_private_directory_details(sources_before)
+
+        subject_names = {
+            path.removeprefix("subjects/")
+            for path, _ in inventory
+            if path.startswith("subjects/")
+        }
+        source_names = {
+            path.removeprefix("sources/")
+            for path, _ in inventory
+            if path.startswith("sources/")
+        }
+        if (
+            _directory_names(candidate_descriptor) != {"candidate.json", "release"}
+            or _directory_names(release)
+            != {"current.json", "sources", "subjects"}
+            or _directory_names(subjects) != subject_names
+            or _directory_names(sources) != source_names
+        ):
+            raise EvidenceWorkflowError("evidence candidate tree is invalid")
+
+        release_files: dict[str, bytes] = {}
+        total_bytes = 0
+        for relative, expected_sha256 in inventory:
+            if relative == "current.json":
+                directory = release
+                name = relative
+                maximum_bytes = _MAX_PARENT_RELEASE_BYTES
+            elif relative.startswith("subjects/"):
+                directory = subjects
+                name = relative.removeprefix("subjects/")
+                maximum_bytes = _MAX_PARENT_RELEASE_BYTES
+            else:
+                directory = sources
+                name = relative.removeprefix("sources/")
+                maximum_bytes = _MAX_SOURCE_ARTIFACT_BYTES
+            payload = _read_private_bytes_at(
+                directory,
+                name,
+                maximum_bytes=maximum_bytes,
+            )
+            total_bytes += len(payload)
+            if (
+                total_bytes > _MAX_CANDIDATE_TOTAL_BYTES
+                or hashlib.sha256(payload).hexdigest() != expected_sha256
+            ):
+                raise EvidenceWorkflowError("evidence candidate file digest mismatch")
+            _canonical_document(payload, "evidence candidate release file")
+            release_files[relative] = payload
+
+        if (
+            _directory_names(candidate_descriptor) != {"candidate.json", "release"}
+            or _directory_names(release)
+            != {"current.json", "sources", "subjects"}
+            or _directory_names(subjects) != subject_names
+            or _directory_names(sources) != source_names
+        ):
+            raise EvidenceWorkflowError("evidence candidate tree is invalid")
+        _stable_directory(release_before, os.fstat(release))
+        _stable_directory(subjects_before, os.fstat(subjects))
+        _stable_directory(sources_before, os.fstat(sources))
+        _verify_private_child_directory_binding(
+            candidate_descriptor,
+            "release",
+            release_before,
+        )
+        _verify_private_child_directory_binding(release, "subjects", subjects_before)
+        _verify_private_child_directory_binding(release, "sources", sources_before)
+        return release_files
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("evidence candidate tree is unsafe") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _load_candidate(
+    state_root: Path,
+    candidate_sha256: str,
+) -> _LoadedCandidate:
+    if not isinstance(candidate_sha256, str) or _SHA256.fullmatch(candidate_sha256) is None:
+        raise EvidenceWorkflowError("evidence candidate digest is malformed")
+    state_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    candidate_descriptor: int | None = None
+    try:
+        state_descriptor, parent_descriptor = _open_existing_candidate_parent(state_root)
+        fcntl.flock(parent_descriptor, fcntl.LOCK_SH)
+        _verify_candidate_parent_binding(
+            state_root,
+            state_descriptor,
+            parent_descriptor,
+        )
+        candidate_descriptor = os.open(
+            candidate_sha256,
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+        candidate_before = os.fstat(candidate_descriptor)
+        _validate_private_directory_details(candidate_before)
+        linked_candidate = os.stat(
+            candidate_sha256,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(linked_candidate.st_mode)
+            or linked_candidate.st_dev != candidate_before.st_dev
+            or linked_candidate.st_ino != candidate_before.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence candidate path binding changed")
+        candidate_payload = _read_private_bytes_at(
+            candidate_descriptor,
+            "candidate.json",
+            maximum_bytes=_MAX_REVIEW_INPUT_BYTES,
+        )
+        document = _canonical_document(candidate_payload, "evidence candidate")
+        if (
+            hashlib.sha256(candidate_payload).hexdigest() != candidate_sha256
+            or set(document) != _CANDIDATE_FIELDS
+            or type(document["schema_version"]) is not int
+            or document["schema_version"] != 1
+            or document["kind"] != "EVIDENCE_RELEASE_CANDIDATE"
+        ):
+            raise EvidenceWorkflowError("evidence candidate wrapper is invalid")
+        for name in (
+            "parent_release_sha256",
+            "proposal_sha256",
+            "release_sha256",
+            "review_input_sha256",
+            "universe_sha256",
+        ):
+            value = document[name]
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise EvidenceWorkflowError("evidence candidate wrapper is invalid")
+        inventory = _candidate_inventory(document)
+        release_files = _read_candidate_release_tree(
+            candidate_descriptor,
+            inventory,
+        )
+        release_sha256 = document["release_sha256"]
+        universe_sha256 = document["universe_sha256"]
+        parent_release_sha256 = document["parent_release_sha256"]
+        assert isinstance(release_sha256, str)
+        assert isinstance(universe_sha256, str)
+        assert isinstance(parent_release_sha256, str)
+        release_document = _canonical_document(
+            release_files["current.json"],
+            "evidence candidate release",
+        )
+        if (
+            hashlib.sha256(release_files["current.json"]).hexdigest()
+            != release_sha256
+            or release_document.get("universe_sha256") != universe_sha256
+        ):
+            raise EvidenceWorkflowError("evidence candidate release binding is invalid")
+        _verify_candidate_tree(
+            parent_descriptor,
+            candidate_sha256,
+            candidate_payload=candidate_payload,
+            release_files=release_files,
+        )
+        _stable_directory(candidate_before, os.fstat(candidate_descriptor))
+        linked_candidate = os.stat(
+            candidate_sha256,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            linked_candidate.st_dev != candidate_before.st_dev
+            or linked_candidate.st_ino != candidate_before.st_ino
+        ):
+            raise EvidenceWorkflowError("evidence candidate path binding changed")
+        _verify_candidate_parent_binding(
+            state_root,
+            state_descriptor,
+            parent_descriptor,
+        )
+        return _LoadedCandidate(
+            candidate_sha256=candidate_sha256,
+            parent_release_sha256=parent_release_sha256,
+            release_sha256=release_sha256,
+            universe_sha256=universe_sha256,
+            release_files=release_files,
+        )
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("evidence candidate is unavailable") from None
+    finally:
+        if candidate_descriptor is not None:
+            os.close(candidate_descriptor)
+        if parent_descriptor is not None:
+            try:
+                fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_descriptor)
+        if state_descriptor is not None:
+            os.close(state_descriptor)
+
+
+def _validate_candidate_release(
+    candidate: _LoadedCandidate,
+    *,
+    current: datetime,
+    universe: UniverseSnapshot,
+) -> tuple[str, ...]:
+    if candidate.universe_sha256 != universe._release_pin:
+        raise EvidenceWorkflowError("evidence candidate universe changed")
+    manifest = _canonical_document(
+        candidate.release_files["current.json"],
+        "evidence candidate release",
+    )
+    manifest_subjects = manifest.get("subjects")
+    if not isinstance(manifest_subjects, list):
+        raise EvidenceWorkflowError("evidence candidate release is invalid")
+    manifest_subject_paths: set[str] = set()
+    for subject in manifest_subjects:
+        if not isinstance(subject, dict) or not isinstance(subject.get("path"), str):
+            raise EvidenceWorkflowError("evidence candidate release is invalid")
+        manifest_subject_paths.add(subject["path"])
+    inventory_subject_paths = {
+        relative
+        for relative in candidate.release_files
+        if relative.startswith("subjects/")
+    }
+    if inventory_subject_paths != manifest_subject_paths:
+        raise EvidenceWorkflowError(
+            "evidence candidate subjects do not exactly match its manifest"
+        )
+    bound_sources: set[str] = set()
+    for relative, payload in candidate.release_files.items():
+        if not relative.startswith("subjects/"):
+            continue
+        child = _canonical_document(payload, "evidence candidate subject")
+        bindings = child.get("source_bindings")
+        if not isinstance(bindings, list):
+            raise EvidenceWorkflowError("evidence candidate subject is invalid")
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                raise EvidenceWorkflowError("evidence candidate subject is invalid")
+            content_hash = binding.get("content_hash")
+            if not isinstance(content_hash, str) or _SHA256.fullmatch(content_hash) is None:
+                raise EvidenceWorkflowError("evidence candidate subject is invalid")
+            bound_sources.add(f"sources/{content_hash}.json")
+    inventory_sources = {
+        relative
+        for relative in candidate.release_files
+        if relative.startswith("sources/")
+    }
+    if inventory_sources != bound_sources:
+        raise EvidenceWorkflowError(
+            "evidence candidate sources do not exactly match subject bindings"
+        )
+    _validate_compiled_release(
+        candidate.release_files,
+        release_sha256=candidate.release_sha256,
+        current=current,
+        universe=universe,
+    )
+    return tuple(record.symbol for record in universe.eligible_records())
+
+
+def _validate_active_directory_details(details: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o022
+    ):
+        raise EvidenceWorkflowError("active evidence directory is unsafe")
+
+
+def _verify_active_evidence_binding(
+    project_root: Path,
+    project_descriptor: int,
+    data_descriptor: int,
+    evidence_descriptor: int,
+) -> None:
+    project_opened = os.fstat(project_descriptor)
+    data_opened = os.fstat(data_descriptor)
+    evidence_opened = os.fstat(evidence_descriptor)
+    _validate_active_directory_details(project_opened)
+    _validate_active_directory_details(data_opened)
+    _validate_active_directory_details(evidence_opened)
+    try:
+        linked_project = project_root.lstat()
+        linked_data = os.stat(
+            "data",
+            dir_fd=project_descriptor,
+            follow_symlinks=False,
+        )
+        linked_evidence = os.stat(
+            "evidence",
+            dir_fd=data_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise EvidenceWorkflowError("active evidence path binding changed") from None
+    for linked, opened in (
+        (linked_project, project_opened),
+        (linked_data, data_opened),
+        (linked_evidence, evidence_opened),
+    ):
+        if (
+            not stat.S_ISDIR(linked.st_mode)
+            or linked.st_dev != opened.st_dev
+            or linked.st_ino != opened.st_ino
+            or linked.st_uid != opened.st_uid
+            or linked.st_mode != opened.st_mode
+        ):
+            raise EvidenceWorkflowError("active evidence path binding changed")
+
+
+def _open_active_evidence_root(project_root: Path) -> tuple[int, int, int]:
+    project_descriptor: int | None = None
+    data_descriptor: int | None = None
+    evidence_descriptor: int | None = None
+    try:
+        project_before = project_root.lstat()
+        project_descriptor = os.open(project_root, _DIRECTORY_OPEN_FLAGS)
+        project_opened = os.fstat(project_descriptor)
+        _validate_active_directory_details(project_opened)
+        if (
+            project_before.st_dev != project_opened.st_dev
+            or project_before.st_ino != project_opened.st_ino
+        ):
+            raise EvidenceWorkflowError("active evidence path binding changed")
+        data_descriptor = os.open(
+            "data",
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=project_descriptor,
+        )
+        _validate_active_directory_details(os.fstat(data_descriptor))
+        evidence_descriptor = os.open(
+            "evidence",
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=data_descriptor,
+        )
+        _validate_active_directory_details(os.fstat(evidence_descriptor))
+        _verify_active_evidence_binding(
+            project_root,
+            project_descriptor,
+            data_descriptor,
+            evidence_descriptor,
+        )
+        return project_descriptor, data_descriptor, evidence_descriptor
+    except EvidenceWorkflowError:
+        if evidence_descriptor is not None:
+            os.close(evidence_descriptor)
+        if data_descriptor is not None:
+            os.close(data_descriptor)
+        if project_descriptor is not None:
+            os.close(project_descriptor)
+        raise
+    except OSError:
+        if evidence_descriptor is not None:
+            os.close(evidence_descriptor)
+        if data_descriptor is not None:
+            os.close(data_descriptor)
+        if project_descriptor is not None:
+            os.close(project_descriptor)
+        raise EvidenceWorkflowError("active evidence tree is unavailable") from None
+
+
+def _open_active_child_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    create: bool,
+) -> tuple[int, os.stat_result]:
+    if name not in {"subjects", "sources"}:
+        raise EvidenceWorkflowError("active evidence destination is invalid")
+    created = False
+    try:
+        if create:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+                created = True
+                os.fsync(parent_descriptor)
+            except FileExistsError:
+                pass
+        descriptor = os.open(
+            name,
+            _DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except OSError:
+        raise EvidenceWorkflowError("active evidence directory is unsafe") from None
+    try:
+        if created:
+            os.fchmod(descriptor, 0o700)
+        opened = os.fstat(descriptor)
+        _validate_active_directory_details(opened)
+        linked = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(linked.st_mode)
+            or linked.st_dev != opened.st_dev
+            or linked.st_ino != opened.st_ino
+            or linked.st_uid != opened.st_uid
+            or linked.st_mode != opened.st_mode
+        ):
+            raise EvidenceWorkflowError("active evidence path binding changed")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_optional_active_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    maximum_bytes: int,
+) -> tuple[bytes | None, os.stat_result | None]:
+    try:
+        descriptor = os.open(
+            name,
+            _FILE_OPEN_FLAGS,
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        raise EvidenceWorkflowError("active evidence file is unsafe") from None
+    try:
+        payload = _read_stable_regular_descriptor(
+            descriptor,
+            maximum_bytes=maximum_bytes,
+            private=False,
+        )
+        opened = os.fstat(descriptor)
+        try:
+            linked = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise EvidenceWorkflowError("active evidence path binding changed") from None
+        if any(
+            getattr(linked, field) != getattr(opened, field)
+            for field in _STABLE_STAT_FIELDS
+        ):
+            raise EvidenceWorkflowError("active evidence path binding changed")
+        return payload, opened
+    finally:
+        os.close(descriptor)
+
+
+def _read_active_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    maximum_bytes: int,
+) -> tuple[bytes, os.stat_result]:
+    payload, details = _read_optional_active_file_at(
+        directory_descriptor,
+        name,
+        maximum_bytes=maximum_bytes,
+    )
+    if payload is None or details is None:
+        raise EvidenceWorkflowError("active evidence file is missing")
+    return payload, details
+
+
+def _verify_active_destination_state(
+    directory_descriptor: int,
+    name: str,
+    expected: os.stat_result | None,
+) -> None:
+    try:
+        actual = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if expected is None:
+            return
+        raise EvidenceWorkflowError("active evidence destination changed") from None
+    except OSError:
+        raise EvidenceWorkflowError("active evidence destination is unsafe") from None
+    if expected is None or any(
+        getattr(actual, field) != getattr(expected, field)
+        for field in _STABLE_STAT_FIELDS
+    ):
+        raise EvidenceWorkflowError("active evidence destination changed")
+
+
+def _atomic_install_write_at(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    *,
+    expected: os.stat_result | None,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
+    temporary_name = f".{name}.{secrets.token_hex(16)}.install.tmp"
+    descriptor: int | None = None
+    temporary_exists = False
+    temporary_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        temporary_exists = True
+        os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short evidence install write")
+            written += count
+        os.fsync(descriptor)
+        details = os.fstat(descriptor)
+        temporary_identity = (details.st_dev, details.st_ino)
+        os.close(descriptor)
+        descriptor = None
+        if before_replace is not None:
+            before_replace()
+        _verify_active_destination_state(directory_descriptor, name, expected)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_exists = False
+        installed = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if temporary_identity != (installed.st_dev, installed.st_ino):
+            raise EvidenceWorkflowError("active evidence publication changed identity")
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_exists:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+
+
+def _verify_active_release_files(
+    evidence_descriptor: int,
+    release_files: dict[str, bytes],
+) -> None:
+    subjects: int | None = None
+    sources: int | None = None
+    try:
+        subjects, subjects_before = _open_active_child_directory(
+            evidence_descriptor,
+            "subjects",
+            create=False,
+        )
+        sources, sources_before = _open_active_child_directory(
+            evidence_descriptor,
+            "sources",
+            create=False,
+        )
+        for relative, expected in sorted(release_files.items()):
+            if relative == "current.json":
+                directory = evidence_descriptor
+                name = relative
+                maximum_bytes = _MAX_PARENT_RELEASE_BYTES
+            elif relative.startswith("subjects/"):
+                directory = subjects
+                name = relative.removeprefix("subjects/")
+                maximum_bytes = _MAX_PARENT_RELEASE_BYTES
+            else:
+                directory = sources
+                name = relative.removeprefix("sources/")
+                maximum_bytes = _MAX_SOURCE_ARTIFACT_BYTES
+            actual, _ = _read_active_file_at(
+                directory,
+                name,
+                maximum_bytes=maximum_bytes,
+            )
+            if actual != expected:
+                raise EvidenceWorkflowError("installed evidence differs from candidate")
+        _stable_review_input_directory(subjects_before, os.fstat(subjects))
+        _stable_review_input_directory(sources_before, os.fstat(sources))
+        _verify_private_child_directory_binding(
+            evidence_descriptor,
+            "subjects",
+            subjects_before,
+        )
+        _verify_private_child_directory_binding(
+            evidence_descriptor,
+            "sources",
+            sources_before,
+        )
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("installed evidence tree is unsafe") from None
+    finally:
+        if sources is not None:
+            os.close(sources)
+        if subjects is not None:
+            os.close(subjects)
+
+
+def _install_release_tree_manifest_last(
+    evidence_descriptor: int,
+    *,
+    release_files: dict[str, bytes],
+    active_manifest: bytes,
+    active_manifest_details: os.stat_result,
+    verify_authority: Callable[[], None],
+) -> None:
+    subjects: int | None = None
+    sources: int | None = None
+    try:
+        subjects, subjects_before = _open_active_child_directory(
+            evidence_descriptor,
+            "subjects",
+            create=True,
+        )
+        sources, sources_before = _open_active_child_directory(
+            evidence_descriptor,
+            "sources",
+            create=True,
+        )
+        subject_files = {
+            relative.removeprefix("subjects/"): payload
+            for relative, payload in release_files.items()
+            if relative.startswith("subjects/")
+        }
+        source_files = {
+            relative.removeprefix("sources/"): payload
+            for relative, payload in release_files.items()
+            if relative.startswith("sources/")
+        }
+        subject_states: dict[
+            str,
+            tuple[bytes | None, os.stat_result | None],
+        ] = {}
+        source_states: dict[
+            str,
+            tuple[bytes | None, os.stat_result | None],
+        ] = {}
+        for name in sorted(subject_files):
+            subject_states[name] = _read_optional_active_file_at(
+                subjects,
+                name,
+                maximum_bytes=_MAX_PARENT_RELEASE_BYTES,
+            )
+        for name, expected_payload in sorted(source_files.items()):
+            state = _read_optional_active_file_at(
+                sources,
+                name,
+                maximum_bytes=_MAX_SOURCE_ARTIFACT_BYTES,
+            )
+            if state[0] is not None and state[0] != expected_payload:
+                raise EvidenceWorkflowError("active evidence source collision")
+            source_states[name] = state
+
+        for name, payload in sorted(source_files.items()):
+            existing_payload, details = source_states[name]
+            if existing_payload is None:
+                _atomic_install_write_at(
+                    sources,
+                    name,
+                    payload,
+                    expected=details,
+                )
+        for name, payload in sorted(subject_files.items()):
+            existing_payload, details = subject_states[name]
+            if existing_payload != payload:
+                _atomic_install_write_at(
+                    subjects,
+                    name,
+                    payload,
+                    expected=details,
+                )
+
+        _stable_review_input_directory(subjects_before, os.fstat(subjects))
+        _stable_review_input_directory(sources_before, os.fstat(sources))
+        _verify_private_child_directory_binding(
+            evidence_descriptor,
+            "subjects",
+            subjects_before,
+        )
+        _verify_private_child_directory_binding(
+            evidence_descriptor,
+            "sources",
+            sources_before,
+        )
+
+        def recheck_active_manifest() -> None:
+            rechecked, _ = _read_active_file_at(
+                evidence_descriptor,
+                "current.json",
+                maximum_bytes=_MAX_PARENT_RELEASE_BYTES,
+            )
+            if rechecked != active_manifest:
+                raise EvidenceWorkflowError("candidate parent release changed")
+            for name, expected_payload in sorted(subject_files.items()):
+                installed_payload, _ = _read_active_file_at(
+                    subjects,
+                    name,
+                    maximum_bytes=_MAX_PARENT_RELEASE_BYTES,
+                )
+                if installed_payload != expected_payload:
+                    raise EvidenceWorkflowError(
+                        "active evidence child changed before manifest"
+                    )
+            for name, expected_payload in sorted(source_files.items()):
+                installed_payload, _ = _read_active_file_at(
+                    sources,
+                    name,
+                    maximum_bytes=_MAX_SOURCE_ARTIFACT_BYTES,
+                )
+                if installed_payload != expected_payload:
+                    raise EvidenceWorkflowError(
+                        "active evidence source changed before manifest"
+                    )
+            _stable_review_input_directory(subjects_before, os.fstat(subjects))
+            _stable_review_input_directory(sources_before, os.fstat(sources))
+            _verify_private_child_directory_binding(
+                evidence_descriptor,
+                "subjects",
+                subjects_before,
+            )
+            _verify_private_child_directory_binding(
+                evidence_descriptor,
+                "sources",
+                sources_before,
+            )
+            verify_authority()
+
+        _atomic_install_write_at(
+            evidence_descriptor,
+            "current.json",
+            release_files["current.json"],
+            expected=active_manifest_details,
+            before_replace=recheck_active_manifest,
+        )
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("active evidence installation failed") from None
+    finally:
+        if sources is not None:
+            os.close(sources)
+        if subjects is not None:
+            os.close(subjects)
+
+
+def _read_installed_summary(
+    *,
+    project_root: Path,
+    project_descriptor: int,
+    data_descriptor: int,
+    evidence_descriptor: int,
+    candidate: _LoadedCandidate,
+    current: datetime,
+    expected_symbols: tuple[str, ...],
+    status: str,
+) -> EvidenceInstallSummary:
+    def current_universe() -> UniverseSnapshot:
+        if (
+            evidence_module.CURRENT_EVIDENCE_RELEASE_SHA256
+            != candidate.release_sha256
+        ):
+            raise EvidenceWorkflowError(
+                "candidate release is not independently pinned"
+            )
+        try:
+            refreshed = load_current_universe(
+                project_root,
+                as_of=current.date(),
+            )
+        except (OSError, TypeError, ValueError):
+            raise EvidenceWorkflowError("evidence universe changed") from None
+        if (
+            refreshed._release_pin != candidate.universe_sha256
+            or tuple(record.symbol for record in refreshed.eligible_records())
+            != expected_symbols
+        ):
+            raise EvidenceWorkflowError("evidence universe changed")
+        return refreshed
+
+    _verify_active_evidence_binding(
+        project_root,
+        project_descriptor,
+        data_descriptor,
+        evidence_descriptor,
+    )
+    universe = current_universe()
+    _verify_active_release_files(
+        evidence_descriptor,
+        candidate.release_files,
+    )
+    try:
+        release = evidence_module.load_current_evidence_release(
+            project_root,
+            as_of=current,
+            universe=universe,
+        )
+    except (EvidenceRegistryError, OSError, TypeError, ValueError):
+        raise EvidenceWorkflowError("installed evidence readback failed") from None
+    _verify_active_evidence_binding(
+        project_root,
+        project_descriptor,
+        data_descriptor,
+        evidence_descriptor,
+    )
+    _verify_active_release_files(
+        evidence_descriptor,
+        candidate.release_files,
+    )
+    current_universe()
+    symbols = tuple(release.by_symbol)
+    if (
+        release.release_sha256 != candidate.release_sha256
+        or release.universe_sha256 != candidate.universe_sha256
+        or symbols != expected_symbols
+    ):
+        raise EvidenceWorkflowError("installed evidence readback differs from candidate")
+    return EvidenceInstallSummary(
+        status=status,
+        candidate_sha256=candidate.candidate_sha256,
+        release_sha256=candidate.release_sha256,
+        installed_at=current,
+        symbols=symbols,
+    )
 
 
 def _remove_directory_contents(descriptor: int, *, depth: int = 0) -> None:
@@ -2780,10 +3788,142 @@ def inspect_evidence_candidate(
     )
 
 
+def install_evidence_candidate(
+    *,
+    project_root: Path,
+    state_root: Path,
+    candidate_sha256: str,
+    as_of: datetime,
+) -> EvidenceInstallSummary:
+    """Install an independently pinned candidate into active evidence."""
+    project_root = _validate_root(project_root, private=False)
+    state_root = _validate_root(state_root, private=True)
+    try:
+        current = require_aware_timestamp(as_of, "installation as_of").astimezone(UTC)
+    except (TypeError, ValueError, OverflowError):
+        raise EvidenceWorkflowError("evidence installation time is invalid") from None
+    candidate = _load_candidate(state_root, candidate_sha256)
+    if candidate.release_sha256 != evidence_module.CURRENT_EVIDENCE_RELEASE_SHA256:
+        raise EvidenceWorkflowError("candidate release is not independently pinned")
+    try:
+        universe = load_current_universe(project_root, as_of=current.date())
+    except (OSError, TypeError, ValueError):
+        raise EvidenceWorkflowError("evidence universe is invalid") from None
+    expected_symbols = _validate_candidate_release(
+        candidate,
+        current=current,
+        universe=universe,
+    )
+
+    project_descriptor: int | None = None
+    data_descriptor: int | None = None
+    evidence_descriptor: int | None = None
+    try:
+        (
+            project_descriptor,
+            data_descriptor,
+            evidence_descriptor,
+        ) = _open_active_evidence_root(project_root)
+        fcntl.flock(evidence_descriptor, fcntl.LOCK_EX)
+        _verify_active_evidence_binding(
+            project_root,
+            project_descriptor,
+            data_descriptor,
+            evidence_descriptor,
+        )
+        active_manifest, active_details = _read_active_file_at(
+            evidence_descriptor,
+            "current.json",
+            maximum_bytes=_MAX_PARENT_RELEASE_BYTES,
+        )
+        active_sha256 = hashlib.sha256(active_manifest).hexdigest()
+        if active_sha256 == candidate.release_sha256:
+            return _read_installed_summary(
+                project_root=project_root,
+                project_descriptor=project_descriptor,
+                data_descriptor=data_descriptor,
+                evidence_descriptor=evidence_descriptor,
+                candidate=candidate,
+                current=current,
+                expected_symbols=expected_symbols,
+                status="ALREADY_INSTALLED",
+            )
+        if active_sha256 != candidate.parent_release_sha256:
+            raise EvidenceWorkflowError("candidate parent release changed")
+
+        def verify_install_authority() -> None:
+            if (
+                evidence_module.CURRENT_EVIDENCE_RELEASE_SHA256
+                != candidate.release_sha256
+            ):
+                raise EvidenceWorkflowError(
+                    "candidate release is not independently pinned"
+                )
+            try:
+                current_universe = load_current_universe(
+                    project_root,
+                    as_of=current.date(),
+                )
+            except (OSError, TypeError, ValueError):
+                raise EvidenceWorkflowError("evidence universe changed") from None
+            if (
+                current_universe._release_pin != candidate.universe_sha256
+                or tuple(record.symbol for record in current_universe.eligible_records())
+                != expected_symbols
+            ):
+                raise EvidenceWorkflowError("evidence universe changed")
+            _verify_active_evidence_binding(
+                project_root,
+                project_descriptor,
+                data_descriptor,
+                evidence_descriptor,
+            )
+
+        _install_release_tree_manifest_last(
+            evidence_descriptor,
+            release_files=candidate.release_files,
+            active_manifest=active_manifest,
+            active_manifest_details=active_details,
+            verify_authority=verify_install_authority,
+        )
+        _verify_active_evidence_binding(
+            project_root,
+            project_descriptor,
+            data_descriptor,
+            evidence_descriptor,
+        )
+        return _read_installed_summary(
+            project_root=project_root,
+            project_descriptor=project_descriptor,
+            data_descriptor=data_descriptor,
+            evidence_descriptor=evidence_descriptor,
+            candidate=candidate,
+            current=current,
+            expected_symbols=expected_symbols,
+            status="INSTALLED",
+        )
+    except EvidenceWorkflowError:
+        raise
+    except OSError:
+        raise EvidenceWorkflowError("active evidence installation failed") from None
+    finally:
+        if evidence_descriptor is not None:
+            try:
+                fcntl.flock(evidence_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(evidence_descriptor)
+        if data_descriptor is not None:
+            os.close(data_descriptor)
+        if project_descriptor is not None:
+            os.close(project_descriptor)
+
+
 __all__ = [
     "EvidenceCandidateSummary",
+    "EvidenceInstallSummary",
     "EvidenceProposalSummary",
     "EvidenceWorkflowError",
     "inspect_evidence_candidate",
+    "install_evidence_candidate",
     "prepare_evidence_proposal",
 ]

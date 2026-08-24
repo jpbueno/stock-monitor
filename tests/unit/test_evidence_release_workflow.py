@@ -217,6 +217,22 @@ def _copy_project(root: Path) -> Path:
     return project_root
 
 
+def _copy_install_project(root: Path) -> Path:
+    project_root = _copy_project(root)
+    source_root = PROJECT_ROOT / "data/evidence"
+    destination_root = project_root / "data/evidence"
+    for source in sorted(source_root.rglob("*")):
+        destination = destination_root / source.relative_to(source_root)
+        if source.is_dir():
+            destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+            destination.chmod(0o700)
+        else:
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(0o600)
+    return project_root
+
+
 def _prepare(
     state_root: Path,
     *,
@@ -346,6 +362,43 @@ def _write_review_input(path: Path, document: dict[str, object]) -> None:
     path.chmod(0o600)
 
 
+def _prepare_install_candidate(
+    root: Path,
+    state_root: Path,
+    *,
+    installed_at: datetime = NOW + timedelta(minutes=10),
+    review_by: datetime = NOW + timedelta(hours=23),
+) -> tuple[Path, workflow_module.EvidenceCandidateSummary]:
+    project_root = _copy_install_project(root)
+    proposal = _prepare(state_root, project_root=project_root)
+    review_path = root / "review-input.json"
+    _write_review_input(
+        review_path,
+        _review_document(proposal, review_by=review_by),
+    )
+    candidate = workflow_module.inspect_evidence_candidate(
+        project_root=project_root,
+        state_root=state_root,
+        proposal_sha256=proposal.proposal_sha256,
+        review_input_path=review_path,
+        as_of=installed_at,
+    )
+    return project_root, candidate
+
+
+def _rewrite_candidate_wrapper(
+    candidate: workflow_module.EvidenceCandidateSummary,
+    document: dict[str, object],
+) -> str:
+    original_root = candidate.candidate_path.parent
+    payload = _canonical_bytes(document)
+    candidate_sha256 = hashlib.sha256(payload).hexdigest()
+    candidate.candidate_path.write_bytes(payload)
+    candidate.candidate_path.chmod(0o600)
+    original_root.rename(original_root.parent / candidate_sha256)
+    return candidate_sha256
+
+
 def _review_subject(
     document: dict[str, object],
     symbol: str,
@@ -390,6 +443,32 @@ def _assert_no_floats(test: unittest.TestCase, value: object) -> None:
 
 
 class EvidenceReleaseWorkflowApiTests(unittest.TestCase):
+    def test_task_five_install_api_is_public_and_exact(self) -> None:
+        summary_type = workflow_module.EvidenceInstallSummary
+        install_candidate = workflow_module.install_evidence_candidate
+
+        self.assertEqual(
+            tuple(item.name for item in fields(summary_type)),
+            (
+                "status",
+                "candidate_sha256",
+                "release_sha256",
+                "installed_at",
+                "symbols",
+            ),
+        )
+        signature = inspect.signature(install_candidate).parameters
+        self.assertEqual(
+            tuple(signature),
+            ("project_root", "state_root", "candidate_sha256", "as_of"),
+        )
+        self.assertTrue(
+            all(
+                value.kind is inspect.Parameter.KEYWORD_ONLY
+                for value in signature.values()
+            )
+        )
+
     def test_task_four_candidate_api_is_public_and_exact(self) -> None:
         summary_type = workflow_module.EvidenceCandidateSummary
         inspect_candidate = workflow_module.inspect_evidence_candidate
@@ -1866,6 +1945,935 @@ class EvidenceCandidateFilesystemTests(unittest.TestCase):
                 list((state_root / "evidence-candidates").iterdir()),
                 [],
             )
+
+
+class EvidenceCandidateInstallTests(unittest.TestCase):
+    def test_independently_pinned_candidate_installs_and_loads(self) -> None:
+        installed_at = NOW + timedelta(minutes=10)
+        with _private_workspace() as (root, state_root):
+            project_root = _copy_project(root)
+            proposal = _prepare(state_root, project_root=project_root)
+            review_path = root / "review-input.json"
+            _write_review_input(review_path, _review_document(proposal))
+            candidate = workflow_module.inspect_evidence_candidate(
+                project_root=project_root,
+                state_root=state_root,
+                proposal_sha256=proposal.proposal_sha256,
+                review_input_path=review_path,
+                as_of=installed_at,
+            )
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                summary = workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=installed_at,
+                )
+                universe = load_current_universe(
+                    project_root,
+                    as_of=installed_at.date(),
+                )
+                release = evidence_module.load_current_evidence_release(
+                    project_root,
+                    as_of=installed_at,
+                    universe=universe,
+                )
+
+            self.assertEqual(summary.status, "INSTALLED")
+            self.assertEqual(summary.candidate_sha256, candidate.candidate_sha256)
+            self.assertEqual(summary.release_sha256, candidate.release_sha256)
+            self.assertEqual(summary.installed_at, installed_at)
+            self.assertEqual(summary.symbols, candidate.symbols)
+            self.assertEqual(
+                hashlib.sha256(
+                    (project_root / "data/evidence/current.json").read_bytes()
+                ).hexdigest(),
+                candidate.release_sha256,
+            )
+            self.assertEqual(tuple(release.by_symbol), candidate.symbols)
+
+    def test_universe_change_before_manifest_replace_is_rejected(self) -> None:
+        installed_at = NOW + timedelta(minutes=10)
+        with _private_workspace() as (root, state_root):
+            project_root = _copy_project(root)
+            proposal = _prepare(state_root, project_root=project_root)
+            review_path = root / "review-input.json"
+            _write_review_input(review_path, _review_document(proposal))
+            candidate = workflow_module.inspect_evidence_candidate(
+                project_root=project_root,
+                state_root=state_root,
+                proposal_sha256=proposal.proposal_sha256,
+                review_input_path=review_path,
+                as_of=installed_at,
+            )
+            manifest_path = project_root / "data/evidence/current.json"
+            manifest_before = manifest_path.read_bytes()
+            universe_path = project_root / "data/universe/2026-08-22.json"
+            real_write = workflow_module._atomic_install_write_at
+            changed = False
+
+            def change_universe(directory_descriptor, name, payload, **kwargs):
+                nonlocal changed
+                if name == "current.json" and not changed:
+                    changed = True
+                    universe_path.write_bytes(universe_path.read_bytes() + b" ")
+                    universe_path.chmod(0o600)
+                return real_write(
+                    directory_descriptor,
+                    name,
+                    payload,
+                    **kwargs,
+                )
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module,
+                "_atomic_install_write_at",
+                change_universe,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=installed_at,
+                    )
+            self.assertTrue(changed)
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+
+    def test_unpinned_candidate_is_rejected_without_active_mutation(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            active_before = _active_tree_snapshot(project_root)
+
+            with self.assertRaises(EvidenceWorkflowError):
+                workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=NOW + timedelta(minutes=10),
+                )
+
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_stale_parent_is_rejected_without_active_mutation(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            current_path = project_root / "data/evidence/current.json"
+            current_path.write_bytes(b'{"different-parent":true}\n')
+            current_path.chmod(0o600)
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_expired_candidate_is_rejected_without_active_mutation(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=candidate.review_by,
+                    )
+
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_changed_current_universe_is_rejected_without_active_mutation(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            universe_path = project_root / "data/universe/2026-08-22.json"
+            universe_document = json.loads(universe_path.read_bytes())
+            universe_document["records"][1]["enabled"] = False
+            universe_document["checksum"] = universe_module.canonical_payload_checksum(
+                universe_document
+            )
+            universe_payload = _canonical_bytes(universe_document)
+            universe_sha256 = hashlib.sha256(universe_payload).hexdigest()
+            universe_path.write_bytes(universe_payload)
+            universe_path.chmod(0o600)
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                universe_module,
+                "CURRENT_UNIVERSE_SHA256",
+                universe_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_candidate_wrapper_inventory_children_sources_and_extras_are_bound(
+        self,
+    ) -> None:
+        cases = (
+            "wrapper",
+            "wrapper-extra",
+            "wrapper-duplicate",
+            "inventory",
+            "subject",
+            "source",
+            "extra",
+        )
+        for case in cases:
+            with self.subTest(case=case), _private_workspace() as (root, state_root):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                candidate_sha256 = candidate.candidate_sha256
+                candidate_root = candidate.candidate_path.parent
+                if case == "wrapper":
+                    candidate.candidate_path.write_bytes(
+                        candidate.candidate_path.read_bytes() + b" "
+                    )
+                    candidate.candidate_path.chmod(0o600)
+                elif case == "wrapper-extra":
+                    document = json.loads(candidate.candidate_path.read_bytes())
+                    document["reviewer_identity"] = "not-authority"
+                    candidate_sha256 = _rewrite_candidate_wrapper(
+                        candidate,
+                        document,
+                    )
+                elif case == "wrapper-duplicate":
+                    original = candidate.candidate_path.read_bytes().rstrip(b"\n")
+                    duplicate = original[:-1] + b',"kind":"duplicate"}\n'
+                    candidate_sha256 = hashlib.sha256(duplicate).hexdigest()
+                    candidate.candidate_path.write_bytes(duplicate)
+                    candidate.candidate_path.chmod(0o600)
+                    candidate_root.rename(candidate_root.parent / candidate_sha256)
+                elif case == "inventory":
+                    document = json.loads(candidate.candidate_path.read_bytes())
+                    document["inventory"][0]["sha256"] = "0" * 64
+                    candidate_sha256 = _rewrite_candidate_wrapper(
+                        candidate,
+                        document,
+                    )
+                elif case == "subject":
+                    subject = next(
+                        (candidate_root / "release/subjects").iterdir()
+                    )
+                    subject.write_bytes(subject.read_bytes() + b" ")
+                    subject.chmod(0o600)
+                elif case == "source":
+                    source = next((candidate_root / "release/sources").iterdir())
+                    source.write_bytes(source.read_bytes() + b" ")
+                    source.chmod(0o600)
+                else:
+                    extra = candidate_root / "release/extra.json"
+                    extra.write_bytes(b"{}\n")
+                    extra.chmod(0o600)
+                active_before = _active_tree_snapshot(project_root)
+
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ):
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+
+                self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_malicious_candidate_inventory_path_is_rejected(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            document = json.loads(candidate.candidate_path.read_bytes())
+            document["inventory"][0]["path"] = "../outside.json"
+            candidate_sha256 = _rewrite_candidate_wrapper(candidate, document)
+            outside = state_root / "outside.json"
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+
+            self.assertFalse(outside.exists())
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_inventory_source_without_subject_binding_is_rejected(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            release_root = candidate.candidate_path.parent / "release"
+            source_payload = next((release_root / "sources").iterdir()).read_bytes()
+            unused_name = f"{'f' * 64}.json"
+            unused_path = release_root / "sources" / unused_name
+            unused_path.write_bytes(source_payload)
+            unused_path.chmod(0o600)
+            document = json.loads(candidate.candidate_path.read_bytes())
+            document["inventory"].append(
+                {
+                    "path": f"sources/{unused_name}",
+                    "sha256": hashlib.sha256(source_payload).hexdigest(),
+                }
+            )
+            document["inventory"].sort(key=lambda item: item["path"])
+            candidate_sha256 = _rewrite_candidate_wrapper(candidate, document)
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_inventory_subject_without_manifest_entry_is_rejected(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            release_root = candidate.candidate_path.parent / "release"
+            subject_payload = (
+                release_root / "subjects/AAPL.json"
+            ).read_bytes()
+            unused_path = release_root / "subjects/ZZZ.json"
+            unused_path.write_bytes(subject_payload)
+            unused_path.chmod(0o600)
+            document = json.loads(candidate.candidate_path.read_bytes())
+            document["inventory"].append(
+                {
+                    "path": "subjects/ZZZ.json",
+                    "sha256": hashlib.sha256(subject_payload).hexdigest(),
+                }
+            )
+            document["inventory"].sort(key=lambda item: item["path"])
+            candidate_sha256 = _rewrite_candidate_wrapper(candidate, document)
+            active_before = _active_tree_snapshot(project_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_repeated_install_is_exact_readback_and_preserves_candidate_bytes(
+        self,
+    ) -> None:
+        installed_at = NOW + timedelta(minutes=10)
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            candidate_release = candidate.candidate_path.parent / "release"
+            expected_files = {
+                path.relative_to(candidate_release).as_posix(): path.read_bytes()
+                for path in candidate_release.rglob("*")
+                if path.is_file()
+            }
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ):
+                first = workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=installed_at,
+                )
+                active_after_first = _active_tree_snapshot(project_root)
+                repeated = workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=installed_at,
+                )
+
+            self.assertEqual(first.status, "INSTALLED")
+            self.assertEqual(repeated.status, "ALREADY_INSTALLED")
+            self.assertEqual(_active_tree_snapshot(project_root), active_after_first)
+            active_root = project_root / "data/evidence"
+            for relative, expected in expected_files.items():
+                self.assertEqual((active_root / relative).read_bytes(), expected)
+            with self.assertRaises(FrozenInstanceError):
+                repeated.status = "MUTATED"  # type: ignore[misc]
+
+    def test_already_installed_requires_valid_candidate_and_active_readback(
+        self,
+    ) -> None:
+        cases = ("candidate", "current", "subject", "source", "mode")
+        for case in cases:
+            with self.subTest(case=case), _private_workspace() as (root, state_root):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+                    if case == "candidate":
+                        candidate.candidate_path.write_bytes(
+                            candidate.candidate_path.read_bytes() + b" "
+                        )
+                        candidate.candidate_path.chmod(0o600)
+                    elif case == "current":
+                        current_path = project_root / "data/evidence/current.json"
+                        current_path.write_bytes(current_path.read_bytes() + b" ")
+                        current_path.chmod(0o600)
+                    elif case == "subject":
+                        subject = project_root / "data/evidence/subjects/AAPL.json"
+                        subject.write_bytes(subject.read_bytes() + b" ")
+                        subject.chmod(0o600)
+                    elif case == "source":
+                        source_name = next(
+                            (candidate.candidate_path.parent / "release/sources").iterdir()
+                        ).name
+                        source = project_root / "data/evidence/sources" / source_name
+                        source.write_bytes(source.read_bytes() + b" ")
+                        source.chmod(0o600)
+                    else:
+                        subject = project_root / "data/evidence/subjects/AAPL.json"
+                        subject.chmod(0o666)
+                    active_before = _active_tree_snapshot(project_root)
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+                self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_late_universe_change_blocks_installed_and_idempotent_summaries(
+        self,
+    ) -> None:
+        for expected_status in ("INSTALLED", "ALREADY_INSTALLED"):
+            with self.subTest(status=expected_status), _private_workspace() as (
+                root,
+                state_root,
+            ):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                universe_path = project_root / "data/universe/2026-08-22.json"
+                if expected_status == "ALREADY_INSTALLED":
+                    with mock.patch.object(
+                        evidence_module,
+                        "CURRENT_EVIDENCE_RELEASE_SHA256",
+                        candidate.release_sha256,
+                    ):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+                real_verify = workflow_module._verify_active_release_files
+                verification_count = 0
+                changed = False
+
+                def change_universe_after_verification(*args, **kwargs):
+                    nonlocal verification_count, changed
+                    result = real_verify(*args, **kwargs)
+                    verification_count += 1
+                    if verification_count == 2:
+                        changed = True
+                        universe_path.write_bytes(
+                            universe_path.read_bytes() + b" "
+                        )
+                        universe_path.chmod(0o600)
+                    return result
+
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ), mock.patch.object(
+                    workflow_module,
+                    "_verify_active_release_files",
+                    change_universe_after_verification,
+                ):
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+                self.assertTrue(changed)
+
+    def test_universe_change_at_manifest_replace_cannot_return_success(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            universe_path = project_root / "data/universe/2026-08-22.json"
+            real_replace = workflow_module.os.replace
+            changed = False
+
+            def replace_after_universe_change(source, destination, *args, **kwargs):
+                nonlocal changed
+                if destination == "current.json" and not changed:
+                    changed = True
+                    universe_path.write_bytes(universe_path.read_bytes() + b" ")
+                    universe_path.chmod(0o600)
+                return real_replace(source, destination, *args, **kwargs)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module.os,
+                "replace",
+                replace_after_universe_change,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertTrue(changed)
+
+    def test_candidate_rejects_unsafe_wrapper_files_and_root_links(self) -> None:
+        cases = ("symlink", "fifo", "hardlink", "mode", "oversize", "root-link")
+        for case in cases:
+            with self.subTest(case=case), _private_workspace() as (root, state_root):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                candidate_path = candidate.candidate_path
+                candidate_root = candidate_path.parent
+                if case == "symlink":
+                    target = root / "candidate-target.json"
+                    target.write_bytes(candidate_path.read_bytes())
+                    target.chmod(0o600)
+                    candidate_path.unlink()
+                    candidate_path.symlink_to(target)
+                elif case == "fifo":
+                    candidate_path.unlink()
+                    os.mkfifo(candidate_path, 0o600)
+                    candidate_path.chmod(0o600)
+                elif case == "hardlink":
+                    os.link(candidate_path, root / "candidate-hardlink.json")
+                elif case == "mode":
+                    candidate_path.chmod(0o644)
+                elif case == "oversize":
+                    candidate_path.write_bytes(b"x" * (1_048_576 + 1))
+                    candidate_path.chmod(0o600)
+                else:
+                    detached = root / "detached-candidate"
+                    candidate_root.rename(detached)
+                    candidate_root.symlink_to(detached, target_is_directory=True)
+                active_before = _active_tree_snapshot(project_root)
+
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ):
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+
+                self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_candidate_nonregular_device_descriptor_is_rejected(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            real_open = workflow_module.os.open
+            substituted = False
+
+            def device_open(path, flags, *args, **kwargs):
+                nonlocal substituted
+                if path == "candidate.json" and kwargs.get("dir_fd") is not None:
+                    substituted = True
+                    return real_open("/dev/null", flags)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(workflow_module.os, "open", device_open):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertTrue(substituted)
+
+    def test_active_destination_rejects_links_fifo_mode_and_oversize(self) -> None:
+        cases = ("symlink", "fifo", "hardlink", "mode", "oversize")
+        for case in cases:
+            with self.subTest(case=case), _private_workspace() as (root, state_root):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                subject = project_root / "data/evidence/subjects/AAPL.json"
+                if case == "symlink":
+                    target = root / "active-subject-target.json"
+                    target.write_bytes(subject.read_bytes())
+                    target.chmod(0o600)
+                    subject.unlink()
+                    subject.symlink_to(target)
+                elif case == "fifo":
+                    subject.unlink()
+                    os.mkfifo(subject, 0o600)
+                    subject.chmod(0o600)
+                elif case == "hardlink":
+                    os.link(subject, root / "active-subject-hardlink.json")
+                elif case == "mode":
+                    subject.chmod(0o666)
+                else:
+                    subject.write_bytes(
+                        b"x" * (workflow_module._MAX_PARENT_RELEASE_BYTES + 1)
+                    )
+                    subject.chmod(0o600)
+                active_before = _active_tree_snapshot(project_root)
+
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ):
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+
+                self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_active_destination_directory_and_source_collisions_are_rejected(
+        self,
+    ) -> None:
+        cases = ("directory-link", "source-content")
+        for case in cases:
+            with self.subTest(case=case), _private_workspace() as (root, state_root):
+                project_root, candidate = _prepare_install_candidate(root, state_root)
+                if case == "directory-link":
+                    subjects = project_root / "data/evidence/subjects"
+                    detached = root / "detached-subjects"
+                    subjects.rename(detached)
+                    subjects.symlink_to(detached, target_is_directory=True)
+                else:
+                    source_name = next(
+                        (candidate.candidate_path.parent / "release/sources").iterdir()
+                    ).name
+                    source = project_root / "data/evidence/sources" / source_name
+                    source.write_bytes(b"{}\n")
+                    source.chmod(0o600)
+                active_before = _active_tree_snapshot(project_root)
+
+                with mock.patch.object(
+                    evidence_module,
+                    "CURRENT_EVIDENCE_RELEASE_SHA256",
+                    candidate.release_sha256,
+                ):
+                    with self.assertRaises(EvidenceWorkflowError):
+                        workflow_module.install_evidence_candidate(
+                            project_root=project_root,
+                            state_root=state_root,
+                            candidate_sha256=candidate.candidate_sha256,
+                            as_of=NOW + timedelta(minutes=10),
+                        )
+
+                self.assertEqual(_active_tree_snapshot(project_root), active_before)
+
+    def test_parent_change_during_child_install_blocks_manifest_replace(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            manifest = project_root / "data/evidence/current.json"
+            raced_payload = b'{"raced-parent":true}\n'
+            real_write = workflow_module._atomic_install_write_at
+            changed = False
+
+            def race_manifest(directory_descriptor, name, payload, **kwargs):
+                nonlocal changed
+                if name == "current.json" and not changed:
+                    changed = True
+                    manifest.write_bytes(raced_payload)
+                    manifest.chmod(0o600)
+                return real_write(
+                    directory_descriptor,
+                    name,
+                    payload,
+                    **kwargs,
+                )
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module,
+                "_atomic_install_write_at",
+                race_manifest,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertTrue(changed)
+            self.assertEqual(manifest.read_bytes(), raced_payload)
+
+    def test_child_directory_swap_before_manifest_keeps_old_manifest(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            manifest = project_root / "data/evidence/current.json"
+            manifest_before = manifest.read_bytes()
+            subjects = project_root / "data/evidence/subjects"
+            detached_subjects = root / "detached-active-subjects"
+            real_write = workflow_module._atomic_install_write_at
+            changed = False
+
+            def swap_subjects(directory_descriptor, name, payload, **kwargs):
+                nonlocal changed
+                if name == "current.json" and not changed:
+                    changed = True
+                    subjects.rename(detached_subjects)
+                    subjects.mkdir(mode=0o700)
+                return real_write(
+                    directory_descriptor,
+                    name,
+                    payload,
+                    **kwargs,
+                )
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module,
+                "_atomic_install_write_at",
+                swap_subjects,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertTrue(changed)
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+
+    def test_failure_before_manifest_is_unchanged_and_partial_children_fail_closed(
+        self,
+    ) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            manifest = project_root / "data/evidence/current.json"
+            manifest_before = manifest.read_bytes()
+            real_write = workflow_module._atomic_install_write_at
+            failed = False
+
+            def fail_manifest(directory_descriptor, name, payload, **kwargs):
+                nonlocal failed
+                if name == "current.json":
+                    failed = True
+                    raise OSError("injected pre-manifest failure")
+                return real_write(
+                    directory_descriptor,
+                    name,
+                    payload,
+                    **kwargs,
+                )
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module,
+                "_atomic_install_write_at",
+                fail_manifest,
+            ):
+                with self.assertRaises(EvidenceWorkflowError):
+                    workflow_module.install_evidence_candidate(
+                        project_root=project_root,
+                        state_root=state_root,
+                        candidate_sha256=candidate.candidate_sha256,
+                        as_of=NOW + timedelta(minutes=10),
+                    )
+            self.assertTrue(failed)
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+            self.assertEqual(
+                list((project_root / "data/evidence").rglob("*.install.tmp")),
+                [],
+            )
+            old_as_of = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+            old_universe = load_current_universe(
+                project_root,
+                as_of=old_as_of.date(),
+            )
+            with self.assertRaises(evidence_module.EvidenceRegistryError):
+                evidence_module.load_current_evidence_release(
+                    project_root,
+                    as_of=old_as_of,
+                    universe=old_universe,
+                )
+
+    def test_candidate_snapshot_and_active_install_use_required_locks(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+            candidate_parent_inode = (
+                state_root / "evidence-candidates"
+            ).stat().st_ino
+            active_inode = (project_root / "data/evidence").stat().st_ino
+            real_flock = workflow_module.fcntl.flock
+            real_read_candidate = workflow_module._read_candidate_release_tree
+            real_install = workflow_module._install_release_tree_manifest_last
+            candidate_shared = False
+            active_exclusive = False
+            saw_candidate_read = False
+            saw_active_install = False
+
+            def tracked_flock(descriptor, operation):
+                nonlocal candidate_shared, active_exclusive
+                result = real_flock(descriptor, operation)
+                inode = os.fstat(descriptor).st_ino
+                if inode == candidate_parent_inode:
+                    if operation == workflow_module.fcntl.LOCK_SH:
+                        candidate_shared = True
+                    elif operation == workflow_module.fcntl.LOCK_UN:
+                        candidate_shared = False
+                elif inode == active_inode:
+                    if operation == workflow_module.fcntl.LOCK_EX:
+                        active_exclusive = True
+                    elif operation == workflow_module.fcntl.LOCK_UN:
+                        active_exclusive = False
+                return result
+
+            def locked_candidate_read(*args, **kwargs):
+                nonlocal saw_candidate_read
+                self.assertTrue(candidate_shared)
+                saw_candidate_read = True
+                return real_read_candidate(*args, **kwargs)
+
+            def locked_install(*args, **kwargs):
+                nonlocal saw_active_install
+                self.assertTrue(active_exclusive)
+                saw_active_install = True
+                return real_install(*args, **kwargs)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch.object(
+                workflow_module.fcntl,
+                "flock",
+                tracked_flock,
+            ), mock.patch.object(
+                workflow_module,
+                "_read_candidate_release_tree",
+                locked_candidate_read,
+            ), mock.patch.object(
+                workflow_module,
+                "_install_release_tree_manifest_last",
+                locked_install,
+            ):
+                workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=NOW + timedelta(minutes=10),
+                )
+            self.assertTrue(saw_candidate_read)
+            self.assertTrue(saw_active_install)
+            self.assertFalse(candidate_shared)
+            self.assertFalse(active_exclusive)
+
+    def test_install_constructs_no_provider_or_network_client(self) -> None:
+        with _private_workspace() as (root, state_root):
+            project_root, candidate = _prepare_install_candidate(root, state_root)
+
+            with mock.patch.object(
+                evidence_module,
+                "CURRENT_EVIDENCE_RELEASE_SHA256",
+                candidate.release_sha256,
+            ), mock.patch(
+                "stock_monitor.providers.evidence_sources.EvidenceSourceClient.__init__",
+                side_effect=AssertionError("provider construction attempted"),
+            ), mock.patch(
+                "stock_monitor.providers.sec.SecClient.__init__",
+                side_effect=AssertionError("SEC construction attempted"),
+            ), mock.patch(
+                "stock_monitor.providers.reference.ReferenceClient.__init__",
+                side_effect=AssertionError("reference construction attempted"),
+            ):
+                summary = workflow_module.install_evidence_candidate(
+                    project_root=project_root,
+                    state_root=state_root,
+                    candidate_sha256=candidate.candidate_sha256,
+                    as_of=NOW + timedelta(minutes=10),
+                )
+            self.assertEqual(summary.status, "INSTALLED")
 
 
 class EvidenceProposalFailureTests(unittest.TestCase):

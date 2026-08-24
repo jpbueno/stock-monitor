@@ -93,6 +93,55 @@ Review the files before trusting a run:
   tick size, and issuer/free-float or official ETF sponsor evidence.
 - `data/evidence/current.json`: confirm reviewed evidence provenance and age.
 
+## Prepare, inspect, approve, and install evidence
+
+Evidence renewal is a daily interactive human-review workflow. Run it from the
+repository root by manually invoking the exact private-environment launcher;
+never place these commands in an external schedule:
+
+```sh
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' evidence prepare --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' evidence inspect --proposal <proposal_sha256> --review-input <absolute-path> --json
+# Human reviews the exact candidate and separately updates CURRENT_EVIDENCE_RELEASE_SHA256.
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' evidence install --candidate <candidate_sha256> --json
+'/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify evidence --json
+```
+
+`prepare` performs credential-free, GET-only retrieval from the compiled exact
+source catalog and writes the unreviewed proposal tree below
+`$STOCK_MONITOR_HOME/.stock-monitor/evidence-proposals/<proposal_sha256>/`.
+SEC retrieval may also populate the private content-addressed cache below
+`$STOCK_MONITOR_HOME/.stock-monitor/cache/`. It never writes
+`data/evidence/**` or changes the compiled release pin. Use the proposal's
+`review-template.json` to create a separate reviewer input, make that input an
+absolute-path regular file owned by the current user with mode 0600, and
+inspect it. A partial collection returns one safe `PREPARED_BLOCKED` JSON
+result and exit `3`; preserve its proposal digest for diagnosis, but do not
+inspect or install it.
+
+`inspect` is network-free. It verifies the proposal and reviewer input and
+writes a digest-bound candidate below
+`$STOCK_MONITOR_HOME/.stock-monitor/evidence-candidates/<candidate_sha256>/`.
+Review the exact candidate digest, intended release digest, review window,
+symbols, coverage states, reason codes, and candidate files. The command does
+not approve or activate the candidate.
+
+Approval is a separate human-reviewed source-control change to the exact
+`CURRENT_EVIDENCE_RELEASE_SHA256` value. Neither `prepare`, `inspect`, nor
+`install` may update that pin, infer approval from a reviewer-input file, or
+self-repin. Only after that independent change is reviewed and present may the
+network-free `install` command run. It returns exit `4` if the exact release is
+not already pinned or if its compare-and-swap parent no longer matches. The
+final `verify evidence` readback is required before any runtime use.
+
+The current public catalog has no approved authority bundle that can turn
+silence into broad clear coverage. Relevant silence therefore remains
+`UNKNOWN`. NVIDIA's FY27 second-quarter financial-results event on August 26,
+2026 overlaps the current 2–10 trading-day NVDA hold window and must remain a
+`BINARY_EVENT_DURING_HOLD` block. Keep the external schedule count at zero
+until a separately approved authority or policy change resolves the coverage
+gap and every activation gate below has passed and been reviewed.
+
 Then run the public validations:
 
 ```sh

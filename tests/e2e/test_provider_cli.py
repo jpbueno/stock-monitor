@@ -4,13 +4,19 @@ import io
 import json
 import os
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
-from contextlib import redirect_stdout
+from unittest.mock import ANY, patch
 
 import stock_monitor.cli as cli
+from stock_monitor.evidence_release_workflow import (
+    EvidenceCandidateSummary,
+    EvidenceInstallSummary,
+    EvidenceProposalSummary,
+    EvidenceWorkflowError,
+)
 from stock_monitor.provider_smoke import ProviderSmokeResult
 from stock_monitor.workflows import WorkflowResult
 
@@ -42,6 +48,373 @@ class ProviderCliTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
         self.environment = _environment(self.home)
+
+    def test_evidence_parser_accepts_only_the_guarded_command_grammar(self) -> None:
+        digest = "a" * 64
+        review_input = self.home / "review.json"
+        parser = cli.build_parser()
+
+        prepare = parser.parse_args(("evidence", "prepare", "--json"))
+        inspect = parser.parse_args(
+            (
+                "evidence",
+                "inspect",
+                "--proposal",
+                digest,
+                "--review-input",
+                str(review_input),
+                "--json",
+            )
+        )
+        install = parser.parse_args(
+            ("evidence", "install", "--candidate", digest, "--json")
+        )
+
+        self.assertEqual(
+            (prepare.command, prepare.evidence_command),
+            ("evidence", "prepare"),
+        )
+        self.assertEqual(inspect.proposal, digest)
+        self.assertEqual(inspect.review_input, review_input)
+        self.assertEqual(install.candidate, digest)
+
+    def test_evidence_parser_rejects_noncanonical_digests_and_relative_review_input(
+        self,
+    ) -> None:
+        parser = cli.build_parser()
+        cases = (
+            (
+                "evidence",
+                "inspect",
+                "--proposal",
+                "A" * 64,
+                "--review-input",
+                str(self.home / "review.json"),
+            ),
+            (
+                "evidence",
+                "inspect",
+                "--proposal",
+                "a" * 63,
+                "--review-input",
+                str(self.home / "review.json"),
+            ),
+            (
+                "evidence",
+                "inspect",
+                "--proposal",
+                "a" * 64,
+                "--review-input",
+                "review.json",
+            ),
+            ("evidence", "install", "--candidate", "g" * 64),
+        )
+
+        for arguments in cases:
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    parser.parse_args(arguments)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_evidence_prepare_emits_only_the_allowlisted_summary(self) -> None:
+        summary = EvidenceProposalSummary(
+            status="PREPARED",
+            proposal_sha256="a" * 64,
+            universe_sha256="b" * 64,
+            parent_release_sha256="c" * 64,
+            symbols=("AAPL", "NVDA"),
+            reason_codes=(),
+            proposal_path=self.home / CANARY / "proposal.json",
+        )
+        output = io.StringIO()
+
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.evidence_release_workflow.prepare_evidence_proposal",
+            return_value=summary,
+        ) as prepared, redirect_stdout(output):
+            code = cli.run(
+                ("evidence", "prepare", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "parent_release_sha256": "c" * 64,
+                "proposal_sha256": "a" * 64,
+                "reason_codes": [],
+                "status": "PREPARED",
+                "symbols": ["AAPL", "NVDA"],
+                "universe_sha256": "b" * 64,
+            },
+        )
+        prepared.assert_called_once()
+        call = prepared.call_args.kwargs
+        self.assertEqual(call["project_root"], ROOT)
+        self.assertEqual(
+            call["state_root"],
+            self.home.resolve() / ".stock-monitor",
+        )
+        self.assertTrue(callable(call["collect"]))
+        self.assertTrue(callable(call["collect_sec"]))
+        combined = output.getvalue()
+        self.assertNotIn(CANARY, combined)
+        self.assertNotIn(self.environment["SEC_USER_AGENT"], combined)
+        self.assertNotIn(self.environment["APCA_API_KEY_ID"], combined)
+        self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
+
+    def test_evidence_prepare_blocked_preserves_safe_digest_in_one_json(self) -> None:
+        summary = EvidenceProposalSummary(
+            status="PREPARED_BLOCKED",
+            proposal_sha256="a" * 64,
+            universe_sha256="b" * 64,
+            parent_release_sha256="c" * 64,
+            symbols=("AAPL",),
+            reason_codes=("SOURCE_COLLECTION_FAILED",),
+            proposal_path=self.home / "proposal.json",
+        )
+        output = io.StringIO()
+
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.evidence_release_workflow.prepare_evidence_proposal",
+            return_value=summary,
+        ), redirect_stdout(output):
+            code = cli.run(
+                ("evidence", "prepare", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "parent_release_sha256": "c" * 64,
+                "proposal_sha256": "a" * 64,
+                "reason_codes": ["SOURCE_COLLECTION_FAILED"],
+                "status": "PREPARED_BLOCKED",
+                "symbols": ["AAPL"],
+                "universe_sha256": "b" * 64,
+            },
+        )
+
+    def test_evidence_inspect_is_network_free_and_emits_exact_safe_json(self) -> None:
+        review_path = self.home / f"{CANARY}-review.json"
+        summary = EvidenceCandidateSummary(
+            status="AWAITING_DIGEST_APPROVAL",
+            candidate_sha256="d" * 64,
+            proposal_sha256="a" * 64,
+            review_input_sha256="e" * 64,
+            release_sha256="f" * 64,
+            universe_sha256="b" * 64,
+            reviewed_at=datetime(2026, 8, 24, 15, 0, tzinfo=UTC),
+            review_by=datetime(2026, 8, 25, 14, 59, tzinfo=UTC),
+            symbols=("AAPL", "NVDA"),
+            coverage=(
+                ("AAPL", "BINARY_EVENT", "UNKNOWN"),
+                ("NVDA", "BINARY_EVENT", "UNKNOWN"),
+            ),
+            reason_codes=("RELEVANT_COVERAGE_UNKNOWN",),
+            candidate_path=self.home / CANARY / "candidate.json",
+        )
+        output = io.StringIO()
+
+        with patch(
+            "stock_monitor.evidence_release_workflow.inspect_evidence_candidate",
+            return_value=summary,
+        ) as inspected, patch(
+            "stock_monitor.providers.http.HttpGetClient",
+            side_effect=AssertionError("HTTP client must not be constructed"),
+        ) as http_client, patch(
+            "stock_monitor.providers.evidence_sources.EvidenceSourceClient",
+            side_effect=AssertionError("source client must not be constructed"),
+        ) as source_client, patch(
+            "stock_monitor.providers.sec.SecClient",
+            side_effect=AssertionError("SEC client must not be constructed"),
+        ) as sec_client, redirect_stdout(output):
+            code = cli.run(
+                (
+                    "evidence",
+                    "inspect",
+                    "--proposal",
+                    "a" * 64,
+                    "--review-input",
+                    str(review_path),
+                    "--json",
+                ),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "candidate_sha256": "d" * 64,
+                "coverage": [
+                    ["AAPL", "BINARY_EVENT", "UNKNOWN"],
+                    ["NVDA", "BINARY_EVENT", "UNKNOWN"],
+                ],
+                "proposal_sha256": "a" * 64,
+                "reason_codes": ["RELEVANT_COVERAGE_UNKNOWN"],
+                "release_sha256": "f" * 64,
+                "review_by": "2026-08-25T14:59:00Z",
+                "review_input_sha256": "e" * 64,
+                "reviewed_at": "2026-08-24T15:00:00Z",
+                "status": "AWAITING_DIGEST_APPROVAL",
+                "symbols": ["AAPL", "NVDA"],
+                "universe_sha256": "b" * 64,
+            },
+        )
+        inspected.assert_called_once_with(
+            project_root=ROOT,
+            state_root=self.home.resolve() / ".stock-monitor",
+            proposal_sha256="a" * 64,
+            review_input_path=review_path,
+            as_of=ANY,
+        )
+        http_client.assert_not_called()
+        source_client.assert_not_called()
+        sec_client.assert_not_called()
+        combined = output.getvalue()
+        self.assertNotIn(CANARY, combined)
+        self.assertNotIn(self.environment["SEC_USER_AGENT"], combined)
+
+    def test_evidence_install_is_network_free_and_emits_exact_safe_json(self) -> None:
+        summary = EvidenceInstallSummary(
+            status="INSTALLED",
+            candidate_sha256="d" * 64,
+            release_sha256="f" * 64,
+            installed_at=datetime(2026, 8, 24, 16, 0, tzinfo=UTC),
+            symbols=("AAPL", "NVDA"),
+        )
+        output = io.StringIO()
+
+        with patch(
+            "stock_monitor.evidence_release_workflow.install_evidence_candidate",
+            return_value=summary,
+        ) as installed, patch(
+            "stock_monitor.providers.http.HttpGetClient",
+            side_effect=AssertionError("HTTP client must not be constructed"),
+        ) as http_client, patch(
+            "stock_monitor.providers.evidence_sources.EvidenceSourceClient",
+            side_effect=AssertionError("source client must not be constructed"),
+        ) as source_client, patch(
+            "stock_monitor.providers.sec.SecClient",
+            side_effect=AssertionError("SEC client must not be constructed"),
+        ) as sec_client, redirect_stdout(output):
+            code = cli.run(
+                (
+                    "evidence",
+                    "install",
+                    "--candidate",
+                    "d" * 64,
+                    "--json",
+                ),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "candidate_sha256": "d" * 64,
+                "installed_at": "2026-08-24T16:00:00Z",
+                "release_sha256": "f" * 64,
+                "status": "INSTALLED",
+                "symbols": ["AAPL", "NVDA"],
+            },
+        )
+        installed.assert_called_once_with(
+            project_root=ROOT,
+            state_root=self.home.resolve() / ".stock-monitor",
+            candidate_sha256="d" * 64,
+            as_of=ANY,
+        )
+        http_client.assert_not_called()
+        source_client.assert_not_called()
+        sec_client.assert_not_called()
+
+    def test_evidence_workflow_failures_use_command_specific_redacted_exits(
+        self,
+    ) -> None:
+        review_path = self.home / "review.json"
+        cases = (
+            (
+                "stock_monitor.evidence_release_workflow.prepare_evidence_proposal",
+                ("evidence", "prepare", "--json"),
+                3,
+                "DATA UNAVAILABLE\nNo candidate or action was produced.\n",
+            ),
+            (
+                "stock_monitor.evidence_release_workflow.inspect_evidence_candidate",
+                (
+                    "evidence",
+                    "inspect",
+                    "--proposal",
+                    "a" * 64,
+                    "--review-input",
+                    str(review_path),
+                    "--json",
+                ),
+                3,
+                "DATA UNAVAILABLE\nNo candidate or action was produced.\n",
+            ),
+            (
+                "stock_monitor.evidence_release_workflow.install_evidence_candidate",
+                (
+                    "evidence",
+                    "install",
+                    "--candidate",
+                    "d" * 64,
+                    "--json",
+                ),
+                4,
+                "VERIFICATION BLOCKED\nNo candidate or action was produced.\n",
+            ),
+        )
+
+        for target, arguments, expected_code, expected_output in cases:
+            with self.subTest(arguments=arguments):
+                output = io.StringIO()
+                with patch(
+                    target,
+                    side_effect=EvidenceWorkflowError(CANARY),
+                ), redirect_stdout(output):
+                    code = cli.run(arguments, environ=self.environment)
+                self.assertEqual(code, expected_code)
+                self.assertEqual(output.getvalue(), expected_output)
+                self.assertNotIn(CANARY, output.getvalue())
+                self.assertNotIn(
+                    self.environment["APCA_API_SECRET_KEY"],
+                    output.getvalue(),
+                )
+
+    def test_evidence_unexpected_failure_remains_generic_and_redacted(self) -> None:
+        output = io.StringIO()
+        with patch(
+            "stock_monitor.evidence_release_workflow.inspect_evidence_candidate",
+            side_effect=RuntimeError(CANARY),
+        ), redirect_stdout(output):
+            code = cli.run(
+                (
+                    "evidence",
+                    "inspect",
+                    "--proposal",
+                    "a" * 64,
+                    "--review-input",
+                    str(self.home / f"{CANARY}.json"),
+                    "--json",
+                ),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 10)
+        self.assertEqual(
+            output.getvalue(),
+            "INTERNAL ERROR\nNo candidate or action was produced.\n",
+        )
+        self.assertNotIn(CANARY, output.getvalue())
 
     def test_provider_smoke_emits_only_safe_json_and_result_exit(self) -> None:
         result = ProviderSmokeResult(

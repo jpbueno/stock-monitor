@@ -13,6 +13,13 @@ launcher reads the private literal `.env` without sourcing it and emits no
 credential value. Never copy environment values into a prompt, schedule,
 command, result, report, or chat.
 
+Evidence lifecycle commands are prohibited in every scheduled prompt. Never
+run `evidence prepare`, `evidence inspect`, or `evidence install` from a
+schedule; never read reviewer input, compile or activate an evidence candidate,
+refresh or extend evidence timestamps, alter the compiled release pin, or
+self-repin. Those steps belong to the interactive, separately reviewed human
+workflow in `docs/operations.md`.
+
 ## Activation gate
 
 Leave scheduling disabled until all of the following have been completed and
@@ -38,6 +45,13 @@ leave zero external schedules. Do not create a partial set. Only after every
 gate passes may all three schedule records be created, read back, and compared
 with the intended name, time, America/New_York timezone, project, enabled
 state, and exact prompt.
+
+Current public-source silence is `UNKNOWN`, not clear coverage, because no
+approved broad clear-capable authority bundle exists. The known NVIDIA FY27
+second-quarter financial-results event on August 26, 2026 also overlaps the
+current NVDA hold window. Therefore the schedule count remains zero until a
+separately approved authority or policy change resolves the evidence gap and
+all five gates above pass on fresh reviewed evidence.
 
 ## Timing and invariant behavior
 

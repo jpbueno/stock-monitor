@@ -398,14 +398,20 @@ def _validate_source_identity(
         return
     scoped = _SCOPED_REFERENCE_ROLE.fullmatch(role or "")
     scoped_authority = _SCOPED_REFERENCE_AUTHORITIES.get(role or "")
+    timestamp_source_is_valid = (
+        document.timestamp_source == "PRIMARY_METADATA"
+        and document.published_at is not None
+    ) or (
+        document.timestamp_source == "UNAVAILABLE"
+        and document.published_at is None
+    )
     if (
         scoped is None
         or scoped.group(1) != symbol
         or scoped_authority is None
         or scoped_authority[0] != issuer_cik
         or (document.url, document.publisher) not in scoped_authority[1]
-        or document.timestamp_source != "PRIMARY_METADATA"
-        or document.published_at is None
+        or not timestamp_source_is_valid
         or document.accession is not None
     ):
         raise ValueError("scoped evidence source role is not bound to its subject")
@@ -884,7 +890,18 @@ def _verify_bindings(
                 or binding.symbol != record.symbol
                 or binding.issuer_cik != record.issuer_cik
                 or binding.retrieved_at != record.retrieved_at
-                or binding.document.published_at != record.published_at
+                or (
+                    binding.document.published_at != record.published_at
+                    and not (
+                        binding.document.source_type == "OFFICIAL_REFERENCE"
+                        and _SCOPED_REFERENCE_ROLE.fullmatch(
+                            binding.document.source_role or ""
+                        )
+                        is not None
+                        and binding.document.timestamp_source == "UNAVAILABLE"
+                        and binding.document.published_at is None
+                    )
+                )
                 or binding.document.accession != record.accession
             ):
                 raise ValueError("evidence record conflicts with its source binding")
@@ -1783,6 +1800,18 @@ def _verify_reviewed_source_bodies(
         raise EvidenceRegistryError(
             "reviewed evidence facts and coverage require distinct observations"
         )
+    record_bodies = {
+        (bindings[identifier].document.url, bindings[identifier].document.content_hash)
+        for identifier in record_sources
+    }
+    coverage_bodies = {
+        (bindings[identifier].document.url, bindings[identifier].document.content_hash)
+        for identifier in coverage_sources
+    }
+    if record_bodies & coverage_bodies:
+        raise EvidenceRegistryError(
+            "reviewed evidence facts and coverage require distinct source bodies"
+        )
     for identifier, binding in bindings.items():
         document = binding.document
         if identifier not in record_sources | coverage_sources:
@@ -1892,7 +1921,10 @@ def _verify_coverage_source_roles(
                     and attestation.complete
                     and attestation.coverage == "NOT_APPLICABLE"
                 )
-                if document.source_role != "OPERATIONAL_STATUS" or not (
+                timestamp_unavailable_role = (
+                    document.source_role == "OPERATIONAL_STATUS" or scoped is not None
+                )
+                if not timestamp_unavailable_role or not (
                     safe_relevant or safe_opposite
                 ):
                     raise EvidenceRegistryError(

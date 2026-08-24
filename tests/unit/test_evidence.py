@@ -52,6 +52,10 @@ def _test_coverage_url(symbol: str) -> str:
     return f"https://reviewed.test.invalid/coverage/{symbol.lower()}"
 
 
+def _test_fact_url(symbol: str) -> str:
+    return f"https://reviewed.test.invalid/facts/{symbol.lower()}"
+
+
 def iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
@@ -357,6 +361,75 @@ def binding_document(value: object) -> dict[str, object]:
         "timestamp_source": document.timestamp_source,
         "valid_until": iso(value.valid_until),  # type: ignore[attr-defined]
     }
+
+
+def scoped_binding(
+    *,
+    identifier: str,
+    body: bytes,
+    url: str,
+    published_at: datetime | None,
+    timestamp_source: str,
+) -> object:
+    document = SourceDocument(
+        url=url,
+        published_at=published_at,
+        retrieved_at=RETRIEVED,
+        content_hash=hashlib.sha256(body).hexdigest(),
+        body=body,
+        source_observation_id=identifier,
+        publisher=_TEST_COVERAGE_PUBLISHER,
+        source_type="OFFICIAL_REFERENCE",
+        timestamp_source=timestamp_source,
+        source_role="CORPORATE_ACTION:EXM",
+    )
+    return evidence_module.EvidenceSourceBinding.from_document(
+        document,
+        symbol="EXM",
+        issuer_cik="0000000001",
+        checked_at=RETRIEVED,
+        valid_until=AS_OF + timedelta(hours=1),
+        healthy=True,
+    )
+
+
+def load_registry_candidate(
+    records: tuple[EvidenceRecord, ...],
+    bindings: tuple[object, ...],
+    attestations: tuple[object, ...],
+    *,
+    registry_id: str,
+) -> object:
+    registry_document = {
+        "coverage_attestations": [
+            coverage_document(value) for value in attestations
+        ],
+        "kind": "REVIEWED_EVIDENCE_BUNDLE",
+        "records": [registry_record_document(value) for value in records],
+        "registry_id": registry_id,
+        "reviewed_at": "2026-08-14T12:40:00Z",
+        "schema_version": 3,
+        "source_bindings": [binding_document(value) for value in bindings],
+        "subject": {
+            "issuer_cik": "0000000001",
+            "subject_kind": "STOCK",
+            "symbol": "EXM",
+        },
+    }
+    payload = json.dumps(
+        registry_document,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return evidence_module._load_evidence_registry_payload(
+        payload,
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        as_of=AS_OF,
+        source_documents={
+            value.source_observation_id: value.document  # type: ignore[attr-defined]
+            for value in bindings
+        },
+    )
 
 
 def decision(
@@ -1284,12 +1357,13 @@ class EvidenceClassificationTests(unittest.TestCase):
             symbol: (_test_coverage_url(symbol), _TEST_COVERAGE_PUBLISHER)
             for symbol in ("EXM", "SPY")
         }
+        fact_pair = (_test_fact_url("EXM"), _TEST_COVERAGE_PUBLISHER)
         cls._scoped_authority_patch = mock.patch.dict(
             evidence_module._SCOPED_REFERENCE_AUTHORITIES,
             {
                 "CORPORATE_ACTION:EXM": (
                     "0000000001",
-                    frozenset({coverage_pairs["EXM"]}),
+                    frozenset({coverage_pairs["EXM"], fact_pair}),
                 ),
                 "CORPORATE_ACTION:SPY": (
                     None,
@@ -2153,6 +2227,229 @@ class EvidenceClassificationTests(unittest.TestCase):
                 checked_at=RETRIEVED,
                 valid_until=AS_OF + timedelta(hours=1),
                 healthy=True,
+            )
+
+    def test_scoped_reference_timestamp_and_identity_pairs_are_exact(self) -> None:
+        body = b'{"reviewed":"whole-page proposal discovery"}'
+        unavailable = SourceDocument(
+            url=_test_fact_url("EXM"),
+            published_at=None,
+            retrieved_at=RETRIEVED,
+            content_hash=hashlib.sha256(body).hexdigest(),
+            body=body,
+            source_observation_id="scoped-unavailable",
+            publisher=_TEST_COVERAGE_PUBLISHER,
+            source_type="OFFICIAL_REFERENCE",
+            timestamp_source="UNAVAILABLE",
+            source_role="CORPORATE_ACTION:EXM",
+        )
+        valid_documents = (
+            unavailable,
+            replace(
+                unavailable,
+                published_at=PUBLISHED,
+                timestamp_source="PRIMARY_METADATA",
+            ),
+        )
+        for document in valid_documents:
+            with self.subTest(valid=document.timestamp_source):
+                binding = evidence_module.EvidenceSourceBinding.from_document(
+                    document,
+                    symbol="EXM",
+                    issuer_cik="0000000001",
+                    checked_at=RETRIEVED,
+                    valid_until=AS_OF + timedelta(hours=1),
+                    healthy=True,
+                )
+                self.assertEqual(binding.document, document)
+
+        invalid_cases = (
+            (
+                "unavailable with publication",
+                replace(unavailable, published_at=PUBLISHED),
+                "EXM",
+                "0000000001",
+            ),
+            (
+                "primary without publication",
+                replace(unavailable, timestamp_source="PRIMARY_METADATA"),
+                "EXM",
+                "0000000001",
+            ),
+            (
+                "off-catalog URL",
+                replace(unavailable, url="https://reviewed.test.invalid/other"),
+                "EXM",
+                "0000000001",
+            ),
+            (
+                "off-catalog publisher",
+                replace(unavailable, publisher="Unreviewed Publisher"),
+                "EXM",
+                "0000000001",
+            ),
+            (
+                "off-catalog role",
+                replace(unavailable, source_role="ISSUER_IR:EXM"),
+                "EXM",
+                "0000000001",
+            ),
+            ("wrong symbol", unavailable, "OTHER", "0000000001"),
+            ("wrong CIK", unavailable, "EXM", "0000000002"),
+        )
+        for case, document, symbol, issuer_cik in invalid_cases:
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                evidence_module.EvidenceSourceBinding.from_document(
+                    document,
+                    symbol=symbol,
+                    issuer_cik=issuer_cik,
+                    checked_at=RETRIEVED,
+                    valid_until=AS_OF + timedelta(hours=1),
+                    healthy=True,
+                )
+
+    def test_timestamp_unavailable_scoped_coverage_has_only_safe_states(self) -> None:
+        binding = scoped_binding(
+            identifier="coverage-unavailable",
+            body=b'{"proposals":[]}',
+            url=_test_coverage_url("EXM"),
+            published_at=None,
+            timestamp_source="UNAVAILABLE",
+        )
+        values = coverage_attestations(
+            "coverage-unavailable",
+            binary_event_coverage="UNKNOWN",
+            etf_action_coverage="NOT_APPLICABLE",
+            complete=False,
+        )
+        safe = tuple(
+            replace(value, complete=value.coverage_kind == "ETF_ACTION")
+            for value in values
+        )
+        by_id = {"coverage-unavailable": binding}
+        evidence_module._verify_coverage_source_roles(safe, by_id)
+
+        relevant = safe[0]
+        opposite = safe[1]
+        unsafe = (
+            replace(relevant, coverage="CONFIRMED_CLEAR", complete=True),
+            replace(relevant, coverage="NOT_APPLICABLE", complete=True),
+            replace(relevant, coverage="UNKNOWN", complete=True),
+            replace(relevant, coverage="OVERLAP", complete=False),
+            replace(relevant, coverage="CONFLICT", complete=False),
+            replace(opposite, coverage="UNKNOWN", complete=False),
+            replace(opposite, coverage="CONFIRMED_CLEAR", complete=True),
+            replace(opposite, complete=False),
+        )
+        with mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {},
+            clear=True,
+        ):
+            for attestation in unsafe:
+                with self.subTest(
+                    kind=attestation.coverage_kind,
+                    state=attestation.coverage,
+                    complete=attestation.complete,
+                ), self.assertRaises(evidence_module.EvidenceRegistryError):
+                    evidence_module._verify_coverage_source_roles(
+                        (attestation,),
+                        by_id,
+                    )
+
+    def test_loader_accepts_classified_record_from_scoped_unavailable_observation(self) -> None:
+        value = record(
+            primary_url=_test_fact_url("EXM"),
+            publisher=_TEST_COVERAGE_PUBLISHER,
+            accession=None,
+            source_observation_ids=("fact-unavailable",),
+        )
+        fact_source = scoped_binding(
+            identifier="fact-unavailable",
+            body=primary_body(value, subject_kind="STOCK"),
+            url=value.primary_url,
+            published_at=None,
+            timestamp_source="UNAVAILABLE",
+        )
+        coverage_source = scoped_binding(
+            identifier="coverage-unavailable",
+            body=b'{"proposals":[]}',
+            url=_test_coverage_url("EXM"),
+            published_at=None,
+            timestamp_source="UNAVAILABLE",
+        )
+        attestations = tuple(
+            replace(item, complete=item.coverage_kind == "ETF_ACTION")
+            for item in coverage_attestations(
+                "coverage-unavailable",
+                binary_event_coverage="UNKNOWN",
+                etf_action_coverage="NOT_APPLICABLE",
+                complete=False,
+            )
+        )
+
+        loaded = load_registry_candidate(
+            (value,),
+            (fact_source, coverage_source),
+            attestations,
+            registry_id="scoped-unavailable-record",
+        )
+
+        self.assertEqual(loaded.records, (value,))
+        self.assertIsNone(fact_source.document.published_at)  # type: ignore[attr-defined]
+
+    def test_loader_separates_fact_and_coverage_by_url_and_hash_not_only_id(self) -> None:
+        value = record(
+            primary_url=_test_fact_url("EXM"),
+            publisher=_TEST_COVERAGE_PUBLISHER,
+            accession=None,
+            source_observation_ids=("fact-purpose",),
+        )
+        fact_body = primary_body(value, subject_kind="STOCK")
+        fact_source = scoped_binding(
+            identifier="fact-purpose",
+            body=fact_body,
+            url=value.primary_url,
+            published_at=PUBLISHED,
+            timestamp_source="PRIMARY_METADATA",
+        )
+        distinct_coverage = scoped_binding(
+            identifier="coverage-purpose",
+            body=b'{"proposals":[]}',
+            url=_test_coverage_url("EXM"),
+            published_at=PUBLISHED,
+            timestamp_source="PRIMARY_METADATA",
+        )
+        attestations = tuple(
+            replace(item, complete=item.coverage_kind == "ETF_ACTION")
+            for item in coverage_attestations(
+                "coverage-purpose",
+                binary_event_coverage="UNKNOWN",
+                etf_action_coverage="NOT_APPLICABLE",
+                complete=False,
+            )
+        )
+        loaded = load_registry_candidate(
+            (value,),
+            (fact_source, distinct_coverage),
+            attestations,
+            registry_id="distinct-purpose-sources",
+        )
+        self.assertEqual(loaded.records, (value,))
+
+        reused_coverage = scoped_binding(
+            identifier="coverage-purpose",
+            body=fact_body,
+            url=value.primary_url,
+            published_at=PUBLISHED,
+            timestamp_source="PRIMARY_METADATA",
+        )
+        with self.assertRaises(evidence_module.EvidenceRegistryError):
+            load_registry_candidate(
+                (value,),
+                (fact_source, reused_coverage),
+                attestations,
+                registry_id="reused-purpose-source",
             )
 
     def test_registry_record_accession_must_match_bound_sec_document(self) -> None:

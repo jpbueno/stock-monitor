@@ -46,9 +46,13 @@ The unattended launcher reads and validates that private file itself:
 credentials used only by this application's allow-listed market-data GET
 boundary. That is an application restriction, not a provider-side read-only
 property of the credentials. `SEC_USER_AGENT` must identify the application
-and a contact email. `STOCK_MONITOR_HOME` must be a non-empty absolute operator
-directory for unattended use; it owns `.stock-monitor/` and `reports/`. Keep
-`.env`, the database, exports, and reports out of version control.
+and a contact email. It is the declared `User-Agent` header for SEC requests
+and compiled official evidence-source GETs. These requests remain
+authentication-free but are not anonymous. The value is never stored in an
+observation or proposal and is never emitted in CLI JSON, reports, or errors.
+`STOCK_MONITOR_HOME` must be a non-empty absolute operator directory for
+unattended use; it owns `.stock-monitor/` and `reports/`. Keep `.env`, the
+database, exports, and reports out of version control.
 
 The provider smoke must return exit `0` before any non-fixture run. An absent
 or unactivated provider adapter fails closed; that is a blocker, not permission

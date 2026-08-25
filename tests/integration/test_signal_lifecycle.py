@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
+import stock_monitor.evidence as evidence_module
 import stock_monitor.journal as journal_module
 import stock_monitor.ledger as ledger_module
 import stock_monitor.providers.alpaca as alpaca_module
@@ -40,6 +41,7 @@ from stock_monitor.risk import (
     plan_long,
 )
 from stock_monitor.providers.http import HttpResponse
+import tests.unit._task5_fixtures as task5_fixture_module
 from tests.support import aware_et, credentials, policy_fixture
 from tests.unit._task5_fixtures import (
     TEST_UNIVERSE,
@@ -2118,6 +2120,17 @@ class SignalLifecyclePersistenceTests(unittest.TestCase):
             path = Path(temporary_directory) / "journal.db"
             candidates = _issued_candidates(1)
 
+            # Finalize the immutable report prerequisite before racing signal
+            # publication. Concurrent report-claim recovery is covered by the
+            # report journal tests; this assertion is specifically about the
+            # atomic signal/event row pair.
+            with Journal.open(path) as journal:
+                _start_window(journal)
+                _issued_publication(
+                    journal,
+                    candidates_override=candidates,
+                )
+
             def publish_once(_: int):
                 last_error: Exception | None = None
                 for _attempt in range(5):
@@ -2440,6 +2453,23 @@ class SignalLifecyclePersistenceTests(unittest.TestCase):
             _prepare_same_session_batch_exit,
             _seed_completed_authority_fill,
         )
+
+        role, pair, authority = task5_fixture_module._test_coverage_authority(
+            "AAPL",
+            "0000000000",
+        )
+        scoped_patcher = patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {role: authority},
+        )
+        clear_patcher = patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {role: frozenset({pair})},
+        )
+        scoped_patcher.start()
+        clear_patcher.start()
+        self.addCleanup(clear_patcher.stop)
+        self.addCleanup(scoped_patcher.stop)
 
         cases = (
             ("fact", "normalized fact integrity failed"),

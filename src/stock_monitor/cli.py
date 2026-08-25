@@ -33,6 +33,7 @@ from .workflows import (
 
 _ET = ZoneInfo("America/New_York")
 _SESSION_DATE_LITERAL = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+_LOWER_SHA256_LITERAL = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class DataCommandError(RuntimeError):
@@ -68,6 +69,24 @@ def build_parser() -> argparse.ArgumentParser:
     provider = commands.add_parser("provider")
     provider_commands = provider.add_subparsers(dest="provider_command", required=True)
     _json_flag(provider_commands.add_parser("smoke"))
+
+    evidence = commands.add_parser("evidence")
+    evidence_commands = evidence.add_subparsers(
+        dest="evidence_command",
+        required=True,
+    )
+    _json_flag(evidence_commands.add_parser("prepare"))
+    evidence_inspect = evidence_commands.add_parser("inspect")
+    evidence_inspect.add_argument("--proposal", required=True, type=_lower_sha256)
+    evidence_inspect.add_argument(
+        "--review-input",
+        required=True,
+        type=_absolute_path,
+    )
+    _json_flag(evidence_inspect)
+    evidence_install = evidence_commands.add_parser("install")
+    evidence_install.add_argument("--candidate", required=True, type=_lower_sha256)
+    _json_flag(evidence_install)
 
     run = commands.add_parser("run")
     run_commands = run.add_subparsers(dest="run_command", required=True)
@@ -165,6 +184,14 @@ def _dispatch(arguments: argparse.Namespace, environ: Mapping[str, str]) -> int:
         result = run_provider_smoke(settings, now=lambda: datetime.now(timezone.utc))
         _emit(result.safe_fields(), arguments.json)
         return result.exit_code
+    if command == "evidence":
+        if arguments.evidence_command == "prepare":
+            return _evidence_prepare(settings, arguments.json)
+        if arguments.evidence_command == "inspect":
+            return _evidence_inspect(settings, arguments)
+        if arguments.evidence_command == "install":
+            return _evidence_install(settings, arguments)
+        raise CommandBoundaryError("unsupported evidence command")
     if command == "run":
         return _run_workflow(settings, arguments)
     if command == "confirm":
@@ -192,6 +219,151 @@ def _db_init(settings: Settings, as_json: bool) -> int:
     with Journal.open(settings.journal_path) as journal:
         count = journal.count("schema_migrations")
     _emit({"status": "INITIALIZED", "migration_count": count}, as_json)
+    return 0
+
+
+def _evidence_prepare(settings: Settings, as_json: bool) -> int:
+    from urllib.parse import urlsplit
+
+    from .evidence_authorities import EVIDENCE_AUTHORITIES
+    from .evidence_release_workflow import (
+        EvidenceWorkflowError,
+        prepare_evidence_proposal,
+    )
+    from .providers.cache import ContentCache
+    from .providers.evidence_sources import EvidenceSourceClient
+    from .providers.http import EgressPolicy, HttpGetClient
+    from .providers.sec import SecClient, SecRateGovernor
+
+    urls = {
+        url
+        for authority in EVIDENCE_AUTHORITIES
+        for url in authority.allowed_final_urls
+    }
+    urls.update(
+        {
+            settings.sources.sec_submissions_url,
+            settings.sources.sec_archives_url,
+        }
+    )
+    hosts = tuple(
+        sorted(
+            {
+                hostname
+                for url in urls
+                if (hostname := urlsplit(url).hostname) is not None
+            }
+        )
+    )
+    transport = HttpGetClient(EgressPolicy(hosts))
+    clock = lambda: datetime.now(timezone.utc)
+    source_client = EvidenceSourceClient(
+        transport=transport,
+        now=clock,
+        user_agent=settings.sec_user_agent,
+    )
+    cache = ContentCache(settings.cache_root)
+    sec_client = SecClient(
+        transport=transport,
+        cache=cache,
+        governor=SecRateGovernor(settings.locks_root / "sec-rate.state"),
+        user_agent=settings.sec_user_agent,
+        submissions_origin=settings.sources.sec_submissions_url,
+        archives_origin=settings.sources.sec_archives_url,
+        now=clock,
+    )
+    try:
+        summary = prepare_evidence_proposal(
+            project_root=settings.project_root,
+            state_root=settings.state_root,
+            as_of=clock(),
+            collect=source_client.fetch,
+            collect_sec=sec_client.get_submission,
+        )
+    except EvidenceWorkflowError as error:
+        raise DataCommandError("evidence proposal is unavailable") from error
+    _emit(
+        {
+            "parent_release_sha256": summary.parent_release_sha256,
+            "proposal_sha256": summary.proposal_sha256,
+            "reason_codes": list(summary.reason_codes),
+            "status": summary.status,
+            "symbols": list(summary.symbols),
+            "universe_sha256": summary.universe_sha256,
+        },
+        as_json,
+    )
+    return 3 if summary.status == "PREPARED_BLOCKED" else 0
+
+
+def _evidence_inspect(
+    settings: Settings,
+    arguments: argparse.Namespace,
+) -> int:
+    from .evidence_release_workflow import (
+        EvidenceWorkflowError,
+        inspect_evidence_candidate,
+    )
+
+    try:
+        summary = inspect_evidence_candidate(
+            project_root=settings.project_root,
+            state_root=settings.state_root,
+            proposal_sha256=arguments.proposal,
+            review_input_path=arguments.review_input,
+            as_of=datetime.now(timezone.utc),
+        )
+    except EvidenceWorkflowError as error:
+        raise DataCommandError("evidence candidate is unavailable") from error
+    _emit(
+        {
+            "candidate_sha256": summary.candidate_sha256,
+            "coverage": summary.coverage,
+            "proposal_sha256": summary.proposal_sha256,
+            "reason_codes": list(summary.reason_codes),
+            "release_sha256": summary.release_sha256,
+            "review_by": _utc_json_timestamp(summary.review_by),
+            "review_input_sha256": summary.review_input_sha256,
+            "reviewed_at": _utc_json_timestamp(summary.reviewed_at),
+            "status": summary.status,
+            "symbols": list(summary.symbols),
+            "universe_sha256": summary.universe_sha256,
+        },
+        arguments.json,
+    )
+    return 0
+
+
+def _evidence_install(
+    settings: Settings,
+    arguments: argparse.Namespace,
+) -> int:
+    from .evidence_release_workflow import (
+        EvidenceWorkflowError,
+        install_evidence_candidate,
+    )
+
+    try:
+        summary = install_evidence_candidate(
+            project_root=settings.project_root,
+            state_root=settings.state_root,
+            candidate_sha256=arguments.candidate,
+            as_of=datetime.now(timezone.utc),
+        )
+    except EvidenceWorkflowError as error:
+        raise VerificationCommandError(
+            "evidence candidate installation is blocked"
+        ) from error
+    _emit(
+        {
+            "candidate_sha256": summary.candidate_sha256,
+            "installed_at": _utc_json_timestamp(summary.installed_at),
+            "release_sha256": summary.release_sha256,
+            "status": summary.status,
+            "symbols": list(summary.symbols),
+        },
+        arguments.json,
+    )
     return 0
 
 
@@ -634,6 +806,19 @@ def _print_message(message: str) -> None:
 
 def _json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
+
+
+def _lower_sha256(value: str) -> str:
+    if not _LOWER_SHA256_LITERAL.fullmatch(value):
+        raise argparse.ArgumentTypeError("expected a lowercase SHA-256 digest")
+    return value
+
+
+def _absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("expected an absolute path")
+    return path
 
 
 def _utc_json_timestamp(value: datetime) -> str:

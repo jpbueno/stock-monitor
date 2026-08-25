@@ -55,6 +55,7 @@ _OCC_SYMBOL = re.compile(
 )
 HISTORICAL_SIP_RELEASE_DELAY = timedelta(minutes=16)
 _LATEST_MAX_AGE_SECONDS = 300
+_LATEST_IEX_MAX_POSITIVE_SKEW = timedelta(seconds=1)
 _MAX_PAGES = 100
 _NEW_YORK = ZoneInfo("America/New_York")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -2045,7 +2046,26 @@ def recompute_alpaca_page_metadata(
             )
         source_time = _timestamp(end_values[0], "request end")
     if source_time > safe_retrieved_at:
-        raise ProviderMalformedError("provider source timestamp is in the future")
+        positive_skew = source_time - safe_retrieved_at
+        try:
+            requested_feeds = urllib.parse.parse_qs(
+                parsed_url.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            ).get("feed", [])
+        except ValueError:
+            raise ProviderMalformedError(
+                "Alpaca page request URL is malformed"
+            ) from None
+        if (
+            source_type != "ALPACA_LATEST_QUOTES"
+            or requested_feeds != ["iex"]
+            or positive_skew > _LATEST_IEX_MAX_POSITIVE_SKEW
+        ):
+            raise ProviderMalformedError(
+                "provider source timestamp is in the future"
+            )
+        safe_retrieved_at = source_time
     return AlpacaPageMetadata(
         source_observation_id=_source_observation_id_for_payload(
             source_type=source_type,
@@ -2261,15 +2281,31 @@ def _provider_fetch_manifest(
         request_token = (
             None if not raw_request_tokens else raw_request_tokens[0]
         )
+        latest_quote_page = source_type == "ALPACA_LATEST_QUOTES"
         if (
             len(raw_request_tokens) > 1
             or request_token != expected_request_token
-            or "next_page_token" not in document
+            or (
+                latest_quote_page
+                and (
+                    collection != "quotes"
+                    or len(values) != 1
+                    or request_token is not None
+                )
+            )
+            or (
+                not latest_quote_page
+                and "next_page_token" not in document
+            )
         ):
             raise ProviderIncompleteError(
                 "provider pagination successor chain is inconsistent"
             )
-        next_token = document["next_page_token"]
+        next_token = document.get("next_page_token")
+        if latest_quote_page and next_token is not None:
+            raise ProviderIncompleteError(
+                "latest quote response cannot be paginated"
+            )
         if next_token is not None and (
             type(next_token) is not str or not next_token
         ):
@@ -3194,8 +3230,6 @@ class AlpacaMarketData:
     ) -> str:
         retrieved_at = self._current_time(request_dependencies)
         safe_timestamp = _utc(source_timestamp, "source timestamp")
-        if safe_timestamp > retrieved_at:
-            raise ProviderMalformedError("provider source timestamp is in the future")
         if source_type in _PAGE_SOURCE_CONTRACTS:
             metadata = recompute_alpaca_page_metadata(
                 payload=payload,
@@ -3211,9 +3245,14 @@ class AlpacaMarketData:
                     "provider source timestamp conflicts with its raw page"
                 )
             safe_timestamp = metadata.source_time
+            retrieved_at = metadata.retrieved_at
             observation_id = metadata.source_observation_id
             delay_seconds = metadata.delay_seconds
         else:
+            if safe_timestamp > retrieved_at:
+                raise ProviderMalformedError(
+                    "provider source timestamp is in the future"
+                )
             observation_id = _source_observation_id_for_payload(
                 source_type=source_type,
                 url=url,
@@ -4381,13 +4420,11 @@ class AlpacaMarketData:
                     f"$.quotes.{symbol}",
                 )
             )
-        manifest_document = dict(document)
-        manifest_document.setdefault("next_page_token", None)
         page_bundle = issue_page_function(
             self,
             page_ordinal=1,
             url=url,
-            document=manifest_document,
+            document=document,
             payload=payload,
             observation_id=observation_id,
             source_type="ALPACA_LATEST_QUOTES",
@@ -4406,7 +4443,7 @@ class AlpacaMarketData:
             pages=(
                 (
                     url,
-                    manifest_document,
+                    document,
                     payload,
                     observation_id,
                     "ALPACA_LATEST_QUOTES",

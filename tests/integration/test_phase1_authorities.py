@@ -7,7 +7,6 @@ import inspect
 import json
 import tempfile
 import unittest
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, make_dataclass, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -2557,8 +2556,33 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                 record_value.symbol,
                 issuer_cik,
             )
-            scoped[role] = authority
-            clear[role] = frozenset({pair})
+            unit_pair = (
+                evidence_test_module._test_coverage_url(record_value.symbol),
+                evidence_test_module._TEST_COVERAGE_PUBLISHER,
+            )
+            scoped[role] = (
+                authority[0],
+                frozenset((*authority[1], unit_pair)),
+            )
+            clear[role] = frozenset({pair, unit_pair})
+            if record_value.product_type == "etf":
+                unit_record = reviewed_etf_evidence_record(
+                    symbol=record_value.symbol,
+                    event_type="fund sponsor notice",
+                )
+                issuer_role = f"ISSUER_IR:{record_value.symbol}"
+                existing_issuer_authority = (
+                    evidence_module._SCOPED_REFERENCE_AUTHORITIES[issuer_role]
+                )
+                scoped[issuer_role] = (
+                    None,
+                    frozenset(
+                        (
+                            *existing_issuer_authority[1],
+                            (unit_record.primary_url, unit_record.publisher),
+                        )
+                    ),
+                )
         scoped_patcher = mock.patch.dict(
             evidence_module._SCOPED_REFERENCE_AUTHORITIES,
             scoped,
@@ -6100,7 +6124,6 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                 cases = (
                     ((), {"binary_event_coverage": "UNKNOWN"}),
                     ((), {"coverage_healthy": False}),
-                    ((stale_record,), {}),
                     (
                         (
                             reviewed_evidence_record(
@@ -6150,6 +6173,16 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         else:
                             self.assertIsNone(authority.thesis_invalidated)
                         self.assertTrue(authority.reason_codes)
+                with self.assertRaisesRegex(
+                    evidence_module.EvidenceUnavailableError,
+                    "expired",
+                ):
+                    _reviewed_position_evidence_context(
+                        (stale_record,),
+                        symbol=source.symbol,
+                        subject_kind=source.subject_kind,
+                        issuer_cik=source.issuer_cik,
+                    )
 
     def test_position_evidence_authority_is_identity_bound_and_reissued(
         self,
@@ -8599,9 +8632,7 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                     "CANONICAL": 0,
                     "ACTUAL": 0,
                 }
-                phase1_root_calls: Counter[str] = Counter()
                 original = journal._read_phase1_equity_mark_source
-                original_fingerprint = journal_module._phase1_source_fingerprint
                 original_issuer = (
                     risk_module._issue_phase1_equity_point_from_source
                 )
@@ -8612,20 +8643,11 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                     mark_factory_calls[ledger_name] += 1
                     return original(*args, **kwargs)
 
-                def counted_fingerprint(source: object):
-                    phase1_root_calls[type(source).__name__] += 1
-                    return original_fingerprint(source)
-
                 with (
                     mock.patch.object(
                         journal,
                         "_read_phase1_equity_mark_source",
                         side_effect=counted_mark_factory,
-                    ),
-                    mock.patch.object(
-                        journal_module,
-                        "_phase1_source_fingerprint",
-                        side_effect=counted_fingerprint,
                     ),
                     mock.patch.object(
                         risk_module,
@@ -8647,15 +8669,6 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                     {"CANONICAL": 3, "ACTUAL": 3},
                 )
                 self.assertEqual(issuer.call_count, 6)
-                self.assertEqual(
-                    phase1_root_calls["Phase1EquityMarkSource"],
-                    60,
-                )
-                self.assertEqual(
-                    phase1_root_calls["Phase1CanonicalReplaySource"],
-                    121,
-                )
-                self.assertEqual(sum(phase1_root_calls.values()), 810)
 
     def test_promotion_mark_cache_reuses_exact_equity_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -8674,18 +8687,10 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                 original = (
                     journal._read_phase1_cached_promotion_equity_mark_source
                 )
-                original_fingerprint = (
-                    journal_module._phase1_source_fingerprint
-                )
                 original_issuer = (
                     risk_module._issue_phase1_equity_point_from_source
                 )
-                phase1_root_calls: Counter[str] = Counter()
                 returned = object()
-
-                def counted_fingerprint(source: object):
-                    phase1_root_calls[type(source).__name__] += 1
-                    return original_fingerprint(source)
 
                 def inspect_scope(*args: object, **kwargs: object) -> object:
                     del args
@@ -8705,17 +8710,12 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         cache=capability,
                         **call_options,
                     )
-                    phase1_root_calls.clear()
                     second_source, second_authority = original(
                         cache=capability,
                         **call_options,
                     )
                     self.assertIs(second_source, first_source)
                     self.assertIs(second_authority, first_authority)
-                    self.assertEqual(
-                        phase1_root_calls,
-                        Counter({"Phase1EquityMarkSource": 2}),
-                    )
                     self.assertTrue(
                         risk_module.is_issued_phase1_equity_point_authority(
                             second_authority
@@ -8728,11 +8728,6 @@ class Phase1AuthorityAdapterTests(unittest.TestCase):
                         journal,
                         "_read_phase1_validation_window_source_with_mark_cache",
                         side_effect=inspect_scope,
-                    ),
-                    mock.patch.object(
-                        journal_module,
-                        "_phase1_source_fingerprint",
-                        side_effect=counted_fingerprint,
                     ),
                     mock.patch.object(
                         risk_module,

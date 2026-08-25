@@ -126,6 +126,25 @@ class ProviderSmokeContractTests(unittest.TestCase):
         self.assertFalse((self.home / ".stock-monitor").exists())
         self.assertFalse((self.home / "reports").exists())
 
+    def test_ready_accepts_live_latest_shape_and_bounded_clock_skew(self) -> None:
+        live_latest = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T13:00:00.024230Z",'
+            '"bp":"651.9","ap":"652.1"}}}'
+        )
+        transport = RoutingTransport(
+            lambda url: (200, _completed_sip())
+            if urlsplit(url).path.endswith("/bars")
+            else (200, live_latest)
+        )
+
+        with patch("stock_monitor.provider_smoke.HttpGetClient", return_value=transport):
+            result = run_provider_smoke(self.settings, now=lambda: NOW)
+
+        self.assertEqual((result.status, result.exit_code), ("READY", 0))
+        self.assertTrue(result.authentication_ok)
+        self.assertTrue(result.historical_sip_ok)
+        self.assertTrue(result.latest_iex_fresh)
+
     def test_expected_typed_failures_have_exact_safe_results(self) -> None:
         def smoke(responder, *, completed_session=COMPLETED) -> ProviderSmokeResult:
             provider = AlpacaMarketData(

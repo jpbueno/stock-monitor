@@ -19,6 +19,7 @@ from stock_monitor.providers.alpaca import (
     ProviderDataError,
     ProviderIncompleteError,
     ProviderMalformedError,
+    ProviderStaleError,
     TimeWindow,
     is_ingestible_provider_fetch_cohort,
     is_ingestible_provider_option_chain,
@@ -1650,6 +1651,74 @@ class AlpacaContractTests(unittest.TestCase):
         self.assertTrue(is_issued_provider_fetch_page_bundle(pages[0]))
         self.assertEqual(pages[0].page.source_type, "ALPACA_LATEST_QUOTES")
 
+    def test_latest_iex_accepts_absent_pagination_field_as_exact_terminal_page(
+        self,
+    ) -> None:
+        body = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T12:59:00Z",'
+            '"bp":"651.9","ap":"652.1"}}}'
+        )
+        pages = []
+        cohort = AlpacaMarketData(
+            RoutingTransport(lambda _: (200, body)),
+            credentials(),
+            now=lambda: NOW,
+        ).latest_iex_quote_cohort(("SPY",), page_sink=pages.append)
+
+        bundle = read_provider_fetch_bundle(cohort)
+        self.assertEqual(len(pages), 1)
+        self.assertIs(pages[0], bundle.pages[0])
+        self.assertEqual(pages[0].payload, body.encode("utf-8"))
+        self.assertIsNone(pages[0].page.next_page_token)
+        self.assertTrue(bundle.manifest.terminal)
+
+    def test_latest_iex_rejects_non_null_pagination_token(self) -> None:
+        body = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T12:59:00Z",'
+            '"bp":"651.9","ap":"652.1"}},'
+            '"next_page_token":"unexpected"}'
+        )
+
+        with self.assertRaisesRegex(
+            ProviderIncompleteError,
+            "cannot be paginated",
+        ):
+            AlpacaMarketData(
+                RoutingTransport(lambda _: (200, body)),
+                credentials(),
+                now=lambda: NOW,
+            ).latest_iex_quotes(("SPY",))
+
+    def test_historical_and_option_pages_still_require_terminal_token(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "historical bars",
+                '{"bars":{"SPY":[{"t":"2026-08-13T20:00:00Z",'
+                '"o":1,"h":1,"l":1,"c":1,"v":1}]}}',
+                lambda client: client.daily_bars(("SPY",), WINDOW),
+            ),
+            (
+                "option snapshots",
+                '{"snapshots":{"SPY260918C00650000":{'
+                '"latestQuote":{"t":"2026-08-14T12:59:00Z",'
+                '"bp":"1.00","ap":"1.05"}}}}',
+                lambda client: client.option_chain("SPY"),
+            ),
+        )
+        for name, body, invoke in cases:
+            with self.subTest(source=name), self.assertRaises(
+                ProviderIncompleteError
+            ):
+                invoke(
+                    AlpacaMarketData(
+                        RoutingTransport(lambda _, value=body: (200, value)),
+                        credentials(),
+                        now=lambda: NOW,
+                    )
+                )
+
     def test_stale_or_wrong_feed_latest_quote_blocks_entire_result(self) -> None:
         bodies = (
             '{"quotes":{"SPY":{"t":"2026-08-14T12:54:59Z","bp":"651.9","ap":"652.1"}},"next_page_token":null}',
@@ -2040,25 +2109,104 @@ class AlpacaContractTests(unittest.TestCase):
                     now=lambda: NOW,
                 ).option_chain("SPY")
 
-    def test_iex_freshness_does_not_truncate_fractional_age_or_future_time(self) -> None:
-        timestamps = (
-            "2026-08-14T12:54:59.999999Z",
-            "2026-08-14T13:00:00.000001Z",
+    def test_iex_freshness_does_not_truncate_fractional_stale_age(self) -> None:
+        body = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T12:54:59.999999Z",'
+            '"bp":"1","ap":"1.01"}},"next_page_token":null}'
         )
-        for timestamp in timestamps:
-            body = (
-                '{"quotes":{"SPY":{"t":"'
-                + timestamp
-                + '","bp":"1","ap":"1.01"}},"next_page_token":null}'
-            )
-            with self.subTest(timestamp=timestamp), self.assertRaises(
-                ProviderDataError
+
+        with self.assertRaises(ProviderStaleError):
+            AlpacaMarketData(
+                RoutingTransport(lambda _: (200, body)),
+                credentials(),
+                now=lambda: NOW,
+            ).latest_iex_quotes(["SPY"])
+
+    def test_latest_iex_accepts_inclusive_one_second_clock_skew(self) -> None:
+        body = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T13:00:01Z",'
+            '"bp":"1","ap":"1.01"}},"next_page_token":null}'
+        )
+        cohort = AlpacaMarketData(
+            RoutingTransport(lambda _: (200, body)),
+            credentials(),
+            now=lambda: NOW,
+        ).latest_iex_quote_cohort(("SPY",))
+
+        quote = cohort["SPY"][0]
+        page = read_provider_fetch_bundle(cohort).pages[0]
+        expected = NOW + timedelta(seconds=1)
+        self.assertEqual(quote.timestamp, expected)
+        self.assertEqual(quote.age_seconds, 0)
+        self.assertEqual(page.observation.source_timestamp, expected)
+        self.assertEqual(page.observation.retrieved_at, expected)
+        self.assertEqual(page.observation.delay_seconds, 0)
+        recomputed = recompute_alpaca_page_metadata(
+            payload=page.payload,
+            request_url=page.page.request_url,
+            source_type=page.page.source_type,
+            retrieved_at=page.observation.retrieved_at,
+        )
+        self.assertEqual(
+            recomputed.source_observation_id,
+            page.observation.observation_id,
+        )
+        self.assertEqual(recomputed.source_time, quote.timestamp)
+        self.assertEqual(recomputed.retrieved_at, expected)
+
+    def test_latest_iex_rejects_clock_skew_beyond_one_second(self) -> None:
+        body = (
+            '{"quotes":{"SPY":{"t":"2026-08-14T13:00:01.000001Z",'
+            '"bp":"1","ap":"1.01"}},"next_page_token":null}'
+        )
+
+        with self.assertRaisesRegex(
+            ProviderMalformedError,
+            "timestamp is in the future",
+        ):
+            AlpacaMarketData(
+                RoutingTransport(lambda _: (200, body)),
+                credentials(),
+                now=lambda: NOW,
+            ).latest_iex_quotes(("SPY",))
+
+    def test_other_sources_reject_one_microsecond_positive_clock_skew(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "historical quotes",
+                b'{"quotes":{"SPY":[{"t":"2026-08-14T13:00:00.000001Z",'
+                b'"bp":"1","ap":"1.01"}]},"next_page_token":null}',
+                (
+                    "https://data.alpaca.markets/v2/stocks/quotes?"
+                    "feed=sip&symbols=SPY"
+                ),
+                "ALPACA_HISTORICAL_QUOTES",
+            ),
+            (
+                "option snapshots",
+                b'{"snapshots":{"SPY260918C00650000":{"latestQuote":{'
+                b'"t":"2026-08-14T13:00:00.000001Z","bp":"1",'
+                b'"ap":"1.01"}}},"next_page_token":null}',
+                (
+                    "https://data.alpaca.markets/v1beta1/options/"
+                    "snapshots/SPY?feed=indicative"
+                ),
+                "ALPACA_OPTION_SNAPSHOTS",
+            ),
+        )
+        for name, payload, request_url, source_type in cases:
+            with self.subTest(source=name), self.assertRaisesRegex(
+                ProviderMalformedError,
+                "timestamp is in the future",
             ):
-                AlpacaMarketData(
-                    RoutingTransport(lambda _: (200, body)),
-                    credentials(),
-                    now=lambda: NOW,
-                ).latest_iex_quotes(["SPY"])
+                recompute_alpaca_page_metadata(
+                    payload=payload,
+                    request_url=request_url,
+                    source_type=source_type,
+                    retrieved_at=NOW,
+                )
 
     def test_smoke_reports_auth_sip_and_iex_separately_without_raising(self) -> None:
         def responder(url: str) -> tuple[int, str]:

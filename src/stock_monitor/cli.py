@@ -257,7 +257,11 @@ def _evidence_prepare(settings: Settings, as_json: bool) -> int:
     )
     transport = HttpGetClient(EgressPolicy(hosts))
     clock = lambda: datetime.now(timezone.utc)
-    source_client = EvidenceSourceClient(transport=transport, now=clock)
+    source_client = EvidenceSourceClient(
+        transport=transport,
+        now=clock,
+        user_agent=settings.sec_user_agent,
+    )
     cache = ContentCache(settings.cache_root)
     sec_client = SecClient(
         transport=transport,

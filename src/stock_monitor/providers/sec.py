@@ -43,7 +43,7 @@ _EMAIL = re.compile(
 )
 _ARCHIVE_PATH = re.compile(r"[A-Za-z0-9._/-]{1,1024}\Z")
 _ACCESSION = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}\Z")
-_PRIMARY_DOCUMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
+_PRIMARY_DOCUMENT_PATH = re.compile(r"[A-Za-z0-9._/-]{1,1024}\Z")
 
 
 class SecRateLimitError(RuntimeError):
@@ -194,7 +194,17 @@ def _json(payload: bytes) -> dict[str, object]:
     return value
 
 
-def _identity_user_agent(value: str) -> str:
+def _safe_primary_document_path(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and _PRIMARY_DOCUMENT_PATH.fullmatch(value) is not None
+        and not value.startswith("/")
+        and all(segment not in {"", ".", ".."} for segment in value.split("/"))
+    )
+
+
+def validate_contact_user_agent(value: str) -> str:
+    """Return an exact printable contact User-Agent or reject it."""
     if (
         not isinstance(value, str)
         or not value
@@ -237,7 +247,7 @@ class SecClient:
             raise TypeError("SEC cache or governor has the wrong type")
         self._transport = _GovernedTransport(transport, governor)
         self._cache = cache
-        self._user_agent = _identity_user_agent(user_agent)
+        self._user_agent = validate_contact_user_agent(user_agent)
         self._submissions_origin = submissions_origin
         self._archives_origin = archives_origin
         self._policy = EgressPolicy({"data.sec.gov", "www.sec.gov"})
@@ -402,12 +412,13 @@ class SecClient:
             if (
                 not isinstance(accession, str)
                 or not _ACCESSION.fullmatch(accession)
-                or accession[:10] != padded
-                or not isinstance(primary_document, str)
-                or not _PRIMARY_DOCUMENT.fullmatch(primary_document)
-                or primary_document in {".", ".."}
             ):
                 raise SecMetadataError("SEC submissions filing identity is malformed")
+            if accession[:10] != padded:
+                continue
+            if not _safe_primary_document_path(primary_document):
+                raise SecMetadataError("SEC submissions filing identity is malformed")
+            assert isinstance(primary_document, str)
             accepted = _timestamp(accepted_value)
             accepted_times.append(accepted)
             compact = accession.replace("-", "")
@@ -508,4 +519,5 @@ __all__ = [
     "SecRateGovernor",
     "SecRateLimitError",
     "SourceDocument",
+    "validate_contact_user_agent",
 ]

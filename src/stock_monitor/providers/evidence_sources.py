@@ -14,6 +14,7 @@ from stock_monitor.evidence_authorities import (
 )
 
 from .http import EgressPolicy, GetTransport, get_with_redirects
+from .sec import validate_contact_user_agent
 
 
 _ACCEPT = "application/json,application/xml,text/html,text/plain"
@@ -85,9 +86,11 @@ class EvidenceSourceClient:
         *,
         transport: GetTransport,
         now: Callable[[], datetime],
+        user_agent: str,
     ) -> None:
         self._transport = transport
         self._now = now
+        self._user_agent = validate_contact_user_agent(user_agent)
         self._identity_fingerprints: dict[
             str,
             tuple[str, str, str, str, str],
@@ -104,7 +107,7 @@ class EvidenceSourceClient:
             self._transport,
             policy,
             authority.requested_url,
-            {"Accept": _ACCEPT},
+            {"Accept": _ACCEPT, "User-Agent": self._user_agent},
             allowed_content_types=_ALLOWED_CONTENT_TYPES,
             max_bytes=_MAX_BYTES,
             exact_url_validator=lambda target: _require_exact_target(

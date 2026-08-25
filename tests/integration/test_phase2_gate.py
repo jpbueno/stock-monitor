@@ -4,11 +4,13 @@ import copy
 import gc
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
@@ -18,6 +20,7 @@ from weakref import ref
 from zoneinfo import ZoneInfo
 
 from stock_monitor import config as config_module
+from stock_monitor import evidence as evidence_module
 from stock_monitor import journal as journal_module
 from stock_monitor import options_paper as options_paper_module
 from stock_monitor import validation as validation_module
@@ -233,6 +236,85 @@ def _append_delayed_phase1_actual_hard_evidence(
 
 
 class Phase2JournalSourceContractTests(unittest.TestCase):
+    @staticmethod
+    def _required_phase1_fingerprint_forest() -> Callable[
+        [tuple[object, ...]],
+        tuple[journal_module._SourceFingerprintSeal, ...],
+    ]:
+        forest = getattr(
+            journal_module,
+            "_phase1_source_fingerprint_forest",
+            None,
+        )
+        if not callable(forest):
+            raise AssertionError(
+                "Phase 1 fingerprint forest helper is unavailable"
+            )
+        return forest
+
+    @staticmethod
+    def _required_phase1_fingerprint_factory(
+        source: object,
+    ) -> Callable[[], object]:
+        factory_type = getattr(
+            journal_module,
+            "_Phase1SourceFingerprintFactory",
+            None,
+        )
+        if not isinstance(factory_type, type):
+            raise AssertionError(
+                "Phase 1 fingerprint factory tag is unavailable"
+            )
+        factory = factory_type(source)
+        if type(factory) is not factory_type or not callable(factory):
+            raise AssertionError("Phase 1 fingerprint factory tag is malformed")
+        return factory
+
+    @staticmethod
+    def _required_phase1_forest_describe_node() -> Callable[..., object]:
+        describe_node = getattr(
+            journal_module,
+            "_phase1_forest_describe_node",
+            None,
+        )
+        if not callable(describe_node):
+            raise AssertionError(
+                "Phase 1 forest node-descriptor helper is unavailable"
+            )
+        return describe_node
+
+    @staticmethod
+    def _synthetic_authority_candidate(
+        journal: Journal,
+        registry: journal_module._JournalSourceRegistry,
+        source: object,
+        expected_fingerprint: object,
+        fingerprint_factory: Callable[[], object],
+    ) -> journal_module._JournalAuthorityCandidate:
+        owner_reference = ref(journal)
+        total_changes = (
+            journal_module._journal_source_authority_total_changes(journal)
+        )
+        data_version = journal._source_authority_data_version()
+        issued = (
+            ref(source),
+            expected_fingerprint,
+            owner_reference,
+            total_changes,
+            data_version,
+        )
+        registry[id(source)] = issued
+        return (
+            registry,
+            source,
+            journal,
+            total_changes,
+            data_version,
+            expected_fingerprint,
+            fingerprint_factory,
+            issued,
+        )
+
     def test_variadic_phase1_owner_check_resolves_anchor_once(self) -> None:
         owner = object()
         sources = (object(), object(), object(), object())
@@ -426,8 +508,12 @@ class Phase2JournalSourceContractTests(unittest.TestCase):
                     policy=policy_fixture(),
                 )
             )
-            phase1_roots: list[object] = []
+            phase1_forest_calls: list[tuple[object, ...]] = []
+            direct_phase1_roots: list[object] = []
             replay_roots: list[object] = []
+            original_phase1_forest = (
+                journal_module._phase1_source_fingerprint_forest
+            )
             original_phase1_fingerprint = (
                 journal_module._phase1_source_fingerprint
             )
@@ -435,18 +521,24 @@ class Phase2JournalSourceContractTests(unittest.TestCase):
                 journal_module._replay_source_fingerprint
             )
 
-            def phase1_fingerprint(
-                source: object,
-                **options: object,
-            ) -> object:
-                phase1_roots.append(source)
-                return original_phase1_fingerprint(source, **options)
+            def phase1_forest(roots: tuple[object, ...]) -> object:
+                phase1_forest_calls.append(roots)
+                return original_phase1_forest(roots)
+
+            def phase1_fingerprint(source: object) -> object:
+                direct_phase1_roots.append(source)
+                return original_phase1_fingerprint(source)
 
             def replay_fingerprint(source: object) -> object:
                 replay_roots.append(source)
                 return original_replay_fingerprint(source)
 
             with (
+                mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint_forest",
+                    side_effect=phase1_forest,
+                ),
                 mock.patch.object(
                     journal_module,
                     "_phase1_source_fingerprint",
@@ -469,28 +561,30 @@ class Phase2JournalSourceContractTests(unittest.TestCase):
                     actual_replay_source=actual,
                 )
 
+            supplied_roots = (disposition, canonical, breaker)
+            supplied_batches = tuple(
+                roots
+                for roots in phase1_forest_calls
+                if all(
+                    any(item is supplied for item in roots)
+                    for supplied in supplied_roots
+                )
+            )
+            self.assertTrue(supplied_batches)
+            for roots in supplied_batches:
+                self.assertTrue(
+                    all(
+                        sum(item is supplied for item in roots) == 1
+                        for supplied in supplied_roots
+                    )
+                )
             self.assertEqual(
-                {
-                    "disposition": sum(
-                        item is disposition for item in phase1_roots
-                    ),
-                    "canonical": sum(item is canonical for item in phase1_roots),
-                    "breaker": sum(item is breaker for item in phase1_roots),
-                    "actual": sum(item is actual for item in replay_roots),
-                    "review": sum(item is review for item in phase1_roots),
-                },
-                {
-                    # Each Phase 1 dependency is first checked before its
-                    # values drive the read, then rechecked once at the final
-                    # callback-free parent-registration boundary.  The ACTUAL
-                    # replay participates only in that final mixed batch, and
-                    # the newly built parent is sealed on both sides of it.
-                    "disposition": 2,
-                    "canonical": 2,
-                    "breaker": 2,
-                    "actual": 1,
-                    "review": 2,
-                },
+                sum(item is actual for item in replay_roots),
+                1,
+            )
+            self.assertGreaterEqual(
+                sum(item is review for item in direct_phase1_roots),
+                1,
             )
 
             with self.assertRaisesRegex(
@@ -1062,6 +1156,1940 @@ class Phase2JournalSourceContractTests(unittest.TestCase):
             self.assertIs(type(seal), journal_module._SourceFingerprintSeal)
             self.assertIs(type(seal.digest), bytes)
             self.assertEqual(len(seal.digest), 32)
+
+    def test_source_fingerprint_seals_resist_object_setattr_and_spoofs(
+        self,
+    ) -> None:
+        for attribute, replacement in (
+            ("digest", b"0" * 32),
+            ("identity_anchors", (object(),)),
+        ):
+            with self.subTest(attribute=attribute):
+                seal = journal_module._phase1_source_fingerprint(
+                    ("immutable", attribute)
+                )
+                original_digest = seal.digest
+                original_anchors = seal.identity_anchors
+                with self.assertRaises((AttributeError, TypeError)):
+                    object.__setattr__(seal, attribute, replacement)
+                self.assertEqual(seal.digest, original_digest)
+                self.assertIs(seal.identity_anchors, original_anchors)
+
+        reference = journal_module._phase1_source_fingerprint(("reference",))
+        try:
+            class SpoofedSeal(journal_module._SourceFingerprintSeal):
+                pass
+        except TypeError:
+            return
+        spoofed = SpoofedSeal(reference.digest, reference.identity_anchors)
+        self.assertFalse(
+            journal_module._source_fingerprint_seals_equal(spoofed, spoofed)
+        )
+        self.assertFalse(journal_module._fingerprints_equal(spoofed, spoofed))
+
+    def test_phase1_fingerprint_forest_matches_independent_root_seals(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class SharedLeaf:
+            value: str
+
+        @dataclass(frozen=True, slots=True)
+        class LeftRoot:
+            child: object
+
+        @dataclass(frozen=True, slots=True)
+        class RightRoot:
+            child: object
+
+        shared = SharedLeaf("shared")
+        left = LeftRoot(shared)
+        right = RightRoot(shared)
+        for roots in (
+            (left, right, left),
+            (right, left, left),
+        ):
+            with self.subTest(order=tuple(type(root).__name__ for root in roots)):
+                independent = tuple(
+                    journal_module._phase1_source_fingerprint(root)
+                    for root in roots
+                )
+                forest = self._required_phase1_fingerprint_forest()(roots)
+                self.assertIs(type(forest), tuple)
+                self.assertEqual(len(forest), len(roots))
+                for expected, actual in zip(
+                    independent,
+                    forest,
+                    strict=True,
+                ):
+                    self.assertIs(
+                        type(actual),
+                        journal_module._SourceFingerprintSeal,
+                    )
+                    self.assertTrue(
+                        journal_module._source_fingerprint_seals_equal(
+                            expected,
+                            actual,
+                        )
+                    )
+                duplicate_indices = tuple(
+                    ordinal
+                    for ordinal, root in enumerate(roots)
+                    if root is left
+                )
+                self.assertEqual(len(duplicate_indices), 2)
+                self.assertTrue(
+                    journal_module._source_fingerprint_seals_equal(
+                        forest[duplicate_indices[0]],
+                        forest[duplicate_indices[1]],
+                    )
+                )
+
+    def test_phase1_fingerprint_forest_keeps_root_identity_anchors_isolated(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class OpaqueValue:
+            value: str
+
+        @dataclass(frozen=True, slots=True)
+        class IdentityRoot:
+            at: datetime
+            opaque: object = field(compare=False)
+
+        first_at = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        second_at = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        first_opaque = OpaqueValue("same")
+        second_opaque = OpaqueValue("same")
+        first_root = IdentityRoot(first_at, first_opaque)
+        second_root = IdentityRoot(second_at, second_opaque)
+        self.assertEqual(first_root, second_root)
+        self.assertIsNot(first_at, second_at)
+        self.assertIsNot(first_opaque, second_opaque)
+
+        forest = self._required_phase1_fingerprint_forest()(
+            (first_root, second_root)
+        )
+        independent = (
+            journal_module._phase1_source_fingerprint(first_root),
+            journal_module._phase1_source_fingerprint(second_root),
+        )
+        for expected, actual in zip(independent, forest, strict=True):
+            self.assertTrue(
+                journal_module._source_fingerprint_seals_equal(expected, actual)
+            )
+
+        first_anchors = forest[0].identity_anchors
+        second_anchors = forest[1].identity_anchors
+        self.assertIsNot(first_anchors, second_anchors)
+        self.assertTrue(any(anchor is first_at for anchor in first_anchors))
+        self.assertTrue(any(anchor is first_opaque for anchor in first_anchors))
+        self.assertFalse(any(anchor is second_at for anchor in first_anchors))
+        self.assertFalse(any(anchor is second_opaque for anchor in first_anchors))
+        self.assertTrue(any(anchor is second_at for anchor in second_anchors))
+        self.assertTrue(any(anchor is second_opaque for anchor in second_anchors))
+        self.assertFalse(any(anchor is first_at for anchor in second_anchors))
+        self.assertFalse(any(anchor is first_opaque for anchor in second_anchors))
+        self.assertFalse(
+            journal_module._source_fingerprint_seals_equal(forest[0], forest[1])
+        )
+
+    def test_single_root_phase1_fingerprint_matches_forest_without_calling_forest(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class SlotNode:
+            value: object
+
+        @dataclass(frozen=True)
+        class DictRoot:
+            label: str
+            child: object
+
+        @dataclass(frozen=True, slots=True)
+        class SharedRoot:
+            left: object
+            right: object
+
+        @dataclass(frozen=True, slots=True)
+        class OpaqueRoot:
+            first_at: datetime
+            second_at: datetime
+            first_opaque: object = field(compare=False)
+            second_opaque: object = field(compare=False)
+            amount: Decimal = field(compare=False)
+
+        shared = SlotNode("shared")
+        repeated_at = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+        repeated_opaque = object()
+        amount = Decimal("12.50")
+        opaque_root = OpaqueRoot(
+            repeated_at,
+            repeated_at,
+            repeated_opaque,
+            repeated_opaque,
+            amount,
+        )
+        self.assertIs(opaque_root.first_at, opaque_root.second_at)
+        self.assertIs(opaque_root.first_opaque, opaque_root.second_opaque)
+
+        cases = (
+            ("slots", SlotNode("slots")),
+            ("dict-backed", DictRoot("dict", SlotNode("child"))),
+            ("shared-dag", SharedRoot(shared, shared)),
+            ("opaque-decimal-duplicate-anchors", opaque_root),
+        )
+        original_forest = self._required_phase1_fingerprint_forest()
+
+        for case, root in cases:
+            with self.subTest(case=case):
+                expected = original_forest((root,))[0]
+                with mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint_forest",
+                    wraps=original_forest,
+                ) as forest:
+                    actual = journal_module._phase1_source_fingerprint(root)
+
+                self.assertIs(
+                    type(actual),
+                    journal_module._SourceFingerprintSeal,
+                )
+                expected_digest = tuple.__getitem__(expected, 0)
+                actual_digest = tuple.__getitem__(actual, 0)
+                self.assertEqual(actual_digest, expected_digest)
+                expected_anchors = tuple.__getitem__(expected, 1)
+                actual_anchors = tuple.__getitem__(actual, 1)
+                self.assertIs(type(actual_anchors), tuple)
+                self.assertEqual(len(actual_anchors), len(expected_anchors))
+                self.assertTrue(
+                    all(
+                        actual_anchor is expected_anchor
+                        for actual_anchor, expected_anchor in zip(
+                            actual_anchors,
+                            expected_anchors,
+                            strict=True,
+                        )
+                    )
+                )
+                if case == "opaque-decimal-duplicate-anchors":
+                    self.assertEqual(
+                        sum(anchor is repeated_at for anchor in actual_anchors),
+                        1,
+                    )
+                    self.assertEqual(
+                        sum(
+                            anchor is repeated_opaque
+                            for anchor in actual_anchors
+                        ),
+                        1,
+                    )
+                    self.assertEqual(
+                        sum(anchor is amount for anchor in actual_anchors),
+                        1,
+                    )
+                self.assertEqual(
+                    forest.call_count,
+                    0,
+                    "single-root fingerprint delegated to forest traversal",
+                )
+
+    def test_phase1_fingerprint_forest_visits_shared_dataclasses_once(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class SharedNode:
+            child: object
+
+        @dataclass(frozen=True, slots=True)
+        class ForestRoot:
+            label: int
+            child: object
+
+        shared_depth = 32
+        root_count = 8
+        shared: object = SharedNode("leaf")
+        for _ in range(shared_depth - 1):
+            shared = SharedNode(shared)
+        roots = tuple(ForestRoot(ordinal, shared) for ordinal in range(root_count))
+        unique_forest_nodes = shared_depth + root_count + root_count + 1
+        describe_node = self._required_phase1_forest_describe_node()
+
+        with (
+            mock.patch.object(
+                journal_module,
+                "_phase1_forest_describe_node",
+                wraps=describe_node,
+            ) as independent_descriptions,
+            mock.patch.object(
+                journal_module,
+                "fields",
+                side_effect=AssertionError(
+                    "Phase 1 forest used dynamic dataclass metadata"
+                ),
+            ),
+        ):
+            independent = tuple(
+                journal_module._phase1_source_fingerprint(root) for root in roots
+            )
+        independent_visits = independent_descriptions.call_count
+
+        with (
+            mock.patch.object(
+                journal_module,
+                "_phase1_forest_describe_node",
+                wraps=describe_node,
+            ) as forest_descriptions,
+            mock.patch.object(
+                journal_module,
+                "fields",
+                side_effect=AssertionError(
+                    "Phase 1 forest used dynamic dataclass metadata"
+                ),
+            ),
+        ):
+            forest = self._required_phase1_fingerprint_forest()(roots)
+        forest_visits = forest_descriptions.call_count
+
+        for expected, actual in zip(independent, forest, strict=True):
+            self.assertTrue(
+                journal_module._source_fingerprint_seals_equal(expected, actual)
+            )
+        self.assertLessEqual(forest_visits, unique_forest_nodes)
+        self.assertGreater(independent_visits, unique_forest_nodes * 4)
+        self.assertLess(forest_visits * 3, independent_visits)
+
+    def test_owner_bypasses_mutable_phase1_factory_call_below_forest_batch_threshold(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class SharedChild:
+            value: str
+
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class AuthorityRoot:
+            label: int
+            child: object
+
+        original_fingerprint = journal_module._phase1_source_fingerprint
+        original_forest = self._required_phase1_fingerprint_forest()
+
+        for root_count in range(1, 4):
+            with (
+                self.subTest(root_count=root_count),
+                tempfile.TemporaryDirectory() as directory,
+                Journal.open(Path(directory) / "journal.sqlite3") as journal,
+            ):
+                shared = SharedChild("original")
+                roots = tuple(
+                    AuthorityRoot(ordinal, shared)
+                    for ordinal in range(root_count)
+                )
+                expected = tuple(
+                    journal_module._phase1_source_fingerprint(root)
+                    for root in roots
+                )
+                factories = tuple(
+                    self._required_phase1_fingerprint_factory(root)
+                    for root in roots
+                )
+                factory_type = type(factories[0])
+                factory_calls: list[object] = []
+
+                def counted_factory_call(factory: object) -> object:
+                    factory_calls.append(factory)
+                    object.__setattr__(shared, "value", "mutated")
+                    source = tuple.__getitem__(factory, 0)
+                    return original_fingerprint(source)
+
+                registry: journal_module._JournalSourceRegistry = {}
+                candidates = tuple(
+                    self._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+
+                with mock.patch.object(
+                    factory_type,
+                    "__call__",
+                    new=counted_factory_call,
+                ), mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint",
+                    wraps=original_fingerprint,
+                ) as fingerprint, mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint_forest",
+                    wraps=original_forest,
+                ) as forest:
+                    owner = (
+                        journal_module._current_journal_source_authority_owner(
+                            candidates
+                        )
+                    )
+
+                self.assertIs(owner, journal)
+                self.assertEqual(factory_calls, [])
+                self.assertEqual(shared.value, "original")
+                self.assertEqual(fingerprint.call_count, root_count)
+                self.assertEqual(forest.call_count, 0)
+
+    def test_owner_batches_four_shared_phase1_roots_into_two_fresh_forests_and_rejects_interpass_mutation(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True)
+        class MutableChild:
+            value: str
+
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class AuthorityRoot:
+            label: str
+            child: object
+
+        shared = MutableChild("original")
+        roots = tuple(
+            AuthorityRoot(label, shared)
+            for label in ("first", "second", "third", "fourth")
+        )
+        expected = tuple(
+            journal_module._phase1_source_fingerprint(root) for root in roots
+        )
+        phase1_factories = tuple(
+            self._required_phase1_fingerprint_factory(root) for root in roots
+        )
+        original_forest = self._required_phase1_fingerprint_forest()
+        forest_calls: list[tuple[object, ...]] = []
+
+        def mutate_between_forest_passes(
+            sources: tuple[object, ...],
+        ) -> tuple[journal_module._SourceFingerprintSeal, ...]:
+            seals = original_forest(sources)
+            forest_calls.append(tuple(sources))
+            if len(forest_calls) == 1:
+                object.__setattr__(shared, "value", "mutated")
+            return seals
+
+        with tempfile.TemporaryDirectory() as directory, Journal.open(
+            Path(directory) / "journal.sqlite3"
+        ) as journal:
+            registry: journal_module._JournalSourceRegistry = {}
+            candidates = tuple(
+                self._synthetic_authority_candidate(
+                    journal,
+                    registry,
+                    source,
+                    fingerprint,
+                    factory,
+                )
+                for source, fingerprint, factory in zip(
+                    roots,
+                    expected,
+                    phase1_factories,
+                    strict=True,
+                )
+            )
+            with mock.patch.object(
+                journal_module,
+                "_phase1_source_fingerprint_forest",
+                side_effect=mutate_between_forest_passes,
+            ):
+                owner = journal_module._current_journal_source_authority_owner(
+                    candidates
+                )
+
+        self.assertIsNone(owner)
+        self.assertEqual(len(forest_calls), 2)
+        for call_roots in forest_calls:
+            self.assertEqual(len(call_roots), len(roots))
+            self.assertTrue(
+                all(
+                    actual is expected_root
+                    for actual, expected_root in zip(
+                        call_roots,
+                        roots,
+                        strict=True,
+                    )
+                )
+            )
+
+    def test_owner_second_forest_later_metaclass_cannot_mutate_completed_shared_root(
+        self,
+    ) -> None:
+        attack_state: dict[str, object] = {
+            "armed": False,
+            "callback_count": 0,
+            "fired_on_forest_call": None,
+        }
+        forest_call_count = 0
+
+        class CallbackMeta(type):
+            def __getattribute__(cls, name: str) -> object:
+                if name == "__dataclass_fields__" and attack_state["armed"]:
+                    attack_state["callback_count"] = (
+                        int(attack_state["callback_count"]) + 1
+                    )
+                    if attack_state["fired_on_forest_call"] is None:
+                        attack_state["fired_on_forest_call"] = forest_call_count
+                        object.__setattr__(shared, "value", "mutated")
+                return type.__getattribute__(cls, name)
+
+        @dataclass(frozen=True, slots=True)
+        class MutableChild:
+            value: str
+
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class EarlierRoot:
+            label: str
+            child: object
+
+        @dataclass(
+            frozen=True,
+            slots=True,
+            weakref_slot=True,
+        )
+        class LaterRoot(metaclass=CallbackMeta):
+            label: str
+            child: object
+
+        shared = MutableChild("original")
+        roots = (
+            EarlierRoot("earlier", shared),
+            EarlierRoot("middle-1", shared),
+            EarlierRoot("middle-2", shared),
+            LaterRoot("later", shared),
+        )
+        expected = tuple(
+            journal_module._phase1_source_fingerprint(root) for root in roots
+        )
+        factories = tuple(
+            self._required_phase1_fingerprint_factory(root) for root in roots
+        )
+        original_forest = self._required_phase1_fingerprint_forest()
+
+        def arm_only_during_second_forest(
+            sources: tuple[object, ...],
+        ) -> tuple[journal_module._SourceFingerprintSeal, ...]:
+            nonlocal forest_call_count
+            forest_call_count += 1
+            attack_state["armed"] = forest_call_count == 2
+            try:
+                return original_forest(sources)
+            finally:
+                attack_state["armed"] = False
+
+        with tempfile.TemporaryDirectory() as directory, Journal.open(
+            Path(directory) / "journal.sqlite3"
+        ) as journal:
+            registry: journal_module._JournalSourceRegistry = {}
+            candidates = tuple(
+                self._synthetic_authority_candidate(
+                    journal,
+                    registry,
+                    source,
+                    fingerprint,
+                    factory,
+                )
+                for source, fingerprint, factory in zip(
+                    roots,
+                    expected,
+                    factories,
+                    strict=True,
+                )
+            )
+            with mock.patch.object(
+                journal_module,
+                "_phase1_source_fingerprint_forest",
+                side_effect=arm_only_during_second_forest,
+            ):
+                owner = journal_module._current_journal_source_authority_owner(
+                    candidates
+                )
+
+            callback_count = int(attack_state["callback_count"])
+            self.assertEqual(forest_call_count, 2)
+            self.assertEqual(callback_count, 0)
+            self.assertIsNone(attack_state["fired_on_forest_call"])
+            self.assertEqual(shared.value, "original")
+            self.assertIs(owner, journal)
+
+    def test_owner_second_forest_field_compare_descriptor_cannot_mutate_completed_shared_root(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import json
+            import sys
+            import tempfile
+            from dataclasses import Field, dataclass
+            from pathlib import Path
+            from types import MemberDescriptorType
+            from unittest import mock
+            from weakref import ref
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import Journal
+
+
+            @dataclass(frozen=True, slots=True)
+            class MutableChild:
+                value: str
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class EarlierRoot:
+                label: str
+                child: object
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class LaterRoot:
+                label: str
+                child: object
+
+
+            shared = MutableChild("original")
+            roots = (
+                EarlierRoot("earlier", shared),
+                EarlierRoot("middle-1", shared),
+                EarlierRoot("middle-2", shared),
+                LaterRoot("later", shared),
+            )
+            expected = tuple(
+                journal_module._phase1_source_fingerprint(root)
+                for root in roots
+            )
+            factories = tuple(
+                journal_module._Phase1SourceFingerprintFactory(root)
+                for root in roots
+            )
+            target_field = LaterRoot.__dataclass_fields__["child"]
+            field_type = type(target_field)
+            if field_type is not Field:
+                raise AssertionError("target metadata is not an exact Field")
+            original_compare = type.__getattribute__(field_type, "compare")
+            if type(original_compare) is not MemberDescriptorType:
+                raise AssertionError("Field.compare is not a member descriptor")
+
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "fired_on_forest_call": None,
+            }
+            forest_call_count = 0
+
+
+            class CallbackCompare:
+                def __get__(self, instance, owner=None):
+                    if instance is None:
+                        return self
+                    if attack_state["armed"] and instance is target_field:
+                        attack_state["callback_count"] += 1
+                        if attack_state["fired_on_forest_call"] is None:
+                            attack_state["fired_on_forest_call"] = (
+                                forest_call_count
+                            )
+                            object.__setattr__(
+                                shared,
+                                "value",
+                                "mutated",
+                            )
+                    return MemberDescriptorType.__get__(
+                        original_compare,
+                        instance,
+                        field_type,
+                    )
+
+
+            def candidate(journal, registry, source, fingerprint, factory):
+                owner_reference = ref(journal)
+                total_changes = (
+                    journal_module._journal_source_authority_total_changes(
+                        journal
+                    )
+                )
+                data_version = journal._source_authority_data_version()
+                issued = (
+                    ref(source),
+                    fingerprint,
+                    owner_reference,
+                    total_changes,
+                    data_version,
+                )
+                registry[id(source)] = issued
+                return (
+                    registry,
+                    source,
+                    journal,
+                    total_changes,
+                    data_version,
+                    fingerprint,
+                    factory,
+                    issued,
+                )
+
+
+            original_forest = journal_module._phase1_source_fingerprint_forest
+
+
+            def arm_only_during_second_forest(sources):
+                global forest_call_count
+                forest_call_count += 1
+                attack_state["armed"] = forest_call_count == 2
+                try:
+                    return original_forest(sources)
+                finally:
+                    attack_state["armed"] = False
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+                setattr(field_type, "compare", CallbackCompare())
+                try:
+                    with mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint_forest",
+                        side_effect=arm_only_during_second_forest,
+                    ):
+                        owner = (
+                            journal_module
+                            ._current_journal_source_authority_owner(candidates)
+                        )
+                finally:
+                    setattr(field_type, "compare", original_compare)
+
+                print(
+                    json.dumps(
+                        {
+                            "callback_count": attack_state["callback_count"],
+                            "fired_on_forest_call": attack_state[
+                                "fired_on_forest_call"
+                            ],
+                            "forest_call_count": forest_call_count,
+                            "owner_granted": owner is journal,
+                            "shared_value": shared.value,
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(outcome["forest_call_count"], 2)
+        self.assertEqual(outcome["callback_count"], 0)
+        self.assertIsNone(outcome["fired_on_forest_call"])
+        self.assertEqual(outcome["shared_value"], "original")
+        self.assertTrue(outcome["owner_granted"])
+
+    def test_owner_second_forest_decimal_tuple_descriptor_is_never_invoked(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import json
+            import sys
+            import tempfile
+            from dataclasses import dataclass, field
+            from decimal import Decimal
+            from pathlib import Path
+            from unittest import mock
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import Journal
+            from tests.integration.test_phase2_gate import (
+                Phase2JournalSourceContractTests as Contract,
+            )
+
+
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "fired_on_forest_call": None,
+            }
+            forest_call_count = 0
+
+
+            @dataclass(frozen=True, slots=True)
+            class MutableChild:
+                value: str
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class EarlierRoot:
+                label: str
+                child: object
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class LaterRoot:
+                label: str
+                child: object
+                amount: Decimal = field(compare=False)
+
+
+            shared = MutableChild("original")
+            roots = (
+                EarlierRoot("earlier", shared),
+                EarlierRoot("middle-1", shared),
+                EarlierRoot("middle-2", shared),
+                LaterRoot("later", shared, Decimal("12.50")),
+            )
+            expected = tuple(
+                journal_module._phase1_source_fingerprint(root)
+                for root in roots
+            )
+            factories = tuple(
+                Contract._required_phase1_fingerprint_factory(root)
+                for root in roots
+            )
+            decimal_tuple_type = type(Decimal("0").as_tuple())
+            if not issubclass(decimal_tuple_type, tuple):
+                raise AssertionError("DecimalTuple is not tuple-backed")
+            original_exponent = type.__getattribute__(
+                decimal_tuple_type,
+                "exponent",
+            )
+
+
+            class CallbackExponent:
+                def __get__(self, instance, owner=None):
+                    if instance is None:
+                        return self
+                    if attack_state["armed"]:
+                        attack_state["callback_count"] += 1
+                        if attack_state["fired_on_forest_call"] is None:
+                            attack_state["fired_on_forest_call"] = (
+                                forest_call_count
+                            )
+                            object.__setattr__(
+                                shared,
+                                "value",
+                                "mutated",
+                            )
+                    return tuple.__getitem__(instance, 2)
+
+
+            original_forest = Contract._required_phase1_fingerprint_forest()
+
+
+            def arm_only_during_second_forest(sources):
+                global forest_call_count
+                forest_call_count += 1
+                attack_state["armed"] = forest_call_count == 2
+                try:
+                    return original_forest(sources)
+                finally:
+                    attack_state["armed"] = False
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    Contract._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+                setattr(decimal_tuple_type, "exponent", CallbackExponent())
+                try:
+                    with mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint_forest",
+                        side_effect=arm_only_during_second_forest,
+                    ):
+                        owner = (
+                            journal_module
+                            ._current_journal_source_authority_owner(candidates)
+                        )
+                finally:
+                    setattr(
+                        decimal_tuple_type,
+                        "exponent",
+                        original_exponent,
+                    )
+
+                print(
+                    json.dumps(
+                        {
+                            "callback_count": attack_state["callback_count"],
+                            "fired_on_forest_call": attack_state[
+                                "fired_on_forest_call"
+                            ],
+                            "forest_call_count": forest_call_count,
+                            "owner_granted": owner is journal,
+                            "shared_value": shared.value,
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(outcome["forest_call_count"], 2)
+        self.assertEqual(
+            outcome["callback_count"],
+            0,
+            "DecimalTuple.exponent dispatched a mutable descriptor during "
+            "authority verification",
+        )
+        self.assertIsNone(outcome["fired_on_forest_call"])
+        self.assertEqual(outcome["shared_value"], "original")
+        self.assertTrue(outcome["owner_granted"])
+
+    def test_owner_later_seal_descriptor_cannot_mutate_completed_shared_root(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import json
+            import sys
+            import tempfile
+            from dataclasses import dataclass
+            from pathlib import Path
+            from unittest import mock
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import Journal
+            from tests.integration.test_phase2_gate import (
+                Phase2JournalSourceContractTests as Contract,
+            )
+
+
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "forest_call_count": 0,
+            }
+            forest_results = []
+
+
+            @dataclass(frozen=True, slots=True)
+            class MutableChild:
+                value: str
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class AuthorityRoot:
+                label: str
+                child: object
+
+
+            shared = MutableChild("original")
+            roots = tuple(
+                AuthorityRoot(label, shared)
+                for label in ("earlier", "middle-1", "middle-2", "later")
+            )
+            expected = tuple(
+                journal_module._phase1_source_fingerprint(root)
+                for root in roots
+            )
+            factories = tuple(
+                Contract._required_phase1_fingerprint_factory(root)
+                for root in roots
+            )
+            seal_type = journal_module._SourceFingerprintSeal
+            original_digest = type.__getattribute__(seal_type, "digest")
+
+
+            class CallbackDigest:
+                def __get__(self, instance, owner=None):
+                    if instance is None:
+                        return self
+                    target = (
+                        forest_results[0][-1]
+                        if len(forest_results) == 2
+                        else None
+                    )
+                    if attack_state["armed"] and instance is target:
+                        attack_state["callback_count"] += 1
+                        object.__setattr__(
+                            shared,
+                            "value",
+                            "mutated",
+                        )
+                    return tuple.__getitem__(instance, 0)
+
+
+            original_forest = Contract._required_phase1_fingerprint_forest()
+
+
+            def capture_two_forest_passes(sources):
+                result = original_forest(sources)
+                forest_results.append(result)
+                attack_state["forest_call_count"] += 1
+                if len(forest_results) == 2:
+                    attack_state["armed"] = True
+                return result
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    Contract._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+                setattr(seal_type, "digest", CallbackDigest())
+                try:
+                    with mock.patch.object(
+                        journal_module,
+                        "_phase1_source_fingerprint_forest",
+                        side_effect=capture_two_forest_passes,
+                    ):
+                        owner = (
+                            journal_module
+                            ._current_journal_source_authority_owner(candidates)
+                        )
+                finally:
+                    attack_state["armed"] = False
+                    setattr(seal_type, "digest", original_digest)
+
+                print(
+                    json.dumps(
+                        {
+                            "callback_count": attack_state["callback_count"],
+                            "forest_call_count": attack_state[
+                                "forest_call_count"
+                            ],
+                            "owner_granted": owner is journal,
+                            "shared_value": shared.value,
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(outcome["forest_call_count"], 2)
+        self.assertEqual(outcome["callback_count"], 0)
+        self.assertEqual(outcome["shared_value"], "original")
+        self.assertTrue(outcome["owner_granted"])
+
+    def test_owner_second_forest_instance_dict_collision_cannot_mutate_completed_shared_root(
+        self,
+    ) -> None:
+        attack_state: dict[str, object] = {
+            "armed": False,
+            "callback_count": 0,
+            "fired_on_forest_call": None,
+        }
+        forest_call_count = 0
+
+        @dataclass(frozen=True, slots=True)
+        class MutableChild:
+            value: str
+
+        class CollidingKey:
+            def __hash__(self) -> int:
+                return hash("child")
+
+            def __eq__(self, other: object) -> bool:
+                if type(other) is not str or other != "child":
+                    return False
+                if attack_state["armed"]:
+                    attack_state["callback_count"] = (
+                        int(attack_state["callback_count"]) + 1
+                    )
+                    if attack_state["fired_on_forest_call"] is None:
+                        attack_state["fired_on_forest_call"] = (
+                            forest_call_count
+                        )
+                        object.__setattr__(shared, "value", "mutated")
+                return True
+
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class EarlierRoot:
+            label: str
+            child: object
+
+        @dataclass(frozen=True)
+        class LaterDictRoot:
+            label: str
+            child: object
+
+        shared = MutableChild("original")
+        later = LaterDictRoot("later", shared)
+        roots = (
+            EarlierRoot("earlier", shared),
+            EarlierRoot("middle-1", shared),
+            EarlierRoot("middle-2", shared),
+            later,
+        )
+        expected = tuple(
+            journal_module._phase1_source_fingerprint(root) for root in roots
+        )
+        factories = tuple(
+            self._required_phase1_fingerprint_factory(root) for root in roots
+        )
+
+        instance_values = object.__getattribute__(later, "__dict__")
+        self.assertIs(type(instance_values), dict)
+        child = dict.pop(instance_values, "child")
+        collision = CollidingKey()
+        dict.__setitem__(instance_values, collision, child)
+        self.assertTrue(
+            any(key is collision for key in dict.keys(instance_values))
+        )
+        self.assertTrue(
+            any(type(key) is not str for key in dict.keys(instance_values))
+        )
+        original_forest = self._required_phase1_fingerprint_forest()
+
+        def arm_only_during_second_forest(
+            sources: tuple[object, ...],
+        ) -> tuple[journal_module._SourceFingerprintSeal, ...]:
+            nonlocal forest_call_count
+            forest_call_count += 1
+            attack_state["armed"] = forest_call_count == 2
+            try:
+                return original_forest(sources)
+            finally:
+                attack_state["armed"] = False
+
+        with tempfile.TemporaryDirectory() as directory, Journal.open(
+            Path(directory) / "journal.sqlite3"
+        ) as journal:
+            registry: journal_module._JournalSourceRegistry = {}
+            candidates = tuple(
+                self._synthetic_authority_candidate(
+                    journal,
+                    registry,
+                    source,
+                    fingerprint,
+                    factory,
+                )
+                for source, fingerprint, factory in zip(
+                    roots,
+                    expected,
+                    factories,
+                    strict=True,
+                )
+            )
+            with mock.patch.object(
+                journal_module,
+                "_phase1_source_fingerprint_forest",
+                side_effect=arm_only_during_second_forest,
+            ):
+                owner = journal_module._current_journal_source_authority_owner(
+                    candidates
+                )
+
+        callback_count = int(attack_state["callback_count"])
+        self.assertEqual(callback_count, 0)
+        self.assertIsNone(attack_state["fired_on_forest_call"])
+        self.assertEqual(shared.value, "original")
+        self.assertIsNone(owner)
+
+    def test_owner_second_forest_class_namespace_collision_cannot_mutate_completed_shared_root(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import gc
+            import json
+            import sys
+            import tempfile
+            import warnings
+            from dataclasses import dataclass
+            from pathlib import Path
+            from unittest import mock
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import Journal
+            from tests.integration.test_phase2_gate import (
+                Phase2JournalSourceContractTests as Contract,
+            )
+
+
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "fired_on_forest_call": None,
+            }
+            forest_call_count = 0
+
+
+            @dataclass(frozen=True, slots=True)
+            class MutableChild:
+                value: str
+
+
+            @dataclass(frozen=True, slots=True, weakref_slot=True)
+            class EarlierRoot:
+                label: str
+                child: object
+
+
+            shared = MutableChild("original")
+
+
+            class CollidingKey:
+                def __hash__(self):
+                    return hash("child")
+
+                def __eq__(self, other):
+                    if type(other) is not str or other != "child":
+                        return False
+                    if attack_state["armed"]:
+                        attack_state["callback_count"] += 1
+                        if attack_state["fired_on_forest_call"] is None:
+                            attack_state["fired_on_forest_call"] = (
+                                forest_call_count
+                            )
+                            object.__setattr__(
+                                shared,
+                                "value",
+                                "mutated",
+                            )
+                    return True
+
+
+            collision = CollidingKey()
+            namespace = {
+                "__module__": __name__,
+                "__annotations__": {
+                    "label": str,
+                    "child": object,
+                },
+                collision: None,
+            }
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                LaterRoot = type("LaterRoot", (), namespace)
+            matching_warnings = tuple(
+                warning
+                for warning in caught
+                if type(warning.message) is RuntimeWarning
+                and "non-string key" in str(warning.message)
+            )
+            if len(matching_warnings) != 1:
+                raise AssertionError(
+                    "class collision fixture did not emit its exact warning"
+                )
+
+            LaterRoot = dataclass(frozen=True)(LaterRoot)
+            later = LaterRoot("later", shared)
+            class_namespace = type.__getattribute__(LaterRoot, "__dict__")
+            namespace_dicts = tuple(
+                value
+                for value in gc.get_referents(class_namespace)
+                if type(value) is dict
+            )
+            if len(namespace_dicts) != 1:
+                raise AssertionError(
+                    "class mappingproxy backing dictionary is unavailable"
+                )
+            mutable_namespace = namespace_dicts[0]
+            dict.__delitem__(mutable_namespace, collision)
+
+            roots = (
+                EarlierRoot("earlier", shared),
+                EarlierRoot("middle-1", shared),
+                EarlierRoot("middle-2", shared),
+                later,
+            )
+            expected = tuple(
+                journal_module._phase1_source_fingerprint(root)
+                for root in roots
+            )
+            factories = tuple(
+                Contract._required_phase1_fingerprint_factory(root)
+                for root in roots
+            )
+            dict.__setitem__(mutable_namespace, collision, None)
+            if not any(key is collision for key in class_namespace.keys()):
+                raise AssertionError("class collision key was not retained")
+            original_forest = Contract._required_phase1_fingerprint_forest()
+
+
+            def arm_only_during_second_forest(sources):
+                global forest_call_count
+                forest_call_count += 1
+                attack_state["armed"] = forest_call_count == 2
+                try:
+                    return original_forest(sources)
+                finally:
+                    attack_state["armed"] = False
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    Contract._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+                with mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint_forest",
+                    side_effect=arm_only_during_second_forest,
+                ):
+                    owner = (
+                        journal_module
+                        ._current_journal_source_authority_owner(candidates)
+                    )
+
+                print(
+                    json.dumps(
+                        {
+                            "callback_count": attack_state["callback_count"],
+                            "fired_on_forest_call": attack_state[
+                                "fired_on_forest_call"
+                            ],
+                            "forest_call_count": forest_call_count,
+                            "owner_granted": owner is journal,
+                            "shared_value": shared.value,
+                            "warning_count": len(matching_warnings),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertEqual(outcome["warning_count"], 1)
+        self.assertEqual(outcome["callback_count"], 0)
+        self.assertIsNone(outcome["fired_on_forest_call"])
+        self.assertEqual(outcome["shared_value"], "original")
+        self.assertFalse(outcome["owner_granted"])
+
+    def test_phase2_owner_second_field_descriptor_cannot_mutate_first_candidate(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import json
+            import sys
+            import tempfile
+            from dataclasses import Field
+            from datetime import date, datetime, timezone
+            from pathlib import Path
+            from types import MemberDescriptorType
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import Journal, Phase2FeeScheduleSource
+            from tests.integration.test_phase2_gate import (
+                Phase2JournalSourceContractTests as Contract,
+            )
+
+
+            def fee_source(ordinal):
+                return Phase2FeeScheduleSource(
+                    row_id=ordinal,
+                    schedule_id=f"schedule-{ordinal}",
+                    effective_session=date(2026, 8, ordinal),
+                    reviewed_at=datetime(
+                        2026,
+                        8,
+                        ordinal,
+                        12,
+                        tzinfo=timezone.utc,
+                    ),
+                    currency="USD",
+                    contract_multiplier=100,
+                    entry_fee_per_contract_micros=1,
+                    exit_fee_per_contract_micros=2,
+                    close_fee_reserve_per_contract_micros=3,
+                    source_sha256=str(ordinal) * 64,
+                    schedule_digest=str(ordinal + 2) * 64,
+                    reviewed_bytes=f"schedule-{ordinal}".encode(),
+                    archived_at=datetime(
+                        2026,
+                        8,
+                        ordinal,
+                        13,
+                        tzinfo=timezone.utc,
+                    ),
+                    row_references=(),
+                    source_digest=str(ordinal + 4) * 64,
+                )
+
+
+            sources = (fee_source(1), fee_source(2))
+            expected = tuple(
+                journal_module._phase2_source_fingerprint(source)
+                for source in sources
+            )
+            target_field = Phase2FeeScheduleSource.__dataclass_fields__[
+                "currency"
+            ]
+            field_type = type(target_field)
+            if field_type is not Field:
+                raise AssertionError("target metadata is not an exact Field")
+            original_compare = type.__getattribute__(field_type, "compare")
+            if type(original_compare) is not MemberDescriptorType:
+                raise AssertionError("Field.compare is not a member descriptor")
+
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "factory_call_count": 0,
+                "fired_on_factory_call": None,
+            }
+
+
+            class CallbackCompare:
+                def __get__(self, instance, owner=None):
+                    if instance is None:
+                        return self
+                    if attack_state["armed"] and instance is target_field:
+                        attack_state["callback_count"] += 1
+                        if attack_state["fired_on_factory_call"] is None:
+                            attack_state["fired_on_factory_call"] = (
+                                attack_state["factory_call_count"]
+                            )
+                            object.__setattr__(
+                                sources[0],
+                                "currency",
+                                "EUR",
+                            )
+                    return MemberDescriptorType.__get__(
+                        original_compare,
+                        instance,
+                        field_type,
+                    )
+
+
+            def factory_for(source):
+                def fingerprint():
+                    attack_state["factory_call_count"] += 1
+                    attack_state["armed"] = (
+                        attack_state["factory_call_count"] == 2
+                    )
+                    try:
+                        return journal_module._phase2_source_fingerprint(source)
+                    finally:
+                        attack_state["armed"] = False
+
+                return fingerprint
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    Contract._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory_for(source),
+                    )
+                    for source, fingerprint in zip(
+                        sources,
+                        expected,
+                        strict=True,
+                    )
+                )
+                setattr(field_type, "compare", CallbackCompare())
+                try:
+                    owner = (
+                        journal_module
+                        ._current_journal_source_authority_owner(candidates)
+                    )
+                finally:
+                    setattr(field_type, "compare", original_compare)
+
+                print(
+                    json.dumps(
+                        {
+                            **attack_state,
+                            "first_currency": sources[0].currency,
+                            "owner_granted": owner is journal,
+                            "source_types_exact": all(
+                                type(source) is Phase2FeeScheduleSource
+                                for source in sources
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertTrue(outcome["source_types_exact"])
+        self.assertEqual(outcome["callback_count"], 0)
+        self.assertIsNone(outcome["fired_on_factory_call"])
+        self.assertEqual(outcome["first_currency"], "USD")
+        self.assertTrue(outcome["owner_granted"])
+
+    def test_phase2_owner_decimal_tuple_descriptor_cannot_mutate_first_candidate(
+        self,
+    ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            r"""
+            import json
+            import sys
+            import tempfile
+            from datetime import date, datetime, timezone
+            from decimal import Decimal
+            from pathlib import Path
+
+            sys.path.insert(0, "src")
+
+            from stock_monitor import journal as journal_module
+            from stock_monitor.journal import (
+                Journal,
+                Phase2OptionChainFactSource,
+            )
+            from tests.integration.test_phase2_gate import (
+                Phase2JournalSourceContractTests as Contract,
+            )
+
+
+            snapshot_field = (
+                Phase2OptionChainFactSource.__dataclass_fields__["snapshot"]
+            )
+            if snapshot_field.compare is not False:
+                raise AssertionError("snapshot is not compare-false")
+
+
+            def option_fact(ordinal):
+                return Phase2OptionChainFactSource(
+                    row_id=ordinal,
+                    snapshot_id=f"snapshot-{ordinal}",
+                    authorization_id=f"authorization-{ordinal}",
+                    chain_set_id=f"chain-{ordinal}",
+                    occ_symbol=f"AAPL26090{ordinal}C00100000",
+                    underlying="AAPL",
+                    expiration=date(2026, 9, 18),
+                    strike_micros=100_000_000,
+                    delta_micros=500_000,
+                    bid_micros=1_000_000,
+                    ask_micros=1_100_000,
+                    daily_volume=100,
+                    source_observation_row_id=ordinal,
+                    external_source_observation_id=f"observation-{ordinal}",
+                    fetch_page_ordinal=1,
+                    source_item_ordinal=ordinal,
+                    source_item_path=f"$.options[{ordinal}]",
+                    payload_sha256=str(ordinal) * 64,
+                    provider_fact_digest=str(ordinal + 2) * 64,
+                    observed_at=datetime(
+                        2026,
+                        8,
+                        ordinal,
+                        12,
+                        tzinfo=timezone.utc,
+                    ),
+                    received_at=datetime(
+                        2026,
+                        8,
+                        ordinal,
+                        12,
+                        1,
+                        tzinfo=timezone.utc,
+                    ),
+                    snapshot=Decimal(f"{ordinal}.25"),
+                    row_references=(),
+                    source_digest=str(ordinal + 4) * 64,
+                )
+
+
+            sources = (option_fact(1), option_fact(2))
+            expected = tuple(
+                journal_module._phase2_source_fingerprint(source)
+                for source in sources
+            )
+            decimal_tuple_type = type(Decimal("0").as_tuple())
+            original_exponent = type.__getattribute__(
+                decimal_tuple_type,
+                "exponent",
+            )
+            attack_state = {
+                "armed": False,
+                "callback_count": 0,
+                "factory_call_count": 0,
+                "fired_on_factory_call": None,
+            }
+
+
+            class CallbackExponent:
+                def __get__(self, instance, owner=None):
+                    if instance is None:
+                        return self
+                    if attack_state["armed"]:
+                        attack_state["callback_count"] += 1
+                        if attack_state["fired_on_factory_call"] is None:
+                            attack_state["fired_on_factory_call"] = (
+                                attack_state["factory_call_count"]
+                            )
+                            object.__setattr__(
+                                sources[0],
+                                "underlying",
+                                "MSFT",
+                            )
+                    return tuple.__getitem__(instance, 2)
+
+
+            def factory_for(source):
+                def fingerprint():
+                    attack_state["factory_call_count"] += 1
+                    attack_state["armed"] = (
+                        attack_state["factory_call_count"] == 2
+                    )
+                    try:
+                        return journal_module._phase2_source_fingerprint(source)
+                    finally:
+                        attack_state["armed"] = False
+
+                return fingerprint
+
+
+            with tempfile.TemporaryDirectory() as directory, Journal.open(
+                Path(directory) / "journal.sqlite3"
+            ) as journal:
+                registry = {}
+                candidates = tuple(
+                    Contract._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory_for(source),
+                    )
+                    for source, fingerprint in zip(
+                        sources,
+                        expected,
+                        strict=True,
+                    )
+                )
+                setattr(
+                    decimal_tuple_type,
+                    "exponent",
+                    CallbackExponent(),
+                )
+                try:
+                    owner = (
+                        journal_module
+                        ._current_journal_source_authority_owner(candidates)
+                    )
+                finally:
+                    setattr(
+                        decimal_tuple_type,
+                        "exponent",
+                        original_exponent,
+                    )
+
+                print(
+                    json.dumps(
+                        {
+                            **attack_state,
+                            "first_underlying": sources[0].underlying,
+                            "owner_granted": owner is journal,
+                            "source_types_exact": all(
+                                type(source) is Phase2OptionChainFactSource
+                                for source in sources
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", "-W", "error", "-c", program],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        outcome = json.loads(completed.stdout)
+        self.assertTrue(outcome["source_types_exact"])
+        self.assertEqual(outcome["callback_count"], 0)
+        self.assertIsNone(outcome["fired_on_factory_call"])
+        self.assertEqual(outcome["first_underlying"], "AAPL")
+        self.assertTrue(outcome["owner_granted"])
+
+    def test_owner_batch_routes_non_phase1_candidates_through_legacy_factory(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class Phase1Root:
+            ordinal: int
+            child: object
+
+        class LegacySource:
+            pass
+
+        shared = ("shared",)
+        phase1_sources = tuple(
+            Phase1Root(ordinal, shared) for ordinal in range(4)
+        )
+        phase1_expected = tuple(
+            journal_module._phase1_source_fingerprint(source)
+            for source in phase1_sources
+        )
+        phase1_factories = tuple(
+            self._required_phase1_fingerprint_factory(source)
+            for source in phase1_sources
+        )
+        legacy_source = LegacySource()
+        legacy_expected = ("legacy", "fingerprint")
+        legacy_factory = mock.Mock(return_value=legacy_expected)
+        original_forest = self._required_phase1_fingerprint_forest()
+
+        with tempfile.TemporaryDirectory() as directory, Journal.open(
+            Path(directory) / "journal.sqlite3"
+        ) as journal:
+            registry: journal_module._JournalSourceRegistry = {}
+            candidates = tuple(
+                self._synthetic_authority_candidate(
+                    journal,
+                    registry,
+                    source,
+                    fingerprint,
+                    factory,
+                )
+                for source, fingerprint, factory in zip(
+                    phase1_sources,
+                    phase1_expected,
+                    phase1_factories,
+                    strict=True,
+                )
+            ) + (
+                self._synthetic_authority_candidate(
+                    journal,
+                    registry,
+                    legacy_source,
+                    legacy_expected,
+                    legacy_factory,
+                ),
+            )
+            with mock.patch.object(
+                journal_module,
+                "_phase1_source_fingerprint_forest",
+                wraps=original_forest,
+            ) as forest:
+                owner = journal_module._current_journal_source_authority_owner(
+                    candidates
+                )
+
+        self.assertIs(owner, journal)
+        self.assertEqual(forest.call_count, 2)
+        for call in forest.call_args_list:
+            self.assertEqual(len(call.args[0]), 4)
+            self.assertTrue(
+                all(
+                    actual is expected
+                    for actual, expected in zip(
+                        call.args[0],
+                        phase1_sources,
+                        strict=True,
+                    )
+                )
+            )
+        legacy_factory.assert_called_once_with()
+
+    def test_owner_batch_rejects_malformed_or_cyclic_phase1_forests(
+        self,
+    ) -> None:
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class ValidRoot:
+            value: str
+
+        @dataclass(frozen=True, slots=True, weakref_slot=True)
+        class CyclicRoot:
+            child: object
+
+        class MalformedRoot:
+            pass
+
+        valid_roots = tuple(
+            ValidRoot(f"valid-{ordinal}") for ordinal in range(3)
+        )
+        valid_expected = tuple(
+            journal_module._phase1_source_fingerprint(valid)
+            for valid in valid_roots
+        )
+        cyclic = CyclicRoot(None)
+        object.__setattr__(cyclic, "child", cyclic)
+
+        for case, invalid in (
+            ("malformed", MalformedRoot()),
+            ("cyclic", cyclic),
+        ):
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as directory,
+                Journal.open(Path(directory) / "journal.sqlite3") as journal,
+            ):
+                registry: journal_module._JournalSourceRegistry = {}
+                invalid_expected = journal_module._phase1_source_fingerprint(
+                    ("placeholder", case)
+                )
+                roots = (*valid_roots, invalid)
+                expected = (*valid_expected, invalid_expected)
+                factories = tuple(
+                    self._required_phase1_fingerprint_factory(root)
+                    for root in roots
+                )
+                candidates = tuple(
+                    self._synthetic_authority_candidate(
+                        journal,
+                        registry,
+                        source,
+                        fingerprint,
+                        factory,
+                    )
+                    for source, fingerprint, factory in zip(
+                        roots,
+                        expected,
+                        factories,
+                        strict=True,
+                    )
+                )
+                original_forest = self._required_phase1_fingerprint_forest()
+                with mock.patch.object(
+                    journal_module,
+                    "_phase1_source_fingerprint_forest",
+                    wraps=original_forest,
+                ) as forest:
+                    owner = (
+                        journal_module._current_journal_source_authority_owner(
+                            candidates
+                        )
+                    )
+
+                self.assertIsNone(owner)
+                self.assertEqual(forest.call_count, 1)
+                called_roots = forest.call_args.args[0]
+                self.assertEqual(len(called_roots), 4)
+                self.assertTrue(
+                    all(
+                        actual is expected_root
+                        for actual, expected_root in zip(
+                            called_roots,
+                            roots,
+                            strict=True,
+                        )
+                    )
+                )
 
     def test_source_merkle_seals_retain_compact_material(self) -> None:
         @dataclass(frozen=True, slots=True)
@@ -1998,6 +4026,24 @@ class Phase2JournalSourceContractTests(unittest.TestCase):
 
 
 class Phase2EventExclusionJournalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        role, pair, authority = task5_fixture_module._test_coverage_authority(
+            "AAPL",
+            "0000000000",
+        )
+        scoped_patcher = mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {role: authority},
+        )
+        clear_patcher = mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {role: frozenset({pair})},
+        )
+        scoped_patcher.start()
+        clear_patcher.start()
+        self.addCleanup(clear_patcher.stop)
+        self.addCleanup(scoped_patcher.stop)
+
     @staticmethod
     def _persist_dated_adverse_evidence(
         journal: Journal,
@@ -3116,7 +5162,7 @@ class Phase2FeeScheduleJournalTests(unittest.TestCase):
             external_path = Path(directory) / "external.sqlite3"
             with Journal.open(external_path):
                 pass
-            with sqlite3.connect(external_path) as connection:
+            with closing(sqlite3.connect(external_path)) as connection:
                 with self.assertRaises(sqlite3.DatabaseError):
                     connection.execute(statement, row)
             with Journal.open(external_path) as restarted:
@@ -3479,6 +5525,24 @@ class Phase2FeeScheduleJournalTests(unittest.TestCase):
 
 
 class Phase2WindowAuthorizationJournalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        role, pair, authority = task5_fixture_module._test_coverage_authority(
+            "AAPL",
+            "0000000000",
+        )
+        scoped_patcher = mock.patch.dict(
+            evidence_module._SCOPED_REFERENCE_AUTHORITIES,
+            {role: authority},
+        )
+        clear_patcher = mock.patch.dict(
+            evidence_module._CLEAR_COVERAGE_AUTHORITIES,
+            {role: frozenset({pair})},
+        )
+        scoped_patcher.start()
+        clear_patcher.start()
+        self.addCleanup(clear_patcher.stop)
+        self.addCleanup(scoped_patcher.stop)
+
     def test_window_genesis_material_is_exact_and_content_addressed(
         self,
     ) -> None:

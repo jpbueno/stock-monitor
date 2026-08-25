@@ -20,6 +20,14 @@ from stock_monitor.providers.http import HttpResponse, ProviderResponseError
 
 
 _ACCEPT = "application/json,application/xml,text/html,text/plain"
+_CONTACT_USER_AGENT = "Stock Monitor tests evidence-owner@example.com"
+_ALTERNATE_USER_AGENT = "Stock Monitor audit reviewer@example.net"
+_GENERIC_USER_AGENT_ERRORS = frozenset(
+    {
+        "SEC User-Agent is malformed",
+        "SEC User-Agent needs application identity and contact email",
+    }
+)
 _ALLOWED_CONTENT_TYPES = frozenset(
     {
         "application/atom+xml",
@@ -66,8 +74,13 @@ def success(
 def client_for(
     transport: SequenceTransport,
     when: object = datetime(2026, 8, 24, 14, 0, tzinfo=UTC),
+    user_agent: str = _CONTACT_USER_AGENT,
 ) -> EvidenceSourceClient:
-    return EvidenceSourceClient(transport=transport, now=lambda: when)  # type: ignore[arg-type,return-value]
+    return EvidenceSourceClient(
+        transport=transport,
+        now=lambda: when,
+        user_agent=user_agent,
+    )  # type: ignore[arg-type,return-value]
 
 
 class EvidenceSourceObservationContractTests(unittest.TestCase):
@@ -98,11 +111,17 @@ class EvidenceSourceObservationContractTests(unittest.TestCase):
             observation.body = b"changed"  # type: ignore[misc]
         self.assertFalse(hasattr(observation, "__dict__"))
 
-    def test_public_api_accepts_only_transport_clock_and_catalog_authority(self) -> None:
+    def test_public_api_requires_transport_clock_contact_identity_and_catalog_authority(
+        self,
+    ) -> None:
         constructor = inspect.signature(EvidenceSourceClient.__init__).parameters
-        self.assertEqual(tuple(constructor), ("self", "transport", "now"))
+        self.assertEqual(
+            tuple(constructor),
+            ("self", "transport", "now", "user_agent"),
+        )
         self.assertIs(constructor["transport"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIs(constructor["now"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(constructor["user_agent"].kind, inspect.Parameter.KEYWORD_ONLY)
         fetch = inspect.signature(EvidenceSourceClient.fetch).parameters
         self.assertEqual(tuple(fetch), ("self", "authority"))
         self.assertFalse(
@@ -135,7 +154,10 @@ class EvidenceSourceObservationContractTests(unittest.TestCase):
         actual_transport, policy, url, headers, options = calls[0]
         self.assertIs(actual_transport, transport)
         self.assertEqual(url, authority.requested_url)
-        self.assertEqual(headers, {"Accept": _ACCEPT})
+        self.assertEqual(
+            headers,
+            {"Accept": _ACCEPT, "User-Agent": _CONTACT_USER_AGENT},
+        )
         self.assertEqual(
             policy.allowed_hosts,
             frozenset(
@@ -153,10 +175,37 @@ class EvidenceSourceObservationContractTests(unittest.TestCase):
             [
                 (
                     authority.requested_url,
-                    {"Accept": _ACCEPT, "Accept-Encoding": "identity"},
+                    {
+                        "Accept": _ACCEPT,
+                        "Accept-Encoding": "identity",
+                        "User-Agent": _CONTACT_USER_AGENT,
+                    },
                 )
             ],
         )
+
+    def test_constructor_rejects_missing_application_or_contact_without_echoing_it(
+        self,
+    ) -> None:
+        invalid_values = (
+            "",
+            "Stock Monitor without contact",
+            "only-contact@example.com",
+            "Stock Monitor\tcontact@example.com",
+            f"Stock Monitor {'x' * 513} contact@example.com",
+            " Stock Monitor contact@example.com",
+            "Stock Monitor contact@example.com ",
+            "Stock Mönitor contact@example.com",
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as raised:
+                    client_for(SequenceTransport([success()]), user_agent=value)
+                message = str(raised.exception)
+                self.assertIn(message, _GENERIC_USER_AGENT_ERRORS)
+                if value:
+                    self.assertNotIn(value, message)
 
     def test_observation_copies_only_catalog_metadata_and_marks_page_time_unavailable(self) -> None:
         authority = EVIDENCE_AUTHORITIES[0]
@@ -229,9 +278,23 @@ class EvidenceSourceAuthorityAndResponseTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             client_for(transport).fetch(authority)
 
-        self.assertEqual(len(transport.calls), 1)
-        self.assertNotIn("redirect-canary", str(raised.exception))
-        self.assertNotIn("cursor=", str(raised.exception))
+        self.assertEqual(
+            transport.calls,
+            [
+                (
+                    authority.requested_url,
+                    {
+                        "Accept": _ACCEPT,
+                        "Accept-Encoding": "identity",
+                        "User-Agent": _CONTACT_USER_AGENT,
+                    },
+                )
+            ],
+        )
+        message = str(raised.exception)
+        self.assertNotIn("redirect-canary", message)
+        self.assertNotIn("cursor=", message)
+        self.assertNotIn(_CONTACT_USER_AGENT, message)
 
     def test_wrong_type_empty_and_oversized_responses_are_rejected(self) -> None:
         fixtures = (
@@ -288,9 +351,35 @@ class EvidenceSourceAuthorityAndResponseTests(unittest.TestCase):
         self.assertNotIn(query_canary, message)
         self.assertNotIn("cursor=", message)
         self.assertNotIn(body_canary, message)
+        self.assertNotIn(_CONTACT_USER_AGENT, message)
 
 
 class EvidenceSourceIdentityTests(unittest.TestCase):
+    def test_contact_identity_is_not_observation_identity_or_repr_material(self) -> None:
+        authority = EVIDENCE_AUTHORITIES[0]
+        body = b'{"identity":"contact-independent"}'
+        first_client = client_for(
+            SequenceTransport([success(body)]),
+            user_agent=_CONTACT_USER_AGENT,
+        )
+        second_client = client_for(
+            SequenceTransport([success(body)]),
+            user_agent=_ALTERNATE_USER_AGENT,
+        )
+
+        first = first_client.fetch(authority)
+        second = second_client.fetch(authority)
+
+        self.assertEqual(first.observation_id, second.observation_id)
+        for rendered in (
+            repr(first_client),
+            repr(second_client),
+            repr(first),
+            repr(second),
+        ):
+            self.assertNotIn(_CONTACT_USER_AGENT, rendered)
+            self.assertNotIn(_ALTERNATE_USER_AGENT, rendered)
+
     def test_identity_is_deterministic_from_normalized_utc_time_and_exact_bytes(self) -> None:
         authority = EVIDENCE_AUTHORITIES[0]
         body = b'{"identity":"exact-bytes"}\n'
@@ -372,6 +461,22 @@ class EvidenceSourceArchitectureTests(unittest.TestCase):
         self.assertEqual(
             {alias.name for alias in http_imports[0].names},
             {"EgressPolicy", "GetTransport", "get_with_redirects"},
+        )
+
+    def test_adapter_imports_only_the_shared_sec_contact_validator(self) -> None:
+        tree = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
+        sec_imports = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.level == 1
+            and node.module == "sec"
+        ]
+
+        self.assertEqual(len(sec_imports), 1)
+        self.assertEqual(
+            {alias.name for alias in sec_imports[0].names},
+            {"validate_contact_user_agent"},
         )
 
     def test_adapter_has_no_direct_network_proxy_process_browser_or_trade_surface(self) -> None:

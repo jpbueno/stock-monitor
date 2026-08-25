@@ -127,11 +127,12 @@ class ProviderCliTests(unittest.TestCase):
             proposal_path=self.home / CANARY / "proposal.json",
         )
         output = io.StringIO()
+        errors = io.StringIO()
 
         with patch.object(cli, "datetime", _FrozenDateTime), patch(
             "stock_monitor.evidence_release_workflow.prepare_evidence_proposal",
             return_value=summary,
-        ) as prepared, redirect_stdout(output):
+        ) as prepared, redirect_stdout(output), redirect_stderr(errors):
             code = cli.run(
                 ("evidence", "prepare", "--json"),
                 environ=self.environment,
@@ -158,10 +159,50 @@ class ProviderCliTests(unittest.TestCase):
         )
         self.assertTrue(callable(call["collect"]))
         self.assertTrue(callable(call["collect_sec"]))
-        combined = output.getvalue()
+        combined = output.getvalue() + errors.getvalue()
         self.assertNotIn(CANARY, combined)
         self.assertNotIn(self.environment["SEC_USER_AGENT"], combined)
         self.assertNotIn(self.environment["APCA_API_KEY_ID"], combined)
+        self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
+
+    def test_evidence_prepare_passes_declared_contact_identity_only_to_clients(
+        self,
+    ) -> None:
+        summary = EvidenceProposalSummary(
+            status="PREPARED",
+            proposal_sha256="a" * 64,
+            universe_sha256="b" * 64,
+            parent_release_sha256="c" * 64,
+            symbols=("AAPL",),
+            reason_codes=(),
+            proposal_path=self.home / "proposal.json",
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with patch.object(cli, "datetime", _FrozenDateTime), patch(
+            "stock_monitor.providers.evidence_sources.EvidenceSourceClient",
+        ) as source_type, patch(
+            "stock_monitor.evidence_release_workflow.prepare_evidence_proposal",
+            return_value=summary,
+        ) as prepared, redirect_stdout(output), redirect_stderr(errors):
+            code = cli.run(
+                ("evidence", "prepare", "--json"),
+                environ=self.environment,
+            )
+
+        self.assertEqual(code, 0)
+        source_type.assert_called_once_with(
+            transport=ANY,
+            now=ANY,
+            user_agent=self.environment["SEC_USER_AGENT"],
+        )
+        self.assertIs(
+            prepared.call_args.kwargs["collect"],
+            source_type.return_value.fetch,
+        )
+        combined = output.getvalue() + errors.getvalue()
+        self.assertNotIn(self.environment["SEC_USER_AGENT"], combined)
         self.assertNotIn(self.environment["APCA_API_SECRET_KEY"], combined)
 
     def test_evidence_prepare_blocked_preserves_safe_digest_in_one_json(self) -> None:

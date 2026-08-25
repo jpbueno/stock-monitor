@@ -14,10 +14,16 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass
+from dataclasses import (
+    _FIELD as _DATACLASS_REGULAR_FIELD,
+    dataclass,
+    field as dataclass_field,
+    fields,
+)
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
+from types import GetSetDescriptorType, MappingProxyType, MemberDescriptorType
 from typing import NamedTuple, Self
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import ReferenceType, ref
@@ -2751,6 +2757,42 @@ class _Phase2PortfolioWindowAuthority(NamedTuple):
     window_issued: object
 
 
+def _new_phase2_portfolio_window_authority(
+    portfolio_reference: ReferenceType[object],
+    window_source: Phase2WindowSource,
+    portfolio_issued: object,
+    window_issued: object,
+) -> _Phase2PortfolioWindowAuthority:
+    return tuple.__new__(
+        _Phase2PortfolioWindowAuthority,
+        (
+            portfolio_reference,
+            window_source,
+            portfolio_issued,
+            window_issued,
+        ),
+    )
+
+
+def _phase2_portfolio_window_authority_values(
+    binding: object,
+) -> tuple[ReferenceType[object], Phase2WindowSource, object, object] | None:
+    if type(binding) is not _Phase2PortfolioWindowAuthority:
+        return None
+    portfolio_reference = tuple.__getitem__(binding, 0)
+    window_source = tuple.__getitem__(binding, 1)
+    if type(portfolio_reference) is not ReferenceType or (
+        type(window_source) is not Phase2WindowSource
+    ):
+        return None
+    return (
+        portfolio_reference,
+        window_source,
+        tuple.__getitem__(binding, 2),
+        tuple.__getitem__(binding, 3),
+    )
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True)
 class Phase2UnderlyingReviewPageSource:
     """One exact raw page in a terminal 1Min SIP review cohort."""
@@ -4989,8 +5031,10 @@ _Phase1FingerprintReadCache = dict[int, tuple[object, object]]
 _SOURCE_FINGERPRINT_ROOT_DOMAIN = (
     b"stock-monitor/source-fingerprint-seal/v1"
 )
-_PHASE1_FINGERPRINT_DOMAIN = b"phase1-normal/v1"
+_PHASE1_FINGERPRINT_DOMAIN = b"phase1-normal/v2"
+_PHASE2_NORMAL_FINGERPRINT_DOMAIN = b"phase1-normal/v1"
 _PHASE2_OPAQUE_FINGERPRINT_DOMAIN = b"phase2-opaque/v1"
+_PHASE1_FINGERPRINT_FOREST_MIN_ROOTS = 4
 _MERKLE_PHASE1_NORMAL = "phase1-normal"
 _MERKLE_PHASE2_NORMAL = "phase2-normal"
 _MERKLE_OPAQUE_IDENTITY = "opaque-identity"
@@ -5009,12 +5053,30 @@ _LEDGER_PAIR_STRUCTURAL_SLOTS = (
 )
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class _SourceFingerprintSeal:
+class _SourceFingerprintSeal(NamedTuple):
     """One fixed-size Merkle root plus exact identity liveness pins."""
 
     digest: bytes
     identity_anchors: tuple[object, ...]
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+    __hash__ = object.__hash__
+
+
+def _new_source_fingerprint_seal(
+    digest: bytes,
+    identity_anchors: tuple[object, ...],
+) -> _SourceFingerprintSeal:
+    """Build one exact seal without dispatching mutable NamedTuple hooks."""
+    return tuple.__new__(
+        _SourceFingerprintSeal,
+        (digest, identity_anchors),
+    )
 
 
 def _source_fingerprint_unsigned(value: int) -> bytes:
@@ -5061,9 +5123,16 @@ def _source_fingerprint_seal(
     *,
     domain: bytes,
     root_mode: str,
+    identity_token_ordinals: bool = True,
+    canonical_anchor_order: bool = False,
 ) -> _SourceFingerprintSeal:
     """Iteratively seal one acyclic source graph without retaining its tree."""
     from .ledger import LedgerPair
+
+    if type(identity_token_ordinals) is not bool or (
+        type(canonical_anchor_order) is not bool
+    ):
+        raise TypeError("source fingerprint options are malformed")
 
     anchors: list[object] = []
     anchor_indices: dict[int, tuple[object, int]] = {}
@@ -5077,6 +5146,7 @@ def _source_fingerprint_seal(
             tuple[tuple[bytes, object, str], ...],
         ],
     ] = {}
+    schema_cache: _Phase1ForestSchemaCache = {}
 
     def anchor_token(kind: bytes, current: object) -> bytes:
         identity = id(current)
@@ -5087,79 +5157,22 @@ def _source_fingerprint_seal(
             ordinal = len(anchors)
             anchors.append(current)
             anchor_indices[identity] = (current, ordinal)
-        return _source_fingerprint_frame(
-            domain,
-            kind,
+        token_parts = (
             (
                 _source_fingerprint_unsigned(ordinal),
                 _source_fingerprint_unsigned(identity),
-            ),
+            )
+            if identity_token_ordinals
+            else (_source_fingerprint_unsigned(identity),)
         )
+        return _source_fingerprint_frame(domain, kind, token_parts)
 
-    def scalar_descriptor(
-        current: object,
-        *,
-        mode: str,
-    ) -> tuple[bytes, tuple[bytes, ...]]:
-        prefix = mode.encode("ascii")
-        current_type = type(current)
-        if current is None:
-            return prefix + b"/none", ()
-        if current_type is bool:
-            return prefix + b"/bool", (b"\x01" if current else b"\x00",)
-        if current_type is int:
-            return prefix + b"/int", (_source_fingerprint_signed(current),)
-        if current_type is str:
-            return prefix + b"/str", (current.encode("utf-8"),)
-        if current_type is bytes:
-            return prefix + b"/bytes", (bytes(current),)
-        if current_type is date:
-            return (
-                prefix + b"/date",
-                (
-                    object.__getattribute__(current, "year").to_bytes(4, "big"),
-                    object.__getattribute__(current, "month").to_bytes(1, "big"),
-                    object.__getattribute__(current, "day").to_bytes(1, "big"),
-                ),
-            )
-        if current_type is datetime:
-            return (
-                prefix + b"/datetime-anchor",
-                (anchor_token(b"datetime-anchor", current),),
-            )
-        if mode == _MERKLE_OPAQUE_STRUCTURAL and current_type is Decimal:
-            decimal_tuple = Decimal.as_tuple(current)
-            exponent = decimal_tuple.exponent
-            exponent_kind: bytes
-            exponent_value: bytes
-            if type(exponent) is int:
-                exponent_kind = b"integer"
-                exponent_value = _source_fingerprint_signed(exponent)
-            elif type(exponent) is str:
-                exponent_kind = b"special"
-                exponent_value = exponent.encode("ascii")
-            else:
-                raise TypeError("unsupported Decimal exponent")
-            return (
-                prefix + b"/decimal",
-                (
-                    b"\x01" if decimal_tuple.sign else b"\x00",
-                    bytes(decimal_tuple.digits),
-                    exponent_kind,
-                    exponent_value,
-                ),
-            )
-        if mode == _MERKLE_PHASE2_NORMAL:
-            return prefix + b"/ignored-leaf", ()
-        if mode == _MERKLE_OPAQUE_STRUCTURAL:
-            return (
-                prefix + b"/opaque-leaf-identity",
-                (
-                    anchor_token(b"type-anchor", current_type),
-                    anchor_token(b"opaque-identity-anchor", current),
-                ),
-            )
-        raise TypeError("unsupported Phase 1 source fingerprint value")
+    def static_anchor_token(
+        kind: bytes,
+        anchored: object,
+        _node_anchor_ids: list[int],
+    ) -> bytes:
+        return anchor_token(kind, anchored)
 
     def describe(
         current: object,
@@ -5169,78 +5182,14 @@ def _source_fingerprint_seal(
         tuple[bytes, ...],
         tuple[tuple[bytes, object, str], ...],
     ]:
-        current_type = type(current)
-        if mode == _MERKLE_OPAQUE_IDENTITY:
-            return (
-                b"opaque-identity/value",
-                (
-                    anchor_token(b"type-anchor", current_type),
-                    anchor_token(b"opaque-identity-anchor", current),
-                ),
-                ((b"structural", current, _MERKLE_OPAQUE_STRUCTURAL),),
-            )
-        if is_dataclass(current) and not isinstance(current, type):
-            dataclass_fields = fields(current_type)
-            children: list[tuple[bytes, object, str]] = []
-            for item in dataclass_fields:
-                item_value = object.__getattribute__(current, item.name)
-                if mode in {
-                    _MERKLE_PHASE1_NORMAL,
-                    _MERKLE_PHASE2_NORMAL,
-                }:
-                    child_mode = (
-                        mode
-                        if item.compare
-                        else _MERKLE_OPAQUE_IDENTITY
-                    )
-                else:
-                    child_mode = mode
-                children.append(
-                    (item.name.encode("utf-8"), item_value, child_mode)
-                )
-            return (
-                mode.encode("ascii") + b"/dataclass",
-                (
-                    anchor_token(b"type-anchor", current_type),
-                    _source_fingerprint_unsigned(len(children)),
-                ),
-                tuple(children),
-            )
-        if current_type is tuple:
-            return (
-                mode.encode("ascii") + b"/tuple",
-                (_source_fingerprint_unsigned(len(current)),),
-                tuple(
-                    (
-                        _source_fingerprint_unsigned(ordinal),
-                        item,
-                        mode,
-                    )
-                    for ordinal, item in enumerate(current)
-                ),
-            )
-        if (
-            mode == _MERKLE_OPAQUE_STRUCTURAL
-            and current_type is LedgerPair
-        ):
-            children = tuple(
-                (
-                    name.encode("ascii"),
-                    object.__getattribute__(current, name),
-                    _MERKLE_OPAQUE_STRUCTURAL,
-                )
-                for name in _LEDGER_PAIR_STRUCTURAL_SLOTS
-            )
-            return (
-                b"opaque-structural/ledger-pair/v1",
-                (
-                    anchor_token(b"type-anchor", current_type),
-                    _source_fingerprint_unsigned(len(children)),
-                ),
-                children,
-            )
-        tag, parts = scalar_descriptor(current, mode=mode)
-        return tag, parts, ()
+        return _phase1_forest_describe_node(
+            current,
+            mode,
+            anchor_token=static_anchor_token,
+            node_anchor_ids=[],
+            schema_cache=schema_cache,
+            ledger_pair_type=LedgerPair,
+        )
 
     root_key = (root_mode, id(value))
     stack: list[tuple[object, str, bool]] = [(value, root_mode, False)]
@@ -5290,14 +5239,681 @@ def _source_fingerprint_seal(
         or type(root_result[1]) is not bytes
     ):
         raise TypeError("source fingerprint traversal is malformed")
-    return _SourceFingerprintSeal(
-        digest=_source_fingerprint_frame(
+    identity_anchors = (
+        tuple(
+            anchor_indices[identity][0]
+            for identity in sorted(anchor_indices)
+        )
+        if canonical_anchor_order
+        else tuple(anchors)
+    )
+    return _new_source_fingerprint_seal(
+        _source_fingerprint_frame(
             domain,
             b"root/" + root_mode.encode("ascii"),
             (root_result[1],),
         ),
-        identity_anchors=tuple(anchors),
+        identity_anchors,
     )
+
+
+_PHASE1_DATACLASS_FIELD_TYPE = type(dataclass_field())
+_PHASE1_DECIMAL_TUPLE_TYPE = type(Decimal(0).as_tuple())
+_PHASE1_DECIMAL_TUPLE_MRO = type.__getattribute__(
+    _PHASE1_DECIMAL_TUPLE_TYPE,
+    "__mro__",
+)
+if type(_PHASE1_DECIMAL_TUPLE_MRO) is not tuple or not any(
+    base is tuple for base in _PHASE1_DECIMAL_TUPLE_MRO
+):
+    raise RuntimeError("Decimal tuple storage is unsafe")
+_PHASE1_DATACLASS_FIELD_NAMESPACE = type.__getattribute__(
+    _PHASE1_DATACLASS_FIELD_TYPE,
+    "__dict__",
+)
+if type(_PHASE1_DATACLASS_FIELD_NAMESPACE) is not MappingProxyType or any(
+    type(name) is not str for name in _PHASE1_DATACLASS_FIELD_NAMESPACE
+):
+    raise RuntimeError("dataclass Field metadata is unsafe")
+_PHASE1_DATACLASS_FIELD_KIND_DESCRIPTOR = (
+    _PHASE1_DATACLASS_FIELD_NAMESPACE["_field_type"]
+)
+_PHASE1_DATACLASS_FIELD_NAME_DESCRIPTOR = (
+    _PHASE1_DATACLASS_FIELD_NAMESPACE["name"]
+)
+_PHASE1_DATACLASS_FIELD_COMPARE_DESCRIPTOR = (
+    _PHASE1_DATACLASS_FIELD_NAMESPACE["compare"]
+)
+for _field_attribute, _field_descriptor in (
+    ("_field_type", _PHASE1_DATACLASS_FIELD_KIND_DESCRIPTOR),
+    ("name", _PHASE1_DATACLASS_FIELD_NAME_DESCRIPTOR),
+    ("compare", _PHASE1_DATACLASS_FIELD_COMPARE_DESCRIPTOR),
+):
+    if (
+        type(_field_descriptor) is not MemberDescriptorType
+        or object.__getattribute__(_field_descriptor, "__objclass__")
+        is not _PHASE1_DATACLASS_FIELD_TYPE
+        or object.__getattribute__(_field_descriptor, "__name__")
+        != _field_attribute
+    ):
+        raise RuntimeError("dataclass Field storage is unsafe")
+del _field_attribute, _field_descriptor
+
+_PHASE1_MEMBER_DESCRIPTOR_READ = MemberDescriptorType.__get__
+_PHASE1_INSTANCE_DICT_READ = GetSetDescriptorType.__get__
+
+
+_Phase1ForestFieldSchema = tuple[str, bytes, bool, object | None]
+_Phase1ForestDataclassSchema = tuple[
+    tuple[_Phase1ForestFieldSchema, ...],
+    object | None,
+]
+
+
+_Phase1ForestSchemaCache = dict[
+    int,
+    tuple[object, _Phase1ForestDataclassSchema | None],
+]
+_Phase1ForestAnchorToken = Callable[[bytes, object, list[int]], bytes]
+
+
+def _phase1_forest_class_namespaces(
+    current_type: type,
+) -> tuple[tuple[type, Mapping[str, object]], ...]:
+    """Read an exact class MRO without dispatching through its metaclass."""
+    class_mro = type.__getattribute__(current_type, "__mro__")
+    if (
+        type(class_mro) is not tuple
+        or not class_mro
+        or class_mro[0] is not current_type
+    ):
+        raise TypeError("Phase 1 fingerprint class metadata is malformed")
+    namespaces: list[tuple[type, Mapping[str, object]]] = []
+    for base in class_mro:
+        if not isinstance(base, type):
+            raise TypeError("Phase 1 fingerprint class metadata is malformed")
+        namespace = type.__getattribute__(base, "__dict__")
+        if type(namespace) is not MappingProxyType or any(
+            type(name) is not str for name in namespace
+        ):
+            raise TypeError("Phase 1 fingerprint class metadata is malformed")
+        namespaces.append((base, namespace))
+    return tuple(namespaces)
+
+
+def _phase1_forest_value_is_descriptor(value: object) -> bool:
+    """Detect descriptor protocol statically without touching the value."""
+    value_type = type(value)
+    for _base, namespace in _phase1_forest_class_namespaces(value_type):
+        if any(
+            attribute in namespace
+            for attribute in ("__get__", "__set__", "__delete__")
+        ):
+            return True
+    return False
+
+
+def _phase1_forest_static_dataclass_schema(
+    current_type: type,
+    schema_cache: _Phase1ForestSchemaCache,
+) -> _Phase1ForestDataclassSchema | None:
+    """Resolve safe dataclass field readers from static class metadata."""
+    identity = id(current_type)
+    cached = schema_cache.get(identity)
+    if cached is not None:
+        if cached[0] is not current_type:
+            raise TypeError("Phase 1 fingerprint class identity is malformed")
+        return cached[1]
+
+    namespaces = _phase1_forest_class_namespaces(current_type)
+    dataclass_fields: object | None = None
+    for _base, namespace in namespaces:
+        if "__dataclass_fields__" in namespace:
+            dataclass_fields = namespace["__dataclass_fields__"]
+            break
+    if dataclass_fields is None:
+        schema_cache[identity] = (current_type, None)
+        return None
+    if type(dataclass_fields) is not dict:
+        raise TypeError("Phase 1 dataclass metadata is malformed")
+
+    field_schemas: list[_Phase1ForestFieldSchema] = []
+    needs_instance_dict = False
+    for field_name, field_definition in tuple(
+        dict.items(dataclass_fields)
+    ):
+        if type(field_name) is not str or (
+            type(field_definition) is not _PHASE1_DATACLASS_FIELD_TYPE
+        ):
+            raise TypeError("Phase 1 dataclass metadata is malformed")
+        if _PHASE1_MEMBER_DESCRIPTOR_READ(
+            _PHASE1_DATACLASS_FIELD_KIND_DESCRIPTOR,
+            field_definition,
+            _PHASE1_DATACLASS_FIELD_TYPE,
+        ) is not _DATACLASS_REGULAR_FIELD:
+            continue
+        metadata_name = _PHASE1_MEMBER_DESCRIPTOR_READ(
+            _PHASE1_DATACLASS_FIELD_NAME_DESCRIPTOR,
+            field_definition,
+            _PHASE1_DATACLASS_FIELD_TYPE,
+        )
+        compare = _PHASE1_MEMBER_DESCRIPTOR_READ(
+            _PHASE1_DATACLASS_FIELD_COMPARE_DESCRIPTOR,
+            field_definition,
+            _PHASE1_DATACLASS_FIELD_TYPE,
+        )
+        if (
+            type(metadata_name) is not str
+            or metadata_name != field_name
+            or type(compare) is not bool
+        ):
+            raise TypeError("Phase 1 dataclass metadata is malformed")
+
+        class_value: object | None = None
+        class_value_found = False
+        for _base, namespace in namespaces:
+            if field_name in namespace:
+                class_value = namespace[field_name]
+                class_value_found = True
+                break
+        descriptor: object | None = None
+        if class_value_found and type(class_value) is MemberDescriptorType:
+            descriptor_owner = object.__getattribute__(
+                class_value,
+                "__objclass__",
+            )
+            descriptor_name = object.__getattribute__(
+                class_value,
+                "__name__",
+            )
+            if (
+                not any(
+                    descriptor_owner is base for base, _namespace in namespaces
+                )
+                or type(descriptor_name) is not str
+                or descriptor_name != field_name
+            ):
+                raise TypeError("Phase 1 dataclass storage is malformed")
+            descriptor = class_value
+        else:
+            if class_value_found and _phase1_forest_value_is_descriptor(
+                class_value
+            ):
+                raise TypeError("Phase 1 dataclass storage is unsafe")
+            needs_instance_dict = True
+        field_schemas.append(
+            (
+                field_name,
+                field_name.encode("utf-8"),
+                compare,
+                descriptor,
+            )
+        )
+
+    instance_dict_descriptor: object | None = None
+    if needs_instance_dict:
+        for base, namespace in namespaces:
+            if "__dict__" not in namespace:
+                continue
+            candidate = namespace["__dict__"]
+            if type(candidate) is not GetSetDescriptorType:
+                raise TypeError("Phase 1 dataclass storage is unsafe")
+            descriptor_owner = object.__getattribute__(
+                candidate,
+                "__objclass__",
+            )
+            if descriptor_owner is not base:
+                raise TypeError("Phase 1 dataclass storage is malformed")
+            instance_dict_descriptor = candidate
+            break
+        if instance_dict_descriptor is None:
+            raise TypeError("Phase 1 dataclass storage is malformed")
+
+    schema = (tuple(field_schemas), instance_dict_descriptor)
+    schema_cache[identity] = (current_type, schema)
+    return schema
+
+
+def _phase1_forest_describe_node(
+    current: object,
+    mode: str,
+    *,
+    anchor_token: _Phase1ForestAnchorToken,
+    node_anchor_ids: list[int],
+    schema_cache: _Phase1ForestSchemaCache,
+    ledger_pair_type: type,
+) -> tuple[
+    bytes,
+    tuple[bytes, ...],
+    tuple[tuple[bytes, object, str], ...],
+]:
+    """Describe one Phase 1 node without invoking user-defined hooks."""
+    current_type = type(current)
+    if mode == _MERKLE_OPAQUE_IDENTITY:
+        return (
+            b"opaque-identity/value",
+            (
+                anchor_token(
+                    b"type-anchor",
+                    current_type,
+                    node_anchor_ids,
+                ),
+                anchor_token(
+                    b"opaque-identity-anchor",
+                    current,
+                    node_anchor_ids,
+                ),
+            ),
+            ((b"structural", current, _MERKLE_OPAQUE_STRUCTURAL),),
+        )
+
+    dataclass_schema = (
+        None
+        if isinstance(current, type)
+        else _phase1_forest_static_dataclass_schema(
+            current_type,
+            schema_cache,
+        )
+    )
+    if dataclass_schema is not None:
+        if type(dataclass_schema) is not tuple or len(dataclass_schema) != 2:
+            raise TypeError("Phase 1 dataclass schema is malformed")
+        field_schemas = tuple.__getitem__(dataclass_schema, 0)
+        if type(field_schemas) is not tuple:
+            raise TypeError("Phase 1 dataclass schema is malformed")
+        instance_values: dict[str, object] | None = None
+        instance_dict_descriptor = tuple.__getitem__(dataclass_schema, 1)
+        if instance_dict_descriptor is not None:
+            candidate_values = _PHASE1_INSTANCE_DICT_READ(
+                instance_dict_descriptor,
+                current,
+                current_type,
+            )
+            if type(candidate_values) is not dict:
+                raise TypeError("Phase 1 dataclass storage is malformed")
+            if any(type(name) is not str for name in candidate_values):
+                raise TypeError("Phase 1 dataclass storage is unsafe")
+            instance_values = candidate_values
+        children: list[tuple[bytes, object, str]] = []
+        for item in field_schemas:
+            if type(item) is not tuple or len(item) != 4:
+                raise TypeError("Phase 1 dataclass schema is malformed")
+            item_name = tuple.__getitem__(item, 0)
+            item_label = tuple.__getitem__(item, 1)
+            item_compare = tuple.__getitem__(item, 2)
+            descriptor = tuple.__getitem__(item, 3)
+            if (
+                type(item_name) is not str
+                or type(item_label) is not bytes
+                or type(item_compare) is not bool
+            ):
+                raise TypeError("Phase 1 dataclass schema is malformed")
+            if descriptor is None:
+                if instance_values is None:
+                    raise TypeError("Phase 1 dataclass storage is malformed")
+                try:
+                    item_value = dict.__getitem__(instance_values, item_name)
+                except KeyError:
+                    raise TypeError(
+                        "Phase 1 dataclass storage is malformed"
+                    ) from None
+            else:
+                item_value = _PHASE1_MEMBER_DESCRIPTOR_READ(
+                    descriptor,
+                    current,
+                    current_type,
+                )
+            if mode in {
+                _MERKLE_PHASE1_NORMAL,
+                _MERKLE_PHASE2_NORMAL,
+            }:
+                child_mode = (
+                    mode if item_compare else _MERKLE_OPAQUE_IDENTITY
+                )
+            else:
+                child_mode = mode
+            children.append((item_label, item_value, child_mode))
+        return (
+            mode.encode("ascii") + b"/dataclass",
+            (
+                anchor_token(
+                    b"type-anchor",
+                    current_type,
+                    node_anchor_ids,
+                ),
+                _source_fingerprint_unsigned(len(children)),
+            ),
+            tuple(children),
+        )
+
+    if current_type is tuple:
+        return (
+            mode.encode("ascii") + b"/tuple",
+            (_source_fingerprint_unsigned(len(current)),),
+            tuple(
+                (
+                    _source_fingerprint_unsigned(ordinal),
+                    item,
+                    mode,
+                )
+                for ordinal, item in enumerate(current)
+            ),
+        )
+    if mode == _MERKLE_OPAQUE_STRUCTURAL and current_type is ledger_pair_type:
+        namespace = type.__getattribute__(ledger_pair_type, "__dict__")
+        if type(namespace) is not MappingProxyType:
+            raise TypeError("Phase 1 LedgerPair metadata is malformed")
+        children: list[tuple[bytes, object, str]] = []
+        for name in _LEDGER_PAIR_STRUCTURAL_SLOTS:
+            descriptor = namespace[name]
+            if type(descriptor) is not MemberDescriptorType:
+                raise TypeError("Phase 1 LedgerPair storage is malformed")
+            children.append(
+                (
+                    name.encode("ascii"),
+                    _PHASE1_MEMBER_DESCRIPTOR_READ(
+                        descriptor,
+                        current,
+                        ledger_pair_type,
+                    ),
+                    _MERKLE_OPAQUE_STRUCTURAL,
+                )
+            )
+        return (
+            b"opaque-structural/ledger-pair/v1",
+            (
+                anchor_token(
+                    b"type-anchor",
+                    current_type,
+                    node_anchor_ids,
+                ),
+                _source_fingerprint_unsigned(len(children)),
+            ),
+            tuple(children),
+        )
+
+    prefix = mode.encode("ascii")
+    if current is None:
+        return prefix + b"/none", (), ()
+    if current_type is bool:
+        return prefix + b"/bool", (b"\x01" if current else b"\x00",), ()
+    if current_type is int:
+        return prefix + b"/int", (_source_fingerprint_signed(current),), ()
+    if current_type is str:
+        return prefix + b"/str", (current.encode("utf-8"),), ()
+    if current_type is bytes:
+        return prefix + b"/bytes", (bytes(current),), ()
+    if current_type is date:
+        return (
+            prefix + b"/date",
+            (
+                object.__getattribute__(current, "year").to_bytes(4, "big"),
+                object.__getattribute__(current, "month").to_bytes(1, "big"),
+                object.__getattribute__(current, "day").to_bytes(1, "big"),
+            ),
+            (),
+        )
+    if current_type is datetime:
+        return (
+            prefix + b"/datetime-anchor",
+            (
+                anchor_token(
+                    b"datetime-anchor",
+                    current,
+                    node_anchor_ids,
+                ),
+            ),
+            (),
+        )
+    if mode == _MERKLE_OPAQUE_STRUCTURAL and current_type is Decimal:
+        decimal_tuple = Decimal.as_tuple(current)
+        if type(decimal_tuple) is not _PHASE1_DECIMAL_TUPLE_TYPE or (
+            tuple.__len__(decimal_tuple) != 3
+        ):
+            raise TypeError("Decimal tuple storage is malformed")
+        sign = tuple.__getitem__(decimal_tuple, 0)
+        digits = tuple.__getitem__(decimal_tuple, 1)
+        exponent = tuple.__getitem__(decimal_tuple, 2)
+        if (
+            type(sign) is not int
+            or sign not in (0, 1)
+            or type(digits) is not tuple
+            or any(
+                type(digit) is not int or digit < 0 or digit > 9
+                for digit in digits
+            )
+        ):
+            raise TypeError("Decimal tuple storage is malformed")
+        exponent_kind: bytes
+        exponent_value: bytes
+        if type(exponent) is int:
+            exponent_kind = b"integer"
+            exponent_value = _source_fingerprint_signed(exponent)
+        elif type(exponent) is str:
+            exponent_kind = b"special"
+            exponent_value = exponent.encode("ascii")
+        else:
+            raise TypeError("unsupported Decimal exponent")
+        return (
+            prefix + b"/decimal",
+            (
+                b"\x01" if sign else b"\x00",
+                bytes(digits),
+                exponent_kind,
+                exponent_value,
+            ),
+            (),
+        )
+    if mode == _MERKLE_PHASE2_NORMAL:
+        return prefix + b"/ignored-leaf", (), ()
+    if mode == _MERKLE_OPAQUE_STRUCTURAL:
+        return (
+            prefix + b"/opaque-leaf-identity",
+            (
+                anchor_token(
+                    b"type-anchor",
+                    current_type,
+                    node_anchor_ids,
+                ),
+                anchor_token(
+                    b"opaque-identity-anchor",
+                    current,
+                    node_anchor_ids,
+                ),
+            ),
+            (),
+        )
+    raise TypeError("unsupported Phase 1 source fingerprint value")
+
+
+def _phase1_source_fingerprint_forest(
+    roots: tuple[object, ...],
+) -> tuple[_SourceFingerprintSeal, ...]:
+    """Seal Phase 1 roots with one invocation-local shared graph walk."""
+    from .ledger import LedgerPair
+
+    if type(roots) is not tuple:
+        raise TypeError("Phase 1 fingerprint roots are malformed")
+
+    anchor_objects: dict[int, object] = {}
+    memo: dict[tuple[str, int], tuple[object, object]] = {}
+    descriptors: dict[
+        tuple[str, int],
+        tuple[
+            object,
+            bytes,
+            tuple[bytes, ...],
+            tuple[tuple[bytes, object, str], ...],
+        ],
+    ] = {}
+    edges: dict[tuple[str, int], tuple[tuple[str, int], ...]] = {}
+    direct_anchor_ids: dict[tuple[str, int], tuple[int, ...]] = {}
+    completed_order: list[tuple[str, int]] = []
+    schema_cache: _Phase1ForestSchemaCache = {}
+
+    def anchor_token(
+        kind: bytes,
+        current: object,
+        node_anchor_ids: list[int],
+    ) -> bytes:
+        identity = id(current)
+        if identity in anchor_objects:
+            if anchor_objects[identity] is not current:
+                raise TypeError("source fingerprint identity is malformed")
+        else:
+            anchor_objects[identity] = current
+        node_anchor_ids.append(identity)
+        return _source_fingerprint_frame(
+            _PHASE1_FINGERPRINT_DOMAIN,
+            kind,
+            (_source_fingerprint_unsigned(identity),),
+        )
+
+    root_keys: list[tuple[str, int]] = []
+    for root in roots:
+        root_key = (_MERKLE_PHASE1_NORMAL, id(root))
+        root_keys.append(root_key)
+        stack: list[tuple[object, str, bool]] = [
+            (root, _MERKLE_PHASE1_NORMAL, False)
+        ]
+        while stack:
+            current, mode, expanded = stack.pop()
+            key = (mode, id(current))
+            cached = memo.get(key)
+            if not expanded:
+                if cached is not None:
+                    if cached[0] is not current:
+                        raise TypeError(
+                            "source fingerprint identity is malformed"
+                        )
+                    if cached[1] is _FINGERPRINT_ACTIVE:
+                        raise TypeError("cyclic source fingerprint graph")
+                    continue
+                memo[key] = (current, _FINGERPRINT_ACTIVE)
+                node_anchor_ids: list[int] = []
+                try:
+                    tag, static_parts, children = (
+                        _phase1_forest_describe_node(
+                            current,
+                            mode,
+                            anchor_token=anchor_token,
+                            node_anchor_ids=node_anchor_ids,
+                            schema_cache=schema_cache,
+                            ledger_pair_type=LedgerPair,
+                        )
+                    )
+                except BaseException:
+                    memo.pop(key, None)
+                    raise
+                descriptors[key] = (
+                    current,
+                    tag,
+                    static_parts,
+                    children,
+                )
+                direct_anchor_ids[key] = tuple(node_anchor_ids)
+                edges[key] = tuple(
+                    (child_mode, id(child))
+                    for _label, child, child_mode in children
+                )
+                stack.append((current, mode, True))
+                for _label, child, child_mode in reversed(children):
+                    stack.append((child, child_mode, False))
+                continue
+
+            descriptor = descriptors.pop(key, None)
+            if descriptor is None or descriptor[0] is not current:
+                raise TypeError("source fingerprint traversal is malformed")
+            _retained, tag, static_parts, children = descriptor
+            parts = list(static_parts)
+            for label, child, child_mode in children:
+                child_result = memo.get((child_mode, id(child)))
+                if (
+                    child_result is None
+                    or child_result[0] is not child
+                    or child_result[1] is _FINGERPRINT_ACTIVE
+                    or type(child_result[1]) is not bytes
+                ):
+                    raise TypeError(
+                        "source fingerprint traversal is malformed"
+                    )
+                parts.extend((label, child_result[1]))
+            digest = _source_fingerprint_frame(
+                _PHASE1_FINGERPRINT_DOMAIN,
+                tag,
+                tuple(parts),
+            )
+            memo[key] = (current, digest)
+            completed_order.append(key)
+
+    if descriptors:
+        raise TypeError("source fingerprint traversal is malformed")
+
+    root_reachability: dict[tuple[str, int], int] = {}
+    for ordinal, (root, root_key) in enumerate(
+        zip(roots, root_keys, strict=True)
+    ):
+        root_result = memo.get(root_key)
+        if (
+            root_result is None
+            or root_result[0] is not root
+            or type(root_result[1]) is not bytes
+        ):
+            raise TypeError("source fingerprint traversal is malformed")
+        root_reachability[root_key] = (
+            root_reachability.get(root_key, 0) | (1 << ordinal)
+        )
+
+    anchor_reachability: dict[int, int] = {}
+    for key in reversed(completed_order):
+        root_bits = root_reachability.get(key, 0)
+        if not root_bits:
+            raise TypeError("source fingerprint traversal is malformed")
+        for identity in direct_anchor_ids.get(key, ()):
+            anchor_reachability[identity] = (
+                anchor_reachability.get(identity, 0) | root_bits
+            )
+        for child_key in edges.get(key, ()):
+            child_result = memo.get(child_key)
+            if (
+                child_result is None
+                or child_result[1] is _FINGERPRINT_ACTIVE
+                or type(child_result[1]) is not bytes
+            ):
+                raise TypeError("source fingerprint traversal is malformed")
+            root_reachability[child_key] = (
+                root_reachability.get(child_key, 0) | root_bits
+            )
+
+    ordered_anchor_ids = tuple(sorted(anchor_reachability))
+    seals: list[_SourceFingerprintSeal] = []
+    for ordinal, (root, root_key) in enumerate(
+        zip(roots, root_keys, strict=True)
+    ):
+        root_result = memo.get(root_key)
+        if (
+            root_result is None
+            or root_result[0] is not root
+            or type(root_result[1]) is not bytes
+        ):
+            raise TypeError("source fingerprint traversal is malformed")
+        root_bit = 1 << ordinal
+        anchors = tuple(
+            anchor_objects[identity]
+            for identity in ordered_anchor_ids
+            if anchor_reachability[identity] & root_bit
+        )
+        seals.append(
+            _new_source_fingerprint_seal(
+                _source_fingerprint_frame(
+                    _PHASE1_FINGERPRINT_DOMAIN,
+                    b"root/" + _MERKLE_PHASE1_NORMAL.encode("ascii"),
+                    (root_result[1],),
+                ),
+                anchors,
+            )
+        )
+    return tuple(seals)
 
 
 def _phase1_fingerprint_value(
@@ -5313,6 +5929,8 @@ def _phase1_fingerprint_value(
         value,
         domain=_PHASE1_FINGERPRINT_DOMAIN,
         root_mode=_MERKLE_PHASE1_NORMAL,
+        identity_token_ordinals=False,
+        canonical_anchor_order=True,
     )
 
 
@@ -5327,6 +5945,15 @@ def _phase1_source_fingerprint(
         source,
         read_cache=read_cache,
     )
+
+
+class _Phase1SourceFingerprintFactory(NamedTuple):
+    """Immutable marker for a batchable exact Phase 1 fingerprint root."""
+
+    source: object
+
+    def __call__(self) -> _SourceFingerprintSeal:
+        return _phase1_source_fingerprint(self.source)
 
 
 def _phase2_opaque_identity_fingerprint(
@@ -5345,7 +5972,11 @@ def _phase2_source_fingerprint(
 ) -> tuple[_SourceFingerprintSeal, _SourceFingerprintSeal]:
     """Fingerprint all durable fields plus identities of issued opaque inputs."""
     return (
-        _phase1_source_fingerprint(source),
+        _source_fingerprint_seal(
+            source,
+            domain=_PHASE2_NORMAL_FINGERPRINT_DOMAIN,
+            root_mode=_MERKLE_PHASE1_NORMAL,
+        ),
         _phase2_opaque_identity_fingerprint(source),
     )
 
@@ -5359,10 +5990,10 @@ def _source_fingerprint_seals_equal(
         type(right) is not _SourceFingerprintSeal
     ):
         return False
-    left_digest = object.__getattribute__(left, "digest")
-    right_digest = object.__getattribute__(right, "digest")
-    left_anchors = object.__getattribute__(left, "identity_anchors")
-    right_anchors = object.__getattribute__(right, "identity_anchors")
+    left_digest = tuple.__getitem__(left, 0)
+    right_digest = tuple.__getitem__(right, 0)
+    left_anchors = tuple.__getitem__(left, 1)
+    right_anchors = tuple.__getitem__(right, 1)
     if (
         type(left_digest) is not bytes
         or type(right_digest) is not bytes
@@ -6341,17 +6972,10 @@ def _current_journal_source_authority_owner(
         return None
 
     # From this point through the return there must be no SQL or currentness
-    # callback.  Every source retains its own exact seal; no parent source may
-    # confer transitive authority on a detached child identity.
-    for candidate in unique:
-        expected_fingerprint = candidate[5]
-        try:
-            fingerprint = candidate[6]()
-        except Exception:
-            return None
-        if not _fingerprints_equal(expected_fingerprint, fingerprint):
-            return None
-        with _JOURNAL_SOURCE_LOCK:
+    # callback.  Precheck every registry identity before invoking a legacy
+    # fingerprint factory or walking any Phase 1 source graph.
+    with _JOURNAL_SOURCE_LOCK:
+        for candidate in unique:
             registry, source = candidate[0], candidate[1]
             issued = registry.get(id(source))
             if (
@@ -6363,11 +6987,98 @@ def _current_journal_source_authority_owner(
                 or issued[1] is not candidate[5]
             ):
                 return None
+
+    phase1_candidates: list[_JournalAuthorityCandidate] = []
+    legacy_candidates: list[_JournalAuthorityCandidate] = []
+    for candidate in unique:
+        fingerprint_factory = candidate[6]
+        if type(fingerprint_factory) is _Phase1SourceFingerprintFactory:
+            if (
+                tuple.__getitem__(fingerprint_factory, 0) is not candidate[1]
+                or type(candidate[5]) is not _SourceFingerprintSeal
+            ):
+                return None
+            phase1_candidates.append(candidate)
+        else:
+            legacy_candidates.append(candidate)
+
+    # Run all untagged legacy factories before the final Phase 1 checks.  This
+    # preserves their behavior while ensuring no later callback can mutate a
+    # Phase 1 root after it has been sealed.
+    for candidate in legacy_candidates:
+        try:
+            fingerprint = candidate[6]()
+            matches = _fingerprints_equal(candidate[5], fingerprint)
+        except Exception:
+            return None
+        if not matches:
+            return None
         del fingerprint
 
+    if 0 < len(phase1_candidates) < _PHASE1_FINGERPRINT_FOREST_MIN_ROOTS:
+        # A one-root static walk is cheaper for the small authority checks
+        # that dominate normal readers.  Call the trusted implementation
+        # directly; even an exact factory tag has mutable class methods.
+        for candidate in phase1_candidates:
+            try:
+                fingerprint = _phase1_source_fingerprint(candidate[1])
+            except Exception:
+                return None
+            if not _source_fingerprint_seals_equal(
+                candidate[5],
+                fingerprint,
+            ):
+                return None
+            del fingerprint
+    elif phase1_candidates:
+        phase1_roots = tuple(
+            candidate[1] for candidate in phase1_candidates
+        )
+        try:
+            first_pass = _phase1_source_fingerprint_forest(phase1_roots)
+        except Exception:
+            return None
+        if (
+            type(first_pass) is not tuple
+            or len(first_pass) != len(phase1_candidates)
+            or any(
+                type(seal) is not _SourceFingerprintSeal
+                for seal in first_pass
+            )
+        ):
+            return None
+        try:
+            second_pass = _phase1_source_fingerprint_forest(phase1_roots)
+        except Exception:
+            return None
+        if (
+            type(second_pass) is not tuple
+            or len(second_pass) != len(phase1_candidates)
+            or any(
+                type(seal) is not _SourceFingerprintSeal
+                for seal in second_pass
+            )
+        ):
+            return None
+        for candidate, first_seal, second_seal in zip(
+            phase1_candidates,
+            first_pass,
+            second_pass,
+            strict=True,
+        ):
+            if (
+                not _source_fingerprint_seals_equal(first_seal, second_seal)
+                or not _source_fingerprint_seals_equal(
+                    first_seal,
+                    candidate[5],
+                )
+            ):
+                return None
+
     # Recheck all registry identities and snapshot tokens together under the
-    # lock after the streamed comparisons, without another SQL call or source
-    # fingerprint traversal.
+    # lock after all comparisons, without another SQL call or source
+    # traversal.  Every source retains its own exact seal; no parent source may
+    # confer transitive authority on a detached child identity.
     with _JOURNAL_SOURCE_LOCK:
         for candidate in unique:
             registry, source = candidate[0], candidate[1]
@@ -6393,7 +7104,7 @@ def _phase1_source_authority_candidate(
     return _registered_journal_source_authority_candidate(
         registry,
         source,
-        lambda: _phase1_source_fingerprint(source),
+        _Phase1SourceFingerprintFactory(source),
     )
 
 
@@ -6427,19 +7138,26 @@ def _phase2_source_authority_expansion(
 
     with _JOURNAL_SOURCE_LOCK:
         binding = _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(id(source))
+        binding_values = _phase2_portfolio_window_authority_values(binding)
+        if binding_values is None:
+            return None
+        (
+            portfolio_reference,
+            window_source,
+            portfolio_issued,
+            window_issued,
+        ) = binding_values
         if (
-            binding is None
-            or binding.portfolio_reference() is not source
-            or binding.portfolio_issued is not source_candidate[7]
-            or type(binding.window_source) is not Phase2WindowSource
+            portfolio_reference() is not source
+            or portfolio_issued is not source_candidate[7]
         ):
             return None
         window_candidate = _phase2_source_authority_candidate(
-            binding.window_source
+            window_source
         )
         if (
             window_candidate is None
-            or binding.window_issued is not window_candidate[7]
+            or window_issued is not window_candidate[7]
         ):
             return None
     return ((source_candidate, window_candidate), binding)
@@ -6455,17 +7173,26 @@ def _phase2_source_authority_expansion_is_current(
         return True
     if len(candidates) != 2:
         return False
+    binding_values = _phase2_portfolio_window_authority_values(binding)
+    if binding_values is None:
+        return False
+    (
+        portfolio_reference,
+        window_source,
+        portfolio_issued,
+        window_issued,
+    ) = binding_values
     with _JOURNAL_SOURCE_LOCK:
         return (
             _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(id(source)) is binding
             and _PHASE2_SOURCE_AUTHORITIES.get(id(source))
-            is binding.portfolio_issued
-            and _PHASE2_SOURCE_AUTHORITIES.get(id(binding.window_source))
-            is binding.window_issued
-            and binding.portfolio_reference() is source
-            and binding.portfolio_issued is candidates[0][7]
-            and binding.window_source is candidates[1][1]
-            and binding.window_issued is candidates[1][7]
+            is portfolio_issued
+            and _PHASE2_SOURCE_AUTHORITIES.get(id(window_source))
+            is window_issued
+            and portfolio_reference() is source
+            and portfolio_issued is candidates[0][7]
+            and window_source is candidates[1][1]
+            and window_issued is candidates[1][7]
         )
 
 
@@ -6804,7 +7531,8 @@ def phase2_portfolio_source_binds_window(
     if expansion is None:
         return False
     binding = expansion[1]
-    if binding is None or binding.window_source is not window_source:
+    binding_values = _phase2_portfolio_window_authority_values(binding)
+    if binding_values is None or binding_values[1] is not window_source:
         return False
     if _current_journal_source_authority_owner(expansion[0]) is None:
         return False
@@ -6831,10 +7559,14 @@ def phase2_sources_share_owner(left: object, right: object) -> bool:
     )
     for _source, expansion in expansions:
         binding = expansion[1]
-        if binding is not None and any(
-            binding.window_source is not window for window in windows
-        ):
-            return False
+        if binding is not None:
+            binding_values = _phase2_portfolio_window_authority_values(
+                binding
+            )
+            if binding_values is None or any(
+                binding_values[1] is not window for window in windows
+            ):
+                return False
 
     if _current_journal_source_authority_owner(candidates) is None:
         return False
@@ -11870,9 +12602,12 @@ class Journal:
                 binding = _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.get(
                     source_identity
                 )
+                binding_values = _phase2_portfolio_window_authority_values(
+                    binding
+                )
                 if (
-                    binding is not None
-                    and binding.portfolio_reference is dead
+                    binding_values is not None
+                    and binding_values[0] is dead
                 ):
                     _PHASE2_PORTFOLIO_WINDOW_AUTHORITIES.pop(
                         source_identity,
@@ -11887,11 +12622,11 @@ class Journal:
             initial_total_changes,
             initial_data_version,
         )
-        window_binding = _Phase2PortfolioWindowAuthority(
-            portfolio_reference=source_reference,
-            window_source=window_source,
-            portfolio_issued=source_issued,
-            window_issued=window_candidate[7],
+        window_binding = _new_phase2_portfolio_window_authority(
+            source_reference,
+            window_source,
+            source_issued,
+            window_candidate[7],
         )
         with _JOURNAL_SOURCE_LOCK:
             registry, nested_source = (

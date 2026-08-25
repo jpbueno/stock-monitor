@@ -48,8 +48,10 @@ reports, or backups. The parser accepts literal `NAME=value` data only; it does
 not remove quotes, interpolate variable references, parse shell syntax, or
 execute command-substitution text. Quotes would become part of the value and
 should not be added. `SEC_USER_AGENT` must contain an application name and
-contact email, and `STOCK_MONITOR_HOME` must be a non-empty absolute operator
-directory.
+contact email. It is sent as the declared `User-Agent` header on SEC and
+compiled official evidence-source GETs, but is never stored in observations or
+proposals and is never emitted in CLI JSON, reports, or errors.
+`STOCK_MONITOR_HOME` must be a non-empty absolute operator directory.
 
 The file must be owned by the current user, have one hard link, and have mode
 0400 or 0600. `chmod 400 .env` and `chmod 600 .env` are the two supported
@@ -107,8 +109,11 @@ never place these commands in an external schedule:
 '/Users/jbuenosantan/Documents/ChatGPT/Stock Monitor/scripts/run_monitor_unattended.sh' verify evidence --json
 ```
 
-`prepare` performs credential-free, GET-only retrieval from the compiled exact
-source catalog and writes the unreviewed proposal tree below
+`prepare` performs authentication-free, GET-only retrieval from the compiled
+exact source catalog. It is not anonymous: every request carries the declared
+application/contact `User-Agent`, which is not retained in the resulting
+observation identity or proposal. The command writes the unreviewed proposal
+tree below
 `$STOCK_MONITOR_HOME/.stock-monitor/evidence-proposals/<proposal_sha256>/`.
 SEC retrieval may also populate the private content-addressed cache below
 `$STOCK_MONITOR_HOME/.stock-monitor/cache/`. It never writes

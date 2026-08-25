@@ -14,6 +14,7 @@ from stock_monitor.providers.sec import (
     SecMetadataError,
     SecRateGovernor,
     SecRateLimitError,
+    validate_contact_user_agent,
 )
 from tests.support import FixtureTransport
 
@@ -86,6 +87,13 @@ class FakeClock:
 
 
 class SecContractTests(unittest.TestCase):
+    def test_contact_user_agent_validator_is_public_and_returns_exact_value(self) -> None:
+        value = "Evidence Source Client operations@example.com"
+
+        self.assertEqual(validate_contact_user_agent(value), value)
+        with self.assertRaises(ValueError):
+            validate_contact_user_agent("Evidence Source Client")
+
     def test_corrupt_rate_state_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "sec-rate.state"
@@ -246,7 +254,7 @@ class SecContractTests(unittest.TestCase):
                     "edgar/data/320193/000032019326000001/aapl-20260813.htm"
                 )
 
-    def test_accession_cik_prefix_must_match_requested_normalized_cik(self) -> None:
+    def test_cross_filer_only_is_unavailable_and_never_authorizes_archive(self) -> None:
         body = (
             b'{"cik":"0000320193","filings":{"recent":{'
             b'"accessionNumber":["0000789019-26-000001"],'
@@ -255,30 +263,191 @@ class SecContractTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            transport = StaticJsonTransport(body)
             client = SecClient(
-                transport=StaticJsonTransport(body),
+                transport=transport,
                 cache=ContentCache(root / "cache"),
                 governor=SecRateGovernor(root / "sec-rate.state"),
                 user_agent="Stock Monitor tests test@example.com",
                 now=lambda: datetime(2026, 8, 14, 12, 45, tzinfo=UTC),
             )
 
-            with self.assertRaises(SecMetadataError):
-                client.get_submission("320193")
+            submission = client.get_submission("320193")
+
+            self.assertIsNone(submission.published_at)
+            self.assertEqual(submission.timestamp_source, "UNAVAILABLE")
             with self.assertRaises(SecMetadataError):
                 client.get_archive(
                     "edgar/data/320193/000078901926000001/aapl-20260813.htm"
                 )
+            self.assertEqual(
+                transport.requested_urls,
+                ["https://data.sec.gov/submissions/CIK0000320193.json"],
+            )
 
-    def test_primary_document_is_a_bounded_ascii_safe_filename(self) -> None:
+    def test_mixed_filers_use_and_authorize_only_the_requested_issuer(self) -> None:
+        body = (
+            b'{"cik":"0000320193","filings":{"recent":{'
+            b'"accessionNumber":['
+            b'"0000789019-26-000777","0000320193-26-000001"],'
+            b'"acceptanceDateTime":['
+            b'"2026-08-14T21:02:03Z","2026-08-13T20:01:02Z"],'
+            b'"primaryDocument":["foreign.htm","aapl-20260813.htm"]}}}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transport = StaticJsonTransport(body)
+            client = SecClient(
+                transport=transport,
+                cache=ContentCache(root / "cache"),
+                governor=SecRateGovernor(root / "sec-rate.state"),
+                user_agent="Stock Monitor tests test@example.com",
+                now=lambda: datetime(2026, 8, 15, 12, 45, tzinfo=UTC),
+            )
+
+            submission = client.get_submission("320193")
+            archive = client.get_archive(
+                "edgar/data/320193/000032019326000001/aapl-20260813.htm"
+            )
+
+            accepted = datetime(2026, 8, 13, 20, 1, 2, tzinfo=UTC)
+            self.assertEqual(submission.published_at, accepted)
+            self.assertEqual(archive.published_at, accepted)
+            self.assertEqual(archive.accession, "0000320193-26-000001")
+            with self.assertRaises(SecMetadataError):
+                client.get_archive(
+                    "edgar/data/320193/000078901926000777/foreign.htm"
+                )
+            self.assertEqual(
+                transport.requested_urls,
+                [
+                    "https://data.sec.gov/submissions/CIK0000320193.json",
+                    (
+                        "https://www.sec.gov/Archives/edgar/data/320193/"
+                        "000032019326000001/aapl-20260813.htm"
+                    ),
+                ],
+            )
+
+    def test_malformed_foreign_accession_shape_is_rejected(self) -> None:
+        body = (
+            b'{"cik":"0000320193","filings":{"recent":{'
+            b'"accessionNumber":["0000789019-26-00001"],'
+            b'"acceptanceDateTime":["2026-08-14T21:02:03Z"],'
+            b'"primaryDocument":["foreign.htm"]}}}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = SecClient(
+                transport=StaticJsonTransport(body),
+                cache=ContentCache(root / "cache"),
+                governor=SecRateGovernor(root / "sec-rate.state"),
+                user_agent="Stock Monitor tests test@example.com",
+                now=lambda: datetime(2026, 8, 15, 12, 45, tzinfo=UTC),
+            )
+
+            with self.assertRaises(SecMetadataError):
+                client.get_submission("320193")
+
+    def test_valid_foreign_prefix_ignores_malformed_document_and_timestamp(self) -> None:
+        foreign_cells = (
+            ("not-a-timestamp", "../foreign.htm"),
+            ({"unexpected": "timestamp"}, "foreign.htm?download=1"),
+        )
+        for accepted_value, primary_document in foreign_cells:
+            body = json.dumps(
+                {
+                    "cik": "0000320193",
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": ["0000789019-26-000777"],
+                            "acceptanceDateTime": [accepted_value],
+                            "primaryDocument": [primary_document],
+                        }
+                    },
+                }
+            ).encode("utf-8")
+            with self.subTest(
+                accepted_value=accepted_value,
+                primary_document=primary_document,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    client = SecClient(
+                        transport=StaticJsonTransport(body),
+                        cache=ContentCache(root / "cache"),
+                        governor=SecRateGovernor(root / "sec-rate.state"),
+                        user_agent="Stock Monitor tests test@example.com",
+                        now=lambda: datetime(2026, 8, 15, 12, 45, tzinfo=UTC),
+                    )
+
+                    submission = client.get_submission("320193")
+
+                    self.assertIsNone(submission.published_at)
+                    self.assertEqual(submission.timestamp_source, "UNAVAILABLE")
+
+    def test_safe_nested_primary_document_stages_exact_archive_metadata(self) -> None:
+        primary_document = "xslF345X06/wk-form4_1787349005.xml"
+        body = json.dumps(
+            {
+                "cik": "0000320193",
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["0000320193-26-000001"],
+                        "acceptanceDateTime": ["2026-08-13T20:01:02Z"],
+                        "primaryDocument": [primary_document],
+                    }
+                },
+            }
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transport = StaticJsonTransport(body)
+            client = SecClient(
+                transport=transport,
+                cache=ContentCache(root / "cache"),
+                governor=SecRateGovernor(root / "sec-rate.state"),
+                user_agent="Stock Monitor tests test@example.com",
+                now=lambda: datetime(2026, 8, 14, 12, 45, tzinfo=UTC),
+            )
+
+            submission = client.get_submission("320193")
+            archive = client.get_archive(
+                "edgar/data/320193/000032019326000001/" + primary_document
+            )
+
+            accepted = datetime(2026, 8, 13, 20, 1, 2, tzinfo=UTC)
+            self.assertEqual(submission.published_at, accepted)
+            self.assertEqual(archive.published_at, accepted)
+            self.assertEqual(archive.accession, "0000320193-26-000001")
+            self.assertEqual(archive.timestamp_source, "SEC_FILING_METADATA")
+            self.assertEqual(
+                transport.requested_urls,
+                [
+                    "https://data.sec.gov/submissions/CIK0000320193.json",
+                    (
+                        "https://www.sec.gov/Archives/edgar/data/320193/"
+                        "000032019326000001/" + primary_document
+                    ),
+                ],
+            )
+
+    def test_primary_document_is_a_bounded_ascii_safe_relative_path(self) -> None:
         poisoned = (
+            "/absolute/filing.htm",
+            "../filing.htm",
+            "nested/../filing.htm",
+            "nested/./filing.htm",
+            "nested//filing.htm",
+            "nested/",
             "filing.htm?download=1",
             "filing.htm#fragment",
             "filing\n.htm",
             "filing-é.htm",
             "%2e%2e",
             "filing%2fexhibit.htm",
-            "a" * 256 + ".htm",
+            "nested\\filing.htm",
+            "a" * 1_025,
         )
         for primary_document in poisoned:
             body = json.dumps(
